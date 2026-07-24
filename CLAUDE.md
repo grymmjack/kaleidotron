@@ -194,6 +194,17 @@ First-time eframe/winit system deps on Debian/KDE:
 sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 ```
 
+**Headless render-to-file (`--render`).** `pixelview --render <PATH>... [-o FILE | --outdir DIR]
+[--font-9px] [--scale N] [--format FMT]` decodes any viewable format (ANS/XB/XBIN/RIP/BIN/… + raster)
+to an image file and **exits without opening a window** (works over SSH / in a batch pack-conversion
+script). `CliArgs::is_render()` short-circuits `main` into `app::run_render` *before* `eframe::run_native`.
+It reuses the same `Registry::decode_path` → `PixImage` the GUI uses (text-mode decoders rasterize
+inside `decode`, so `pixels` is already the finished art), then writes via `image::save_buffer[_with_format]`.
+Inputs may be files (tried directly) or folders (scanned non-recursively, filtered by `is_render_candidate`
+= scene/raster art, skipping audio/PDF/source-code). `--font-9px` calls `decode::set_font_9px` (the GUI
+primes this from storage; headless must set it explicitly). `-o` is single-file-only; batches use `--outdir`
+(default: beside each input, `<stem>.<fmt>`). `--scale` is an integer nearest-neighbor upscale (`upscale_nn`).
+
 **Windows (MSVC) build.** Builds with the standard MSVC toolchain — no extra setup. Three
 platform gotchas are already handled: (1) the `xattr` crate is Unix-only, so it's a
 `[target.'cfg(unix)'.dependencies]` entry and `rating.rs` `#[cfg(unix)]`-gates it (Windows ratings

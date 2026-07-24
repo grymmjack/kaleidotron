@@ -25,6 +25,12 @@ use eframe::egui;
 fn main() -> Result<(), eframe::Error> {
     let cli = app::CliArgs::parse();
 
+    // Headless render-to-file mode (`--render`): convert art to image files and exit,
+    // without ever opening a window. Runs fine over SSH / in a batch script.
+    if cli.is_render() {
+        std::process::exit(app::run_render(&cli));
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])

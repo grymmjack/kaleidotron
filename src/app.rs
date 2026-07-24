@@ -25514,6 +25514,14 @@ const HOTKEYS: &[(&str, &str)] = &[
 pub struct CliArgs {
     pub folder: Option<PathBuf>,
     pub thumb_size: Option<f32>,
+    // Headless render-to-file mode. When `render_inputs` is non-empty, `main` runs the
+    // conversion and exits *without* opening a window (works over SSH / in a batch script).
+    pub render_inputs: Vec<PathBuf>, // files and/or folders to convert
+    pub render_out: Option<PathBuf>, // -o: single explicit output file (one input file only)
+    pub render_outdir: Option<PathBuf>, // --outdir: output folder for batches
+    pub render_font_9px: bool,       // --font-9px: 9-dot VGA cell (ansilove/16colo look)
+    pub render_scale: u32,           // --scale N: nearest-neighbor upscale (0 = unset ⇒ 1×)
+    pub render_format: Option<String>, // --format png|bmp|…: force the encoder
 }
 
 const USAGE: &str = "\
@@ -25521,6 +25529,7 @@ pixelview — a pixel-art-first image viewer
 
 USAGE:
     pixelview [OPTIONS]
+    pixelview --render <PATH>... [RENDER OPTIONS]   (headless; no window)
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
@@ -25529,6 +25538,19 @@ OPTIONS:
                                   larger dimension is used)
     -h, --help                    Print this help
 
+RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files):
+    -r, --render <PATH>...        One or more input files and/or folders. A folder
+                                  converts every viewable art file inside it. Inputs
+                                  must follow --render together (before other flags).
+    -o, --out <FILE>              Output file (only with a single input file).
+        --outdir <DIR>            Output folder for batch conversion (created if needed).
+                                  Default: each file is written beside its input.
+        --font-9px                Render the 9-dot VGA text cell (line-draw chars join),
+                                  the way real VGA / ansilove / 16colo do. Default: 8-dot.
+        --scale <N>               Nearest-neighbor upscale the output N× (default 1).
+        --format <FMT>            Force the output encoder (png, bmp, tga, …) instead of
+                                  inferring it from the output filename's extension.
+
 Settings passed here override the persisted ones and are remembered afterward.
 ";
 
@@ -25536,7 +25558,9 @@ impl CliArgs {
     /// Parse `std::env::args`. Exits the process on `--help` or a bad argument.
     pub fn parse() -> Self {
         let mut out = CliArgs::default();
-        let mut args = std::env::args().skip(1);
+        // Peekable so `--render` can greedily gather its trailing input paths (every
+        // token up to the next `-flag`) without consuming a following option.
+        let mut args = std::env::args().skip(1).peekable();
         while let Some(a) = args.next() {
             match a.as_str() {
                 "-h" | "--help" => {
@@ -25554,10 +25578,47 @@ impl CliArgs {
                     },
                     None => cli_fail("--thumbnail-size requires a value like 160 or 120x160"),
                 },
+                "-r" | "--render" => {
+                    // Collect every following non-flag token as an input path.
+                    while let Some(p) = args.peek() {
+                        if p.starts_with('-') && p.len() > 1 {
+                            break; // next option — stop gathering inputs
+                        }
+                        out.render_inputs.push(PathBuf::from(args.next().unwrap()));
+                    }
+                    if out.render_inputs.is_empty() {
+                        cli_fail("--render requires at least one file or folder");
+                    }
+                }
+                "-o" | "--out" | "--output" => match args.next() {
+                    Some(v) => out.render_out = Some(PathBuf::from(v)),
+                    None => cli_fail("--out requires a path"),
+                },
+                "--outdir" => match args.next() {
+                    Some(v) => out.render_outdir = Some(PathBuf::from(v)),
+                    None => cli_fail("--outdir requires a path"),
+                },
+                "--font-9px" => out.render_font_9px = true,
+                "--scale" => match args.next() {
+                    Some(v) => match v.parse::<u32>() {
+                        Ok(n) if n >= 1 => out.render_scale = n,
+                        _ => cli_fail("--scale requires a positive integer (e.g. 2)"),
+                    },
+                    None => cli_fail("--scale requires a number"),
+                },
+                "--format" => match args.next() {
+                    Some(v) => out.render_format = Some(v.to_ascii_lowercase()),
+                    None => cli_fail("--format requires a value like png or bmp"),
+                },
                 other => cli_fail(&format!("unknown argument '{other}' (try --help)")),
             }
         }
         out
+    }
+
+    /// True when headless render-to-file mode was requested (`--render` given inputs).
+    pub fn is_render(&self) -> bool {
+        !self.render_inputs.is_empty()
     }
 }
 
@@ -25576,6 +25637,179 @@ fn parse_thumb_size(s: &str) -> Result<f32, String> {
         Ok(w.max(h))
     } else {
         s.trim().parse::<f32>().map_err(|_| bad())
+    }
+}
+
+// ─── Headless render-to-file (`--render`) ──────────────────────────────────────
+//
+// The whole GUI is bypassed: we build the same decoder `Registry` the app uses, decode
+// each input to a fully-rendered `PixImage`, optionally upscale, and write it out with the
+// `image` crate. Runs entirely on the main thread with no window/GPU, so it works over SSH
+// and in batch scripts. Called from `main` before `eframe::run_native`.
+
+/// Whether a file found *by scanning a folder* should be converted: scene/text art plus
+/// raster images, but not the heavy non-art plugins (audio → waveform, PDF → page render)
+/// or generic source code. An explicitly-named input file bypasses this and is always tried.
+fn is_render_candidate(p: &Path) -> bool {
+    if is_audio_ext(p) {
+        return false;
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => return false,
+        Some(e) if crate::decode::CODE_EXTS.contains(&e) => return false,
+        _ => {}
+    }
+    is_image_ext(p)
+}
+
+/// List a folder's convertible art files (non-recursive, sorted for stable output order).
+fn scan_render_dir(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_render_candidate(p))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Nearest-neighbor upscale by an integer factor — the right filter for pixel/scene art.
+fn upscale_nn(pixels: &[crate::image_types::Rgba], w: u32, h: u32, s: u32) -> (Vec<u8>, u32, u32) {
+    let (ow, oh) = (w * s, h * s);
+    let mut out = vec![0u8; (ow * oh * 4) as usize];
+    for y in 0..oh {
+        let sy = y / s;
+        for x in 0..ow {
+            let src = &pixels[(sy * w + x / s) as usize];
+            let di = ((y * ow + x) * 4) as usize;
+            out[di..di + 4].copy_from_slice(src);
+        }
+    }
+    (out, ow, oh)
+}
+
+/// Decode one file and write the resulting image. Returns the path written on success.
+fn render_one(
+    reg: &crate::decode::Registry,
+    input: &Path,
+    cli: &CliArgs,
+) -> Result<PathBuf, String> {
+    let img = reg.decode_path(input).map_err(|e| e.to_string())?;
+    let scale = cli.render_scale.max(1);
+    let (bytes, w, h) = if scale > 1 {
+        upscale_nn(&img.pixels, img.width, img.height, scale)
+    } else {
+        (img.rgba_bytes(), img.width, img.height)
+    };
+
+    // Output path: -o wins (single-file case), else <outdir-or-input-dir>/<stem>.<ext>.
+    let out = if let Some(o) = &cli.render_out {
+        o.clone()
+    } else {
+        let ext = cli.render_format.as_deref().unwrap_or("png");
+        let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let dir = cli
+            .render_outdir
+            .clone()
+            .or_else(|| input.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
+        dir.join(format!("{stem}.{ext}"))
+    };
+
+    // --format (if set) forces the encoder; otherwise it's inferred from the path extension.
+    let color = image::ColorType::Rgba8;
+    if let Some(fmt) = &cli.render_format {
+        let f = image::ImageFormat::from_extension(fmt)
+            .ok_or_else(|| format!("unsupported --format '{fmt}'"))?;
+        image::save_buffer_with_format(&out, &bytes, w, h, color, f).map_err(|e| e.to_string())?;
+    } else {
+        image::save_buffer(&out, &bytes, w, h, color).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// Entry point for `--render`. Returns a process exit code (0 = all ok).
+pub fn run_render(cli: &CliArgs) -> i32 {
+    // The 9-dot cell is a decode-time process-global (the GUI primes it from storage; here
+    // there is no GUI, so set it explicitly before any decode).
+    crate::decode::set_font_9px(cli.render_font_9px);
+
+    // Fail fast on a bad --format before doing any work.
+    if let Some(fmt) = &cli.render_format {
+        if image::ImageFormat::from_extension(fmt).is_none() {
+            eprintln!("pixelview: unsupported --format '{fmt}' (try png, bmp, tga, …)");
+            return 2;
+        }
+    }
+
+    // -o maps one input to one output; it can't address a batch.
+    let single_input_file = cli.render_inputs.len() == 1 && cli.render_inputs[0].is_file();
+    if cli.render_out.is_some() && !single_input_file {
+        eprintln!(
+            "pixelview: -o/--out only works with a single input file; use --outdir for batches"
+        );
+        return 2;
+    }
+
+    if let Some(d) = &cli.render_outdir {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            eprintln!("pixelview: cannot create output dir {}: {e}", d.display());
+            return 2;
+        }
+    }
+
+    // Expand inputs (files as-is; folders scanned) into a flat job list.
+    let mut jobs: Vec<PathBuf> = Vec::new();
+    for inp in &cli.render_inputs {
+        if inp.is_dir() {
+            let files = scan_render_dir(inp);
+            if files.is_empty() {
+                eprintln!("pixelview: no viewable art files in {}", inp.display());
+            }
+            jobs.extend(files);
+        } else if inp.is_file() {
+            jobs.push(inp.clone());
+        } else {
+            eprintln!("pixelview: not found: {}", inp.display());
+        }
+    }
+    if jobs.is_empty() {
+        eprintln!("pixelview: nothing to render");
+        return 1;
+    }
+
+    let reg = crate::decode::Registry::with_builtins();
+    let (mut ok, mut fail) = (0u32, 0u32);
+    for job in &jobs {
+        match render_one(&reg, job, cli) {
+            Ok(out) => {
+                println!("{} → {}", job.display(), out.display());
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("pixelview: {}: {e}", job.display());
+                fail += 1;
+            }
+        }
+    }
+    eprintln!(
+        "Rendered {ok} file(s){}",
+        if fail > 0 {
+            format!(", {fail} failed")
+        } else {
+            String::new()
+        }
+    );
+    if fail > 0 {
+        1
+    } else {
+        0
     }
 }
 
@@ -26759,6 +26993,39 @@ mod tests {
         assert!(is_image_ext(Path::new("z.cpp"))); // source code now renders too
         assert!(is_image_ext(Path::new("main.rs")));
         assert!(!is_image_ext(Path::new("z.exe"))); // genuinely non-viewable stays hidden
+    }
+
+    #[test]
+    fn render_candidate_takes_art_skips_heavy_plugins() {
+        use std::path::Path;
+        // Scene / raster art a folder scan should convert.
+        assert!(is_render_candidate(Path::new("ART.ANS")));
+        assert!(is_render_candidate(Path::new("scene.xb")));
+        assert!(is_render_candidate(Path::new("logo.rip")));
+        assert!(is_render_candidate(Path::new("pic.png")));
+        assert!(is_render_candidate(Path::new("noext"))); // extensionless scene art
+
+        // The heavy non-art plugins + source code are skipped for a *folder* scan
+        // (an explicitly-named file still gets tried directly, bypassing this filter).
+        assert!(!is_render_candidate(Path::new("song.mp3")));
+        assert!(!is_render_candidate(Path::new("doc.pdf")));
+        assert!(!is_render_candidate(Path::new("main.rs")));
+        assert!(!is_render_candidate(Path::new("notes.exe"))); // not viewable at all
+    }
+
+    #[test]
+    fn upscale_nn_doubles_and_replicates_pixels() {
+        // A 2×1 image scaled 2× → 4×2, each source pixel filling a 2×2 block.
+        let src = vec![[10, 20, 30, 255], [40, 50, 60, 255]];
+        let (bytes, w, h) = upscale_nn(&src, 2, 1, 2);
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(bytes.len(), (4 * 2 * 4) as usize);
+        // Top-left 2 px are the first source color; the next 2 are the second.
+        assert_eq!(&bytes[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&bytes[4..8], &[10, 20, 30, 255]);
+        assert_eq!(&bytes[8..12], &[40, 50, 60, 255]);
+        // Row 2 (offset 16 bytes = 4 px * 4) replicates row 1 exactly.
+        assert_eq!(&bytes[16..20], &[10, 20, 30, 255]);
     }
 
     #[test]

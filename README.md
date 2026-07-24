@@ -45,6 +45,7 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   - [Animated GIFs](#animated-gifs)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Command-line options](#command-line-options)
+  - [Rendering text art to files](#rendering-text-art-to-files---render)
 - [Menu reference](#menu-reference)
 - [Settings & where things are stored](#settings--where-things-are-stored)
 - [Bundled palettes](#bundled-palettes)
@@ -656,6 +657,7 @@ pixelview — a pixel-art-first image viewer
 
 USAGE:
     pixelview [OPTIONS]
+    pixelview --render <PATH>... [RENDER OPTIONS]   (headless; no window)
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
@@ -663,10 +665,74 @@ OPTIONS:
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
     -h, --help                    Print this help
+
+RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files):
+    -r, --render <PATH>...        One or more input files and/or folders. A folder
+                                  converts every viewable art file inside it. Inputs
+                                  must follow --render together (before other flags).
+    -o, --out <FILE>              Output file (only with a single input file).
+        --outdir <DIR>            Output folder for batch conversion (created if needed).
+                                  Default: each file is written beside its input.
+        --font-9px                Render the 9-dot VGA text cell (line-draw chars join),
+                                  the way real VGA / ansilove / 16colo do. Default: 8-dot.
+        --scale <N>               Nearest-neighbor upscale the output N× (default 1).
+        --format <FMT>            Force the output encoder (png, bmp, tga, …) instead of
+                                  inferring it from the output filename's extension.
 ```
 
 `--thumb-size` is accepted as an alias of `--thumbnail-size`. **Settings passed on
 the command line override the persisted ones and are remembered afterward.**
+
+### Rendering text art to files (`--render`)
+
+`--render` turns any format pixelview can decode — **ANSI, XBin, RIPscript, raw BIN,
+iCE Draw, Artworx, TundraDraw, PETSCII, …** and ordinary images — straight into a PNG
+(or BMP/TGA/…) **with no window**, so it works over SSH and in batch scripts. The output
+is pixel-identical to what the viewer shows: text-mode art is rasterized with the real
+IBM VGA / C64 fonts, SAUCE-aware, in true 24-bit color.
+
+```sh
+# One ANSI file → PNG written beside it (ART.png)
+pixelview --render ART.ANS
+
+# ANSI → an explicit output path
+pixelview --render ART.ANS -o ~/renders/art.png
+
+# XBin, using the authentic 9-dot VGA cell (matches ansilove / 16colo widths)
+pixelview --render SCENE.XB --font-9px -o scene.png
+
+# RIPscript (EGA vector) → PNG
+pixelview --render LOGO.RIP -o logo.png
+
+# The other binary scene formats, one per line:
+pixelview --render ART.BIN -o art.png     # raw BIN (SAUCE width)
+pixelview --render ART.IDF -o art.png     # iCE Draw
+pixelview --render ART.ADF -o art.png     # Artworx
+pixelview --render ART.TND -o art.png     # TundraDraw (24-bit truecolor)
+pixelview --render ART.SEQ -o art.png     # Commodore PETSCII (.seq / .pet)
+
+# 2× nearest-neighbor upscale, encoded as BMP
+pixelview --render ART.ANS --scale 2 --format bmp -o art.bmp
+
+# Batch — convert a whole pack folder into an output folder
+pixelview --render ~/packs/blocktronics/ --outdir ~/renders/
+
+# Batch — several named files at once, all 9-dot, into one folder
+pixelview --render a.ans b.xb c.rip --outdir out/ --font-9px
+```
+
+**Behavior & rules**
+
+- Each input is either a **file** (converted directly, whatever its type) or a **folder**
+  (scanned non-recursively; every scene/raster art file inside is converted — audio, PDF
+  and source-code files are skipped).
+- `-o/--out` maps **one input file → one output file**. For multiple inputs or a folder,
+  use `--outdir` (each file is written as `<name>.<fmt>`); with neither, output lands
+  **beside each input**.
+- Format is inferred from the output extension; `--format` forces it (handy with `--outdir`,
+  e.g. `--format tga`).
+- Exit code: **0** = all rendered, **1** = one or more failed / nothing found, **2** = bad
+  usage (e.g. `-o` with a batch, or an unknown `--format`).
 
 ---
 
@@ -783,7 +849,7 @@ cargo run --release      # build + launch
 cargo check              # fast type-check
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 180 tests (unit + headless egui_kittest GUI tests)
+cargo test               # 233 tests (unit + headless egui_kittest GUI tests)
 cargo test gui_tests     # just the GUI tests
 ```
 
