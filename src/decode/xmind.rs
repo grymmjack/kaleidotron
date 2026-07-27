@@ -399,14 +399,24 @@ pub fn xmind_sheet_titles(bytes: &[u8]) -> Vec<String> {
 /// Render sheet `idx` of the `.xmind`, falling back to XMind's embedded thumbnail if
 /// the tree can't be rendered — so the viewer always shows *something* XMind-shaped.
 pub fn render_xmind_sheet(bytes: &[u8], idx: usize) -> Result<PixImage, DecodeError> {
-    match render_sheet_inner(bytes, idx) {
+    render_xmind_sheet_at(bytes, idx, RASTER_TARGET)
+}
+
+/// Render sheet `idx` at a chosen longest-side resolution — the viewer bumps this as
+/// the user zooms in (pseudo-vector re-render), so the map stays crisp.
+pub fn render_xmind_sheet_at(
+    bytes: &[u8],
+    idx: usize,
+    target: f32,
+) -> Result<PixImage, DecodeError> {
+    match render_sheet_inner(bytes, idx, target) {
         Ok(img) => Ok(img),
         Err(primary) => embedded_thumbnail(bytes).map_err(|_| primary),
     }
 }
 
-/// Parse sheet `idx`'s topic tree, lay it out, and rasterize.
-fn render_sheet_inner(bytes: &[u8], idx: usize) -> Result<PixImage, DecodeError> {
+/// Parse sheet `idx`'s topic tree, lay it out, and rasterize at `target` longest side.
+fn render_sheet_inner(bytes: &[u8], idx: usize, target: f32) -> Result<PixImage, DecodeError> {
     let sheets = parse_content(bytes)?;
     let sheet = sheets
         .get(idx)
@@ -453,7 +463,7 @@ fn render_sheet_inner(bytes: &[u8], idx: usize) -> Result<PixImage, DecodeError>
     let theme = parse_theme(sheet);
 
     let svg = build_svg(&root, structure, &theme, &rels);
-    rasterize(&svg)
+    rasterize(&svg, target)
 }
 
 /// Recursively build a [`Node`] from an XMind topic object. `budget` caps the total
@@ -1619,8 +1629,9 @@ fn draw_glyph(svg: &mut String, glyph: &str, cx: f32, cy: f32, ms: f32, color: &
 
 // ---- rasterization -------------------------------------------------------
 
-/// Rasterize the generated SVG with the embedded font loaded, so text renders.
-fn rasterize(svg: &str) -> Result<PixImage, DecodeError> {
+/// Rasterize the generated SVG with the embedded font loaded, so text renders, at a
+/// scale that brings the longest side up to `target` px.
+fn rasterize(svg: &str, target: f32) -> Result<PixImage, DecodeError> {
     let mut opt = usvg::Options::default();
     opt.fontdb_mut().load_font_data(FONT.to_vec());
     opt.font_family = FONT_FAMILY.to_string();
@@ -1629,11 +1640,12 @@ fn rasterize(svg: &str) -> Result<PixImage, DecodeError> {
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let size = tree.size();
     let maxdim = size.width().max(size.height()).max(1.0);
-    // Render at a scale that brings the longest side up to ~RASTER_TARGET. Because the
-    // source is vector, this is *true* higher-res rendering (crisper glyphs), not upscaling,
-    // so a small map no longer looks chunky once the viewer fits it to the window. The 8×
-    // cap keeps a 1–2 node map from ballooning.
-    let scale = (RASTER_TARGET / maxdim).clamp(0.02, 8.0);
+    // Render at a scale that brings the longest side up to ~`target`. Because the source
+    // is vector, this is *true* higher-res rendering (crisper glyphs), not upscaling — so
+    // a small map isn't chunky once fit to the window, and the viewer can re-render at a
+    // larger target as the user zooms in (pseudo-vector). The 12× cap keeps a 1–2 node map
+    // from ballooning at a high target.
+    let scale = (target.max(1.0) / maxdim).clamp(0.02, 12.0);
     let w = (size.width() * scale).round().max(1.0) as u32;
     let h = (size.height() * scale).round().max(1.0) as u32;
 

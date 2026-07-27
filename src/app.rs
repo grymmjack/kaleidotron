@@ -791,12 +791,15 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     xmind_view: Option<XMindView>, // in-app multi-sheet XMind viewer state (None = not viewing one)
+    // Pseudo-vector zoom: a deferred request to re-rasterize the open XMind/PDF at this
+    // longest-side px (set while drawing when the texture is being upscaled; applied after).
+    want_rerender: Option<u32>,
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     tracker_cache: HashMap<PathBuf, Option<crate::libxmp::TrackerInfo>>, // lazy module structure
     sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
-    sfz_cache: HashMap<PathBuf, Option<crate::sfz::SfzInfo>>, // lazy .sfz directory info
-    dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>, // lazy .dls directory info
-    xi_cache: HashMap<PathBuf, Option<crate::xi::XiInfo>>, // lazy .xi instrument info
+    sfz_cache: HashMap<PathBuf, Option<crate::sfz::SfzInfo>>,        // lazy .sfz directory info
+    dls_cache: HashMap<PathBuf, Option<crate::dls::DlsInfo>>,        // lazy .dls directory info
+    xi_cache: HashMap<PathBuf, Option<crate::xi::XiInfo>>,           // lazy .xi instrument info
     audio_player: Option<AudioPlayer>, // in-app play/pause/seek preview (rodio), None = idle
     audio_decode_cache: Vec<(PathBuf, u64, DecodedAudio)>, // LRU of decoded audio (key: path+sig)
     audio_loading: Option<AudioLoading>, // a background audio decode in flight (spinner while pending)
@@ -1840,6 +1843,7 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             xmind_view: None,
+            want_rerender: None,
             audio_cache: HashMap::new(),
             tracker_cache: HashMap::new(),
             audio_decode_cache: Vec::new(),
@@ -9136,7 +9140,7 @@ impl PixelView {
         let size = [img.width as usize, img.height as usize];
         let rgba = img.rgba_bytes();
         let tex =
-            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, doc_tex_opts());
         self.full_src = Some((path.clone(), size, rgba));
         self.full_tex = Some((path, tex));
         self.full_reduced = None;
@@ -9177,7 +9181,7 @@ impl PixelView {
         let size = [img.width as usize, img.height as usize];
         let rgba = img.rgba_bytes();
         let tex =
-            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, doc_tex_opts());
         self.full_src = Some((path.clone(), size, rgba));
         self.full_tex = Some((path, tex));
         self.full_reduced = None;
@@ -14525,6 +14529,66 @@ impl PixelView {
                 self.step_image(ctx, forward);
             }
         }
+        // Apply a deferred pseudo-vector re-render (requested inside draw_image_view when the
+        // texture is being upscaled): re-rasterize the XMind/PDF source larger and rescale
+        // zoom to keep the view. Done here so it never runs while the texture is borrowed.
+        if let Some(target) = self.want_rerender.take() {
+            self.rerender_at(ctx, target);
+        }
+    }
+
+    /// Re-rasterize the open XMind map / PDF page at `target_longest` px and swap it into
+    /// `full_tex`, dividing `zoom` by the resolution change so the on-screen size (and pan)
+    /// stay put. This is the "pseudo-vector" step: zooming in re-renders from the source
+    /// instead of upscaling the old raster, so it stays crisp.
+    fn rerender_at(&mut self, ctx: &egui::Context, target_longest: u32) {
+        let Some((path, old_size)) = self.full_tex.as_ref().map(|(p, t)| (p.clone(), t.size))
+        else {
+            return;
+        };
+        let old_longest = old_size[0].max(old_size[1]) as f32;
+        let target = target_longest as f32;
+
+        // Render the source at the new resolution.
+        let img = if let Some(v) = &self.xmind_view {
+            let (vp, idx) = (v.path.clone(), v.sheet);
+            std::fs::read(self.resolve_local(&vp))
+                .ok()
+                .and_then(|b| crate::decode::render_xmind_sheet_at(&b, idx, target).ok())
+        } else if let Some(pv) = &self.pdf_view {
+            let (pp, page, two, pages) = (pv.path.clone(), pv.page, pv.two_page, pv.pages);
+            std::fs::read(self.resolve_local(&pp)).ok().and_then(|b| {
+                let scale = (target as u32).max(1);
+                let left = crate::decode::render_pdf_page(&b, page, scale)?;
+                Some(if two && page < pages {
+                    match crate::decode::render_pdf_page(&b, page + 1, scale) {
+                        Some(right) => compose_side_by_side(&left, &right),
+                        None => left,
+                    }
+                } else {
+                    left
+                })
+            })
+        } else {
+            None
+        };
+        let Some(img) = img else { return };
+
+        let size = [img.width as usize, img.height as usize];
+        let new_longest = size[0].max(size[1]) as f32;
+        let rgba = img.rgba_bytes();
+        let tex =
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, doc_tex_opts());
+        self.full_src = Some((path.clone(), size, rgba));
+        self.full_tex = Some((path, tex));
+        self.full_reduced = None; // recolor cache was keyed to the old resolution
+        self.minimap = None;
+        // Preserve the on-screen size (displayed = tex_longest · zoom): rescale zoom by the
+        // resolution change. Pan (offset, in points) stays valid since the size is unchanged.
+        if old_longest > 0.0 && new_longest > 0.0 {
+            let k = new_longest / old_longest;
+            self.zoom = (self.zoom / k).clamp(0.01, 64.0);
+        }
     }
 
     /// Step the viewer zoom by one whole **device** pixel per source pixel — the
@@ -14710,7 +14774,12 @@ impl PixelView {
         // *device* pixels per source pixel — the only scale nearest-neighbor keeps
         // undistorted (see the blit below). `ppp` folds in fractional desktop scaling.
         let ppp = ui.ctx().pixels_per_point();
-        let pixel_perfect = self.viewing_textmode || self.zoom_lock;
+        // XMind maps / PDF pages are smooth vector renders (no native pixel grid), and
+        // they re-render on zoom — pixel-perfect would make them blocky AND fight the
+        // re-render's zoom preservation, so they always scale smoothly.
+        let pixel_perfect = (self.viewing_textmode || self.zoom_lock)
+            && self.xmind_view.is_none()
+            && self.pdf_view.is_none();
         if resp.hovered() {
             if pixel_perfect {
                 // One device-pixel ladder step per *physical notch*. `zoom_delta()` is
@@ -14778,6 +14847,27 @@ impl PixelView {
         } else {
             egui::vec2(self.zoom, self.zoom * aspect_y)
         };
+        // Pseudo-vector zoom: a re-renderable source (XMind map / PDF page) being upscaled
+        // past ~1.5 device-px per source-px looks blurry — schedule a higher-res re-raster
+        // (applied after this borrow of the texture ends) so it stays crisp like the real
+        // app. `scale.x * ppp` is the true device-px/source-px factor.
+        if (self.xmind_view.is_some() || self.pdf_view.is_some())
+            && self.player.is_none()
+            && self.anim.is_none()
+            && self.want_rerender.is_none()
+        {
+            const RERENDER_UP: f32 = 1.5; // re-render once the texture upscales past this
+            const RERENDER_TO: f32 = 0.75; // re-render target brings `up` down to this (headroom)
+            const MAX_RERENDER_PX: f32 = 6000.0; // memory ceiling on the re-rendered texture
+            let up = scale.x * ppp;
+            let cur_longest = sw.max(sh);
+            if up > RERENDER_UP && cur_longest < MAX_RERENDER_PX - 1.0 {
+                let target = (cur_longest * up / RERENDER_TO).min(MAX_RERENDER_PX);
+                if target > cur_longest * 1.15 {
+                    self.want_rerender = Some(target.round() as u32);
+                }
+            }
+        }
         let img_px = egui::vec2(sw, sh) * scale;
         let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let bg = if self.black_bg {
@@ -17822,7 +17912,12 @@ impl eframe::App for PixelView {
                     // (so Z+3 → "3×" exactly, matching the readout); free zoom keeps
                     // N = logical 100·N%. Steps use the same device ladder.
                     let ppp = ctx.pixels_per_point();
-                    let pixel_perfect = self.viewing_textmode || self.zoom_lock;
+                    // XMind maps / PDF pages are smooth vector renders (no native pixel grid), and
+                    // they re-render on zoom — pixel-perfect would make them blocky AND fight the
+                    // re-render's zoom preservation, so they always scale smoothly.
+                    let pixel_perfect = (self.viewing_textmode || self.zoom_lock)
+                        && self.xmind_view.is_none()
+                        && self.pdf_view.is_none();
                     if let Some(z) = zoom_set {
                         self.zoom = if pixel_perfect { z / ppp } else { z };
                         self.offset = egui::Vec2::ZERO;
@@ -20422,6 +20517,17 @@ fn pp_device_scale(dev: f32) -> f32 {
 /// aliased noise a nearest-sampled downscale produces. Repeat wrap for the Tile view.
 fn view_tex_opts() -> egui::TextureOptions {
     egui::TextureOptions {
+        minification: egui::TextureFilter::Linear,
+        ..egui::TextureOptions::NEAREST_REPEAT
+    }
+}
+
+/// Texture options for smooth vector documents (XMind maps, PDF pages): linear both
+/// ways, so when zoomed past the re-render resolution cap the art stays soft rather
+/// than nearest-neighbor blocky (these aren't pixel art).
+fn doc_tex_opts() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Linear,
         minification: egui::TextureFilter::Linear,
         ..egui::TextureOptions::NEAREST_REPEAT
     }

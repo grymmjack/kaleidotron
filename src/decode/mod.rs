@@ -53,8 +53,9 @@ pub use pdf::{pdf_meta, render_page as render_pdf_page, PdfMeta};
 /// the Details pane and `is_image_ext`.
 pub use audio::{audio_info, AudioInfo, AUDIO_EXTS};
 
-/// XMind mind-map sheet titles + a per-sheet renderer, for the in-app multi-sheet viewer.
-pub use xmind::{render_xmind_sheet, xmind_sheet_titles};
+/// XMind mind-map sheet titles + a per-sheet renderer (with a resolution knob for the
+/// pseudo-vector zoom re-render), for the in-app multi-sheet viewer.
+pub use xmind::{render_xmind_sheet, render_xmind_sheet_at, xmind_sheet_titles};
 
 #[derive(Debug)]
 pub enum DecodeError {

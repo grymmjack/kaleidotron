@@ -136,10 +136,10 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
                      shows its content). Renders at RASTER_TARGET≈3200px longest side (supersamples
                      small maps so text isn't chunky). `decode()` renders sheet 0 (grid tile);
                      `xmind_sheet_titles` + `render_xmind_sheet(bytes, idx)` back the in-app
-                     multi-sheet viewer + `--render --sheet N`. Falls back to the embedded
-                     Thumbnails/thumbnail.png if content.json can't be parsed. **TODO (deferred):**
-                     pseudo-vector re-render at zoom (re-rasterize the SVG / PDF page at higher res
-                     as the user zooms in) — for XMind + the PDF viewer
+                     multi-sheet viewer + `--render --sheet N`; `render_xmind_sheet_at(bytes,
+                     idx, target_px)` re-rasterizes at a chosen longest-side for the pseudo-vector
+                     zoom (below). Falls back to the embedded Thumbnails/thumbnail.png if
+                     content.json can't be parsed
     ansi.rs          .ans/.asc/.nfo/.diz/.ice/.cia — CP437 + ANSI SGR/cursor + iCE
                      + SAUCE-driven 8×8 (VGA50/EGA43) vs 8×16 cell selection;
                      optional 9-dot VGA cell (font_9px); pads to a ≥25-row screen;
@@ -961,6 +961,17 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   idx)` into `full_tex` (so the existing zoom/pan/fit + Recolor pane + OSD all work on the map).
   `load_full`'s `is_xmind_path` branch sets it up + renders sheet 0; `render_xmind_to_full` /
   `xmind_step_sheet` mirror the PDF pair. `xmind` is in `is_image_ext` (prev/next + montages).
+- **Pseudo-vector zoom (XMind + PDF).** These are smooth *vector* sources (an SVG re-render,
+  a pdfium page), so instead of nearest-upscaling a fixed raster, the viewer **re-renders from
+  the source as you zoom in**. `draw_image_view` measures the texture's on-screen upscale
+  (`up = scale.x·ppp`, device-px per source-px); when `up > 1.5` it defers a
+  `want_rerender = target_px` (= `cur_longest·up/0.75`, capped at 6000). After the draw (borrow
+  released) `rerender_at` re-rasterizes — `render_xmind_sheet_at` / `render_pdf_page` at the new
+  longest side — swaps `full_tex`, and **divides `zoom` by the resolution change** so the
+  on-screen size + pan are preserved and `up` drops to ~0.75 (stable, ~1 re-render per doubling,
+  no feedback loop). Because they're vector, these sources are **excluded from `pixel_perfect`**
+  (nearest/integer-snap would go blocky AND re-snap away the zoom preservation) and upload with
+  **`doc_tex_opts`** (linear mag+min), so past the 6000px cap they stay soft, not pixelated.
 - **Audio** (`AudioPlayer` in app.rs, `rodio`): decodes the file to a sample buffer ONCE, then
   each play appends a fresh `SamplesBuffer` of the selected region to a new `Player` — so it
   restarts cleanly (the old "play once" bug), loops (`repeat_infinite`), and plays a drag-
