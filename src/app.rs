@@ -790,6 +790,7 @@ pub struct PixelView {
     sauce_cache: HashMap<PathBuf, Option<crate::sauce::Sauce>>, // parsed SAUCE per path
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
+    xmind_view: Option<XMindView>, // in-app multi-sheet XMind viewer state (None = not viewing one)
     audio_cache: HashMap<PathBuf, Option<crate::decode::AudioInfo>>, // lazy audio metadata
     tracker_cache: HashMap<PathBuf, Option<crate::libxmp::TrackerInfo>>, // lazy module structure
     sf_cache: HashMap<PathBuf, Option<crate::soundfont::SoundFontInfo>>, // lazy .sf2 directory info
@@ -915,7 +916,7 @@ pub struct PixelView {
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
     pixelfx: Vec<FxPreset>,
     pixelfx_name: String,                    // "save current" name buffer
-    pixelfx_folder: String,                  // "save into folder" buffer (empty = top level); also the "＋ new folder" target in Move-to
+    pixelfx_folder: String, // "save into folder" buffer (empty = top level); also the "＋ new folder" target in Move-to
     pixelfx_rename: Option<(usize, String)>, // inline-rename buffer (transient)
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
@@ -1838,6 +1839,7 @@ impl PixelView {
             sauce_cache: HashMap::new(),
             pdf_cache: HashMap::new(),
             pdf_view: None,
+            xmind_view: None,
             audio_cache: HashMap::new(),
             tracker_cache: HashMap::new(),
             audio_decode_cache: Vec::new(),
@@ -5964,7 +5966,11 @@ impl PixelView {
                             let mut g = (vs / step).floor() * step;
                             while g <= ve {
                                 if g >= vs {
-                                    p.vline(x_of(g), rect.y_range(), egui::Stroke::new(1.0_f32, gcol));
+                                    p.vline(
+                                        x_of(g),
+                                        rect.y_range(),
+                                        egui::Stroke::new(1.0_f32, gcol),
+                                    );
                                 }
                                 g += step;
                             }
@@ -6205,7 +6211,10 @@ impl PixelView {
                                 }
                             }
                         }
-                        p.add(egui::Shape::line(contour, egui::Stroke::new(2.0_f32, env_col)));
+                        p.add(egui::Shape::line(
+                            contour,
+                            egui::Stroke::new(2.0_f32, env_col),
+                        ));
                         // Node handles (drag to move; right-click deletes, keeping ≥2).
                         let ptr = ui.input(|inp| inp.pointer.latest_pos());
                         for (idx, pt) in pts.iter().enumerate() {
@@ -7559,7 +7568,10 @@ impl PixelView {
                                     } else if cresp.hovered() {
                                         egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
                                     } else {
-                                        egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(70))
+                                        egui::Stroke::new(
+                                            1.0_f32,
+                                            egui::Color32::from_black_alpha(70),
+                                        )
                                     };
                                     ui.painter().rect_stroke(
                                         cr,
@@ -8936,6 +8948,7 @@ impl PixelView {
         self.anim = None;
         self.player = None;
         self.pdf_view = None;
+        self.xmind_view = None;
         self.full_tex = None;
         self.full_src = None;
         self.full_reduced = None;
@@ -8971,6 +8984,23 @@ impl PixelView {
                 two_page: false,
             });
             self.render_pdf_to_full(ctx);
+            return;
+        }
+
+        // XMind → the in-app multi-sheet viewer. Render the current sheet now; the
+        // sheet selector (shown only for a multi-sheet file) + Left/Right re-render on
+        // demand. Single-sheet files behave like any static image (arrows step images).
+        if is_xmind_path(&path) {
+            let names = std::fs::read(&src)
+                .ok()
+                .map(|b| crate::decode::xmind_sheet_titles(&b))
+                .unwrap_or_default();
+            self.xmind_view = Some(XMindView {
+                path: path.clone(),
+                names,
+                sheet: 0,
+            });
+            self.render_xmind_to_full(ctx);
             return;
         }
 
@@ -9125,6 +9155,48 @@ impl PixelView {
         if next as usize != pv.page {
             pv.page = next as usize;
             self.render_pdf_to_full(ctx);
+        }
+    }
+
+    /// Render the XMind viewer's current sheet and upload it into `full_tex`, so the
+    /// existing zoom/pan/fit viewer (and recolor/minimap) show it. Fits to the window.
+    fn render_xmind_to_full(&mut self, ctx: &egui::Context) {
+        let Some(v) = &self.xmind_view else { return };
+        let (path, idx) = (v.path.clone(), v.sheet);
+        let Ok(bytes) = std::fs::read(self.resolve_local(&path)) else {
+            self.status = "Couldn't read the .xmind".into();
+            return;
+        };
+        let img = match crate::decode::render_xmind_sheet(&bytes, idx) {
+            Ok(img) => img,
+            Err(e) => {
+                self.status = format!("Couldn't render this mind map: {e}");
+                return;
+            }
+        };
+        let size = [img.width as usize, img.height as usize];
+        let rgba = img.rgba_bytes();
+        let tex =
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+        self.full_src = Some((path.clone(), size, rgba));
+        self.full_tex = Some((path, tex));
+        self.full_reduced = None;
+        self.minimap = None;
+        self.offset = egui::Vec2::ZERO;
+        self.view_to_top = true;
+        self.fit_requested = true;
+    }
+
+    /// Step the open XMind's sheet by `delta` (clamped) and re-render.
+    fn xmind_step_sheet(&mut self, ctx: &egui::Context, delta: isize) {
+        let Some(v) = &mut self.xmind_view else {
+            return;
+        };
+        let last = v.sheets() as isize;
+        let next = (v.sheet as isize + delta).clamp(0, (last - 1).max(0));
+        if next as usize != v.sheet {
+            v.sheet = next as usize;
+            self.render_xmind_to_full(ctx);
         }
     }
 
@@ -12811,7 +12883,10 @@ impl PixelView {
                             let stroke = if is_selected {
                                 egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color)
                             } else if resp.hovered() {
-                                egui::Stroke::new(1.0_f32, ui.visuals().widgets.hovered.bg_stroke.color)
+                                egui::Stroke::new(
+                                    1.0_f32,
+                                    ui.visuals().widgets.hovered.bg_stroke.color,
+                                )
                             } else {
                                 egui::Stroke::new(
                                     1.0_f32,
@@ -13976,11 +14051,15 @@ impl PixelView {
             }
         }
         if self.rebinding.is_none() && !interrupt {
-            // In the PDF viewer, Left/Right turn PAGES (stepping to another file mid-read is
-            // rarely what you want); everywhere else they step images.
+            // In the PDF viewer, Left/Right turn PAGES; in a multi-sheet XMind they turn
+            // SHEETS (stepping to another file mid-read is rarely what you want);
+            // everywhere else they step images.
+            let xmind_multi = self.xmind_view.as_ref().is_some_and(|v| v.sheets() > 1);
             if prev {
                 if self.pdf_view.is_some() {
                     self.pdf_step_page(ctx, -1);
+                } else if xmind_multi {
+                    self.xmind_step_sheet(ctx, -1);
                 } else {
                     self.step_image(ctx, false);
                 }
@@ -13988,6 +14067,8 @@ impl PixelView {
             if next {
                 if self.pdf_view.is_some() {
                     self.pdf_step_page(ctx, 1);
+                } else if xmind_multi {
+                    self.xmind_step_sheet(ctx, 1);
                 } else {
                     self.step_image(ctx, true);
                 }
@@ -14166,6 +14247,56 @@ impl PixelView {
                 self.pdf_step_page(ctx, -1);
             } else if pdf_next {
                 self.pdf_step_page(ctx, 1);
+            }
+        }
+
+        // XMind viewer controls: a sheet selector, shown only for a multi-sheet file.
+        // Deferred (a `goto` local) so the closure needn't hold `&mut self.xmind_view`
+        // while it re-renders.
+        if self.xmind_view.as_ref().is_some_and(|v| v.sheets() > 1) && !immersive {
+            let (sheet, sheets, names) = {
+                let v = self.xmind_view.as_ref().unwrap();
+                (v.sheet, v.sheets(), v.names.clone())
+            };
+            let mut goto: Option<usize> = None;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(sheet > 0, egui::Button::new("⬅ Prev"))
+                    .clicked()
+                {
+                    goto = Some(sheet.saturating_sub(1));
+                }
+                let label = format!(
+                    "Sheet {} / {}: {}",
+                    sheet + 1,
+                    sheets,
+                    names.get(sheet).map(String::as_str).unwrap_or("")
+                );
+                egui::ComboBox::from_id_salt("xmind_sheet_picker")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            if ui
+                                .selectable_label(i == sheet, format!("{}. {}", i + 1, name))
+                                .clicked()
+                            {
+                                goto = Some(i);
+                            }
+                        }
+                    });
+                if ui
+                    .add_enabled(sheet + 1 < sheets, egui::Button::new("Next ➡"))
+                    .clicked()
+                {
+                    goto = Some(sheet + 1);
+                }
+                ui.weak("· ⬅/➡ turn sheets · scroll/Ctrl+wheel to zoom");
+            });
+            if let Some(g) = goto {
+                if let Some(v) = &mut self.xmind_view {
+                    v.sheet = g.min(sheets - 1);
+                }
+                self.render_xmind_to_full(ctx);
             }
         }
 
@@ -16568,7 +16699,7 @@ impl PixelView {
         let mut fx_rename_commit: Option<(usize, String)> = None;
         let mut fx_rename_edit: Option<(usize, String)> = None; // in-progress inline-rename buffer
         let mut fx_move: Option<(usize, Option<String>)> = None; // move preset i to a folder (None = top level)
-        // Tabs: Places | Folders (one at a time, to save vertical room).
+                                                                 // Tabs: Places | Folders (one at a time, to save vertical room).
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(self.explorer_tab == 0, "Places")
@@ -17532,8 +17663,8 @@ impl eframe::App for PixelView {
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
-                                                          // Screensaver: once a (random) pack has finished downloading + mounting, open its
-                                                          // first art file. Both async ops idle ⇒ the listing has settled.
+                                                               // Screensaver: once a (random) pack has finished downloading + mounting, open its
+                                                               // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
             self.pending_autoplay = false;
             if let Some(idx) = self.entries.iter().position(|e| !e.is_dir && !e.is_archive) {
@@ -19533,7 +19664,13 @@ impl PostFx {
 
 /// One PixelFX-tab row snapshot: `(index into pixelfx, name, bg color, fg color, folder)` —
 /// owned so the grouped/collapsible render closures don't borrow `self.pixelfx`.
-type FxRow = (usize, String, Option<[u8; 3]>, Option<[u8; 3]>, Option<String>);
+type FxRow = (
+    usize,
+    String,
+    Option<[u8; 3]>,
+    Option<[u8; 3]>,
+    Option<String>,
+);
 
 /// A saved "PixelFX" preset — a snapshot of the WHOLE recolor stack (adjustments +
 /// order, post-FX, dither, color balance, resize, reduce, and the active palette), so
@@ -20906,6 +21043,21 @@ struct PdfView {
     pages: usize,
     page: usize,
     two_page: bool,
+}
+
+/// In-app multi-sheet XMind viewer state: which file, its sheet titles, and the
+/// current sheet. A `.xmind` can hold several sheets; each renders on demand via
+/// `render_xmind_sheet`. Left/Right turn sheets when there's more than one.
+struct XMindView {
+    path: PathBuf,
+    names: Vec<String>,
+    sheet: usize,
+}
+
+impl XMindView {
+    fn sheets(&self) -> usize {
+        self.names.len().max(1)
+    }
 }
 
 /// A decoded audio buffer + its precomputed waveform peaks — the *swappable* playback unit:
@@ -23344,6 +23496,13 @@ fn is_pdf_path(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
+/// Is `p` an XMind mind map (`.xmind`)? Opens the in-app multi-sheet viewer.
+fn is_xmind_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xmind"))
+}
+
 /// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.
 fn is_kit_ext(p: &Path) -> bool {
     p.extension()
@@ -25119,7 +25278,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip", "pdf",
+        "petscii", "petmate", "rip", "pdf", "xmind",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
@@ -25522,6 +25681,7 @@ pub struct CliArgs {
     pub render_font_9px: bool,       // --font-9px: 9-dot VGA cell (ansilove/16colo look)
     pub render_scale: u32,           // --scale N: nearest-neighbor upscale (0 = unset ⇒ 1×)
     pub render_format: Option<String>, // --format png|bmp|…: force the encoder
+    pub render_sheet: Option<usize>, // --sheet N: render sheet N (1-based) of a multi-sheet .xmind
 }
 
 const USAGE: &str = "\
@@ -25550,6 +25710,8 @@ RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files
         --scale <N>               Nearest-neighbor upscale the output N× (default 1).
         --format <FMT>            Force the output encoder (png, bmp, tga, …) instead of
                                   inferring it from the output filename's extension.
+        --sheet <N>               Render sheet N (1-based) of a multi-sheet .xmind mind map.
+                                  Default: the first sheet.
 
 Settings passed here override the persisted ones and are remembered afterward.
 ";
@@ -25609,6 +25771,13 @@ impl CliArgs {
                 "--format" => match args.next() {
                     Some(v) => out.render_format = Some(v.to_ascii_lowercase()),
                     None => cli_fail("--format requires a value like png or bmp"),
+                },
+                "--sheet" => match args.next() {
+                    Some(v) => match v.parse::<usize>() {
+                        Ok(n) if n >= 1 => out.render_sheet = Some(n),
+                        _ => cli_fail("--sheet requires a positive integer (1-based)"),
+                    },
+                    None => cli_fail("--sheet requires a number"),
                 },
                 other => cli_fail(&format!("unknown argument '{other}' (try --help)")),
             }
@@ -25700,7 +25869,16 @@ fn render_one(
     input: &Path,
     cli: &CliArgs,
 ) -> Result<PathBuf, String> {
-    let img = reg.decode_path(input).map_err(|e| e.to_string())?;
+    // `--sheet N` renders a specific sheet of a multi-sheet .xmind (1-based); otherwise
+    // the registry decode renders the first sheet (or the file normally).
+    let img = match (cli.render_sheet, is_xmind_path(input)) {
+        (Some(n), true) => {
+            let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+            crate::decode::render_xmind_sheet(&bytes, n.saturating_sub(1))
+                .map_err(|e| e.to_string())?
+        }
+        _ => reg.decode_path(input).map_err(|e| e.to_string())?,
+    };
     let scale = cli.render_scale.max(1);
     let (bytes, w, h) = if scale > 1 {
         upscale_nn(&img.pixels, img.width, img.height, scale)
@@ -26473,7 +26651,11 @@ mod tests {
         // must trim back to `n` frames exactly, so this is a regression guard, not just a smoke test.
         let inst = vec![0u8; 20];
         let mut body = Vec::from(*b"AIFF");
-        for (tag, chunk) in [(&b"COMM"[..], &comm), (&b"SSND"[..], &ssnd), (&b"INST"[..], &inst)] {
+        for (tag, chunk) in [
+            (&b"COMM"[..], &comm),
+            (&b"SSND"[..], &ssnd),
+            (&b"INST"[..], &inst),
+        ] {
             body.extend_from_slice(tag);
             body.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
             body.extend_from_slice(chunk); // all chunks are even-sized (word-aligned)
@@ -26486,7 +26668,11 @@ mod tests {
         assert_eq!(d.channels.get(), 1);
         assert_eq!(d.sample_rate.get(), 8000);
         // EXACT frame count — no over-read garbage past the declared COMM length.
-        assert_eq!(d.samples.len(), n as usize, "AIFF trimmed to the COMM frame count");
+        assert_eq!(
+            d.samples.len(),
+            n as usize,
+            "AIFF trimmed to the COMM frame count"
+        );
     }
 
     #[test]
@@ -26652,38 +26838,71 @@ mod tests {
     #[test]
     fn builtin_fx_presets_parse_and_reference_bundled_palettes() {
         let fx = builtin_fx_presets();
-        assert!(fx.len() >= 20, "bundled PixelFX presets embedded ({} found)", fx.len());
-        assert!(fx.iter().any(|p| p.name == "Gameboy"), "a known preset is present");
+        assert!(
+            fx.len() >= 20,
+            "bundled PixelFX presets embedded ({} found)",
+            fx.len()
+        );
+        assert!(
+            fx.iter().any(|p| p.name == "Gameboy"),
+            "a known preset is present"
+        );
         // Every referenced palette must resolve to embedded contents — else a fresh install would
         // recall a preset whose palette silently doesn't exist.
         for p in fx {
             if let Some(pal) = &p.selected_palette {
-                let text = builtin_palette_contents(pal)
-                    .unwrap_or_else(|| panic!("preset {:?} references missing palette {:?}", p.name, pal));
-                assert!(!crate::thumb::parse_gpl(text).is_empty(), "{:?} palette parsed empty", p.name);
+                let text = builtin_palette_contents(pal).unwrap_or_else(|| {
+                    panic!("preset {:?} references missing palette {:?}", p.name, pal)
+                });
+                assert!(
+                    !crate::thumb::parse_gpl(text).is_empty(),
+                    "{:?} palette parsed empty",
+                    p.name
+                );
             }
         }
         // Every bundled preset is filed under the Factory folder.
         assert!(
-            fx.iter().all(|p| p.folder.as_deref() == Some(FX_FACTORY_FOLDER)),
+            fx.iter()
+                .all(|p| p.folder.as_deref() == Some(FX_FACTORY_FOLDER)),
             "bundled presets are in the Factory folder"
         );
         // Merge is idempotent: overlaying builtins onto a list that already has them adds nothing.
         let mut have: Vec<FxPreset> = fx.to_vec();
         let before = have.len();
         merge_builtin_fx_presets(&mut have);
-        assert_eq!(have.len(), before, "merging builtins twice must not duplicate");
+        assert_eq!(
+            have.len(),
+            before,
+            "merging builtins twice must not duplicate"
+        );
 
         // Migration: a folder-less copy of a builtin (the earlier release) is moved into Factory;
         // a builtin the user re-filed elsewhere is left; a user-only preset is untouched.
         let mut user = vec![
-            FxPreset { name: "Gameboy".into(), folder: None, ..Default::default() },
-            FxPreset { name: "CGA1".into(), folder: Some("Mine".into()), ..Default::default() },
-            FxPreset { name: "My Look".into(), folder: None, ..Default::default() },
+            FxPreset {
+                name: "Gameboy".into(),
+                folder: None,
+                ..Default::default()
+            },
+            FxPreset {
+                name: "CGA1".into(),
+                folder: Some("Mine".into()),
+                ..Default::default()
+            },
+            FxPreset {
+                name: "My Look".into(),
+                folder: None,
+                ..Default::default()
+            },
         ];
         merge_builtin_fx_presets(&mut user);
         let f = |n: &str| user.iter().find(|p| p.name == n).unwrap().folder.clone();
-        assert_eq!(f("Gameboy").as_deref(), Some(FX_FACTORY_FOLDER), "folderless builtin → Factory");
+        assert_eq!(
+            f("Gameboy").as_deref(),
+            Some(FX_FACTORY_FOLDER),
+            "folderless builtin → Factory"
+        );
         assert_eq!(f("CGA1").as_deref(), Some("Mine"), "re-filed builtin kept");
         assert_eq!(f("My Look"), None, "user preset untouched");
         assert!(user.len() > 3, "missing builtins were appended");

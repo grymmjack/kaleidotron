@@ -28,6 +28,7 @@ mod svg;
 mod tundra;
 mod xbin;
 mod xcf;
+mod xmind;
 
 use crate::image_types::PixImage;
 use std::path::Path;
@@ -51,6 +52,9 @@ pub use pdf::{pdf_meta, render_page as render_pdf_page, PdfMeta};
 /// Audio metadata (duration / sample rate / channels / codec) + the extension list, for
 /// the Details pane and `is_image_ext`.
 pub use audio::{audio_info, AudioInfo, AUDIO_EXTS};
+
+/// XMind mind-map sheet titles + a per-sheet renderer, for the in-app multi-sheet viewer.
+pub use xmind::{render_xmind_sheet, xmind_sheet_titles};
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -103,6 +107,7 @@ impl Registry {
                 Box::new(psd::PsdDecoder),            // .psd flattened (psd crate)
                 Box::new(xcf::XcfDecoder),            // .xcf composited (xcf crate)
                 Box::new(svg::SvgDecoder),            // .svg rasterized (resvg)
+                Box::new(xmind::XMindDecoder),        // .xmind mind map → SVG → raster (resvg)
                 Box::new(ansi::AnsiDecoder),          // .ans/.asc/.nfo/.diz (CP437 + ANSI)
                 Box::new(xbin::XBinDecoder),          // .xb/.xbin (binary ANSI: palette/font/RLE)
                 Box::new(tundra::TundraDecoder),      // .tnd (TundraDraw — 24-bit truecolor)
@@ -314,7 +319,7 @@ mod tests {
         let r = Registry::with_builtins();
         for ext in [
             "aseprite", "ase", "psd", "pcx", "xcf", "draw", "ico", "svg", "xb", "xbin", "bin",
-            "ice", "cia", "tnd", "idf", "adf",
+            "ice", "cia", "tnd", "idf", "adf", "xmind",
         ] {
             assert!(r.known_extension(ext), "{ext} should be a known extension");
         }

@@ -20,7 +20,8 @@ Preferences (Dark/Light theme, grid spacing, caption fields) dialogs, a custom a
 icon, plus persisted settings and CLI flags.
 Decodes png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/**ico** (image crate), **PCX**,
 **Aseprite** (`.aseprite`/`.ase`), **PSD**, GIMP **XCF**, **.draw** (PNG preview),
-**SVG** (resvg), **ANSI/ASCII art** (`.ans`/`.asc`/`.nfo`/`.diz`/`.ice`/`.cia`,
+**SVG** (resvg), **XMind mind maps** (`.xmind` — unzip → parse `content.json` → tidy-tree
+layout → SVG → the same resvg raster path), **ANSI/ASCII art** (`.ans`/`.asc`/`.nfo`/`.diz`/`.ice`/`.cia`,
 embedded CP437 VGA font), and the binary scene formats **XBin** (`.xb`/`.xbin`),
 **raw BIN** (`.bin`), **TundraDraw** (`.tnd`, 24-bit), **iCE Draw** (`.idf`),
 **Artworx** (`.adf`), **PETSCII** (`.seq`/`.pet` — Commodore C64), **petmate** (`.petmate`
@@ -117,6 +118,28 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     psd.rs           .psd via the psd crate (flattened composite)
     xcf.rs           GIMP .xcf — composites layers (xcf crate; offsets not applied)
     svg.rs           .svg rasterized via resvg/usvg/tiny-skia
+    xmind.rs         .xmind mind maps — unzip (zip crate) → parse content.json (serde_json)
+                     → tidy-tree balanced-map layout → emit an SVG string → rasterize via
+                     resvg/usvg (embedded DejaVu Sans loaded into usvg's fontdb so text
+                     renders). **Reads the file's OWN theme** (`sheet.theme`, `parse_theme`):
+                     canvas bg, per-branch `multi-line-colors` palette (→ filled branch topics)
+                     OR a single-colour theme (→ outlined boxes in the theme's border colour),
+                     central/main/sub fills+text+borders. Renders like the XMind program: central
+                     topic, filled/outlined rounded-rect main branches, sub-topics as text on a
+                     coloured underline, tapered filled-ribbon connectors. **Semantic features:**
+                     markers (priority discs / task pies / flag / star / symbol — `draw_marker`),
+                     a note indicator, labels, **embedded images** (resources/* → base64 data URI,
+                     `resolve_image`), **boundaries** (translucent dashed group outline — subtree
+                     rects unioned in `place`/`collect_boundaries`), **relationships** (dashed
+                     arrows between topics by id, sheet- AND topic-level), and **detached/floating
+                     topics** (`children.detached` merged with `attached`, so a "notes board" sheet
+                     shows its content). Renders at RASTER_TARGET≈3200px longest side (supersamples
+                     small maps so text isn't chunky). `decode()` renders sheet 0 (grid tile);
+                     `xmind_sheet_titles` + `render_xmind_sheet(bytes, idx)` back the in-app
+                     multi-sheet viewer + `--render --sheet N`. Falls back to the embedded
+                     Thumbnails/thumbnail.png if content.json can't be parsed. **TODO (deferred):**
+                     pseudo-vector re-render at zoom (re-rasterize the SVG / PDF page at higher res
+                     as the user zooms in) — for XMind + the PDF viewer
     ansi.rs          .ans/.asc/.nfo/.diz/.ice/.cia — CP437 + ANSI SGR/cursor + iCE
                      + SAUCE-driven 8×8 (VGA50/EGA43) vs 8×16 cell selection;
                      optional 9-dot VGA cell (font_9px); pads to a ≥25-row screen;
@@ -185,7 +208,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 218 tests (208 unit + 10 headless egui_kittest GUI tests; +11 ignored network/real-trash)
+cargo test               # 238 tests (228 unit + 10 headless egui_kittest GUI tests; +12 ignored network/real-trash)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -204,6 +227,8 @@ Inputs may be files (tried directly) or folders (scanned non-recursively, filter
 = scene/raster art, skipping audio/PDF/source-code). `--font-9px` calls `decode::set_font_9px` (the GUI
 primes this from storage; headless must set it explicitly). `-o` is single-file-only; batches use `--outdir`
 (default: beside each input, `<stem>.<fmt>`). `--scale` is an integer nearest-neighbor upscale (`upscale_nn`).
+`--sheet N` renders sheet **N** (1-based) of a multi-sheet `.xmind` (via `render_xmind_sheet`); without it
+the first sheet is rendered.
 
 **Windows (MSVC) build.** Builds with the standard MSVC toolchain — no extra setup. Three
 platform gotchas are already handled: (1) the `xattr` crate is Unix-only, so it's a
@@ -929,6 +954,13 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   Prev/Next + "Page N/M" + a 1-page vs 2-page spread toggle; Left/Right turn pages (not step
   images); each page renders on demand via `render_pdf_page` into `full_tex` (reusing zoom/pan/
   fit); two-page mode composes facing pages side by side.
+- **XMind**: opening a `.xmind` enters an in-app **multi-sheet viewer** (`XMindView` in app.rs,
+  modeled on `PdfView`): a sheet selector row (⬅ Prev / a `ComboBox` of sheet titles / Next ➡),
+  shown only for a multi-sheet file; **Left/Right turn sheets** (single-sheet files fall through
+  to normal prev/next-image). Each sheet renders on demand via `decode::render_xmind_sheet(bytes,
+  idx)` into `full_tex` (so the existing zoom/pan/fit + Recolor pane + OSD all work on the map).
+  `load_full`'s `is_xmind_path` branch sets it up + renders sheet 0; `render_xmind_to_full` /
+  `xmind_step_sheet` mirror the PDF pair. `xmind` is in `is_image_ext` (prev/next + montages).
 - **Audio** (`AudioPlayer` in app.rs, `rodio`): decodes the file to a sample buffer ONCE, then
   each play appends a fresh `SamplesBuffer` of the selected region to a new `Player` — so it
   restarts cleanly (the old "play once" bug), loops (`repeat_infinite`), and plays a drag-
@@ -1552,7 +1584,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 218 tests, all headless (208 unit + 10 GUI; plus 11 `#[ignore]`
+`cargo test` runs 238 tests, all headless (228 unit + 10 GUI; plus 12 `#[ignore]`
 network / real-trash tests that hit the live 16colo.rs API or the system trash):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
