@@ -132,6 +132,19 @@ pub fn get_file(url: &str, filename: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// True if `url` is already stored as a file blob (so [`get_file`] would be a local hit,
+/// no network). Lets the bulk downloader honestly report cache reuse vs. fresh fetches.
+/// Verifies the blob file still exists on disk, not just the index row.
+pub fn contains(url: &str) -> bool {
+    let Some(c) = cache() else { return false };
+    let file: Option<String> = {
+        let Ok(db) = c.db.lock() else { return false };
+        db.query_row("SELECT file FROM cache WHERE url = ?1", [url], |r| r.get(0))
+            .ok()
+    };
+    file.is_some_and(|f| c.dir.join(f).exists())
+}
+
 fn read_blob(url: &str, ttl: Option<i64>) -> Option<Vec<u8>> {
     let c = cache()?;
     let (file, fetched): (String, i64) = {

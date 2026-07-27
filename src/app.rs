@@ -172,6 +172,73 @@ enum ColoSource {
     SearchGroups(String),  // substring across group names only
 }
 
+/// One file to save in a bulk 16colo.rs download: enough to place it on disk under its
+/// pack and record it in the `_index.csv`. Built from a [`ColoPiece`]/[`sixteen::Piece`].
+#[derive(Clone)]
+struct BulkItem {
+    artist: String,
+    group: String,
+    year: u32,
+    pack: String,
+    raw_url: String, // the single-file download URL (cache-first)
+    filename: String,
+}
+
+impl BulkItem {
+    fn from_piece(p: crate::sixteen::Piece) -> Self {
+        Self {
+            artist: p.artist,
+            group: p.group,
+            year: p.year,
+            pack: p.pack,
+            raw_url: p.raw_url,
+            filename: p.filename,
+        }
+    }
+}
+
+/// What a bulk download saves: an already-enumerated set of pieces (the current flat
+/// listing), a whole artist/group/search (enumerated on the worker via [`colo_walk`]),
+/// or a single pack.
+enum BulkJob {
+    Pieces(Vec<BulkItem>),
+    Source(ColoSource),
+    Pack { group: String, year: u32, pack: String },
+}
+
+/// What happened to one file in a bulk download.
+enum BulkOutcome {
+    Cached,        // already in the HTTP cache → copied locally, no network
+    Fetched,       // downloaded from 16colo.rs (and cached for next time)
+    Skipped,       // already present in the destination folder
+    Failed(String),
+}
+
+/// A progress update streamed from the bulk-download worker thread (mirrors [`ColoMsg`]).
+enum BulkMsg {
+    Total(usize),                            // enumeration done: N art files to save
+    Item { name: String, out: BulkOutcome }, // one file processed
+    Done,
+    Err(String),
+}
+
+/// Live state for the bulk-download progress window (`Download from 16colo.rs`). The
+/// worker runs on a background thread; `cancel` stops it, `rx` streams [`BulkMsg`]s.
+struct BulkDownload {
+    label: String,
+    dest: PathBuf,
+    total: usize, // 0 while still enumerating
+    done: usize,
+    cached: usize,
+    fetched: usize,
+    skipped: usize,
+    failed: usize,
+    last: String,
+    finished: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    rx: std::sync::mpsc::Receiver<BulkMsg>,
+}
+
 /// A virtual (non-on-disk) directory `Entry`, used for the 16colo.rs year/pack tree.
 fn virtual_dir(path: PathBuf) -> Entry {
     Entry {
@@ -1186,6 +1253,9 @@ pub struct PixelView {
     pending_external: Option<(String, String, String)>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
+    // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
+    // cache-first). `None` when idle; a progress window shows while `Some`.
+    bulk_dl: Option<BulkDownload>,
     // Background pack-SAUCE fetcher for *inspected* (hovered) 16colo pieces. 16colo
     // strips SAUCE from the raw file and the artist/search endpoints omit it, so when
     // the Details panel inspects a piece with no SAUCE we fetch its whole pack's SAUCE
@@ -2160,6 +2230,7 @@ impl PixelView {
             colo_open_rx: None,
             pending_external: None,
             colo_save_rx: None,
+            bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
             colo_sauce_done: HashSet::new(),
@@ -2726,6 +2797,255 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(_) => self.colo_save_rx = None,
+        }
+    }
+
+    /// Build a bulk-download job for a 16colo.rs *folder* (an artist, group, or pack), so
+    /// the grid/table right-click can "Download all" without opening the listing first.
+    /// Returns `(job, human label)`, or `None` if `path` isn't such a folder.
+    fn bulk_job_for_path(&self, path: &Path) -> Option<(BulkJob, String)> {
+        use crate::sixteen;
+        if !sixteen::is_remote(path) {
+            return None;
+        }
+        let parts = sixteen::rel_parts(path);
+        match parts.as_slice() {
+            [s, name] if s == sixteen::ARTISTS => Some((
+                BulkJob::Source(ColoSource::Artist(name.clone())),
+                format!("{name} (artist)"),
+            )),
+            [s, name] if s == sixteen::GROUPS => Some((
+                BulkJob::Source(ColoSource::Group(name.clone())),
+                format!("{name} (group)"),
+            )),
+            [year, pack] if year.parse::<u32>().is_ok() => Some((
+                BulkJob::Pack {
+                    group: String::new(),
+                    year: year.parse().unwrap_or(0),
+                    pack: pack.clone(),
+                },
+                format!("{pack} (pack)"),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Build a bulk-download job from the *current* flat piece listing (the nav-bar
+    /// "Download all" button). Uses `self.entries` — the filtered/sorted view — so it
+    /// downloads exactly what's on screen. `None` when not in a flat listing.
+    fn current_flat_bulk_job(&self) -> Option<(BulkJob, String)> {
+        if !self.colo_flat || self.colo_pieces.is_empty() {
+            return None;
+        }
+        let items: Vec<BulkItem> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let pc = self.colo_pieces.get(&e.path)?;
+                Some(BulkItem {
+                    artist: pc.artist.clone(),
+                    group: pc.group.clone(),
+                    year: pc.year,
+                    pack: pc.pack.clone(),
+                    raw_url: pc.raw_url.clone(),
+                    filename: e.path.file_name()?.to_str()?.to_string(),
+                })
+            })
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        let label = self
+            .folder
+            .as_deref()
+            .map(short_name)
+            .unwrap_or_else(|| "listing".into());
+        Some((BulkJob::Pieces(items), label))
+    }
+
+    /// Ask where to save, then kick off a bulk 16colo.rs download on a worker thread.
+    /// A progress window (`ui_bulk_progress`) shows counts + a Cancel while it runs.
+    fn start_bulk_download(&mut self, job: BulkJob, label: String) {
+        if self.bulk_dl.as_ref().is_some_and(|b| !b.finished) {
+            self.status = "A bulk download is already running".into();
+            return;
+        }
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title(format!("Choose a folder to save “{label}”"))
+            .pick_folder()
+        else {
+            return; // user cancelled the folder picker
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = Arc::clone(&self.registry);
+        let (c2, dest2) = (Arc::clone(&cancel), dest.clone());
+        std::thread::spawn(move || bulk_walk(job, dest2, c2, tx, registry));
+        self.status = format!("Downloading {label}…");
+        self.bulk_dl = Some(BulkDownload {
+            label,
+            dest,
+            total: 0,
+            done: 0,
+            cached: 0,
+            fetched: 0,
+            skipped: 0,
+            failed: 0,
+            last: String::new(),
+            finished: false,
+            cancel,
+            rx,
+        });
+        self.want_repaint = true;
+    }
+
+    /// Drain bulk-download progress into `self.bulk_dl` each frame (mirrors the other
+    /// `poll_*` methods). Keeps repainting while the worker runs.
+    fn poll_bulk_download(&mut self) {
+        let Some(b) = self.bulk_dl.as_mut() else {
+            return;
+        };
+        if b.finished {
+            return;
+        }
+        let mut newly_finished = false;
+        loop {
+            match b.rx.try_recv() {
+                Ok(BulkMsg::Total(n)) => b.total = n,
+                Ok(BulkMsg::Item { name, out }) => {
+                    b.done += 1;
+                    match out {
+                        BulkOutcome::Cached => {
+                            b.cached += 1;
+                            b.last = format!("Reused {name}");
+                        }
+                        BulkOutcome::Fetched => {
+                            b.fetched += 1;
+                            b.last = format!("Downloaded {name}");
+                        }
+                        BulkOutcome::Skipped => {
+                            b.skipped += 1;
+                            b.last = format!("Skipped {name} (already saved)");
+                        }
+                        BulkOutcome::Failed(e) => {
+                            b.failed += 1;
+                            b.last = format!("Failed {name}: {e}");
+                        }
+                    }
+                }
+                Ok(BulkMsg::Done) => {
+                    b.finished = true;
+                    newly_finished = true;
+                    break;
+                }
+                Ok(BulkMsg::Err(e)) => {
+                    b.finished = true;
+                    newly_finished = true;
+                    b.last = format!("Error: {e}");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    b.finished = true;
+                    newly_finished = true;
+                    break;
+                }
+            }
+        }
+        let finished = b.finished;
+        let summary = newly_finished.then(|| {
+            format!(
+                "Bulk download done — {} downloaded, {} reused from cache, {} skipped, {} failed",
+                b.fetched, b.cached, b.skipped, b.failed
+            )
+        });
+        if let Some(s) = summary {
+            self.status = s;
+        }
+        if !finished {
+            self.want_repaint = true;
+        }
+    }
+
+    /// The bulk-download progress window: counts, a progress bar, and Cancel / Close /
+    /// Open-folder. Shown whenever a bulk download is active or just-finished.
+    fn ui_bulk_progress(&mut self, ctx: &egui::Context) {
+        let Some(b) = self.bulk_dl.as_ref() else {
+            return;
+        };
+        let (label, dest, total, done, finished) =
+            (b.label.clone(), b.dest.clone(), b.total, b.done, b.finished);
+        let (cached, fetched, skipped, failed) = (b.cached, b.fetched, b.skipped, b.failed);
+        let last = b.last.clone();
+        let enumerating = total == 0 && !finished;
+        let mut do_cancel = false;
+        let mut do_close = false;
+        let mut do_open = false;
+        egui::Window::new("Download from 16colo.rs")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(format!("Downloading: {label}"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Saving to:");
+                    ui.weak(dest.display().to_string());
+                });
+                ui.separator();
+                if enumerating {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Finding files…");
+                    });
+                } else {
+                    let frac = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        1.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!("{done} / {total}"))
+                            .desired_width(324.0),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(format!(
+                        "{fetched} downloaded · {cached} reused · {skipped} skipped · {failed} failed"
+                    ));
+                    if !last.is_empty() {
+                        ui.weak(&last);
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if finished {
+                        if ui.button("Close").clicked() {
+                            do_close = true;
+                        }
+                        if ui
+                            .button("Open folder")
+                            .on_hover_text("Reveal the downloaded files")
+                            .clicked()
+                        {
+                            do_open = true;
+                        }
+                    } else if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+        if do_cancel {
+            if let Some(b) = self.bulk_dl.as_ref() {
+                b.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.status = "Cancelling…".into();
+        }
+        if do_open {
+            self.open_in_default_app(&dest);
+        }
+        if do_close {
+            self.bulk_dl = None;
         }
     }
 
@@ -8254,6 +8574,7 @@ impl PixelView {
             || self.colo_save_rx.is_some()
             || self.random_rx.is_some()
             || self.colo_sauce_pending > 0
+            || self.bulk_dl.as_ref().is_some_and(|b| !b.finished)
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -9402,6 +9723,17 @@ impl PixelView {
         let first = parts.first().map(String::as_str);
         let in_years = first.is_none_or(|s| s.parse::<u32>().is_ok());
         let mut nav: Option<PathBuf> = None;
+        // "Download all" is offered while viewing a flat artist/group/search listing;
+        // it saves exactly the rows currently shown (respecting any active filter).
+        let flat_count = if self.colo_flat {
+            self.entries
+                .iter()
+                .filter(|e| self.colo_pieces.contains_key(&e.path))
+                .count()
+        } else {
+            0
+        };
+        let mut want_bulk = false;
         // Plain-text labels: the bundled egui font renders many emoji as tofu (see the
         // font gotcha in CLAUDE.md), so avoid 📅/👥/🎨 here.
         ui.horizontal(|ui| {
@@ -9461,7 +9793,26 @@ impl PixelView {
                     });
                 }
             }
+            // Bulk-save the whole current listing (artist / group / search) to a folder.
+            if flat_count > 0 {
+                ui.separator();
+                if ui
+                    .button(format!("{} Download all ({flat_count})", icons::DOWNLOAD))
+                    .on_hover_text(
+                        "Save every piece in this listing to a folder\n\
+                         (reuses your 16colo.rs cache — already-viewed files don't re-download)",
+                    )
+                    .clicked()
+                {
+                    want_bulk = true;
+                }
+            }
         });
+        if want_bulk {
+            if let Some((job, label)) = self.current_flat_bulk_job() {
+                self.start_bulk_download(job, label);
+            }
+        }
         if let Some(p) = nav {
             self.open_folder(p);
         }
@@ -12579,6 +12930,7 @@ impl PixelView {
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
+        let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
         let can_paste = self.clipboard.is_some();
         // In a 16colo flat listing the rows are pieces, so offer pinning the whole
         // listing (the artist/group/search) — its virtual path re-runs the search.
@@ -12930,9 +13282,10 @@ impl PixelView {
                             let openers = self.opener_items();
                             let facts = self.folder_action_items();
                             let local_dir = Self::is_local_path(&entry.path);
+                            let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                             if let Some(pick) = entry_context_menu(
                                 ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
-                                &openers, &facts, local_dir,
+                                &openers, &facts, local_dir, bulk_dir,
                             ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
@@ -12941,6 +13294,7 @@ impl PixelView {
                                     TilePick::File(a) => ctx_action = Some((idx, a)),
                                     TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                     TilePick::Download(pack) => dl = Some((idx, pack)),
+                                    TilePick::DownloadAll => bulk_on = Some(idx),
                                     TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                     TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                     TilePick::OpenWithOther => open_other = Some(idx),
@@ -13029,6 +13383,13 @@ impl PixelView {
         if let Some((idx, want_pack)) = dl {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.download_piece(&p, want_pack);
+            }
+        }
+        if let Some(idx) = bulk_on {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                if let Some((job, label)) = self.bulk_job_for_path(&p) {
+                    self.start_bulk_download(job, label);
+                }
             }
         }
         self.empty_area_menu(empty_bg);
@@ -13332,6 +13693,7 @@ impl PixelView {
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
+        let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
         let mut colo_link: Option<(usize, ColKind)> = None; // pack/year/group link click
         let can_paste = self.clipboard.is_some();
         // In a flat listing the rows are pieces — offer pinning the whole listing.
@@ -13792,9 +14154,10 @@ impl PixelView {
                         let openers = self.opener_items();
                         let facts = self.folder_action_items();
                         let local_dir = Self::is_local_path(&entry.path);
+                        let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                         if let Some(pick) = entry_context_menu(
                             ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece, &openers,
-                            &facts, local_dir,
+                            &facts, local_dir, bulk_dir,
                         ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
@@ -13803,6 +14166,7 @@ impl PixelView {
                                 TilePick::File(a) => ctx_action = Some((idx, a)),
                                 TilePick::ToggleViewed(b) => toggle_viewed = Some((idx, b)),
                                 TilePick::Download(pack) => dl = Some((idx, pack)),
+                                TilePick::DownloadAll => bulk_on = Some(idx),
                                 TilePick::Rate(stars) => rate_to = Some((idx, stars)),
                                 TilePick::OpenWith(oi) => open_with = Some((idx, oi)),
                                 TilePick::OpenWithOther => open_other = Some(idx),
@@ -13939,6 +14303,13 @@ impl PixelView {
         if let Some((idx, want_pack)) = dl {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.download_piece(&p, want_pack);
+            }
+        }
+        if let Some(idx) = bulk_on {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                if let Some((job, label)) = self.bulk_job_for_path(&p) {
+                    self.start_bulk_download(job, label);
+                }
             }
         }
         self.empty_area_menu(empty_bg);
@@ -17749,6 +18120,7 @@ impl eframe::App for PixelView {
         self.poll_colo_pieces();
         self.poll_colo_open(&ctx);
         self.poll_colo_save();
+        self.poll_bulk_download();
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
@@ -18156,6 +18528,7 @@ impl eframe::App for PixelView {
         });
 
         self.paint_audio_loading_overlay(&ctx);
+        self.ui_bulk_progress(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -24319,6 +24692,7 @@ enum TilePick {
     File(FileAction),
     ToggleViewed(bool),    // mark this entry viewed (true) / not viewed (false)
     Download(bool),        // save a 16colo piece (false) or its whole pack .zip (true)
+    DownloadAll,           // bulk-download a 16colo artist/group/pack folder to disk
     Rate(u8),              // set this entry's star rating (0 = clear), via the context menu
     OpenWith(usize),       // "Open in…" → launch the external opener at this index
     OpenWithOther,         // "Open in…" → pick an arbitrary program (one-off, rfd)
@@ -24754,6 +25128,7 @@ fn entry_context_menu(
     openers: &[OpenerItem],         // user "Open in…" programs (filtered here by extension)
     folder_actions: &[OpenerItem],  // "Open folder in…" actions (shown for local dirs)
     local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
+    bulk_dir: bool, // a 16colo artist/group/pack folder → offer "Download all pieces…"
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -24844,6 +25219,21 @@ fn entry_context_menu(
         ui.separator();
     }
     if entry.is_dir {
+        // A 16colo artist/group/pack folder: bulk-download all its art to a local folder.
+        if bulk_dir {
+            if ui
+                .button(format!("{} Download all pieces…", icons::DOWNLOAD))
+                .on_hover_text(
+                    "Save every art file in this artist / group / pack to a folder\n\
+                     (reuses your 16colo.rs cache — already-viewed files don't re-download)",
+                )
+                .clicked()
+            {
+                pick = Some(TilePick::DownloadAll);
+                ui.close();
+            }
+            ui.separator();
+        }
         // Open this folder in the OS file browser or a user folder action (local dirs only —
         // a virtual 16colo path has nothing to reveal on disk).
         if local_dir {
@@ -25183,6 +25573,166 @@ fn colo_walk(
         }
     }
     let _ = tx.send(ColoMsg::Done(count));
+}
+
+/// Make a filesystem-safe path component (Linux target, but guard the obvious traps):
+/// strip path separators / NUL / control chars, and never emit `""` / `.` / `..`.
+fn safe_name(s: &str) -> String {
+    let mut t: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if t.is_empty() || t == "." || t == ".." {
+        t = "_".into();
+    }
+    t
+}
+
+/// Quote a field for the `_index.csv` (RFC-4180: wrap in quotes, double interior quotes).
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Save one bulk item under `<dest>/<pack>/<file>`. **Cache-first**: an item already in
+/// the persistent HTTP cache (browsed earlier) is a local copy with no network; a miss is
+/// fetched once (and cached). A file already present at the destination is skipped, so a
+/// re-run resumes cheaply.
+fn save_bulk_item(it: &BulkItem, dest: &Path) -> BulkOutcome {
+    let dir = dest.join(safe_name(&it.pack));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return BulkOutcome::Failed(e.to_string());
+    }
+    let out = dir.join(safe_name(&it.filename));
+    if out.exists() {
+        return BulkOutcome::Skipped;
+    }
+    let was_cached = crate::cache::contains(&it.raw_url);
+    // `download_file` == `cache::get_file`: returns the cached blob path (no network on a
+    // hit), else downloads + caches. Then we copy it into the user's destination folder.
+    match crate::sixteen::download_file(&it.raw_url, &it.filename) {
+        Ok(cached) => match std::fs::copy(&cached, &out) {
+            Ok(_) => {
+                if was_cached {
+                    BulkOutcome::Cached
+                } else {
+                    BulkOutcome::Fetched
+                }
+            }
+            Err(e) => BulkOutcome::Failed(e.to_string()),
+        },
+        Err(e) => BulkOutcome::Failed(e),
+    }
+}
+
+/// Background worker for a bulk 16colo.rs download. Enumerates the job's pieces (reusing
+/// [`colo_walk`] for an artist/group/search so the multi-word-artist + cap handling is
+/// shared), filters to viewable art + dedupes by URL, then saves each cache-first,
+/// streaming [`BulkMsg`] progress. Writes an `_index.csv` (artist,group,year,pack,file)
+/// beside the packs so the provenance survives the download. `cancel` stops it promptly.
+fn bulk_walk(
+    job: BulkJob,
+    dest: PathBuf,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<BulkMsg>,
+    registry: Arc<crate::decode::Registry>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // 1. Enumerate the item list.
+    let mut items: Vec<BulkItem> = match job {
+        BulkJob::Pieces(v) => v,
+        BulkJob::Pack { group, year, pack } => {
+            match crate::sixteen::fetch_pack_pieces(&group, year, &pack) {
+                Ok(ps) => ps.into_iter().map(BulkItem::from_piece).collect(),
+                Err(e) => {
+                    let _ = tx.send(BulkMsg::Err(e));
+                    return;
+                }
+            }
+        }
+        BulkJob::Source(src) => {
+            // Reuse colo_walk's enumeration (shared cancel), collecting the pieces.
+            let (itx, irx) = std::sync::mpsc::channel();
+            let c2 = Arc::clone(&cancel);
+            let handle = std::thread::spawn(move || colo_walk(src, c2, itx));
+            let mut v = Vec::new();
+            while let Ok(msg) = irx.recv() {
+                match msg {
+                    ColoMsg::Hit(entry, piece) => {
+                        if let Some(fname) = entry.path.file_name().and_then(|n| n.to_str()) {
+                            v.push(BulkItem {
+                                artist: piece.artist,
+                                group: piece.group,
+                                year: piece.year,
+                                pack: piece.pack,
+                                raw_url: piece.raw_url,
+                                filename: fname.to_string(),
+                            });
+                        }
+                    }
+                    ColoMsg::Done(_) => break,
+                    ColoMsg::Err(e) => {
+                        let _ = tx.send(BulkMsg::Err(e));
+                        let _ = handle.join();
+                        return;
+                    }
+                }
+            }
+            let _ = handle.join();
+            v
+        }
+    };
+    if cancel.load(Relaxed) {
+        return;
+    }
+    // 2. Keep only viewable art, and dedupe by URL (a search can list a piece via both its
+    //    artist and its group).
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|it| {
+        if it.raw_url.is_empty() {
+            return false;
+        }
+        let art = std::path::Path::new(&it.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| registry.known_extension(e));
+        art && seen.insert(it.raw_url.clone())
+    });
+    let total = items.len();
+    let _ = tx.send(BulkMsg::Total(total));
+
+    // 3. Save each, recording successes in the index.
+    let mut csv = String::from("artist,group,year,pack,file\n");
+    for it in items {
+        if cancel.load(Relaxed) {
+            break;
+        }
+        let out = save_bulk_item(&it, &dest);
+        if !matches!(out, BulkOutcome::Failed(_)) {
+            csv.push_str(&format!(
+                "{},{},{},{},{}\n",
+                csv_field(&it.artist),
+                csv_field(&it.group),
+                it.year,
+                csv_field(&it.pack),
+                csv_field(&it.filename),
+            ));
+        }
+        if tx.send(BulkMsg::Item {
+            name: it.filename,
+            out,
+        })
+        .is_err()
+        {
+            return; // UI dropped the receiver (window closed) — stop.
+        }
+    }
+    // 4. Best-effort provenance sidecar next to the downloaded packs.
+    let _ = std::fs::write(dest.join("_index.csv"), csv);
+    let _ = tx.send(BulkMsg::Done);
 }
 
 fn hover_details(
@@ -26100,6 +26650,29 @@ pub fn run_render(cli: &CliArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_name_neutralizes_path_traps() {
+        // Ordinary DOS-style scene filenames survive untouched (extension dispatch relies
+        // on it, and the by-pack layout keeps its provenance readable).
+        assert_eq!(safe_name("GJ-LOGO.ANS"), "GJ-LOGO.ANS");
+        assert_eq!(safe_name("blocktronics-42"), "blocktronics-42");
+        // Separators / control chars can't escape the destination dir…
+        assert_eq!(safe_name("a/b\\c"), "a_b_c");
+        assert_eq!(safe_name("x\ny"), "x_y");
+        // …and `.`/`..`/"" never become a real component.
+        assert_eq!(safe_name(".."), "_");
+        assert_eq!(safe_name("."), "_");
+        assert_eq!(safe_name(""), "_");
+    }
+
+    #[test]
+    fn csv_field_quotes_and_escapes() {
+        assert_eq!(csv_field("jed"), "\"jed\"");
+        // A comma in a group/pack name mustn't shift columns; interior quotes double.
+        assert_eq!(csv_field("blocktronics, inc"), "\"blocktronics, inc\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
 
     #[test]
     fn ansi32_palette_loads_32_colors() {

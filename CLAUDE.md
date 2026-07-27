@@ -443,6 +443,21 @@ map; `load_full` decodes via `resolve_local`, keeping the virtual path as identi
 Per-row ⬇ menu saves the file or its pack `.zip` to disk (`download_piece` → rfd +
 `sixteen::download_to`, reported via `colo_save_rx`). Entering a flat listing auto-switches
 to table view; navigating away (`show_folder`) cancels the stream + clears `colo_pieces`.
+**Bulk download** (a whole artist/group/pack → a local folder, for building an offline
+corpus — e.g. AI-training on one's own scene art): the nav-bar **⬇ Download all (N)** button
+(shown in a flat listing, saves the on-screen `self.entries` rows) and a folder's right-click
+**⬇ Download all pieces…** (`entry_context_menu`'s `bulk_dir` arg → `TilePick::DownloadAll`;
+`bulk_job_for_path` maps an `artists/<x>` / `groups/<x>` / `<year>/<pack>` virtual path to a
+`BulkJob`). The worker `bulk_walk` **reuses `colo_walk`** for artist/group/search enumeration
+(keeps the multi-word-artist fallback + search caps), filters to viewable art
+(`registry.known_extension`) + dedupes by URL, then saves each **cache-first** via
+`sixteen::download_file` (= `cache::get_file`) — a piece already in the HTTP cache (browsed
+before) is a local **copy, no network**; a miss is fetched once + cached; a file already at
+the destination is **skipped** (re-runs resume). Layout is `<dest>/<pack>/<file>` + an
+`_index.csv` (artist,group,year,pack,file) provenance sidecar. `cache::contains` only labels
+reused-vs-downloaded in the counts. Progress streams `BulkMsg` (mirrors `ColoMsg`) into
+`BulkDownload`, drained by `poll_bulk_download`, shown by the `ui_bulk_progress` window
+(bar + counts + Cancel/Close/Open-folder); folds into `net_busy`.
 **URL encoding:** the API returns *literal* paths, so a filename with a `#` (e.g.
 `#44_FIRE.ANS`) would truncate every URL at the fragment — leaving the piece
 un-downloadable and its thumbnail spinning forever. `sixteen::enc_path` percent-encodes a
