@@ -55,7 +55,10 @@ online ANSI archive: a Places entry with a nav bar — Years / Latest / Groups /
 Packs (→ auto-downloaded pack art); **Artist / Group / Search** instead flatten to a
 **sortable table of individual pieces** (thumb · filename · artist · type · year · group ·
 pack + a per-row "download file / pack" menu), fetched from the JSON API with no pack
-download — opening a piece grabs just its single `raw` file. Keys: 1–5/0 rate, Esc→grid, Backspace→up — the nav keys
+download — opening a piece grabs just its single `raw` file. Keys: 1–5/0 rate, Esc→grid, Backspace→up,
+**F5** re-scans the current place, **Shift+F5** hard-refreshes it (also drops cached thumbnails/metadata so
+items re-decode from disk — `clear_current_view_cache`; also a ⟳ toolbar button by the ✎ path-edit +
+View → Refresh / Force refresh) — the nav keys
 are rebindable (Preferences → Hotkeys); in the viewer, Ctrl+wheel or hold-Z + 1-9/0
 zooms (Snap locks to 100% steps).
 
