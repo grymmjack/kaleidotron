@@ -85,6 +85,13 @@ impl RemoteThumbs {
     pub fn drain(&self) -> Vec<RemoteThumbResult> {
         self.results.try_iter().collect()
     }
+
+    /// Forget that `path` was requested, so a later `request` re-decodes it (mirrors
+    /// `ThumbBuilder::forget`). Used by Shift+F5's cache clear to re-fetch/re-render a
+    /// 16colo piece's thumbnail from the persistent disk cache.
+    pub fn forget(&mut self, path: &Path) {
+        self.requested.remove(path);
+    }
 }
 
 /// Download + decode one thumbnail, area-downscaling if it's bigger than `target`. A

@@ -654,6 +654,8 @@ enum MenuAction {
     File(FileAction),
     Undo,
     Search,
+    Refresh,     // re-scan the current folder (F5)
+    HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
 
 /// The advanced-search form: every field is optional (empty = no constraint). The
@@ -4432,6 +4434,41 @@ impl PixelView {
             self.thumb_rgba.remove(&k);
             self.thumbs.forget(&k);
         }
+        self.want_repaint = true;
+    }
+
+    /// Shift+F5 — drop every in-memory decode/thumbnail cache for the items in the
+    /// current place, so each RE-DECODES from disk on the next frame. Complements plain
+    /// F5 (which only re-scans the listing, keeping cached thumbnails): use this when a
+    /// file's *contents* changed on disk but its path didn't, so its thumbnail/metadata
+    /// went stale. We invalidate the whole `all_entries` scan (the entire directory, not
+    /// just the filtered view), `forget` each path in BOTH thumbnailers (local + remote —
+    /// forgetting is what lets a later `request` re-decode; see `rethumbnail_audio`), then
+    /// `refresh()` (a disk re-scan) so this is a strict superset of F5.
+    fn clear_current_view_cache(&mut self) {
+        // Snapshot the paths first — we can't hold a borrow of `all_entries` while
+        // mutating the cache maps below.
+        let paths: Vec<PathBuf> = self.all_entries.iter().map(|e| e.path.clone()).collect();
+        let n = paths.len();
+        for p in &paths {
+            self.thumb_tex.remove(p); // GPU thumbnail texture
+            self.thumb_rgba.remove(p); // CPU thumb pixels (grid recolor source)
+            self.img_meta.remove(p); // dims / color count
+            self.palettes.remove(p); // details-pane swatches
+            self.grid_recolor.remove(p); // recolored grid tile
+            self.sauce_cache.remove(p); // parsed SAUCE
+            self.folder_info.remove(p); // montage + count (for directory entries)
+            self.thumbs.forget(p); // local thumbnailer dedupe set
+            self.colo_thumbs.forget(p); // remote (16colo) thumbnailer dedupe set
+        }
+        // The current folder's own montage/count preview (it may be a tile in its parent).
+        if let Some(f) = self.folder.clone() {
+            self.folder_info.remove(&f);
+        }
+        // Re-scan disk so added/removed files are caught too, then report (open_folder
+        // clears status, so set it AFTER — same ordering as the file-op handlers).
+        self.refresh();
+        self.status = format!("Cleared cache for {n} item(s) — reloading from disk");
         self.want_repaint = true;
     }
 
@@ -9606,6 +9643,19 @@ impl PixelView {
                     if ui.button("✎").on_hover_text("Edit path").clicked() {
                         self.path_edit = Some(disp.to_string_lossy().into_owned());
                         self.focus_path = true;
+                    }
+                    // Refresh this place. Plain click = re-scan the listing (F5); Shift+click
+                    // = hard refresh, also dropping cached thumbnails/metadata so items
+                    // re-decode from disk (Shift+F5). Shift is read at click time.
+                    let refresh = ui.button(icons::REFRESH).on_hover_text(
+                        "Refresh — re-scan this folder from disk\nShift+click: hard refresh (also clear cached thumbnails)",
+                    );
+                    if refresh.clicked() {
+                        if ui.input(|i| i.modifiers.shift) {
+                            self.clear_current_view_cache();
+                        } else {
+                            self.refresh();
+                        }
                     }
                     ui.separator();
                     let crumbs: Vec<PathBuf> = disp
@@ -16778,6 +16828,26 @@ impl PixelView {
             });
             Self::menu_bar_button(ui, &mut menu_resps, "View", |ui| {
                 if ui
+                    .button(format!("{}  Refresh (F5)", icons::REFRESH))
+                    .on_hover_text("Re-scan the current folder from disk")
+                    .clicked()
+                {
+                    action = Some(MenuAction::Refresh);
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{}  Force refresh (Shift+F5)", icons::REFRESH))
+                    .on_hover_text(
+                        "Also clear cached thumbnails / metadata for this place so every \
+                         item re-decodes from disk",
+                    )
+                    .clicked()
+                {
+                    action = Some(MenuAction::HardRefresh);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
                     .selectable_label(self.table_view, "Table view")
                     .on_hover_text("Show the current folder as a sortable table")
                     .clicked()
@@ -17131,6 +17201,8 @@ impl PixelView {
             }
             MenuAction::File(fa) => self.do_file_action(fa),
             MenuAction::Undo => self.undo(),
+            MenuAction::Refresh => self.refresh(),
+            MenuAction::HardRefresh => self.clear_current_view_cache(),
         }
     }
 
@@ -17978,6 +18050,22 @@ impl eframe::App for PixelView {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
+        }
+        // F5 — refresh the folder view: re-scan the current folder from disk so on-disk
+        // changes (files added/removed/renamed outside the app) show up. `refresh` reopens
+        // `self.folder` (suppressing a spurious history entry); the path-keyed thumb/meta
+        // caches survive the re-scan, so unchanged tiles stay instant. Guarded by `!typing`
+        // so it can't clobber an in-progress rename or a search-box edit.
+        //
+        // Shift+F5 — the heavier "hard refresh": additionally DROP the cached thumbnail /
+        // metadata / SAUCE / montage for every item in this place so they re-decode from
+        // disk (catches a file whose *contents* changed but whose path didn't).
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            if ctx.input(|i| i.modifiers.shift) {
+                self.clear_current_view_cache();
+            } else {
+                self.refresh();
+            }
         }
         // Renoise-style pane focus: while the Samples pane holds keyboard focus (and is visible),
         // its keys drive the hot-swap and are CONSUMED (consume_key) so they never also fire the
@@ -26307,6 +26395,8 @@ const HOTKEYS: &[(&str, &str)] = &[
     ("F", "Fit to window + auto-fit new images (viewer)"),
     ("T", "Tile preview — fill window (viewer) · Grid ↔ Table"),
     ("F11", "Immersive fullscreen (hide all bars)"),
+    ("F5", "Refresh — re-scan the current folder from disk"),
+    ("Shift + F5", "Hard refresh — also clear cached thumbnails / metadata"),
     ("R", "Load a random 16colo.rs pack"),
     ("1 – 5", "Set star rating"),
     ("0", "Clear rating"),
