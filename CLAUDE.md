@@ -17,7 +17,13 @@ recursive folder montages + count badges, sort/filter, filename search (`/`),
 file operations (copy/cut/paste, new folder, rename, trash + Ctrl+Z undo via the
 `trash` crate; context menu / Edit menu / shortcuts), a menu bar with hotkeys +
 Preferences (Dark/Light theme, grid spacing, caption fields) dialogs, a custom app
-icon, plus persisted settings and CLI flags.
+icon, plus persisted settings and CLI flags. A **side-by-side image compare**
+(grid/table right-click → **Compare ▸ Set as source / diff**) opens a two-pane
+`Mode::Compare` that overlays per-pixel differences in a user-picked colour (the ANSI32
+swatch picker) on the diff pane — independent or **synced** pan/zoom, diff-**tolerance** +
+overlay-**opacity** sliders, side **swap**, a differing-pixel readout, **layered-PSD
+export** (base image + an opaque diff-colour layer whose layer-opacity = the slider), and
+**save/recall of named comparisons** (see Image compare below).
 Decodes png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/**ico** (image crate), **PCX**,
 **Aseprite** (`.aseprite`/`.ase`), **PSD**, GIMP **XCF**, **.draw** (PNG preview),
 **SVG** (resvg), **XMind mind maps** (`.xmind` — unzip → parse `content.json` → tidy-tree
@@ -211,7 +217,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 238 tests (228 unit + 10 headless egui_kittest GUI tests; +12 ignored network/real-trash)
+cargo test               # 243 tests (233 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -835,6 +841,64 @@ rematch**, and the *order* of all of it is user-controlled.
   (ACID-RN.ANS, gj-os.ans) — see `save_at_right_margin_wraps_before_saving`. The top
   check excludes CR/LF, so an exactly-`wrap`-wide line + CRLF still occupies one row
   (no blank), keeping `full_width_line_plus_newline_has_no_blank_row`.
+
+## Image compare (side-by-side diff)
+
+**Right-click any file in the grid/table → `Compare ▸ Set as source (left)` / `Set as diff
+(right)`** — a `TilePick::CompareSource`/`CompareDiff`, threaded through the same deferred-
+pick pattern as the other tile actions in *both* `ui_grid` and `ui_table`
+(`compare_pick` → `set_compare_pick`). Setting *both* opens **`Mode::Compare`**
+(`ui_compare`) — a distinct view mode, **not** a `table_view`-style bool, because its
+keyboard + pan/zoom semantics differ from browse/single (adding the variant made the
+compiler flag every `match self.mode` site to decide Compare's behaviour). The chosen paths
+live on `PixelView` (`compare_source`/`compare_diff`); the transient runtime — decoded
+`PixImage`s, two `TiledTexture`s, the overlay texture, per-pane zoom/offset — is a
+`Compare` struct. `enter_compare` decodes both via `resolve_local` (so archive / 16colo
+virtual paths work) and builds the textures with `view_tex_opts`.
+
+**Two panes, `source | diff`**, split from `available_rect_before_wrap` with a 2px gutter +
+a divider and `SOURCE`/`DIFF` captions. Each pane paints via **`paint_compare_pane`**
+(a clipped `painter_at` → the same tile-blit loop the viewer uses). **Pan/zoom is per-pane**
+(drag = pan, wheel/pinch = zoom-to-cursor via `zoom_pane`, which keeps the cursor's source
+pixel fixed: `off' = f·off + (cursor − centre)·(1 − f)`); the **Sync pan/zoom** checkbox
+(persisted) mirrors whichever pane moved onto the other so they lock together. `zoom == 0`
+is the "fit-on-next-frame" sentinel. **⇄ Swap** flips which side shows source vs diff (the
+overlay + captions follow the diff image); **Reset view** refits; **‹ Grid** / **Esc** /
+mouse-back return to the browser. Borrow-ordering matters: handle input (mutate the pane
+transforms) → copy the `f32`/`Vec2` transforms into locals → borrow the textures immutably
+to paint, so the `&self` `paint_compare_pane` and the texture borrows coexist.
+
+**The diff overlay** is computed by **`compute_diff_mask`** — a pure free fn shared by the
+live view *and* the export so they can't disagree. It compares the DIFF image to the SOURCE
+**aligned at the top-left** (a diff pixel outside the source's bounds counts as different),
+per a per-channel **tolerance** (`pixel_differs`, 0 = exact), and returns an RGBA mask of
+the picked colour at full alpha on differing pixels (transparent elsewhere) + the differing
+count. `compare_recompute_overlay` builds it into a texture **only when the images /
+tolerance / colour change** (a `dirty` flag); **opacity is a paint-time tint alpha**, so the
+slider is instant with no rebuild. It's painted over the diff pane's image rect (same size +
+tex opts → pixel-aligned with the diff texture). The diff **colour** reuses the shared
+`ansi32_swatch_grid` picker (in a `menu_button`) + a hex field; a readout shows
+`N px differ (P%)`.
+
+**Layered-PSD export** (`Export PSD…` → **`build_compare_psd`**, a pure hand-rolled 8-bit-
+RGB writer — no PSD-*writer* crate exists in the tree, only the `psd` *reader*): a bottom
+**"Base"** layer (the diff image, forced opaque), a top **"Diff"** layer of *opaque* diff-
+colour pixels (alpha 0 where unchanged) whose **layer opacity == the overlay slider** — so
+the fade lives in layer metadata (re-tunable in Photoshop/GIMP), not baked into pixels —
+plus a flattened RGB composite so flat viewers show the blend. PSD is planar, big-endian,
+uncompressed (compression tag `0`); the one non-obvious field is the **outer length of the
+layer-and-mask section** (omitting it makes a reader mis-align and report 0 layers). Verified
+by `build_compare_psd_roundtrips` (re-parsed through the project's `psd` reader: 2 layers,
+names, and the Diff layer's opacity byte); `#[ignore]`d `dump_compare_psd_for_gimp` writes
+one to `/tmp` for a real-editor check. XCF was ruled out — GIMP's native format has no
+viable Rust writer.
+
+**Save / recall.** `Save` (+ a name field) stores a `SavedCompare` (paths + colour /
+opacity / tolerance / swapped; serde-derived) in `saved_compares`, replacing any same-named
+entry; the **Recall ▾** combo restores its settings + re-enters the comparison (per-row ✕
+deletes). Everything persists: `COMPARE_SAVED_KEY` for the list, and
+`COMPARE_COLOR/OPACITY/TOLERANCE/SYNC_KEY` for the live overlay settings. Defaults: diff
+colour magenta `[255,0,255]`, opacity `0.6`, tolerance `0`, sync on.
 
 ## Font glyph gotcha (solved — two embedded fallbacks + an icon set)
 
@@ -1613,8 +1677,9 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 238 tests, all headless (228 unit + 10 GUI; plus 12 `#[ignore]`
-network / real-trash tests that hit the live 16colo.rs API or the system trash):
+`cargo test` runs 243 tests, all headless (233 unit + 10 GUI; plus 13 `#[ignore]`
+network / real-trash / PSD-dump tests that hit the live 16colo.rs API, the system trash,
+or write a sample `.psd` to `/tmp`):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
   `count_colors`, `PixImage` palette expansion, `rating.rs` parse/encode + a
@@ -1624,7 +1689,10 @@ network / real-trash tests that hit the live 16colo.rs API or the system trash):
   rasterizer (golden-scene guards), `viewdb` round-trips, the `blend_toward` tile-bg
   mix, and the sample-pad grid (`Pad::record`/`from_record` round-trip incl.
   loop/pitch/type, `pad_is_audible` solo/mute truth table, and a `wav_bytes_16` →
-  `decode_audio` round-trip proving pad-WAV reload needs no separate reader).
+  `decode_audio` round-trip proving pad-WAV reload needs no separate reader), and the
+  **image-compare** diff/PSD logic (`pixel_differs` tolerance, `compute_diff_mask`
+  overlap-at-top-left + count, and `build_compare_psd_roundtrips` — the hand-written layered
+  PSD re-parsed through the `psd` crate with the right layers/names/opacity).
 - **GUI tests** (`gui_tests` in `app.rs`, via the `egui_kittest` dev-dep with its
   `eframe` feature): `Harness::builder().build_eframe(|cc| PixelView::new(cc,
   CliArgs::default()))` boots the real app with no window and drives menus through

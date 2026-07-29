@@ -117,6 +117,42 @@ const DEFAULT_PALETTE_FAVS: &[&str] = &[
 enum Mode {
     Grid,
     Single,
+    /// Side-by-side image comparison (source | diff) with a per-pixel diff overlay.
+    Compare,
+}
+
+/// Runtime (transient) state for the side-by-side image compare view. The chosen
+/// files + overlay settings live on `PixelView` (so they persist); this holds only
+/// the decoded pixels, GPU textures, per-pane view transforms and the diff overlay,
+/// all rebuilt when a comparison is (re)entered.
+#[derive(Default)]
+struct Compare {
+    src_img: Option<crate::image_types::PixImage>, // decoded "source" pixels (for diff/export)
+    diff_img: Option<crate::image_types::PixImage>, // decoded "diff" pixels
+    src_tex: Option<TiledTexture>,                 // source texture
+    diff_tex: Option<TiledTexture>,                // diff texture
+    overlay: Option<egui::TextureHandle>, // diff-colour mask (opaque on differing px), over the diff pane
+    // Per-pane view transform: `zoom` = points per source pixel, `off` = pan offset.
+    // Left pane is index L, right pane index R; the sync toggle keeps them equal.
+    zoom_l: f32,
+    off_l: egui::Vec2,
+    zoom_r: f32,
+    off_r: egui::Vec2,
+    diff_count: usize, // # pixels flagged as different
+    diff_total: usize, // # pixels compared (the diff image's area)
+    dirty: bool,       // overlay needs recompute (images / tolerance / colour changed)
+}
+
+/// A saved, recallable image comparison (persisted via `COMPARE_SAVED_KEY`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SavedCompare {
+    name: String,
+    source: PathBuf,
+    diff: PathBuf,
+    color: [u8; 3],
+    opacity: f32,
+    tolerance: u8,
+    swapped: bool,
 }
 
 /// One cell in the grid: either a subdirectory or an image file.
@@ -203,14 +239,18 @@ impl BulkItem {
 enum BulkJob {
     Pieces(Vec<BulkItem>),
     Source(ColoSource),
-    Pack { group: String, year: u32, pack: String },
+    Pack {
+        group: String,
+        year: u32,
+        pack: String,
+    },
 }
 
 /// What happened to one file in a bulk download.
 enum BulkOutcome {
-    Cached,        // already in the HTTP cache → copied locally, no network
-    Fetched,       // downloaded from 16colo.rs (and cached for next time)
-    Skipped,       // already present in the destination folder
+    Cached,  // already in the HTTP cache → copied locally, no network
+    Fetched, // downloaded from 16colo.rs (and cached for next time)
+    Skipped, // already present in the destination folder
     Failed(String),
 }
 
@@ -1088,9 +1128,24 @@ pub struct PixelView {
     full_tex: Option<(PathBuf, TiledTexture)>,
     full_src: Option<(PathBuf, [usize; 2], Vec<u8>)>, // decoded full pixels (for reduction)
     full_reduced: Option<(PathBuf, String, TiledTexture)>, // remapped, per (path,recolor)
-    anim: Option<AnimState>,                          // Some when viewing an animated GIF
-    hover_anim: Option<AnimState>,                    // the hovered grid GIF, playing in its tile
-    player: Option<Player>, // baud-rate playback for the open text/RIP art (ANSImation)
+
+    // --- Image compare (side-by-side diff) -------------------------------------
+    // The two files chosen from the grid/table context menu (Compare ▸ source / diff).
+    compare_source: Option<PathBuf>,
+    compare_diff: Option<PathBuf>,
+    compare_color: [u8; 3],            // diff-highlight colour (persisted)
+    compare_hex: String,               // hex entry buffer for the colour field (transient)
+    compare_opacity: f32,              // diff overlay opacity 0..1 (persisted)
+    compare_tolerance: u8,             // per-channel diff tolerance, 0 = exact match (persisted)
+    compare_swapped: bool,             // swap which side shows source vs diff (transient)
+    compare_sync: bool,                // pan/zoom moves both panes together (persisted)
+    compare_name: String,              // "save as…" name buffer (transient)
+    compare: Compare,                  // transient runtime (textures, per-pane view, overlay)
+    saved_compares: Vec<SavedCompare>, // saved, recallable comparisons (persisted)
+
+    anim: Option<AnimState>,       // Some when viewing an animated GIF
+    hover_anim: Option<AnimState>, // the hovered grid GIF, playing in its tile
+    player: Option<Player>,        // baud-rate playback for the open text/RIP art (ANSImation)
     zoom: f32,
     zoom_lock: bool, // viewer: snap zoom to 100% steps (¼ steps below 100%)
     offset: egui::Vec2,
@@ -1410,6 +1465,12 @@ impl PixelView {
     const PALETTE_FAV_KEY: &'static str = "palette_favorites";
     const SELECTED_PAL_KEY: &'static str = "selected_palette";
     const KEYMAP_KEY: &'static str = "keymap";
+    /// Image-compare overlay settings + saved comparisons.
+    const COMPARE_COLOR_KEY: &'static str = "compare_color";
+    const COMPARE_OPACITY_KEY: &'static str = "compare_opacity";
+    const COMPARE_TOLERANCE_KEY: &'static str = "compare_tolerance";
+    const COMPARE_SYNC_KEY: &'static str = "compare_sync";
+    const COMPARE_SAVED_KEY: &'static str = "saved_compares";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -1572,6 +1633,21 @@ impl PixelView {
         let sort_desc = get_bool(Self::SORT_DESC).unwrap_or(false);
         let table_view = get_bool(Self::TABLE_VIEW_KEY).unwrap_or(false);
         let table_grid = get_bool(Self::TABLE_GRID_KEY).unwrap_or(false);
+        // Image-compare persisted settings.
+        let compare_color = cc
+            .storage
+            .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::COMPARE_COLOR_KEY))
+            .unwrap_or([255, 0, 255]); // bright magenta reads on most art
+        let compare_opacity = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::COMPARE_OPACITY_KEY))
+            .unwrap_or(0.6);
+        let compare_tolerance = get_u8(Self::COMPARE_TOLERANCE_KEY).unwrap_or(0);
+        let compare_sync = get_bool(Self::COMPARE_SYNC_KEY).unwrap_or(true);
+        let saved_compares = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<SavedCompare>>(s, Self::COMPARE_SAVED_KEY))
+            .unwrap_or_default();
         let table_columns = cc
             .storage
             .and_then(|s| eframe::get_value::<u16>(s, Self::TABLE_COLUMNS_KEY))
@@ -2004,6 +2080,20 @@ impl PixelView {
             grid_recolor: HashMap::new(),
             folder_info: HashMap::new(),
             mode: Mode::Grid,
+            compare_source: None,
+            compare_diff: None,
+            compare_color,
+            compare_hex: format!(
+                "{:02X}{:02X}{:02X}",
+                compare_color[0], compare_color[1], compare_color[2]
+            ),
+            compare_opacity,
+            compare_tolerance,
+            compare_swapped: false,
+            compare_sync,
+            compare_name: String::new(),
+            compare: Compare::default(),
+            saved_compares,
             kit_editor: false,
             midi_follow: get_bool(Self::MIDI_FOLLOW_KEY).unwrap_or(false),
             kit_map_lock: get_bool(Self::KIT_MAP_LOCK_KEY).unwrap_or(false),
@@ -10838,6 +10928,7 @@ impl PixelView {
                 .or_else(|| self.anim.as_ref().map(|a| a.path.clone()))
                 .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone())),
             Mode::Grid => self.folder.clone(),
+            Mode::Compare => self.compare_source.clone(),
         };
         p.map(|p| self.to_display(&p).display().to_string())
     }
@@ -10879,6 +10970,7 @@ impl PixelView {
                 .and_then(|i| self.entries.get(i))
                 .map(|e| e.path.clone())
                 .or_else(|| self.last_inspected.clone()),
+            Mode::Compare => None,
         };
         path.and_then(|p| self.entries.iter().find(|e| e.path == p).cloned())
     }
@@ -12978,6 +13070,7 @@ impl PixelView {
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
         let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
+        let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -13350,6 +13443,8 @@ impl PixelView {
                                     TilePick::OpenWithOther => open_other = Some(idx),
                                     TilePick::OpenDefault => open_default = Some(idx),
                                     TilePick::Folder(fp) => folder_act = Some((idx, fp)),
+                                    TilePick::CompareSource => compare_pick = Some((idx, false)),
+                                    TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                 }
                             }
                         });
@@ -13425,6 +13520,11 @@ impl PixelView {
         if let Some((idx, fp)) = folder_act {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.run_folder_action(p, fp);
+            }
+        }
+        if let Some((idx, is_diff)) = compare_pick {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.set_compare_pick(ctx, p, is_diff);
             }
         }
         if pin_current {
@@ -13741,6 +13841,7 @@ impl PixelView {
         let mut open_other: Option<usize> = None; // "Open in… → Other" on this entry
         let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
+        let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -14222,6 +14323,8 @@ impl PixelView {
                                 TilePick::OpenWithOther => open_other = Some(idx),
                                 TilePick::OpenDefault => open_default = Some(idx),
                                 TilePick::Folder(fp) => folder_act = Some((idx, fp)),
+                                TilePick::CompareSource => compare_pick = Some((idx, false)),
+                                TilePick::CompareDiff => compare_pick = Some((idx, true)),
                             }
                         }
                     });
@@ -14345,6 +14448,11 @@ impl PixelView {
         if let Some((idx, fp)) = folder_act {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.run_folder_action(p, fp);
+            }
+        }
+        if let Some((idx, is_diff)) = compare_pick {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.set_compare_pick(ctx, p, is_diff);
             }
         }
         if pin_current {
@@ -15139,6 +15247,589 @@ impl PixelView {
                 Some(ctx.load_texture("crt_scanline", img, egui::TextureOptions::NEAREST_REPEAT));
         }
         self.scanline_tex.as_ref().unwrap().id()
+    }
+
+    // ===================== Image compare (side-by-side diff) =====================
+
+    /// Record `path` as the compare "source" (left) or "diff" (right). Once BOTH are
+    /// set, open the side-by-side comparison; otherwise nudge the user to pick the
+    /// other half.
+    fn set_compare_pick(&mut self, ctx: &egui::Context, path: PathBuf, is_diff: bool) {
+        if is_diff {
+            self.compare_diff = Some(path);
+        } else {
+            self.compare_source = Some(path);
+        }
+        if self.compare_source.is_some() && self.compare_diff.is_some() {
+            self.enter_compare(ctx);
+        } else {
+            let (set, want) = if is_diff {
+                ("diff", "source")
+            } else {
+                ("source", "diff")
+            };
+            self.status =
+                format!("Compare {set} set — right-click another image → Compare ▸ Set as {want}");
+        }
+    }
+
+    /// Decode the chosen source/diff files, build their textures, reset the per-pane
+    /// view and switch into `Mode::Compare`. Called when both files are set, or on
+    /// recall of a saved comparison.
+    fn enter_compare(&mut self, ctx: &egui::Context) {
+        let (Some(src), Some(dif)) = (self.compare_source.clone(), self.compare_diff.clone())
+        else {
+            return;
+        };
+        // Decode via the REAL on-disk path so archive / 16colo virtual paths work.
+        let src_img = self.registry.decode_path(&self.resolve_local(&src));
+        let dif_img = self.registry.decode_path(&self.resolve_local(&dif));
+        let (src_img, dif_img) = match (src_img, dif_img) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                self.status = "Compare: couldn't decode one of the images".into();
+                return;
+            }
+        };
+        let mk = |img: &crate::image_types::PixImage, name: &str| {
+            let size = [img.width as usize, img.height as usize];
+            TiledTexture::from_rgba(ctx, name, size, &img.rgba_bytes(), view_tex_opts())
+        };
+        self.compare.src_tex = Some(mk(&src_img, "compare_src"));
+        self.compare.diff_tex = Some(mk(&dif_img, "compare_diff"));
+        self.compare.src_img = Some(src_img);
+        self.compare.diff_img = Some(dif_img);
+        self.compare.overlay = None;
+        self.compare.dirty = true; // build the diff overlay on the first compare frame
+                                   // zoom == 0 is the "fit on next frame" sentinel (see `ui_compare`).
+        self.compare.zoom_l = 0.0;
+        self.compare.zoom_r = 0.0;
+        self.compare.off_l = egui::Vec2::ZERO;
+        self.compare.off_r = egui::Vec2::ZERO;
+        self.mode = Mode::Compare;
+        self.status = "Comparing — drag to pan, wheel to zoom, Esc for the grid".into();
+    }
+
+    /// (Re)build the diff overlay texture: `compare_color` at full alpha on every pixel
+    /// of the DIFF image that differs from the source (per `compare_tolerance`), and
+    /// transparent elsewhere. Different-sized images align at the top-left; a diff pixel
+    /// outside the source's bounds counts as different. Opacity is applied at paint time
+    /// (a tint), so only a colour/tolerance/image change dirties this.
+    fn compare_recompute_overlay(&mut self, ctx: &egui::Context) {
+        self.compare.dirty = false;
+        let (Some(src), Some(dif)) = (&self.compare.src_img, &self.compare.diff_img) else {
+            self.compare.overlay = None;
+            return;
+        };
+        let (dw, dh) = (dif.width as usize, dif.height as usize);
+        let (px, count) = compute_diff_mask(src, dif, self.compare_tolerance, self.compare_color);
+        let img = egui::ColorImage::from_rgba_unmultiplied([dw, dh], &px);
+        self.compare.overlay = Some(ctx.load_texture("compare_overlay", img, view_tex_opts()));
+        self.compare.diff_count = count;
+        self.compare.diff_total = dw * dh;
+    }
+
+    /// Apply a zoom factor `f` to one pane, keeping the point under the cursor fixed
+    /// (`center` is the pane's centre; `ptr` the pointer position, if any).
+    fn zoom_pane(&mut self, right: bool, f: f32, ptr: Option<egui::Pos2>, center: egui::Pos2) {
+        let (zoom, off) = if right {
+            (&mut self.compare.zoom_r, &mut self.compare.off_r)
+        } else {
+            (&mut self.compare.zoom_l, &mut self.compare.off_l)
+        };
+        if *zoom <= 0.0 {
+            return; // not fitted yet this frame
+        }
+        let new_zoom = (*zoom * f).clamp(0.02, 64.0);
+        let rf = new_zoom / *zoom; // real factor after clamping
+                                   // off' = rf·off + (cursor − centre)·(1 − rf)  → the cursor's source px stays put.
+        let d = ptr.map(|p| p - center).unwrap_or(egui::Vec2::ZERO);
+        *off = *off * rf + d * (1.0 - rf);
+        *zoom = new_zoom;
+    }
+
+    /// Paint one compare pane: bg, the image `tt` at (`zoom`,`offset`), then an optional
+    /// diff-colour `overlay` (tex, opacity) over the same image rect. Clipped to `rect`
+    /// so a panned image never bleeds into the other pane.
+    fn paint_compare_pane(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        tt: &TiledTexture,
+        overlay: Option<(&egui::TextureHandle, f32)>,
+        zoom: f32,
+        offset: egui::Vec2,
+    ) {
+        let painter = ui.painter_at(rect);
+        let bg = if self.black_bg {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::from_gray(28)
+        };
+        painter.rect_filled(rect, 0.0, bg);
+        let (sw, sh) = (tt.size[0] as f32, tt.size[1] as f32);
+        let img_px = egui::vec2(sw, sh) * zoom;
+        let img_tl = rect.center() + offset - img_px / 2.0;
+        let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for t in &tt.tiles {
+            let dst = egui::Rect::from_min_size(
+                img_tl + egui::vec2(t.x as f32, t.y as f32) * zoom,
+                egui::vec2(t.w as f32, t.h as f32) * zoom,
+            );
+            painter.image(t.tex.id(), dst, full_uv, egui::Color32::WHITE);
+        }
+        if let Some((ov, op)) = overlay {
+            // The overlay is the diff image's size (== this pane's `tt`), so it lines up
+            // over the whole image rect. Opacity is the tint alpha (instant, no rebuild).
+            let dst = egui::Rect::from_min_size(img_tl, img_px);
+            let tint = egui::Color32::from_white_alpha((op.clamp(0.0, 1.0) * 255.0) as u8);
+            painter.image(ov.id(), dst, full_uv, tint);
+        }
+    }
+
+    /// Save the current comparison (files + overlay settings) under `compare_name`
+    /// (or an auto name), replacing any existing entry with the same name.
+    fn save_current_compare(&mut self) {
+        let (Some(src), Some(dif)) = (self.compare_source.clone(), self.compare_diff.clone())
+        else {
+            self.status = "Nothing to save — set a source and a diff first".into();
+            return;
+        };
+        let stem = |p: &Path| {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let name = if self.compare_name.trim().is_empty() {
+            format!("{} vs {}", stem(&src), stem(&dif))
+        } else {
+            self.compare_name.trim().to_string()
+        };
+        let rec = SavedCompare {
+            name: name.clone(),
+            source: src,
+            diff: dif,
+            color: self.compare_color,
+            opacity: self.compare_opacity,
+            tolerance: self.compare_tolerance,
+            swapped: self.compare_swapped,
+        };
+        if let Some(slot) = self.saved_compares.iter_mut().find(|s| s.name == name) {
+            *slot = rec;
+        } else {
+            self.saved_compares.push(rec);
+        }
+        self.compare_name = name.clone();
+        self.status = format!("Saved comparison “{name}”");
+    }
+
+    /// Recall a saved comparison: restore its files + settings, then (re)enter compare.
+    fn recall_compare(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(sc) = self.saved_compares.get(idx).cloned() else {
+            return;
+        };
+        self.compare_source = Some(sc.source);
+        self.compare_diff = Some(sc.diff);
+        self.compare_color = sc.color;
+        self.compare_hex = format!("{:02X}{:02X}{:02X}", sc.color[0], sc.color[1], sc.color[2]);
+        self.compare_opacity = sc.opacity;
+        self.compare_tolerance = sc.tolerance;
+        self.compare_swapped = sc.swapped;
+        self.compare_name = sc.name;
+        self.enter_compare(ctx);
+    }
+
+    /// Export the comparison as a layered PSD: a "Base" layer (the diff image) and a
+    /// "Diff" layer of opaque diff-colour pixels whose layer opacity == the slider.
+    fn export_compare_psd(&mut self) {
+        // Build the two layers' pixel data, dropping the image borrows before any
+        // `self` mutation (status / dialog).
+        let built = {
+            let (Some(src), Some(dif)) = (
+                self.compare.src_img.as_ref(),
+                self.compare.diff_img.as_ref(),
+            ) else {
+                self.status = "Nothing to export — set a source and a diff first".into();
+                return;
+            };
+            // Base layer = the diff image, forced fully opaque.
+            let base: Vec<[u8; 4]> = dif.pixels.iter().map(|p| [p[0], p[1], p[2], 255]).collect();
+            // Diff layer = the same mask the live overlay uses (diff colour where changed).
+            let (mask, _) = compute_diff_mask(src, dif, self.compare_tolerance, self.compare_color);
+            let diff_px: Vec<[u8; 4]> = mask
+                .chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect();
+            (dif.width, dif.height, base, diff_px)
+        };
+        let (w, h, base, diff_px) = built;
+        let opacity = (self.compare_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let psd = build_compare_psd(w, h, &base, &diff_px, opacity);
+        let default = self
+            .compare_diff
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}_diff.psd", s.to_string_lossy()))
+            .unwrap_or_else(|| "comparison_diff.psd".into());
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default)
+            .add_filter("Photoshop PSD", &["psd"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, &psd) {
+            Ok(_) => self.status = format!("Exported layered PSD → {}", path.display()),
+            Err(e) => self.status = format!("PSD export failed: {e}"),
+        }
+    }
+
+    /// The side-by-side compare view: a control strip, then two panes (source | diff)
+    /// with independent — or synced — pan/zoom and a diff-colour overlay on the diff.
+    fn ui_compare(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let mut want_back = false;
+        let mut want_swap = false;
+        let mut want_reset = false;
+        let mut want_export = false;
+        let mut want_save = false;
+        let mut recall: Option<usize> = None;
+        let mut delete_saved: Option<usize> = None;
+
+        let swapped = self.compare_swapped;
+        // Filenames for the two panes (left/right depend on swap).
+        let name_of = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "—".into())
+        };
+        let src_name = name_of(&self.compare_source);
+        let dif_name = name_of(&self.compare_diff);
+        let (left_name, right_name) = if swapped {
+            (dif_name.clone(), src_name.clone())
+        } else {
+            (src_name.clone(), dif_name.clone())
+        };
+
+        // --- Control strip: navigation + readout -------------------------------
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("‹ Grid")
+                .on_hover_text("Back to the browser (Esc)")
+                .clicked()
+            {
+                want_back = true;
+            }
+            ui.separator();
+            if ui
+                .button("⇄ Swap")
+                .on_hover_text("Swap which side shows source vs diff")
+                .clicked()
+            {
+                want_swap = true;
+            }
+            let mut sync = self.compare_sync;
+            if ui
+                .checkbox(&mut sync, "Sync pan/zoom")
+                .on_hover_text("Pan/zoom moves both panes together")
+                .changed()
+            {
+                self.compare_sync = sync;
+                if sync {
+                    // Snap the panes together the moment sync is enabled.
+                    self.compare.zoom_r = self.compare.zoom_l;
+                    self.compare.off_r = self.compare.off_l;
+                }
+            }
+            if ui.button("Reset view").clicked() {
+                want_reset = true;
+            }
+            ui.separator();
+            let (c, t) = (self.compare.diff_count, self.compare.diff_total.max(1));
+            let pct = c as f32 / t as f32 * 100.0;
+            ui.label(format!("{c} px differ ({pct:.2}%)"))
+                .on_hover_text(format!("left: {left_name}   right: {right_name}"));
+        });
+
+        // --- Control strip: diff overlay + export + save/recall ----------------
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Diff colour:");
+            let col = self.compare_color;
+            let (sr, _) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(sr, 2.0, egui::Color32::from_rgb(col[0], col[1], col[2]));
+            ui.menu_button("Pick ▾", |ui| {
+                if let Some(c) = ansi32_swatch_grid(ui, "compare_color_grid", Some(col)) {
+                    self.compare_color = c;
+                    self.compare_hex = format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+                    self.compare.dirty = true;
+                    ui.close();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("#");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.compare_hex)
+                            .desired_width(70.0)
+                            .hint_text("RRGGBB"),
+                    );
+                    if r.changed() {
+                        if let Some(rgb) = parse_hex(&self.compare_hex) {
+                            self.compare_color = rgb;
+                            self.compare.dirty = true;
+                        }
+                    }
+                });
+            });
+            let mut op = self.compare_opacity;
+            if ui
+                .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"))
+                .changed()
+            {
+                self.compare_opacity = op; // paint-time tint; no overlay rebuild
+            }
+            let mut tol = self.compare_tolerance;
+            if ui
+                .add(egui::Slider::new(&mut tol, 0..=64).text("Tolerance"))
+                .on_hover_text("Per-channel: 0 = exact match, higher ignores small differences")
+                .changed()
+            {
+                self.compare_tolerance = tol;
+                self.compare.dirty = true;
+            }
+            ui.separator();
+            if ui
+                .button("Export PSD…")
+                .on_hover_text("Layered PSD: base image + a diff-colour layer at this opacity")
+                .clicked()
+            {
+                want_export = true;
+            }
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.compare_name)
+                    .desired_width(120.0)
+                    .hint_text("comparison name"),
+            );
+            if ui.button("Save").clicked() {
+                want_save = true;
+            }
+            if !self.saved_compares.is_empty() {
+                egui::ComboBox::from_id_salt("compare_recall")
+                    .selected_text("Recall ▾")
+                    .show_ui(ui, |ui| {
+                        for i in 0..self.saved_compares.len() {
+                            let nm = self.saved_compares[i].name.clone();
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(false, &nm).clicked() {
+                                    recall = Some(i);
+                                }
+                                if ui.small_button("✕").on_hover_text("Delete").clicked() {
+                                    delete_saved = Some(i);
+                                }
+                            });
+                        }
+                    });
+            }
+        });
+        ui.separator();
+
+        // Rebuild the overlay before painting if anything changed this frame or last.
+        if self.compare.dirty {
+            self.compare_recompute_overlay(ctx);
+        }
+
+        // --- The two panes -----------------------------------------------------
+        let have = self.compare.src_tex.is_some() && self.compare.diff_tex.is_some();
+        if !have {
+            ui.centered_and_justified(|ui| {
+                ui.label("Nothing to compare — pick a source and a diff from the grid.");
+            });
+        } else {
+            let area = ui.available_rect_before_wrap();
+            let gutter = 2.0;
+            let half_w = ((area.width() - gutter) / 2.0).max(1.0);
+            let rect_l = egui::Rect::from_min_size(area.min, egui::vec2(half_w, area.height()));
+            let rect_r = egui::Rect::from_min_size(
+                egui::pos2(area.min.x + half_w + gutter, area.min.y),
+                egui::vec2(half_w, area.height()),
+            );
+
+            // Dims (Copy) so we can compute fit without holding a texture borrow.
+            let l_dims = if swapped {
+                self.compare.diff_tex.as_ref().map(|t| t.size)
+            } else {
+                self.compare.src_tex.as_ref().map(|t| t.size)
+            };
+            let r_dims = if swapped {
+                self.compare.src_tex.as_ref().map(|t| t.size)
+            } else {
+                self.compare.diff_tex.as_ref().map(|t| t.size)
+            };
+            let fit = |dims: [usize; 2], rect: egui::Rect| -> f32 {
+                let (sw, sh) = (dims[0] as f32, dims[1] as f32);
+                if sw <= 0.0 || sh <= 0.0 {
+                    return 1.0;
+                }
+                ((rect.width() / sw).min(rect.height() / sh) * 0.98).clamp(0.02, 64.0)
+            };
+            if self.compare.zoom_l <= 0.0 {
+                if let Some(d) = l_dims {
+                    self.compare.zoom_l = fit(d, rect_l);
+                    self.compare.off_l = egui::Vec2::ZERO;
+                }
+            }
+            if self.compare.zoom_r <= 0.0 {
+                if let Some(d) = r_dims {
+                    self.compare.zoom_r = fit(d, rect_r);
+                    self.compare.off_r = egui::Vec2::ZERO;
+                }
+            }
+
+            // Input: drag = pan, wheel/pinch = zoom-to-cursor on the hovered pane.
+            let resp_l = ui.interact(rect_l, ui.id().with("cmp_l"), egui::Sense::click_and_drag());
+            let resp_r = ui.interact(rect_r, ui.id().with("cmp_r"), egui::Sense::click_and_drag());
+            let (scroll, pinch, ptr) = ui.input(|i| {
+                (
+                    i.smooth_scroll_delta.y,
+                    i.zoom_delta(),
+                    i.pointer.hover_pos(),
+                )
+            });
+            let mut f = 1.0;
+            if pinch != 1.0 {
+                f *= pinch;
+            }
+            if scroll.abs() > 0.0 {
+                f *= (scroll * 0.0015).exp(); // wheel up → zoom in
+            }
+            let mut moved_l = false;
+            let mut moved_r = false;
+            if resp_l.dragged() {
+                self.compare.off_l += resp_l.drag_delta();
+                moved_l = true;
+            }
+            if resp_r.dragged() {
+                self.compare.off_r += resp_r.drag_delta();
+                moved_r = true;
+            }
+            if f != 1.0 {
+                if resp_l.hovered() {
+                    self.zoom_pane(false, f, ptr, rect_l.center());
+                    moved_l = true;
+                } else if resp_r.hovered() {
+                    self.zoom_pane(true, f, ptr, rect_r.center());
+                    moved_r = true;
+                }
+            }
+            // Sync: mirror the pane that moved onto the other.
+            if self.compare_sync {
+                if moved_l {
+                    self.compare.zoom_r = self.compare.zoom_l;
+                    self.compare.off_r = self.compare.off_l;
+                } else if moved_r {
+                    self.compare.zoom_l = self.compare.zoom_r;
+                    self.compare.off_l = self.compare.off_r;
+                }
+            }
+
+            // Paint (Copy the transforms out, then borrow the textures immutably).
+            let (zl, ol, zr, or) = (
+                self.compare.zoom_l,
+                self.compare.off_l,
+                self.compare.zoom_r,
+                self.compare.off_r,
+            );
+            let op = self.compare_opacity;
+            // Left pane
+            {
+                let tt = if swapped {
+                    self.compare.diff_tex.as_ref()
+                } else {
+                    self.compare.src_tex.as_ref()
+                };
+                let ov = if swapped {
+                    self.compare.overlay.as_ref().map(|o| (o, op))
+                } else {
+                    None
+                };
+                if let Some(tt) = tt {
+                    self.paint_compare_pane(ui, rect_l, tt, ov, zl, ol);
+                }
+            }
+            // Right pane
+            {
+                let tt = if swapped {
+                    self.compare.src_tex.as_ref()
+                } else {
+                    self.compare.diff_tex.as_ref()
+                };
+                let ov = if swapped {
+                    None
+                } else {
+                    self.compare.overlay.as_ref().map(|o| (o, op))
+                };
+                if let Some(tt) = tt {
+                    self.paint_compare_pane(ui, rect_r, tt, ov, zr, or);
+                }
+            }
+            // Divider + per-pane captions.
+            let painter = ui.painter_at(area);
+            painter.line_segment(
+                [
+                    egui::pos2(area.min.x + half_w + gutter / 2.0, area.min.y),
+                    egui::pos2(area.min.x + half_w + gutter / 2.0, area.max.y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            );
+            let caption = |p: &egui::Painter, rect: egui::Rect, text: &str, is_diff: bool| {
+                let tag = if is_diff { "DIFF  " } else { "SOURCE  " };
+                p.text(
+                    rect.left_top() + egui::vec2(6.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{tag}{text}"),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgba_unmultiplied(230, 230, 230, 220),
+                );
+            };
+            caption(&painter, rect_l, &left_name, swapped);
+            caption(&painter, rect_r, &right_name, !swapped);
+        }
+
+        // Esc → back to the grid.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            want_back = true;
+        }
+
+        // --- Apply deferred actions -------------------------------------------
+        if want_back {
+            self.mode = Mode::Grid;
+        }
+        if want_swap {
+            self.compare_swapped = !self.compare_swapped;
+        }
+        if want_reset {
+            self.compare.zoom_l = 0.0;
+            self.compare.zoom_r = 0.0;
+            self.compare.off_l = egui::Vec2::ZERO;
+            self.compare.off_r = egui::Vec2::ZERO;
+        }
+        if want_export {
+            self.export_compare_psd();
+        }
+        if want_save {
+            self.save_current_compare();
+        }
+        if let Some(i) = recall {
+            self.recall_compare(ctx, i);
+        }
+        if let Some(i) = delete_saved {
+            if i < self.saved_compares.len() {
+                let nm = self.saved_compares.remove(i).name;
+                self.status = format!("Deleted comparison “{nm}”");
+            }
+        }
+        // Keep repainting so drags/zoom feel live.
+        ctx.request_repaint();
     }
 
     /// Single-view image painter: wheel-zoom + pinch + drag-pan (persisted zoom),
@@ -16028,6 +16719,7 @@ impl PixelView {
                     _ => self.selection.iter().cloned().collect(),
                 }
             }
+            Mode::Compare => Vec::new(),
         };
         let mut n = 0;
         for path in &targets {
@@ -16659,6 +17351,7 @@ impl PixelView {
                         ui.separator();
                         self.ui_shuffle_controls(ui);
                     }
+                    Mode::Compare => {}
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // Global "working" spinner: any network request (16colo listing /
@@ -16727,6 +17420,11 @@ impl PixelView {
                                 s.push_str(&self.status); // transient op feedback
                             }
                             ui.add(egui::Label::new(s).truncate());
+                        }
+                        Mode::Compare => {
+                            if !self.status.is_empty() {
+                                ui.add(egui::Label::new(self.status.clone()).truncate());
+                            }
                         }
                     }
                 });
@@ -18472,12 +19170,14 @@ impl eframe::App for PixelView {
             match self.mode {
                 Mode::Grid => self.go_history(true),
                 Mode::Single => self.step_image(&ctx, false),
+                Mode::Compare => self.mode = Mode::Grid,
             }
         }
         if mouse_fwd {
             match self.mode {
                 Mode::Grid => self.go_history(false),
                 Mode::Single => self.step_image(&ctx, true),
+                Mode::Compare => {}
             }
         }
 
@@ -18613,6 +19313,7 @@ impl eframe::App for PixelView {
             Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
             Mode::Grid => self.ui_grid(&ctx, ui),
             Mode::Single => self.ui_single(&ctx, ui),
+            Mode::Compare => self.ui_compare(&ctx, ui),
         });
 
         self.paint_audio_loading_overlay(&ctx);
@@ -19193,6 +19894,15 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SORT_KEY, &self.sort_key.to_u8());
         eframe::set_value(storage, Self::SORT_DESC, &self.sort_desc);
         eframe::set_value(storage, Self::TABLE_VIEW_KEY, &self.table_view);
+        eframe::set_value(storage, Self::COMPARE_COLOR_KEY, &self.compare_color);
+        eframe::set_value(storage, Self::COMPARE_OPACITY_KEY, &self.compare_opacity);
+        eframe::set_value(
+            storage,
+            Self::COMPARE_TOLERANCE_KEY,
+            &self.compare_tolerance,
+        );
+        eframe::set_value(storage, Self::COMPARE_SYNC_KEY, &self.compare_sync);
+        eframe::set_value(storage, Self::COMPARE_SAVED_KEY, &self.saved_compares);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
@@ -24572,6 +25282,179 @@ fn write_wav_16(
     std::fs::File::create(path)?.write_all(&wav_bytes_16(samples, channels, sample_rate))
 }
 
+/// Whether two RGBA pixels count as "different" for the compare overlay. `tol` is a
+/// per-channel tolerance: 0 = exact match (any channel differing → flagged), and a
+/// higher value ignores small differences (e.g. a re-encode's ±1 noise). Alpha is
+/// compared too, so a transparent→opaque change of the same RGB still flags.
+fn pixel_differs(a: [u8; 4], b: [u8; 4], tol: u8) -> bool {
+    let t = tol as i32;
+    (0..4).any(|c| (a[c] as i32 - b[c] as i32).abs() > t)
+}
+
+/// Per-pixel diff of the DIFF image against the SOURCE. Images align at the top-left;
+/// a diff pixel outside the source's bounds counts as different. Returns an RGBA buffer
+/// (row-major, `dif.width*dif.height*4`) of `color` at full alpha on every differing
+/// pixel and transparent (0,0,0,0) elsewhere — the overlay mask — plus the differing
+/// pixel count. Shared by the live overlay (`compare_recompute_overlay`) and the PSD
+/// export so both agree exactly.
+fn compute_diff_mask(
+    src: &crate::image_types::PixImage,
+    dif: &crate::image_types::PixImage,
+    tol: u8,
+    color: [u8; 3],
+) -> (Vec<u8>, usize) {
+    let (dw, dh) = (dif.width as usize, dif.height as usize);
+    let (sw, sh) = (src.width as usize, src.height as usize);
+    let mut px = vec![0u8; dw * dh * 4];
+    let mut count = 0usize;
+    for y in 0..dh {
+        for x in 0..dw {
+            let di = y * dw + x;
+            let differs = if x < sw && y < sh {
+                pixel_differs(src.pixels[y * sw + x], dif.pixels[di], tol)
+            } else {
+                true // outside the source → the diff added pixels here
+            };
+            if differs {
+                count += 1;
+                let o = di * 4;
+                px[o] = color[0];
+                px[o + 1] = color[1];
+                px[o + 2] = color[2];
+                px[o + 3] = 255;
+            }
+        }
+    }
+    (px, count)
+}
+
+/// Build a layered PSD (8-bit RGB, uncompressed) for the compare export:
+/// - a bottom **"Base"** layer = the fully-opaque `base` image,
+/// - a top **"Diff"** layer = `diff` (opaque diff-colour pixels, alpha 0 where
+///   unchanged) whose *layer opacity* is `diff_opacity` (so the fade lives in layer
+///   metadata, not the pixels), and
+/// - a flattened RGB composite so flat viewers show the blended result.
+///
+/// `base` and `diff` are row-major RGBA of length `width*height`. Pure (no I/O), so it
+/// is unit-tested via the `psd` crate's reader (`build_compare_psd_roundtrips`).
+fn build_compare_psd(
+    width: u32,
+    height: u32,
+    base: &[[u8; 4]],
+    diff: &[[u8; 4]],
+    diff_opacity: u8,
+) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let n = w * h;
+    debug_assert_eq!(base.len(), n);
+    debug_assert_eq!(diff.len(), n);
+
+    fn be16(v: u16, o: &mut Vec<u8>) {
+        o.extend_from_slice(&v.to_be_bytes());
+    }
+    fn be32(v: u32, o: &mut Vec<u8>) {
+        o.extend_from_slice(&v.to_be_bytes());
+    }
+    // A Pascal string padded so (length byte + bytes) is a multiple of 4.
+    fn pascal_padded(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(255);
+        let mut v = vec![len as u8];
+        v.extend_from_slice(&bytes[..len]);
+        while !v.len().is_multiple_of(4) {
+            v.push(0);
+        }
+        v
+    }
+
+    // One layer → (layer record, its channel image data). Channels are planar raw
+    // R,G,B,A; each channel's length field INCLUDES the 2-byte compression tag.
+    let build_layer = |name: &str, opacity: u8, px: &[[u8; 4]]| -> (Vec<u8>, Vec<u8>) {
+        let mut ch_data = Vec::with_capacity(4 * (2 + n));
+        for c in 0..4 {
+            be16(0, &mut ch_data); // 0 = raw
+            for p in px {
+                ch_data.push(p[c]);
+            }
+        }
+        let mut rec = Vec::new();
+        be32(0, &mut rec); // top
+        be32(0, &mut rec); // left
+        be32(height, &mut rec); // bottom
+        be32(width, &mut rec); // right
+        be16(4, &mut rec); // channel count (R,G,B,A)
+        let per_ch_len = (2 + n) as u32;
+        for id in [0i16, 1, 2, -1] {
+            rec.extend_from_slice(&id.to_be_bytes());
+            be32(per_ch_len, &mut rec);
+        }
+        rec.extend_from_slice(b"8BIM");
+        rec.extend_from_slice(b"norm"); // normal blend
+        rec.push(opacity); // <-- the layer opacity (your slider) lives here
+        rec.push(0); // clipping = base
+        rec.push(0); // flags = visible
+        rec.push(0); // filler
+        let name_bytes = pascal_padded(name);
+        let extra_len = (4 + 4 + name_bytes.len()) as u32;
+        be32(extra_len, &mut rec);
+        be32(0, &mut rec); // layer mask data length
+        be32(0, &mut rec); // layer blending ranges length
+        rec.extend_from_slice(&name_bytes);
+        (rec, ch_data)
+    };
+
+    // Bottom (Base) layer first, then the Diff layer on top.
+    let (base_rec, base_ch) = build_layer("Base", 255, base);
+    let (diff_rec, diff_ch) = build_layer("Diff", diff_opacity, diff);
+
+    // Layer info = count + records + channel data (all layers), padded to even.
+    let mut layer_info = Vec::new();
+    layer_info.extend_from_slice(&2i16.to_be_bytes()); // 2 layers
+    layer_info.extend_from_slice(&base_rec);
+    layer_info.extend_from_slice(&diff_rec);
+    layer_info.extend_from_slice(&base_ch);
+    layer_info.extend_from_slice(&diff_ch);
+    if !layer_info.len().is_multiple_of(2) {
+        layer_info.push(0);
+    }
+
+    // Layer & mask info: [u32 layer_info_len][layer_info][u32 global_mask_len = 0].
+    let mut lm = Vec::new();
+    be32(layer_info.len() as u32, &mut lm);
+    lm.extend_from_slice(&layer_info);
+    be32(0, &mut lm);
+
+    // Flattened composite (planar R,G,B) = base with the diff colour over it.
+    let a_top = diff_opacity as f32 / 255.0;
+    let mut merged = vec![0u8; 3 * n];
+    for i in 0..n {
+        let (b, d) = (base[i], diff[i]);
+        let a = if d[3] > 0 { a_top } else { 0.0 };
+        for c in 0..3 {
+            let v = b[c] as f32 * (1.0 - a) + d[c] as f32 * a;
+            merged[c * n + i] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    // Assemble: 26-byte header, empty colour-mode + image-resources, layer/mask, image.
+    let mut out = Vec::with_capacity(26 + 8 + lm.len() + 2 + merged.len());
+    out.extend_from_slice(b"8BPS"); // signature
+    be16(1, &mut out); // version 1 (PSD)
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    be16(3, &mut out); // channels in the merged image (RGB)
+    be32(height, &mut out);
+    be32(width, &mut out);
+    be16(8, &mut out); // depth
+    be16(3, &mut out); // colour mode = RGB
+    be32(0, &mut out); // colour mode data length
+    be32(0, &mut out); // image resources length
+    be32(lm.len() as u32, &mut out); // length of the layer & mask information section
+    out.extend_from_slice(&lm); // layer & mask information
+    be16(0, &mut out); // merged image compression = raw
+    out.extend_from_slice(&merged); // R,G,B planes
+    out
+}
+
 /// Lay two rendered pages side by side (a small gutter between), each top-aligned on a white
 /// canvas sized to fit both — for the two-page PDF spread.
 fn compose_side_by_side(
@@ -24786,6 +25669,8 @@ enum TilePick {
     OpenWithOther,         // "Open in…" → pick an arbitrary program (one-off, rfd)
     OpenDefault,           // "Open in…" → the OS default app (xdg-open / open / explorer)
     Folder(FolderActPick), // "Open folder in…" → run a folder action on this dir
+    CompareSource,         // "Compare ▸ Set as source" — this file becomes the left pane
+    CompareDiff,           // "Compare ▸ Set as diff" — this file becomes the right pane
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -25363,6 +26248,21 @@ fn entry_context_menu(
         });
         ui.separator();
     }
+    // Compare (files only): mark this file as the "source" (left) or "diff" (right)
+    // pane of the side-by-side compare view. Setting both opens the comparison.
+    if !entry.is_dir {
+        ui.menu_button("Compare", |ui| {
+            if ui.button("Set as source (left)").clicked() {
+                pick = Some(TilePick::CompareSource);
+                ui.close();
+            }
+            if ui.button("Set as diff (right)").clicked() {
+                pick = Some(TilePick::CompareDiff);
+                ui.close();
+            }
+        });
+        ui.separator();
+    }
     // Star rating (files only) — same effect as the 0-5 hotkeys, shown alongside each
     // entry, so 16colo pieces (where the keys can be fiddly) are always ratable here.
     if !entry.is_dir {
@@ -25809,11 +26709,12 @@ fn bulk_walk(
                 csv_field(&it.filename),
             ));
         }
-        if tx.send(BulkMsg::Item {
-            name: it.filename,
-            out,
-        })
-        .is_err()
+        if tx
+            .send(BulkMsg::Item {
+                name: it.filename,
+                out,
+            })
+            .is_err()
         {
             return; // UI dropped the receiver (window closed) — stop.
         }
@@ -26396,7 +27297,10 @@ const HOTKEYS: &[(&str, &str)] = &[
     ("T", "Tile preview — fill window (viewer) · Grid ↔ Table"),
     ("F11", "Immersive fullscreen (hide all bars)"),
     ("F5", "Refresh — re-scan the current folder from disk"),
-    ("Shift + F5", "Hard refresh — also clear cached thumbnails / metadata"),
+    (
+        "Shift + F5",
+        "Hard refresh — also clear cached thumbnails / metadata",
+    ),
     ("R", "Load a random 16colo.rs pack"),
     ("1 – 5", "Set star rating"),
     ("0", "Clear rating"),
@@ -29480,5 +30384,110 @@ mod hold_test {
         // First sample 0.0 -> 0; the +1.0 clamps to 32767 (not overflow).
         assert_eq!(i16::from_le_bytes([bytes[44], bytes[45]]), 0);
         assert_eq!(i16::from_le_bytes([bytes[50], bytes[51]]), 32767);
+    }
+
+    #[test]
+    fn pixel_differs_respects_tolerance() {
+        assert!(!super::pixel_differs(
+            [10, 20, 30, 255],
+            [10, 20, 30, 255],
+            0
+        ));
+        assert!(super::pixel_differs(
+            [10, 20, 30, 255],
+            [10, 20, 31, 255],
+            0
+        )); // exact
+        assert!(!super::pixel_differs(
+            [10, 20, 30, 255],
+            [10, 20, 35, 255],
+            5
+        )); // within tol
+        assert!(super::pixel_differs(
+            [10, 20, 30, 255],
+            [10, 20, 36, 255],
+            5
+        )); // beyond tol
+        assert!(super::pixel_differs([0, 0, 0, 0], [0, 0, 0, 255], 0)); // alpha counts
+    }
+
+    #[test]
+    fn compute_diff_mask_overlap_and_tolerance() {
+        use crate::image_types::PixImage;
+        let white = |n| vec![[255u8, 255, 255, 255]; n];
+        let src = PixImage::from_rgba(2, 2, white(4));
+        // dif differs from src only at pixel 1, by a small amount (Δ=5).
+        let mut dp = white(4);
+        dp[1] = [250, 255, 255, 255];
+        let dif = PixImage::from_rgba(2, 2, dp);
+
+        // Exact (tol 0): pixel 1 flagged red, others transparent.
+        let (mask, n) = super::compute_diff_mask(&src, &dif, 0, [255, 0, 0]);
+        assert_eq!(n, 1);
+        assert_eq!(&mask[0..4], &[0, 0, 0, 0]); // pixel 0 unchanged → transparent
+        assert_eq!(&mask[4..8], &[255, 0, 0, 255]); // pixel 1 → opaque diff colour
+
+        // Tolerance 10 ignores the Δ=5 difference.
+        let (_, n2) = super::compute_diff_mask(&src, &dif, 10, [255, 0, 0]);
+        assert_eq!(n2, 0);
+
+        // Size mismatch: a wider diff → its extra column (x=2, both rows) counts as diff.
+        let dif_big = PixImage::from_rgba(3, 2, white(6));
+        let (_, n3) = super::compute_diff_mask(&src, &dif_big, 0, [255, 0, 0]);
+        assert_eq!(n3, 2);
+    }
+
+    // Dumps a real 2-layer PSD to /tmp for manual / GIMP inspection (like
+    // `dump_sfz_for_lint`). Run: `cargo test dump_compare_psd -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_compare_psd_for_gimp() {
+        let (w, h) = (16u32, 16u32);
+        let n = (w * h) as usize;
+        let base = vec![[200u8, 200, 200, 255]; n];
+        let mut diff = vec![[0u8, 0, 0, 0]; n];
+        for (i, d) in diff.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *d = [255, 0, 255, 255]; // magenta diff pixels
+            }
+        }
+        let bytes = super::build_compare_psd(w, h, &base, &diff, 153); // 60% layer opacity
+        std::fs::write("/tmp/pv_compare_test.psd", &bytes).unwrap();
+        eprintln!("wrote /tmp/pv_compare_test.psd ({} bytes)", bytes.len());
+    }
+
+    #[test]
+    fn build_compare_psd_roundtrips() {
+        // 2×2: base all white, diff colour (red) on the top-left pixel, layer opacity 128.
+        let base = vec![[255u8, 255, 255, 255]; 4];
+        let mut diff = vec![[0u8, 0, 0, 0]; 4];
+        diff[0] = [255, 0, 0, 255]; // top-left flagged
+        let bytes = super::build_compare_psd(2, 2, &base, &diff, 128);
+        assert_eq!(&bytes[0..4], b"8BPS");
+        let psd = psd::Psd::from_bytes(&bytes).expect("built PSD must re-parse");
+        assert_eq!(psd.width(), 2);
+        assert_eq!(psd.height(), 2);
+        // A "Base" layer (opaque) and a "Diff" layer whose LAYER opacity == the slider
+        // value — the key invariant: the fade lives in metadata, not the pixels.
+        let layers = psd.layers();
+        assert_eq!(layers.len(), 2);
+        let base_l = layers
+            .iter()
+            .find(|l| l.name() == "Base")
+            .expect("Base layer");
+        let diff_l = layers
+            .iter()
+            .find(|l| l.name() == "Diff")
+            .expect("Diff layer");
+        assert_eq!(base_l.opacity(), 255);
+        assert_eq!(diff_l.opacity(), 128);
+        // Flattened composite: flagged pixel ≈ white·0.5 + red·0.5 = (255,~128,~128);
+        // an unchanged pixel stays white.
+        let merged = psd.rgba();
+        assert_eq!(merged.len(), 2 * 2 * 4);
+        assert_eq!(merged[0], 255); // R of the flagged pixel
+        assert!((118..=138).contains(&merged[1])); // G blended down
+        assert!((118..=138).contains(&merged[2])); // B blended down
+        assert_eq!(&merged[12..15], &[255, 255, 255]); // bottom-right untouched
     }
 }
