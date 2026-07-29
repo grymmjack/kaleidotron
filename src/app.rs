@@ -680,6 +680,7 @@ enum MenuAction {
     ToggleDetails,
     ToggleRecolor,
     ToggleTable,
+    ToggleHidden,
     ToggleFavBarColored,
     Up,
     Home,
@@ -1002,6 +1003,10 @@ pub struct PixelView {
     sort_desc: bool,
     dirs_first: bool,
     min_rating: u8,
+    // Show dotfiles / hidden entries in the grid + table (`.` hotkey / View menu).
+    // A *view* filter (like `min_rating`): the scan always keeps hidden entries in
+    // `all_entries`, so toggling is an instant `rebuild_view`, never a re-scan.
+    show_hidden: bool,
     // Cross-platform ratings sidecar — the source of truth for virtual art (inside
     // archives / 16colo.rs) that can't carry a `user.baloo.rating` xattr.
     ratings: crate::ratings::RatingStore,
@@ -1381,6 +1386,7 @@ impl PixelView {
     const SORT_DESC: &'static str = "sort_desc";
     const DIRS_FIRST: &'static str = "dirs_first";
     const MIN_RATING: &'static str = "min_rating";
+    const SHOW_HIDDEN: &'static str = "show_hidden";
     const EXPLORER_KEY: &'static str = "show_explorer";
     const DETAILS_KEY: &'static str = "show_details";
     /// Show the open path/file in the window title bar (zoom % is always appended when ≠100%).
@@ -1671,6 +1677,7 @@ impl PixelView {
             .unwrap_or_default();
         let dirs_first = get_bool(Self::DIRS_FIRST).unwrap_or(true);
         let min_rating = get_u8(Self::MIN_RATING).unwrap_or(0);
+        let show_hidden = get_bool(Self::SHOW_HIDDEN).unwrap_or(false);
         let show_explorer = get_bool(Self::EXPLORER_KEY).unwrap_or(false);
         let show_details = get_bool(Self::DETAILS_KEY).unwrap_or(false);
         let show_recolor = get_bool(Self::RECOLOR_KEY).unwrap_or(false);
@@ -2105,6 +2112,7 @@ impl PixelView {
             sort_desc,
             dirs_first,
             min_rating,
+            show_hidden,
             ratings,
             viewdb,
             show_explorer,
@@ -2394,13 +2402,9 @@ impl PixelView {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                // Skip dotfiles/hidden entries to match a Dolphin-like default view.
-                if p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with('.'))
-                {
-                    continue;
-                }
+                // Hidden (dotfile) entries are kept in `all_entries`; the grid/table
+                // view drops them unless `show_hidden` is on (an instant toggle — see
+                // `rebuild_view`). Default off = a Dolphin-like clean view.
                 if p.is_dir() {
                     all.push(make_entry(p, true));
                 } else if p
@@ -8769,9 +8773,20 @@ impl PixelView {
     fn rebuild_view(&mut self) {
         // In advanced-search mode the grid renders the recursive results, not the
         // current folder; the same sort/filter pipeline applies either way.
-        let src: &[Entry] = match &self.search_results {
+        let base: &[Entry] = match &self.search_results {
             Some(r) => r,
             None => &self.all_entries,
+        };
+        // Hidden-file toggle (`.` / View → Hidden files): drop dotfiles/hidden entries
+        // here — before the shared sort/filter — so toggling is an instant re-filter,
+        // no re-scan. Unlike the rating filter it has no dirs-kept exception (`ls -a`
+        // reveals hidden dirs too). Owned Vec only while hiding; passed through when on.
+        let filtered: Vec<Entry>;
+        let src: &[Entry] = if self.show_hidden {
+            base
+        } else {
+            filtered = base.iter().filter(|e| !is_hidden(&e.path)).cloned().collect();
+            &filtered
         };
         self.entries = sorted_filtered_view(
             src,
@@ -17554,6 +17569,14 @@ impl PixelView {
                     ui.close();
                 }
                 if ui
+                    .selectable_label(self.show_hidden, "Hidden files (.)")
+                    .on_hover_text("Show dotfiles / hidden entries in this folder")
+                    .clicked()
+                {
+                    action = Some(MenuAction::ToggleHidden);
+                    ui.close();
+                }
+                if ui
                     .selectable_label(self.fav_bar_colored_only, "Favorites bar: colored only")
                     .on_hover_text(
                         "Show only color-tagged favorites in the top bar (the rest stay in \
@@ -17860,6 +17883,10 @@ impl PixelView {
                 self.fav_bar_colored_only = !self.fav_bar_colored_only
             }
             MenuAction::ToggleTable => self.table_view = !self.table_view,
+            MenuAction::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                self.rebuild_view();
+            }
             MenuAction::Up => {
                 // Compute the parent in *display* space so "up" from an archive root
                 // lands in the archive's real parent folder, not its temp dir.
@@ -18508,13 +18535,14 @@ impl PixelView {
                             }
                         }
                         let filt = self.explorer_filter.to_lowercase();
-                        for child in subdirs_sorted(&folder) {
+                        let show_hidden = self.show_hidden;
+                        for child in subdirs_sorted(&folder, show_hidden) {
                             if !filt.is_empty()
                                 && !short_name(&child).to_lowercase().contains(&filt)
                             {
                                 continue;
                             }
-                            folder_tree_node(ui, &child, &mut nav);
+                            folder_tree_node(ui, &child, &mut nav, show_hidden);
                         }
                     }
                 }
@@ -18764,6 +18792,13 @@ impl eframe::App for PixelView {
             } else {
                 self.refresh();
             }
+        }
+        // `.` — toggle hidden (dotfile) entries in the grid/table, like a shell's
+        // `ls -a` or Dolphin's Alt+.  A pure view filter, so it re-filters instantly
+        // (no re-scan). Guarded by `!typing` so it can't fire while editing a field.
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+            self.show_hidden = !self.show_hidden;
+            self.rebuild_view();
         }
         // Renoise-style pane focus: while the Samples pane holds keyboard focus (and is visible),
         // its keys drive the hot-swap and are CONSUMED (consume_key) so they never also fire the
@@ -19912,6 +19947,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::COLO_ORDER_KEY, &self.colo_order);
         eframe::set_value(storage, Self::DIRS_FIRST, &self.dirs_first);
         eframe::set_value(storage, Self::MIN_RATING, &self.min_rating);
+        eframe::set_value(storage, Self::SHOW_HIDDEN, &self.show_hidden);
         eframe::set_value(storage, Self::EXPLORER_KEY, &self.show_explorer);
         eframe::set_value(storage, Self::DETAILS_KEY, &self.show_details);
         eframe::set_value(storage, Self::TITLE_PATH_KEY, &self.title_show_path);
@@ -21801,13 +21837,14 @@ fn wheel_cycle(ui: &egui::Ui, resp: &egui::Response, index: &mut usize, len: usi
     changed
 }
 
-/// The visible (non-hidden) subdirectories of `dir`, sorted by path.
-fn subdirs_sorted(dir: &Path) -> Vec<PathBuf> {
+/// The subdirectories of `dir`, sorted by path. Hidden (dotfile) dirs are included
+/// only when `show_hidden` is on — matching the grid/table's `.` toggle.
+fn subdirs_sorted(dir: &Path, show_hidden: bool) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.is_dir() && !is_hidden(p))
+                .filter(|p| p.is_dir() && (show_hidden || !is_hidden(p)))
                 .collect()
         })
         .unwrap_or_default();
@@ -21817,13 +21854,17 @@ fn subdirs_sorted(dir: &Path) -> Vec<PathBuf> {
 
 /// Cheap "does this folder contain at least one subfolder?" — uses the dirent's
 /// `file_type()` (no per-entry `stat` on Linux) and short-circuits on the first
-/// hit, so even a folder of hundreds of images is just one `read_dir`.
-fn has_subdirs(dir: &Path) -> bool {
+/// hit, so even a folder of hundreds of images is just one `read_dir`. Hidden
+/// dirs count only when `show_hidden` is on, so a disclosure triangle appears
+/// iff `subdirs_sorted` (same flag) would actually yield children.
+fn has_subdirs(dir: &Path, show_hidden: bool) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return false;
     };
     for e in rd.flatten() {
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) && !is_hidden(&e.path()) {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && (show_hidden || !is_hidden(&e.path()))
+        {
             return true;
         }
     }
@@ -21844,15 +21885,15 @@ fn folder_tree_label(ui: &mut egui::Ui, path: &Path, nav: &mut Option<PathBuf>) 
 /// subfolders get a disclosure triangle (which expands lazily — `body` only runs
 /// when open, so collapsed nodes do no further I/O); leaf folders render flush,
 /// indented to line their names up with the branches. Clicking a name navigates.
-fn folder_tree_node(ui: &mut egui::Ui, path: &Path, nav: &mut Option<PathBuf>) {
+fn folder_tree_node(ui: &mut egui::Ui, path: &Path, nav: &mut Option<PathBuf>, show_hidden: bool) {
     use egui::containers::collapsing_header::CollapsingState;
-    if has_subdirs(path) {
+    if has_subdirs(path, show_hidden) {
         let id = ui.make_persistent_id(("ftree", path));
         CollapsingState::load_with_default_open(ui.ctx(), id, false)
             .show_header(ui, |ui| folder_tree_label(ui, path, nav))
             .body(|ui| {
-                for child in subdirs_sorted(path) {
-                    folder_tree_node(ui, &child, nav);
+                for child in subdirs_sorted(path, show_hidden) {
+                    folder_tree_node(ui, &child, nav, show_hidden);
                 }
             });
     } else {
@@ -28778,6 +28819,18 @@ mod tests {
         assert_eq!(names, vec!["catdir", "Cat.png"]); // dir first; "dog" excluded
     }
 
+    #[test]
+    fn is_hidden_matches_dotfiles_and_dotdirs_only() {
+        // The predicate `rebuild_view` uses to drop entries when `show_hidden` is off:
+        // any leading-dot name (file OR dir), and nothing else.
+        assert!(is_hidden(Path::new("/a/.bashrc"))); // dotfile, no extension
+        assert!(is_hidden(Path::new("/a/.hidden.png"))); // dotfile with extension
+        assert!(is_hidden(Path::new("/a/.git"))); // dot-dir
+        assert!(!is_hidden(Path::new("/a/visible.png")));
+        assert!(!is_hidden(Path::new("/a/no.dot.here.ans")));
+        assert!(!is_hidden(Path::new("/a/dir"))); // ordinary dir
+    }
+
     fn piece(artist: &str, group: &str, year: u32, pack: &str) -> ColoPiece {
         ColoPiece {
             artist: artist.into(),
@@ -29161,11 +29214,31 @@ mod tests {
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(base.join("a.png"), b"x").unwrap(); // a file, not a subdir
                                                            // `base` contains the subfolder "leaf" → true.
-        assert!(has_subdirs(&base));
+        assert!(has_subdirs(&base, false));
         // `leaf` has only files → false (no disclosure triangle in the tree).
         std::fs::write(leaf.join("x.png"), b"x").unwrap();
         std::fs::write(leaf.join("y.png"), b"x").unwrap();
-        assert!(!has_subdirs(&leaf));
+        assert!(!has_subdirs(&leaf, false));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn explorer_tree_honors_show_hidden_flag() {
+        let base = std::env::temp_dir().join(format!("pv_hidtree_{}", std::process::id()));
+        std::fs::create_dir_all(base.join(".hidden_dir")).unwrap();
+        std::fs::create_dir_all(base.join("visible_dir")).unwrap();
+        // Hidden off: only the visible subdir is seen, and it drives the triangle.
+        assert_eq!(
+            subdirs_sorted(&base, false),
+            vec![base.join("visible_dir")]
+        );
+        assert!(has_subdirs(&base, false));
+        // Hidden on: the dot-dir shows up too (sorted before "visible_dir").
+        assert_eq!(
+            subdirs_sorted(&base, true),
+            vec![base.join(".hidden_dir"), base.join("visible_dir")]
+        );
+        assert!(has_subdirs(&base, true));
         std::fs::remove_dir_all(&base).ok();
     }
 
