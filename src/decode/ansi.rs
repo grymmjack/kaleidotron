@@ -23,11 +23,13 @@ const MAX_COLS: usize = 20000;
 const MAX_ROWS: usize = 10000; // safety cap for very long files (canvas sizes to the
                                // *actual* content rows; this is only the upper bound)
 
-/// Render the 8×16 VGA font in a 9-dot-wide cell, the way real VGA text mode did.
-/// The 9th column is background for every glyph except the line-draw range
-/// `0xC0..=0xDF`, where the hardware repeated column 8 so horizontal rules joined
-/// across cells. Off → exact 8-pixel cells. A process-wide rendering preference
-/// (set from the UI); read at decode time. See [`set_font_9px`].
+/// Render the VGA font in a 9-dot-wide cell, the way real VGA text mode did —
+/// applies to BOTH the 8×16 font and the 8×8 VGA50/EGA43 cell (→ 9×16 / 9×8). The
+/// 9th column is background for every glyph except the line-draw range `0xC0..=0xDF`,
+/// where the hardware repeated column 8 so horizontal rules joined across cells (the
+/// repeat is font-independent — it reads the glyph's rightmost bit — so it works for
+/// both fonts). Off → exact 8-pixel cells. A process-wide rendering preference (set
+/// from the UI); read at decode time. See [`set_font_9px`].
 static FONT_9PX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Toggle the 9-dot VGA cell width for subsequent ANSI/CP437 decodes.
@@ -149,10 +151,9 @@ pub struct TextStream {
     content: Vec<u8>, // SAUCE-stripped bytes
     wrap: usize,
     ice: bool,
-    glyph_h: usize,  // 8 (VGA50) or 16
-    allow_9px: bool, // the 9-dot cell only applies to the 8×16 font
-    cols: usize,     // full canvas columns
-    rows: usize,     // full canvas rows
+    glyph_h: usize, // 8 (VGA50) or 16
+    cols: usize,    // full canvas columns
+    rows: usize,    // full canvas rows
 }
 
 impl TextStream {
@@ -179,15 +180,15 @@ impl TextStream {
             wrap,
             ice,
             glyph_h,
-            allow_9px: glyph_h == FONT_H,
             cols,
             rows,
         })
     }
 
-    /// 9-dot cell only for the 8×16 font, and only when the global toggle is on.
+    /// 9-dot cell (both the 8×16 font and the 8×8 VGA50/EGA43 cell) when the global
+    /// toggle is on; exact 8-pixel cells otherwise.
     fn cell_w(&self) -> usize {
-        if self.allow_9px && font_9px() {
+        if font_9px() {
             9
         } else {
             FONT_W
@@ -746,6 +747,26 @@ mod tests {
         assert!(
             !dot_on(0b0000_0001, 8, 0xE0),
             "just above the range stays blank"
+        );
+    }
+
+    #[test]
+    fn nine_dot_cell_widens_the_8x8_font_too() {
+        // The 9-dot cell is font-independent, so an 8×8 (VGA50/EGA43) grid renders 9px-
+        // wide cells (→ 9×8) exactly like the 8×16 font (→ 9×16). `render_grid` takes the
+        // cell width explicitly, so this exercises the 9×8 combination directly without
+        // flipping the process-global `font_9px` flag — a parallel test asserting an 8px
+        // VGA50 width would otherwise race on that shared atomic.
+        let grid = vec![vec![Cell {
+            ch: b'A',
+            fg: PALETTE[7],
+            bg: PALETTE[0],
+        }]];
+        let img = render_grid(&grid, 1, 1, 8, 9);
+        assert_eq!(
+            (img.width, img.height),
+            (9, 8),
+            "1 col → 9-dot-wide, 8px-tall cell"
         );
     }
 

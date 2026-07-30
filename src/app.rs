@@ -17200,6 +17200,8 @@ impl PixelView {
                                     );
                                 // 9-dot VGA cell width: the real DOS text cell was 9px
                                 // wide for the 8px font (independent of the CRT stretch).
+                                // Applies to the 8×16 font AND the 8×8 VGA50/EGA43 cell
+                                // (→ 9×16 / 9×8); the CRT aspect stays a flat 1.2×.
                                 if ui
                                     .checkbox(&mut self.font_9px, "9-dot VGA cell (9px)")
                                     .on_hover_text(
