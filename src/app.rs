@@ -47,6 +47,7 @@ const TC_COLORS: u16 = 1 << 3;
 const TC_RATING: u16 = 1 << 4;
 const TC_MODIFIED: u16 = 1 << 5;
 const TC_CREATED: u16 = 1 << 6;
+const TC_GIT: u16 = 1 << 7;
 const TABLE_COLUMNS: &[(u16, &str)] = &[
     (TC_TYPE, "Type"),
     (TC_SIZE, "Size"),
@@ -55,6 +56,7 @@ const TABLE_COLUMNS: &[(u16, &str)] = &[
     (TC_RATING, "Rating"),
     (TC_MODIFIED, "Modified"),
     (TC_CREATED, "Created"),
+    (TC_GIT, "Git"),
 ];
 // Default mirrors the original fixed column set (Created off).
 const TABLE_COLUMNS_DEFAULT: u16 =
@@ -91,6 +93,7 @@ enum ColKind {
     Rating,
     Modified,
     Created,
+    Git,    // git status word (file layout only)
     Artist, // scene-only
     Year,
     Group,
@@ -119,7 +122,40 @@ enum Mode {
     Single,
     /// Side-by-side image comparison (source | diff) with a per-pixel diff overlay.
     Compare,
+    /// Interactive 3D model viewer (OBJ/STL/PLY/glTF/GLB/DAE): a CPU-rasterized viewport
+    /// re-rendered on camera move (rotate / zoom / pan / WASD).
+    ThreeD,
 }
+
+/// Runtime state for the interactive 3D viewer. The mesh + camera live here; the texture
+/// is re-rasterized (on the CPU, via `mesh3d::render_rgba`) only when the camera or the
+/// viewport size changes — tracked by `sig` — so an idle model view costs nothing.
+struct ThreeDView {
+    path: PathBuf, // display identity (for stepping / the title)
+    mesh: crate::decode::mesh3d::Mesh3D,
+    // ONE perspective camera drives the viewport. In orbit mode drag rotates it around
+    // `pivot`; in FPS mode it free-flies. Unifying to a single camera means toggling FPS
+    // (or leaving it) never changes the view — no snap, no ortho↔perspective jump.
+    fly: crate::decode::mesh3d::FlyCam,
+    pivot: [f32; 3], // orbit pivot (default: mesh centre)
+    pre_fly: Option<(crate::decode::mesh3d::FlyCam, [f32; 3])>, // saved on FPS entry (Home restores)
+    tex: Option<egui::TextureHandle>,                           // last rasterized frame
+    sig: u64,  // hash of (cam+opts, viewport px) the tex was rendered for
+    fps: bool, // first-person fly mode (right-click toggles): mouse looks, WASD moves
+}
+
+/// Named 3D "scenes" — a key-light direction (view-space azimuth ↔ / elevation ↕) + a
+/// background colour. The `Scene…` menu applies one in a click. Light is screen-relative,
+/// so it stays put as you turn the model (a studio key light, not a world sun).
+const SCENE_PRESETS: &[(&str, f32, f32, [u8; 3])] = &[
+    ("Studio", 0.4, 0.6, [24, 24, 28]), // gentle upper-front key on dark grey (default)
+    ("Product", 0.2, 0.5, [235, 235, 235]), // soft front key on white (catalog shot)
+    ("Top", 0.0, 1.35, [22, 22, 26]),   // straight-down key
+    ("Left", -1.1, 0.4, [20, 20, 26]),  // key from screen-left
+    ("Right", 1.1, 0.4, [20, 20, 26]),  // key from screen-right
+    ("Rim", std::f32::consts::PI, 0.3, [10, 10, 14]), // back/rim light on near-black
+    ("Dramatic", 1.3, -0.15, [6, 6, 8]), // low hard side light, black bg
+];
 
 /// Runtime (transient) state for the side-by-side image compare view. The chosen
 /// files + overlay settings live on `PixelView` (so they persist); this holds only
@@ -701,7 +737,7 @@ enum MenuAction {
 
 /// The advanced-search form: every field is optional (empty = no constraint). The
 /// numeric bounds are kept as text so a blank box means "unbounded".
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct SearchSpec {
     name: String, // filename contains (case-insensitive)
     ext: String,  // comma/space-separated extensions; empty = any type
@@ -714,7 +750,30 @@ struct SearchSpec {
     smax: String,
     dfrom: String, // modified-date bounds, YYYY-MM-DD (inclusive)
     dto: String,
-    rmin: String, // minimum star rating (0..=5)
+    rmin: String,    // minimum star rating (0..=5)
+    recursive: bool, // walk subfolders? on = the classic recursive search; off = this folder only
+}
+
+// Manual Default so `recursive` starts ON (derive would make the bool false). Every
+// struct-literal construction uses `..Default::default()`, so this stays correct there.
+impl Default for SearchSpec {
+    fn default() -> Self {
+        SearchSpec {
+            name: String::new(),
+            ext: String::new(),
+            wmin: String::new(),
+            wmax: String::new(),
+            hmin: String::new(),
+            hmax: String::new(),
+            sauce: String::new(),
+            smin: String::new(),
+            smax: String::new(),
+            dfrom: String::new(),
+            dto: String::new(),
+            rmin: String::new(),
+            recursive: true,
+        }
+    }
 }
 
 impl SearchSpec {
@@ -742,7 +801,9 @@ impl SearchSpec {
     /// Flatten to the persisted field order (extend with new fields at the END so old
     /// saved filters still load — `from_record` defaults any missing trailing field).
     fn record(&self) -> Vec<String> {
-        self.all_fields().iter().map(|s| (*s).clone()).collect()
+        let mut r: Vec<String> = self.all_fields().iter().map(|s| (*s).clone()).collect();
+        r.push(if self.recursive { "1" } else { "0" }.to_string()); // index 12
+        r
     }
 
     fn from_record(r: &[String]) -> Self {
@@ -760,6 +821,9 @@ impl SearchSpec {
             dfrom: g(9),
             dto: g(10),
             rmin: g(11),
+            // A pre-recursive-toggle saved filter has no index 12 → default ON (its
+            // original recursive behaviour), so old smart filters are unchanged.
+            recursive: r.get(12).map(|s| s != "0").unwrap_or(true),
         }
     }
 
@@ -795,6 +859,9 @@ impl SearchSpec {
         }
         if !self.sauce.trim().is_empty() {
             parts.push(format!("sauce:{}", self.sauce.trim()));
+        }
+        if !self.recursive {
+            parts.push("this folder".into()); // flags a non-recursive saved filter
         }
         if parts.is_empty() {
             "filter".into()
@@ -901,6 +968,7 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     xmind_view: Option<XMindView>, // in-app multi-sheet XMind viewer state (None = not viewing one)
+    three_d: Option<ThreeDView>, // in-app interactive 3D model viewer (None = not viewing a mesh)
     // Pseudo-vector zoom: a deferred request to re-rasterize the open XMind/PDF at this
     // longest-side px (set while drawing when the texture is being upscaled; applied after).
     want_rerender: Option<u32>,
@@ -1059,6 +1127,7 @@ pub struct PixelView {
     plugin_pdf: bool,
     plugin_audio: bool,
     plugin_code: bool,
+    plugin_3d: bool, // 3D models (.obj/.stl/.ply/.gltf/.glb/.dae) → thumbnail + 3D viewer
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
     assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
@@ -1183,6 +1252,21 @@ pub struct PixelView {
     glow: bool,             // phosphor-glow bloom around bright pixels (persisted)
     glow_amt: f32,          // phosphor-glow intensity (persisted)
     black_bg: bool,         // fill the viewer background black instead of dark grey (persisted)
+    // Transparency backdrop: what shows *through* an image's transparent pixels in the
+    // viewer (checkerboard or a solid colour of the user's choosing). All persisted.
+    transp_solid: bool,        // false = checkerboard, true = solid `transp_color`
+    transp_checker_size: u8,   // 0 = Small, 1 = Medium, 2 = Large (checker cell in device px)
+    transp_checker_a: [u8; 3], // the two alternating checker colours
+    transp_checker_b: [u8; 3],
+    transp_color: [u8; 3], // the solid backdrop colour
+    // A 2×2 Repeat-wrapped checker texture, rebuilt when the two colours change (runtime).
+    checker_tex: Option<(egui::TextureHandle, [u8; 3], [u8; 3])>,
+    // 3D viewer "scene setup" (persisted): shading, light direction, background.
+    td_shade: u8,           // bitmask: bit0 = Textured base, bit1 = Wireframe overlay
+    td_wire_color: [u8; 3], // wireframe overlay line colour
+    td_light_yaw: f32,      // view-space key-light azimuth
+    td_light_pitch: f32,    // view-space key-light elevation
+    td_bg: [u8; 3],         // 3D viewport background colour
     // Metadata OSD: a fading info overlay shown on each newly opened image.
     osd_enabled: bool,                         // show the OSD at all (persisted)
     osd_position: u8, // anchor 0..=7: TL,T,TR,L,R,BL,B,BR (3×3 grid, no center) (persisted)
@@ -1239,8 +1323,25 @@ pub struct PixelView {
     dir_pos: usize,
     suppress_history: bool, // set while navigating *via* history (don't re-record)
     archive_mount: Option<ArchiveMount>, // the archive currently browsed as a folder
+    // Git status of the current local folder's repo (badge / column / details / tint).
+    // Computed off-thread on each folder change; None when not a repo or disabled.
+    git_enabled: bool, // Preferences toggle (persisted); off = feature fully inert
+    git_info: Option<crate::git::GitInfo>, // current folder's status map (runtime)
+    #[allow(clippy::type_complexity)]
+    git_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Option<crate::git::GitInfo>)>>, // pending compute
+    // Headless-Blender renders of `.blend` files (right-click → Render). The result is cached
+    // and becomes the file's thumbnail. Runs off-thread (a render can take a while).
+    #[allow(clippy::type_complexity)]
+    blend_render_tx: std::sync::mpsc::Sender<(PathBuf, Result<PathBuf, String>)>,
+    #[allow(clippy::type_complexity)]
+    blend_render_rx: std::sync::mpsc::Receiver<(PathBuf, Result<PathBuf, String>)>,
+    blend_render_pending: usize, // in-flight render count (drives the busy spinner)
+    // Auto-refresh: (folder, cheap change-signature) + last poll time. When the current
+    // local folder's signature changes (a new/removed/modified file), re-scan in place.
+    dir_watch: Option<(PathBuf, u64)>,
+    dir_watch_at: f64,
     remote_rx: Option<std::sync::mpsc::Receiver<RemoteMsg>>, // pending 16colo.rs fetch
-    remote_urls: HashMap<PathBuf, String>, // virtual pack path → download URL
+    remote_urls: HashMap<PathBuf, String>,                   // virtual pack path → download URL
     #[allow(clippy::type_complexity)]
     remote_cache: HashMap<PathBuf, (Vec<Entry>, HashMap<PathBuf, String>)>, // year → packs (session)
     scroll_target: Option<usize>, // grid: scroll so this entry index becomes visible
@@ -1357,6 +1458,7 @@ impl PixelView {
     const PLUGIN_PDF_KEY: &'static str = "plugin_pdf";
     const PLUGIN_AUDIO_KEY: &'static str = "plugin_audio";
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
+    const PLUGIN_3D_KEY: &'static str = "plugin_3d";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1419,6 +1521,16 @@ impl PixelView {
     const CRT_SCANLINE_DARK_KEY: &'static str = "crt_scanline_dark";
     const CRT_SCANLINE_SCALE_KEY: &'static str = "crt_scanline_scale";
     const BLACK_BG_KEY: &'static str = "black_bg";
+    const TRANSP_SOLID_KEY: &'static str = "transp_solid";
+    const TRANSP_CHECKER_SIZE_KEY: &'static str = "transp_checker_size";
+    const TRANSP_CHECKER_A_KEY: &'static str = "transp_checker_a";
+    const TRANSP_CHECKER_B_KEY: &'static str = "transp_checker_b";
+    const TRANSP_COLOR_KEY: &'static str = "transp_color";
+    const TD_SHADE_KEY: &'static str = "td_shade";
+    const TD_WIRE_COLOR_KEY: &'static str = "td_wire_color";
+    const TD_LIGHT_KEY: &'static str = "td_light"; // [yaw, pitch]
+    const TD_BG_KEY: &'static str = "td_bg";
+    const GIT_ENABLED_KEY: &'static str = "git_enabled";
     const OSD_ENABLED_KEY: &'static str = "osd_enabled";
     const OSD_POSITION_KEY: &'static str = "osd_position";
     const OSD_SECS_KEY: &'static str = "osd_secs";
@@ -1507,6 +1619,7 @@ impl PixelView {
         let plugin_pdf = load_bool(Self::PLUGIN_PDF_KEY, false);
         let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, false);
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, false);
+        let plugin_3d = load_bool(Self::PLUGIN_3D_KEY, false); // heavy loaders → default OFF
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -1551,6 +1664,7 @@ impl PixelView {
         registry.set_plugin("pdf", plugin_pdf);
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
+        registry.set_plugin("3d", plugin_3d);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -1750,6 +1864,25 @@ impl PixelView {
             .clamp(0.0, 1.0);
         let crt_scanline_scale = get_bool(Self::CRT_SCANLINE_SCALE_KEY).unwrap_or(false);
         let black_bg = get_bool(Self::BLACK_BG_KEY).unwrap_or(true);
+        let get_rgb = |key: &str, default: [u8; 3]| -> [u8; 3] {
+            cc.storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, key))
+                .unwrap_or(default)
+        };
+        let transp_solid = get_bool(Self::TRANSP_SOLID_KEY).unwrap_or(false);
+        let transp_checker_size = get_u8(Self::TRANSP_CHECKER_SIZE_KEY).unwrap_or(1).min(2);
+        let transp_checker_a = get_rgb(Self::TRANSP_CHECKER_A_KEY, [64, 64, 64]);
+        let transp_checker_b = get_rgb(Self::TRANSP_CHECKER_B_KEY, [96, 96, 96]);
+        let transp_color = get_rgb(Self::TRANSP_COLOR_KEY, [20, 20, 20]);
+        // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
+        let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
+        let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
+        let td_light = cc
+            .storage
+            .and_then(|s| eframe::get_value::<[f32; 2]>(s, Self::TD_LIGHT_KEY))
+            .unwrap_or([0.4, 0.6]);
+        let td_bg = get_rgb(Self::TD_BG_KEY, [24, 24, 28]);
+        let git_enabled = get_bool(Self::GIT_ENABLED_KEY).unwrap_or(true);
         let osd_enabled = get_bool(Self::OSD_ENABLED_KEY).unwrap_or(true);
         let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(1).min(7);
         let osd_secs = cc
@@ -1777,6 +1910,8 @@ impl PixelView {
         let viewdb = crate::viewdb::ViewDb::open(&data_dir);
         // Persistent on-disk HTTP cache (16colo JSON / thumbnails / files / zips).
         crate::cache::init(&data_dir);
+        // Channel for headless-Blender `.blend` render results (path, Ok(cache png) / Err).
+        let (blend_render_tx, blend_render_rx) = std::sync::mpsc::channel();
         // Sample-pad kit: metadata rows + each non-empty pad's WAV, reloaded from `<data>/pads`.
         let pad_rows: Vec<Vec<String>> = cc
             .storage
@@ -1998,6 +2133,7 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             xmind_view: None,
+            three_d: None,
             want_rerender: None,
             audio_cache: HashMap::new(),
             tracker_cache: HashMap::new(),
@@ -2166,6 +2302,7 @@ impl PixelView {
             plugin_pdf,
             plugin_audio,
             plugin_code,
+            plugin_3d,
             openers,
             assoc_selected: 0,
             folder_actions,
@@ -2238,6 +2375,25 @@ impl PixelView {
             crt_scanline_dark,
             crt_scanline_scale,
             black_bg,
+            transp_solid,
+            transp_checker_size,
+            transp_checker_a,
+            transp_checker_b,
+            transp_color,
+            checker_tex: None,
+            td_shade,
+            td_wire_color,
+            td_light_yaw: td_light[0],
+            td_light_pitch: td_light[1],
+            td_bg,
+            git_enabled,
+            git_info: None,
+            git_rx: None,
+            blend_render_tx,
+            blend_render_rx,
+            blend_render_pending: 0,
+            dir_watch: None,
+            dir_watch_at: 0.0,
             osd_enabled,
             osd_position,
             osd_secs,
@@ -2398,8 +2554,15 @@ impl PixelView {
                 self.archive_mount = None;
             }
         }
+        let all = self.scan_dir_entries(&dir);
+        self.show_folder(dir, all);
+    }
+
+    /// Scan a real on-disk `dir` into folder + viewable-file `Entry`s (with ratings
+    /// resolved). Shared by `open_folder` and the auto-refresh `auto_rescan`.
+    fn scan_dir_entries(&self, dir: &Path) -> Vec<Entry> {
         let mut all: Vec<Entry> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let p = e.path();
                 // Hidden (dotfile) entries are kept in `all_entries`; the grid/table
@@ -2428,7 +2591,46 @@ impl PixelView {
         for e in all.iter_mut().filter(|e| !e.is_dir) {
             e.rating = self.read_rating(&e.path);
         }
-        self.show_folder(dir, all);
+        all
+    }
+
+    /// Poll the current local folder for filesystem changes (new/removed/modified files —
+    /// e.g. a PNG we just exported, or an external tool dropping a file) and re-scan when it
+    /// changed, **preserving** selection / scroll / mode (selection is `PathBuf`-keyed, so it
+    /// survives). Throttled to ~1.5s; skipped for search results / remote / archive-mount /
+    /// non-directory views. This is what makes exports appear without a manual Shift+F5.
+    fn poll_dir_changes(&mut self, ctx: &egui::Context) {
+        if self.search_results.is_some() || self.colo_flat {
+            return;
+        }
+        let Some(dir) = self.folder.clone() else {
+            return;
+        };
+        if crate::sixteen::is_remote(&dir) || !dir.is_dir() {
+            return;
+        }
+        if let Some(m) = &self.archive_mount {
+            if dir.starts_with(&m.temp_root) {
+                return; // a disposable mount doesn't change under us
+            }
+        }
+        // Wake ~every 1.5s so changes are noticed even when the UI is otherwise idle
+        // (a lone `request_repaint_after` coalesces; it doesn't busy-loop).
+        ctx.request_repaint_after(std::time::Duration::from_millis(1500));
+        let now = ctx.input(|i| i.time);
+        if now - self.dir_watch_at < 1.5 {
+            return;
+        }
+        self.dir_watch_at = now;
+        let sig = dir_signature(&dir);
+        if self.dir_watch.as_ref().map(|(d, _)| d) != Some(&dir) {
+            self.dir_watch = Some((dir, sig)); // new folder → baseline only, no rescan
+        } else if self.dir_watch.as_ref().map(|(_, s)| *s) != Some(sig) {
+            self.dir_watch = Some((dir.clone(), sig)); // changed → re-scan in place
+            self.all_entries = self.scan_dir_entries(&dir);
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
     }
 
     /// Commit a navigation: set the entry list + current folder, record history,
@@ -2477,6 +2679,7 @@ impl PixelView {
         self.path_edit = None;
         self.mode = Mode::Grid;
         self.rebuild_view();
+        self.start_git_status(); // compute this folder's git status off-thread
     }
 
     /// Navigate the virtual 16colo.rs tree. Level 0 (root) lists Years synchronously;
@@ -2782,8 +2985,7 @@ impl PixelView {
                 if let Some((exec, args, env)) = self.pending_external.take() {
                     self.launch_external(&exec, &args, &env, &vpath);
                 } else {
-                    self.load_full(ctx, vpath);
-                    self.mode = Mode::Single;
+                    self.load_full(ctx, vpath); // sets the mode (Single, or ThreeD for a mesh)
                 }
                 self.want_repaint = true;
             }
@@ -8706,6 +8908,7 @@ impl PixelView {
             || self.random_rx.is_some()
             || self.colo_sauce_pending > 0
             || self.bulk_dl.as_ref().is_some_and(|b| !b.finished)
+            || self.blend_render_pending > 0
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -8785,7 +8988,11 @@ impl PixelView {
         let src: &[Entry] = if self.show_hidden {
             base
         } else {
-            filtered = base.iter().filter(|e| !is_hidden(&e.path)).cloned().collect();
+            filtered = base
+                .iter()
+                .filter(|e| !is_hidden(&e.path))
+                .cloned()
+                .collect();
             &filtered
         };
         self.entries = sorted_filtered_view(
@@ -9040,6 +9247,123 @@ impl PixelView {
         self.show_search = false;
         self.search_results = None;
         self.rebuild_view();
+    }
+
+    /// Kick off a background `git status` for the current local folder. A no-op (and
+    /// clears any stale info) for remote / archive-mount / virtual folders, or when the
+    /// feature is off. Runs off-thread so a big monorepo can't hitch navigation; the
+    /// result is claimed by `poll_git_status` only if we're still in the same folder.
+    fn start_git_status(&mut self) {
+        self.git_info = None;
+        self.git_rx = None;
+        if !self.git_enabled {
+            return;
+        }
+        let Some(dir) = self.folder.clone() else {
+            return;
+        };
+        // Only real, on-disk folders outside any archive/soundfont mount get git status —
+        // a mount is a disposable temp extraction, and remote paths aren't on disk at all.
+        if crate::sixteen::is_remote(&dir) || !dir.is_dir() {
+            return;
+        }
+        if let Some(m) = &self.archive_mount {
+            if dir.starts_with(&m.temp_root) {
+                return;
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let info = crate::git::status_for_dir(&dir);
+            let _ = tx.send((dir, info));
+        });
+        self.git_rx = Some(rx);
+    }
+
+    /// Claim a finished git-status computation, but only if it's for the folder we're
+    /// still looking at (a fast nav could leave an older job in flight).
+    fn poll_git_status(&mut self) {
+        let Some(rx) = self.git_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((dir, info)) => {
+                self.git_rx = None;
+                if self.folder.as_deref() == Some(dir.as_path()) {
+                    self.git_info = info;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true, // keep polling
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.git_rx = None,
+        }
+    }
+
+    /// Kick off a headless-Blender render of a `.blend` (frame 1) on a background thread. The
+    /// result is cached at `mesh3d::blend_render_path` and becomes the file's thumbnail.
+    fn start_blend_render(&mut self, path: PathBuf) {
+        let Some(out) = crate::decode::mesh3d::blend_render_path(&path) else {
+            self.status = "Cache unavailable — can't store the render".into();
+            return;
+        };
+        let real = self.resolve_local(&path); // the actual .blend to render
+        self.blend_render_pending += 1;
+        self.status = format!("Rendering {} with Blender…", short_name(&path));
+        let tx = self.blend_render_tx.clone();
+        std::thread::spawn(move || {
+            let res = run_blender_render(&real, &out);
+            let _ = tx.send((path, res));
+        });
+    }
+
+    /// Drain finished Blender renders: on success, drop the file's cached tile so the grid
+    /// re-decodes it (now finding the cached render); on failure, surface the message.
+    fn poll_blend_render(&mut self) {
+        while let Ok((path, res)) = self.blend_render_rx.try_recv() {
+            self.blend_render_pending = self.blend_render_pending.saturating_sub(1);
+            match res {
+                Ok(_png) => {
+                    // Force a re-decode so the new render replaces the placeholder tile.
+                    self.thumb_tex.remove(&path);
+                    self.thumb_rgba.remove(&path);
+                    self.img_meta.remove(&path);
+                    self.thumbs.forget(&path);
+                    self.status = format!("Rendered {} with Blender", short_name(&path));
+                    self.want_repaint = true;
+                }
+                Err(e) => self.status = format!("Blender: {e}"),
+            }
+        }
+        if self.blend_render_pending > 0 {
+            self.want_repaint = true; // keep polling until the render thread reports back
+        }
+    }
+
+    /// Copy a `.blend`'s cached Blender render out to a visible PNG next to the file
+    /// (`<stem>_render[_N].png`, auto-named, no dialog). No-op if nothing's cached yet.
+    fn export_blend_render(&mut self, path: &Path) {
+        let Some(cached) = crate::decode::mesh3d::blend_render_path(path).filter(|p| p.is_file())
+        else {
+            self.status = "No cached render — use “Render with Blender” first".into();
+            return;
+        };
+        let real = self.resolve_local(path);
+        let dir = real.parent().unwrap_or_else(|| Path::new("."));
+        let stem = real.file_stem().and_then(|s| s.to_str()).unwrap_or("blend");
+        let mut out = dir.join(format!("{stem}_render.png"));
+        let mut n = 2;
+        while out.exists() {
+            out = dir.join(format!("{stem}_render_{n}.png"));
+            n += 1;
+        }
+        match std::fs::copy(&cached, &out) {
+            Ok(_) => self.status = format!("Exported render → {}", out.display()),
+            Err(e) => self.status = format!("Export failed: {e}"),
+        }
+    }
+
+    /// The git status of one file/folder (None = not in a repo, or feature off).
+    fn git_status_of(&self, path: &Path) -> Option<crate::git::GitStatus> {
+        self.git_info.as_ref().and_then(|g| g.status(path))
     }
 
     /// Drain freshly-found search hits each frame and refresh the results grid.
@@ -9375,6 +9699,13 @@ impl PixelView {
         self.kit_editor = false; // opening any file leaves the standalone pad editor
         self.editor_source = None;
         self.edit_focus = EditFocus::Song; // a freshly-opened file isn't a pad drill-in
+                                           // load_full owns the view mode: default to Single (covers static images, GIF, PDF,
+                                           // XMind, audio — all render inside the single view), and the 3D branch below
+                                           // overrides to `Mode::ThreeD` for a mesh. Callers must NOT set the mode after us
+                                           // (that clobbered ThreeD), so stepping between a model and an image switches modes
+                                           // correctly on its own. Set before the `already` early-return so re-opening an
+                                           // already-decoded image from the grid still enters the viewer.
+        self.mode = Mode::Single;
         let already = self
             .full_tex
             .as_ref()
@@ -9416,6 +9747,7 @@ impl PixelView {
         self.player = None;
         self.pdf_view = None;
         self.xmind_view = None;
+        self.three_d = None;
         self.full_tex = None;
         self.full_src = None;
         self.full_reduced = None;
@@ -9469,6 +9801,33 @@ impl PixelView {
             });
             self.render_xmind_to_full(ctx);
             return;
+        }
+
+        // 3D model → the interactive viewer (rotate / zoom / pan / WASD). Load the geometry
+        // (from the resolved local file, so archive/16colo virtual paths work); on success
+        // switch into `Mode::ThreeD`. If it won't load, fall through — `decode_path` below
+        // still routes the mesh ext to a static CPU-rendered thumbnail as a graceful default.
+        if self.plugin_3d && is_mesh_path(&path) {
+            if let Some(mesh) = crate::decode::mesh3d::load(&src) {
+                let fly = crate::decode::mesh3d::FlyCam::from_orbit(
+                    &crate::decode::mesh3d::Camera::default(),
+                    mesh.center,
+                    mesh.radius,
+                );
+                let pivot = mesh.center;
+                self.three_d = Some(ThreeDView {
+                    path: path.clone(),
+                    mesh,
+                    fly,
+                    pivot,
+                    pre_fly: None,
+                    tex: None,
+                    sig: u64::MAX, // force a first render
+                    fps: false,
+                });
+                self.mode = Mode::ThreeD;
+                return;
+            }
         }
 
         // Audio → load the interactive player now so the big transport + waveform + keyboard
@@ -9687,8 +10046,7 @@ impl PixelView {
             self.start_piece_open(entry.path);
         } else {
             self.selected = idx;
-            self.load_full(ctx, entry.path);
-            self.mode = Mode::Single;
+            self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
         }
     }
 
@@ -10332,6 +10690,10 @@ impl PixelView {
             enter |= field(ui, &mut self.search_spec.rmin, 28.0, "0");
             ui.label("SAUCE");
             enter |= field(ui, &mut self.search_spec.sauce, 130.0, "title/author…");
+            ui.checkbox(&mut self.search_spec.recursive, "Recursive")
+                .on_hover_text(
+                    "On: search this folder and every subfolder. Off: this folder only.",
+                );
             if ui.button("Search").clicked() {
                 go = true;
             }
@@ -10944,6 +11306,7 @@ impl PixelView {
                 .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone())),
             Mode::Grid => self.folder.clone(),
             Mode::Compare => self.compare_source.clone(),
+            Mode::ThreeD => self.three_d.as_ref().map(|v| v.path.clone()),
         };
         p.map(|p| self.to_display(&p).display().to_string())
     }
@@ -10986,6 +11349,7 @@ impl PixelView {
                 .map(|e| e.path.clone())
                 .or_else(|| self.last_inspected.clone()),
             Mode::Compare => None,
+            Mode::ThreeD => self.three_d.as_ref().map(|v| v.path.clone()),
         };
         path.and_then(|p| self.entries.iter().find(|e| e.path == p).cloned())
     }
@@ -11148,7 +11512,8 @@ impl PixelView {
                     let meta = self.img_meta.get(&entry.path).copied();
                     // View history (count + last-viewed) for the stats rows below.
                     let views = self.view_record(&entry.path);
-                    // PDF: parse (cached) page count / size / title / author for the info rows.
+                    let git = self.git_status_of(&entry.path); // computed before the borrow-y grid
+                                                               // PDF: parse (cached) page count / size / title / author for the info rows.
                     let is_pdf = entry
                         .path
                         .extension()
@@ -11374,6 +11739,19 @@ impl PixelView {
                             if let Some(t) = entry.mtime {
                                 ui.weak("Modified");
                                 ui.label(fmt_time(t));
+                                ui.end_row();
+                            }
+                            // Git status of this file (only shown when inside a repo).
+                            if let Some(s) = git {
+                                ui.weak("Git");
+                                let text = egui::RichText::new(s.label());
+                                let text = match s.color() {
+                                    Some(rgb) => {
+                                        text.color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                                    }
+                                    None => text, // clean → default colour
+                                };
+                                ui.label(text);
                                 ui.end_row();
                             }
                         });
@@ -13086,6 +13464,8 @@ impl PixelView {
         let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
+        let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
+        let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -13151,6 +13531,10 @@ impl PixelView {
                         let is_selected = self.selection.contains(path);
                         let meta = self.img_meta.get(path).copied();
                         let viewed = self.is_viewed(path); // visited check badge
+                                                           // Git status (badge + caption tint); None = not a repo / clean / off.
+                        let git = self
+                            .git_status_of(path)
+                            .filter(|s| *s != crate::git::GitStatus::Clean);
                         let (cell_rect, resp) =
                             ui.allocate_exact_size(egui::vec2(tile, cell_h), egui::Sense::click());
                         // The thumbnail occupies the top square; any caption sits
@@ -13359,6 +13743,19 @@ impl PixelView {
                             let c = rect.right_top() + egui::vec2(-(r + 4.0), r + 4.0);
                             paint_check_badge(&ui.painter_at(rect), c, r);
                         }
+                        // Git-status badge (top-LEFT, so it never collides with the check
+                        // badge): a filled dot in the status colour.
+                        if let Some(rgb) = git.and_then(|s| s.color()) {
+                            let r = (tile * 0.075).clamp(6.0, 10.0);
+                            let c = rect.left_top() + egui::vec2(r + 4.0, r + 4.0);
+                            let p = ui.painter_at(rect);
+                            p.circle_filled(c, r, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                            p.circle_stroke(
+                                c,
+                                r,
+                                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(130)),
+                            );
+                        }
 
                         // Configurable caption strip below the thumbnail.
                         if caption_h > 0.0 {
@@ -13368,6 +13765,9 @@ impl PixelView {
                                 caption_lines(&entry, meta, self.caption_fields, folder.as_deref());
                             let color = if is_selected {
                                 ui.visuals().strong_text_color()
+                            } else if let Some(rgb) = git.and_then(|s| s.color()) {
+                                // Tint the caption by git status (new/modified/conflict/ignored).
+                                egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
                             } else if ui.visuals().dark_mode {
                                 // weak_text_color() is dim against the dark grid; lift it
                                 // to a clearly readable grey (light mode is already fine).
@@ -13460,6 +13860,8 @@ impl PixelView {
                                     TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                                     TilePick::CompareSource => compare_pick = Some((idx, false)),
                                     TilePick::CompareDiff => compare_pick = Some((idx, true)),
+                                    TilePick::RenderBlend => render_blend = Some(idx),
+                                    TilePick::ExportBlendRender => export_blend = Some(idx),
                                 }
                             }
                         });
@@ -13540,6 +13942,16 @@ impl PixelView {
         if let Some((idx, is_diff)) = compare_pick {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.set_compare_pick(ctx, p, is_diff);
+            }
+        }
+        if let Some(idx) = render_blend {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.start_blend_render(p);
+            }
+        }
+        if let Some(idx) = export_blend {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.export_blend_render(&p);
             }
         }
         if pin_current {
@@ -13793,6 +14205,10 @@ impl PixelView {
                     false,
                 ));
             }
+            if tc & TC_GIT != 0 {
+                // Non-sortable (no SortKey): git status is a per-repo attribute.
+                cols.push(col(ColKind::Git, "Git", None, 84.0, false, false));
+            }
         }
         // Apply the user's drag-to-reorder column order (data columns only — the
         // thumbnail stays first, the scene Download menu stays last). Unknown / newly
@@ -13857,6 +14273,8 @@ impl PixelView {
         let mut open_default: Option<usize> = None; // "Open in… → Default app" on this entry
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
+        let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
+        let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -14051,6 +14469,11 @@ impl PixelView {
                 let meta = self.img_meta.get(&path).copied();
                 let piece = self.colo_pieces.get(&path).cloned();
                 let viewed = self.is_viewed(&path); // browser-style visited filename link
+                                                    // Git status for the Name tint + the optional Git column (None outside a repo).
+                let git = self.git_status_of(&path);
+                let git_tint = git
+                    .filter(|s| *s != crate::git::GitStatus::Clean)
+                    .and_then(|s| s.color());
 
                 // Request the thumbnail once: a remote piece via the HTTP pool (its `tn`
                 // PNG), any other file via the local decoder; both land in `thumb_tex`.
@@ -14208,6 +14631,21 @@ impl PixelView {
                                     egui::Color32::from_rgb(255, 200, 60),
                                 );
                             }
+                        } else if c.kind == ColKind::Git {
+                            // Git status word, tinted; blank for clean / non-repo files.
+                            if let Some(s) = git.filter(|s| *s != crate::git::GitStatus::Clean) {
+                                let color = s
+                                    .color()
+                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                    .unwrap_or(fg);
+                                ui.painter().with_clip_rect(rect).text(
+                                    rect.left_center() + egui::vec2(cell_pad, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    s.label(),
+                                    egui::FontId::proportional(12.5),
+                                    color,
+                                );
+                            }
                         } else {
                             let txt = table_cell_text(&entry, meta, piece.as_ref(), c.kind);
                             if !txt.is_empty() {
@@ -14232,6 +14670,15 @@ impl PixelView {
                                     ui.visuals().weak_text_color()
                                 } else {
                                     fg
+                                };
+                                // Git status tints the filename (new/modified/conflict/…),
+                                // overriding the visited/unvisited link colour.
+                                let col = if name_link {
+                                    git_tint
+                                        .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                        .unwrap_or(col)
+                                } else {
+                                    col
                                 };
                                 // Budget chars to the *padded* inner width with a
                                 // conservative px/char so a proportional glyph string
@@ -14340,6 +14787,8 @@ impl PixelView {
                                 TilePick::Folder(fp) => folder_act = Some((idx, fp)),
                                 TilePick::CompareSource => compare_pick = Some((idx, false)),
                                 TilePick::CompareDiff => compare_pick = Some((idx, true)),
+                                TilePick::RenderBlend => render_blend = Some(idx),
+                                TilePick::ExportBlendRender => export_blend = Some(idx),
                             }
                         }
                     });
@@ -14468,6 +14917,16 @@ impl PixelView {
         if let Some((idx, is_diff)) = compare_pick {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.set_compare_pick(ctx, p, is_diff);
+            }
+        }
+        if let Some(idx) = render_blend {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.start_blend_render(p);
+            }
+        }
+        if let Some(idx) = export_blend {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.export_blend_render(&p);
             }
         }
         if pin_current {
@@ -15159,6 +15618,60 @@ impl PixelView {
         self.zoom = (scale / ppp).clamp(0.01, 64.0);
     }
 
+    /// Paint the transparency backdrop into `img_rect` (the image's on-screen rect),
+    /// *before* the art blits over it, so it shows through the image's transparent
+    /// pixels: either a solid colour or a checkerboard (a 2×2 Repeat-wrapped texture
+    /// tiled across the rect). Anchored to the image rect so it pans with the art.
+    fn paint_transparency_backdrop(
+        &mut self,
+        painter: &egui::Painter,
+        img_rect: egui::Rect,
+        ppp: f32,
+    ) {
+        if img_rect.width() < 1.0 || img_rect.height() < 1.0 {
+            return;
+        }
+        if self.transp_solid {
+            let c = self.transp_color;
+            painter.rect_filled(img_rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+            return;
+        }
+        // Checkerboard. Rebuild the tiny texture only when the two colours change.
+        let (a, b) = (self.transp_checker_a, self.transp_checker_b);
+        let fresh = matches!(&self.checker_tex, Some((_, ca, cb)) if *ca == a && *cb == b);
+        if !fresh {
+            // 2×2 texels: a b / b a → one Repeat tile is a 2-cell checker square.
+            let px = [
+                a[0], a[1], a[2], 255, b[0], b[1], b[2], 255, // row 0
+                b[0], b[1], b[2], 255, a[0], a[1], a[2], 255, // row 1
+            ];
+            let img = egui::ColorImage::from_rgba_unmultiplied([2, 2], &px);
+            let opts = egui::TextureOptions {
+                wrap_mode: egui::TextureWrapMode::Repeat, // so UVs > 1 tile the checker
+                ..egui::TextureOptions::NEAREST
+            };
+            let tex = painter.ctx().load_texture("transp_checker", img, opts);
+            self.checker_tex = Some((tex, a, b));
+        }
+        let Some((tex, _, _)) = &self.checker_tex else {
+            return;
+        };
+        // Cell size is a screen-space (device-px) constant, so the checkerboard looks the
+        // same regardless of image zoom — a backdrop, not part of the image's pixels.
+        let cell_dev = match self.transp_checker_size {
+            0 => 8.0,
+            2 => 20.0,
+            _ => 12.0,
+        };
+        let cell_pts = (cell_dev / ppp).max(1.0);
+        let tile = 2.0 * cell_pts; // one 2×2 texture tile spans two cells
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(img_rect.width() / tile, img_rect.height() / tile),
+        );
+        painter.image(tex.id(), img_rect, uv, egui::Color32::WHITE);
+    }
+
     /// A crisp minimap texture for the navigator overview. The shared thumbnail is
     /// capped at ~512px on its long side, so the tall viewer strip would upscale it
     /// blurry; instead area-average the full-res CPU pixels (`full_src`) down to the
@@ -15499,8 +16012,398 @@ impl PixelView {
         }
     }
 
-    /// The side-by-side compare view: a control strip, then two panes (source | diff)
-    /// with independent — or synced — pan/zoom and a diff-colour overlay on the diff.
+    /// Interactive 3D model viewport. CPU-rasterized (`mesh3d::render`) and re-rendered only
+    /// when the camera / scene options / viewport size change (`sig`), so an idle view is free.
+    /// **Orbit** (default): drag/middle = rotate, wheel = zoom, Space+drag = pan, W/S dolly,
+    /// A/D turn. **Right-click toggles FPS free-fly** (Blender walk-mode): mouse looks, WASD
+    /// moves, Q/E down/up, wheel = dolly forward. Scene setup (shading / light / background) in
+    /// the top bar; Esc / ‹ Grid = back, ←/→ = prev/next.
+    fn ui_three_d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        use crate::decode::mesh3d::{self, Camera, FlyCam, RenderOpts, View};
+        let mut want_back = false;
+        let mut want_prev = false;
+        let mut want_next = false;
+        let mut want_reset = false;
+        let mut want_export = false;
+        let mut want_home = false;
+
+        // ── Top control bar (mutates self.td_* directly — runs before the three_d borrow) ──
+        ui.horizontal(|ui| {
+            if ui
+                .button("‹ Grid")
+                .on_hover_text("Back to the browser (Esc)")
+                .clicked()
+            {
+                want_back = true;
+            }
+            if ui.button("Reset view").clicked() {
+                want_reset = true;
+            }
+            ui.separator();
+            // Textured base + an independent Wireframe overlay (not mutually exclusive) —
+            // stored as bits 0/1 of `td_shade`.
+            let mut textured = self.td_shade & 1 != 0;
+            let mut wire = self.td_shade & 2 != 0;
+            if ui
+                .checkbox(&mut textured, "Textured")
+                .on_hover_text("Map the model's diffuse texture (falls back to flat if none)")
+                .changed()
+            {
+                self.td_shade = (self.td_shade & !1) | textured as u8;
+            }
+            if ui
+                .checkbox(&mut wire, "Wireframe")
+                .on_hover_text("Overlay hidden-line edges — composes with flat AND textured")
+                .changed()
+            {
+                self.td_shade = (self.td_shade & !2) | ((wire as u8) << 1);
+            }
+            ui.add_enabled_ui(wire, |ui| {
+                ui.color_edit_button_srgb(&mut self.td_wire_color)
+                    .on_hover_text("Wireframe line colour");
+            });
+            // Scene setup: light presets + manual light + background.
+            ui.menu_button("Scene…", |ui| {
+                ui.label("Light presets");
+                ui.horizontal_wrapped(|ui| {
+                    for (name, ly, lp, bg) in SCENE_PRESETS {
+                        if ui.button(*name).clicked() {
+                            self.td_light_yaw = *ly;
+                            self.td_light_pitch = *lp;
+                            self.td_bg = *bg;
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                ui.label("Key light");
+                let pi = std::f32::consts::PI;
+                ui.add(egui::Slider::new(&mut self.td_light_yaw, -pi..=pi).text("↔ azimuth"));
+                ui.add(egui::Slider::new(&mut self.td_light_pitch, -1.5..=1.5).text("↕ elevation"));
+                ui.horizontal(|ui| {
+                    ui.label("Background");
+                    ui.color_edit_button_srgb(&mut self.td_bg);
+                });
+            });
+            if ui
+                .button("⬇ PNG")
+                .on_hover_text("Export the current view as a transparent PNG next to the model")
+                .clicked()
+            {
+                want_export = true;
+            }
+            let fps = self.three_d.as_ref().is_some_and(|v| v.fps);
+            if let Some(v) = &self.three_d {
+                ui.separator();
+                ui.weak(format!(
+                    "{} · {} tris{}",
+                    short_name(&v.path),
+                    v.mesh.tri_count(),
+                    if v.mesh.texture.is_some() {
+                        " · textured"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            ui.separator();
+            if fps {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 200, 120),
+                    "● FPS: mouse look · WASD move · Q/E down/up · right-click to exit (keeps view) · Home",
+                );
+            } else {
+                ui.weak("Drag: orbit · Wheel: zoom · Space+drag: pan · WASD · Right-click: FPS fly");
+            }
+        });
+
+        // Snapshot the scene opts before borrowing `three_d` (can't read self.td_* inside it).
+        let opts = RenderOpts {
+            textured: self.td_shade & 1 != 0,
+            wireframe: self.td_shade & 2 != 0,
+            wire_color: self.td_wire_color,
+            light_yaw: self.td_light_yaw,
+            light_pitch: self.td_light_pitch,
+            bg: [self.td_bg[0], self.td_bg[1], self.td_bg[2], 255],
+        };
+
+        let avail = ui.available_size();
+        let (resp, painter) = ui.allocate_painter(avail, egui::Sense::click_and_drag());
+        let ppp = ctx.pixels_per_point();
+
+        // Gather input up front (a single `ui.input` borrow) so the camera mutation doesn't
+        // re-borrow. Keys are read as *down* for continuous navigation.
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let (scroll, zdelta) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let (kw, ka, ks, kd, kq, ke) = ui.input(|i| {
+            (
+                i.key_down(egui::Key::W),
+                i.key_down(egui::Key::A),
+                i.key_down(egui::Key::S),
+                i.key_down(egui::Key::D),
+                i.key_down(egui::Key::Q),
+                i.key_down(egui::Key::E),
+            )
+        });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            want_back = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Home)) {
+            want_home = true; // restore the pre-fly orbit view
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+            want_prev = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+            want_next = true;
+        }
+        let rotating = resp.dragged_by(egui::PointerButton::Middle)
+            || (!space && resp.dragged_by(egui::PointerButton::Primary));
+        let panning = space && resp.dragged_by(egui::PointerButton::Primary);
+        let drag = resp.drag_delta();
+        let wasd = kw || ka || ks || kd || kq || ke;
+        let toggle_fps = resp.clicked_by(egui::PointerButton::Secondary);
+        let look = ui.input(|i| i.pointer.delta());
+        let hov = resp.hovered();
+
+        painter.rect_filled(
+            resp.rect,
+            0.0,
+            egui::Color32::from_rgb(self.td_bg[0], self.td_bg[1], self.td_bg[2]),
+        );
+
+        if let Some(v) = self.three_d.as_mut() {
+            let (center, radius) = (v.mesh.center, v.mesh.radius);
+            if toggle_fps {
+                v.fps = !v.fps;
+                if v.fps {
+                    v.pre_fly = Some((v.fly, v.pivot)); // Home restores this exact view
+                } else {
+                    // Leaving FPS: put the orbit pivot in front of the camera WITHOUT moving
+                    // it — so the view is byte-identical (no snap), and future orbit-drags
+                    // rotate around what you were looking at.
+                    let f = v.fly.forward();
+                    let d = dist3(v.fly.eye, center).max(radius);
+                    v.pivot = [
+                        v.fly.eye[0] + f[0] * d,
+                        v.fly.eye[1] + f[1] * d,
+                        v.fly.eye[2] + f[2] * d,
+                    ];
+                }
+            }
+            if want_home {
+                if let Some((fly, pivot)) = v.pre_fly {
+                    v.fly = fly;
+                    v.pivot = pivot;
+                }
+                v.fps = false;
+            }
+            if want_reset {
+                v.fly = FlyCam::from_orbit(&Camera::default(), center, radius);
+                v.pivot = center;
+            }
+            let fps = v.fps;
+            if fps {
+                // ── Free-fly (Blender walk mode): mouse looks, WASD moves ──
+                let fly = &mut v.fly;
+                if hov && (look.x != 0.0 || look.y != 0.0) {
+                    fly.yaw += look.x * 0.005;
+                    fly.pitch = (fly.pitch - look.y * 0.005).clamp(-1.5, 1.5); // mouse up = look up
+                }
+                let (fwd, right) = (fly.forward(), fly.right());
+                let mut mv = [0.0f32; 3];
+                let mut acc = |d: [f32; 3], s: f32| {
+                    mv[0] += d[0] * s;
+                    mv[1] += d[1] * s;
+                    mv[2] += d[2] * s;
+                };
+                if kw {
+                    acc(fwd, 1.0);
+                }
+                if ks {
+                    acc(fwd, -1.0);
+                }
+                if kd {
+                    acc(right, 1.0);
+                }
+                if ka {
+                    acc(right, -1.0);
+                }
+                if ke {
+                    acc([0.0, 1.0, 0.0], 1.0); // Q/E: world up / down
+                }
+                if kq {
+                    acc([0.0, 1.0, 0.0], -1.0);
+                }
+                if hov && scroll != 0.0 {
+                    acc(fwd, scroll * 0.03); // wheel dollies forward
+                }
+                let speed = radius.max(1e-3) * dt * 2.0;
+                v.fly.eye = [
+                    v.fly.eye[0] + mv[0] * speed,
+                    v.fly.eye[1] + mv[1] * speed,
+                    v.fly.eye[2] + mv[2] * speed,
+                ];
+            } else {
+                // ── Orbit around `pivot` (perspective) — one camera, so exiting FPS never
+                // jumps. Work in spherical (azimuth/elevation/radius) about the pivot. ──
+                let pivot = v.pivot;
+                let off = sub3(v.fly.eye, pivot);
+                let mut r = norm3(off).max(radius * 0.05);
+                let mut az = off[0].atan2(off[2]);
+                let mut el = (off[1] / r).clamp(-0.999, 0.999).asin();
+                if rotating {
+                    az += drag.x * 0.01;
+                    el = (el - drag.y * 0.01).clamp(-1.5, 1.5);
+                }
+                if ka {
+                    az -= dt * 1.6; // A/D turn around the model
+                }
+                if kd {
+                    az += dt * 1.6;
+                }
+                if hov && scroll.abs() > 0.0 {
+                    r *= 1.0 - scroll * 0.0015; // wheel dolly
+                }
+                if hov && (zdelta - 1.0).abs() > 1e-3 {
+                    r /= zdelta;
+                }
+                if kw {
+                    r *= 1.0 - dt * 1.5; // W/S dolly in/out
+                }
+                if ks {
+                    r *= 1.0 + dt * 1.5;
+                }
+                r = r.clamp(radius * 0.1, radius * 60.0);
+                let (ce, se) = (el.cos(), el.sin());
+                let (ca, sa) = (az.cos(), az.sin());
+                let mut eye = [
+                    pivot[0] + r * ce * sa,
+                    pivot[1] + r * se,
+                    pivot[2] + r * ce * ca,
+                ];
+                // Pan (Space+drag): translate eye AND pivot together (relative view unchanged).
+                if panning {
+                    let dir = normalize3(sub3(pivot, eye));
+                    let right = normalize3(cross3([0.0, 1.0, 0.0], dir));
+                    let up = cross3(dir, right);
+                    let k = r * 0.0022;
+                    let shift = [
+                        -drag.x * right[0] * k + drag.y * up[0] * k,
+                        -drag.x * right[1] * k + drag.y * up[1] * k,
+                        -drag.x * right[2] * k + drag.y * up[2] * k,
+                    ];
+                    v.pivot = [
+                        pivot[0] + shift[0],
+                        pivot[1] + shift[1],
+                        pivot[2] + shift[2],
+                    ];
+                    eye = [eye[0] + shift[0], eye[1] + shift[1], eye[2] + shift[2]];
+                }
+                // Point the camera at the pivot.
+                let dir = normalize3(sub3(v.pivot, eye));
+                v.fly.eye = eye;
+                v.fly.pitch = dir[1].clamp(-0.999, 0.999).asin();
+                v.fly.yaw = dir[0].atan2(dir[2]);
+            }
+
+            // Re-rasterize only when the camera / opts / viewport size changed (tracked by `sig`).
+            let wpx = (avail.x * ppp).round().max(1.0) as usize;
+            let hpx = (avail.y * ppp).round().max(1.0) as usize;
+            let view = View::Fly(v.fly); // one perspective camera drives the viewport
+            let sig = three_d_sig(&view, &opts, wpx, hpx);
+            if v.tex.is_none() || sig != v.sig {
+                let px = mesh3d::render(&v.mesh, wpx, hpx, &view, &opts);
+                let mut flat = Vec::with_capacity(px.len() * 4);
+                for p in &px {
+                    flat.extend_from_slice(p);
+                }
+                let img = egui::ColorImage::from_rgba_unmultiplied([wpx, hpx], &flat);
+                let tex = ctx.load_texture("three_d_view", img, egui::TextureOptions::LINEAR);
+                v.tex = Some(tex);
+                v.sig = sig;
+            }
+            if let Some(tex) = &v.tex {
+                let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(tex.id(), resp.rect, full, egui::Color32::WHITE);
+            }
+        }
+
+        // Keep repainting while driven by the keyboard / in FPS mode (a held key doesn't
+        // generate the pointer events egui repaints for). Hide the cursor in FPS mode.
+        let fps_on = self.three_d.as_ref().is_some_and(|v| v.fps);
+        if wasd || fps_on {
+            ctx.request_repaint();
+        }
+        if fps_on && resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+
+        // Export the current view as a transparent PNG at the exact viewport size — the same
+        // framing on screen (orbit rotation/zoom/pan, or the fly pose), padding transparent.
+        if want_export {
+            let ew = (avail.x * ppp).round().max(1.0) as usize;
+            let eh = (avail.y * ppp).round().max(1.0) as usize;
+            self.export_three_d_png(ew, eh, opts);
+        }
+
+        // Apply deferred navigation (out of the `three_d` borrow).
+        if want_back {
+            self.mode = Mode::Grid;
+            self.three_d = None;
+        } else if want_prev {
+            self.step_image(ctx, false);
+        } else if want_next {
+            self.step_image(ctx, true);
+        }
+    }
+
+    /// Render the current 3D view at `ew`×`eh` with a transparent background and save it as
+    /// a PNG next to the model (auto-named `<stem>_view[_N].png`, no dialog).
+    fn export_three_d_png(
+        &mut self,
+        ew: usize,
+        eh: usize,
+        mut opts: crate::decode::mesh3d::RenderOpts,
+    ) {
+        use crate::decode::mesh3d::View;
+        opts.bg = [0, 0, 0, 0]; // transparent
+        let (buf, path) = {
+            let Some(v) = &self.three_d else {
+                return;
+            };
+            let view = View::Fly(v.fly); // the viewport is always the perspective fly camera
+            let px = crate::decode::mesh3d::render(&v.mesh, ew, eh, &view, &opts);
+            let mut buf = Vec::with_capacity(px.len() * 4);
+            for p in &px {
+                buf.extend_from_slice(p);
+            }
+            (buf, v.path.clone())
+        };
+        // Save next to the model's real file (archive / 16colo virtual paths resolve to a
+        // real cache/temp dir). Auto-name, avoiding an overwrite.
+        let real = self.resolve_local(&path);
+        let dir = real.parent().unwrap_or_else(|| Path::new("."));
+        let stem = real.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+        let mut out = dir.join(format!("{stem}_view.png"));
+        let mut n = 2;
+        while out.exists() {
+            out = dir.join(format!("{stem}_view_{n}.png"));
+            n += 1;
+        }
+        match image::save_buffer(
+            &out,
+            &buf,
+            ew as u32,
+            eh as u32,
+            image::ExtendedColorType::Rgba8,
+        ) {
+            Ok(_) => self.status = format!("Exported view → {}", out.display()),
+            Err(e) => self.status = format!("PNG export failed: {e}"),
+        }
+    }
+
     fn ui_compare(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let mut want_back = false;
         let mut want_swap = false;
@@ -16150,6 +17053,11 @@ impl PixelView {
                 (img_tl.y * ppp).round() / ppp,
             );
         }
+        // Transparency backdrop (checkerboard / solid colour) painted UNDER the art, so
+        // it shows through the image's transparent pixels. `img_px` is the on-screen size.
+        let img_rect = egui::Rect::from_min_size(img_tl, img_px);
+        self.paint_transparency_backdrop(&painter, img_rect, ppp);
+
         // Scanlines hug the *viewport* (the monitor), not the art, so a scrolling
         // ANSImation isn't distorted. They need one texture to overlay, so they only kick
         // in for an untiled image; huge tiled images fall back to a plain blit.
@@ -16735,6 +17643,12 @@ impl PixelView {
                 }
             }
             Mode::Compare => Vec::new(),
+            // Rating in the 3D viewer applies to the open model file.
+            Mode::ThreeD => self
+                .three_d
+                .as_ref()
+                .map(|v| vec![v.path.clone()])
+                .unwrap_or_default(),
         };
         let mut n = 0;
         for path in &targets {
@@ -17368,7 +18282,7 @@ impl PixelView {
                         ui.separator();
                         self.ui_shuffle_controls(ui);
                     }
-                    Mode::Compare => {}
+                    Mode::Compare | Mode::ThreeD => {}
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // Global "working" spinner: any network request (16colo listing /
@@ -17438,7 +18352,7 @@ impl PixelView {
                             }
                             ui.add(egui::Label::new(s).truncate());
                         }
-                        Mode::Compare => {
+                        Mode::Compare | Mode::ThreeD => {
                             if !self.status.is_empty() {
                                 ui.add(egui::Label::new(self.status.clone()).truncate());
                             }
@@ -18939,6 +19853,9 @@ impl eframe::App for PixelView {
         // Apply any finished 16colo.rs fetch/download (keeps repainting while pending).
         self.poll_remote();
         self.poll_search();
+        self.poll_git_status();
+        self.poll_blend_render();
+        self.poll_dir_changes(&ctx);
         self.poll_random();
         self.poll_colo_pieces();
         self.poll_colo_open(&ctx);
@@ -19206,14 +20123,14 @@ impl eframe::App for PixelView {
         if mouse_back {
             match self.mode {
                 Mode::Grid => self.go_history(true),
-                Mode::Single => self.step_image(&ctx, false),
+                Mode::Single | Mode::ThreeD => self.step_image(&ctx, false),
                 Mode::Compare => self.mode = Mode::Grid,
             }
         }
         if mouse_fwd {
             match self.mode {
                 Mode::Grid => self.go_history(false),
-                Mode::Single => self.step_image(&ctx, true),
+                Mode::Single | Mode::ThreeD => self.step_image(&ctx, true),
                 Mode::Compare => {}
             }
         }
@@ -19351,6 +20268,7 @@ impl eframe::App for PixelView {
             Mode::Grid => self.ui_grid(&ctx, ui),
             Mode::Single => self.ui_single(&ctx, ui),
             Mode::Compare => self.ui_compare(&ctx, ui),
+            Mode::ThreeD => self.ui_three_d(&ctx, ui),
         });
 
         self.paint_audio_loading_overlay(&ctx);
@@ -19388,6 +20306,7 @@ impl eframe::App for PixelView {
             let mut prefs_refresh = false; // a plugin toggle → re-scan the folder after
             let mut color_change: Option<(String, [u8; 3])> = None; // a format-color edit
             let mut reset_colors = false; // "Reset" the format colors
+            let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
@@ -19586,10 +20505,18 @@ impl eframe::App for PixelView {
                                     .checkbox(&mut self.plugin_audio, "Audio")
                                     .on_hover_text("Audio waveform + metadata + in-app preview")
                                     .changed();
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_3d, "3D models")
+                                    .on_hover_text(
+                                        "OBJ / STL / PLY / glTF / GLB / DAE — a shaded thumbnail \
+                                         + an interactive 3D viewer (rotate / zoom / pan / WASD)",
+                                    )
+                                    .changed();
                                 if plug_changed {
                                     self.registry.set_plugin("code", self.plugin_code);
                                     self.registry.set_plugin("pdf", self.plugin_pdf);
                                     self.registry.set_plugin("audio", self.plugin_audio);
+                                    self.registry.set_plugin("3d", self.plugin_3d);
                                     prefs_refresh = true; // re-scan so the listing adds/drops those types
                                 }
 
@@ -19692,6 +20619,56 @@ impl eframe::App for PixelView {
                                 });
 
                                 ui.add_space(10.0);
+                                ui.label("Transparency");
+                                ui.weak("What shows through an image's transparent pixels in the viewer.");
+                                // Checkerboard row: radio + size dropdown + two colour chips.
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut self.transp_solid, false, "Checkerboard");
+                                    ui.add_enabled_ui(!self.transp_solid, |ui| {
+                                        ui.label("Size");
+                                        let size_label = ["Small", "Medium", "Large"]
+                                            [self.transp_checker_size.min(2) as usize];
+                                        egui::ComboBox::from_id_salt("transp_checker_size")
+                                            .selected_text(size_label)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut self.transp_checker_size, 0, "Small");
+                                                ui.selectable_value(&mut self.transp_checker_size, 1, "Medium");
+                                                ui.selectable_value(&mut self.transp_checker_size, 2, "Large");
+                                            });
+                                        ui.label("Colors");
+                                        ui.color_edit_button_srgb(&mut self.transp_checker_a);
+                                        ui.color_edit_button_srgb(&mut self.transp_checker_b);
+                                    });
+                                });
+                                // Solid-colour row: radio + one colour chip.
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut self.transp_solid, true, "Solid color");
+                                    ui.add_enabled_ui(self.transp_solid, |ui| {
+                                        ui.label("Color");
+                                        ui.color_edit_button_srgb(&mut self.transp_color);
+                                    });
+                                });
+
+                                ui.add_space(10.0);
+                                ui.label("Git status");
+                                if ui
+                                    .checkbox(
+                                        &mut self.git_enabled,
+                                        "Show git status in the browser",
+                                    )
+                                    .on_hover_text(
+                                        "Badge (grid) / column (table) / Details line / filename \
+                                         tint for files in a git repo: new, modified, ignored, \
+                                         conflict. Runs `git status` per folder. Turn off on a \
+                                         very large repo if navigation feels slow.",
+                                    )
+                                    .changed()
+                                {
+                                    self.start_git_status(); // recompute now (or clear) so it's immediate
+                                }
+                                ui.weak("Add a \"Git\" column via the table header's right-click menu.");
+
+                                ui.add_space(10.0);
                                 ui.label("16colo.rs cache");
                                 let (bytes, count) = crate::cache::stats();
                                 ui.horizontal(|ui| {
@@ -19711,6 +20688,23 @@ impl eframe::App for PixelView {
                                         self.status = "Cache cleared".into();
                                     }
                                 });
+
+                                ui.add_space(10.0);
+                                ui.label("3D render cache");
+                                let (bbytes, bcount) = crate::decode::mesh3d::blend_cache_stats();
+                                ui.horizontal(|ui| {
+                                    ui.weak(format!("{} · {bcount} renders", human_size(bbytes)));
+                                    if ui
+                                        .button("Clear renders")
+                                        .on_hover_text(
+                                            "Delete every cached .blend render (right-click → \
+                                             Render re-creates them on demand)",
+                                        )
+                                        .clicked()
+                                    {
+                                        clear_blend_renders = true;
+                                    }
+                                });
                             });
                         });
                 });
@@ -19723,6 +20717,23 @@ impl eframe::App for PixelView {
             }
             if let Some((ext, rgb)) = color_change {
                 self.set_format_color(&ext, rgb);
+            }
+            if clear_blend_renders {
+                crate::decode::mesh3d::clear_blend_cache();
+                // Revert any `.blend` tiles in view to the placeholder (drop their cached texture).
+                let blends: Vec<PathBuf> = self
+                    .entries
+                    .iter()
+                    .filter(|e| is_blend_path(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                for p in blends {
+                    self.thumb_tex.remove(&p);
+                    self.thumb_rgba.remove(&p);
+                    self.img_meta.remove(&p);
+                    self.thumbs.forget(&p);
+                }
+                self.status = "3D render cache cleared".into();
             }
         }
 
@@ -19889,6 +20900,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_PDF_KEY, &self.plugin_pdf);
         eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
+        eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -19972,6 +20984,24 @@ impl eframe::App for PixelView {
             &self.crt_scanline_scale,
         );
         eframe::set_value(storage, Self::BLACK_BG_KEY, &self.black_bg);
+        eframe::set_value(storage, Self::TRANSP_SOLID_KEY, &self.transp_solid);
+        eframe::set_value(
+            storage,
+            Self::TRANSP_CHECKER_SIZE_KEY,
+            &self.transp_checker_size,
+        );
+        eframe::set_value(storage, Self::TRANSP_CHECKER_A_KEY, &self.transp_checker_a);
+        eframe::set_value(storage, Self::TRANSP_CHECKER_B_KEY, &self.transp_checker_b);
+        eframe::set_value(storage, Self::TRANSP_COLOR_KEY, &self.transp_color);
+        eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
+        eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
+        eframe::set_value(
+            storage,
+            Self::TD_LIGHT_KEY,
+            &[self.td_light_yaw, self.td_light_pitch],
+        );
+        eframe::set_value(storage, Self::TD_BG_KEY, &self.td_bg);
+        eframe::set_value(storage, Self::GIT_ENABLED_KEY, &self.git_enabled);
         eframe::set_value(storage, Self::OSD_ENABLED_KEY, &self.osd_enabled);
         eframe::set_value(storage, Self::OSD_POSITION_KEY, &self.osd_position);
         eframe::set_value(storage, Self::OSD_SECS_KEY, &self.osd_secs);
@@ -24823,6 +25853,180 @@ fn is_xmind_path(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("xmind"))
 }
 
+/// A cheap change-signature for the 3D viewport: the active camera + scene options + the
+/// viewport pixel size. Unchanged ⇒ the last rasterized texture is reused (no re-render).
+fn three_d_sig(
+    view: &crate::decode::mesh3d::View,
+    opts: &crate::decode::mesh3d::RenderOpts,
+    w: usize,
+    h: usize,
+) -> u64 {
+    use crate::decode::mesh3d::View;
+    use std::hash::{Hash, Hasher};
+    let mut hsh = std::collections::hash_map::DefaultHasher::new();
+    // Collect every f32 into one array, then hash the bit patterns in a loop.
+    let (disc, floats): (u8, Vec<f32>) = match view {
+        View::Orbit(c) => (0, vec![c.yaw, c.pitch, c.zoom, c.pan[0], c.pan[1]]),
+        View::Fly(c) => (1, vec![c.eye[0], c.eye[1], c.eye[2], c.yaw, c.pitch]),
+    };
+    disc.hash(&mut hsh);
+    for v in floats.into_iter().chain([opts.light_yaw, opts.light_pitch]) {
+        v.to_bits().hash(&mut hsh);
+    }
+    opts.textured.hash(&mut hsh);
+    opts.wireframe.hash(&mut hsh);
+    opts.wire_color.hash(&mut hsh);
+    opts.bg.hash(&mut hsh);
+    w.hash(&mut hsh);
+    h.hash(&mut hsh);
+    hsh.finish()
+}
+
+/// How Blender is invoked: a native `blender` on PATH, or the Flatpak app
+/// (`flatpak run org.blender.Blender`). `command()` returns the argv prefix.
+fn blender_invocation() -> Option<Vec<String>> {
+    use std::process::Command;
+    let ok = |c: &mut Command| c.output().map(|o| o.status.success()).unwrap_or(false);
+    // Native binary first (fast, and the render can write anywhere).
+    if ok(Command::new("blender").arg("--version")) {
+        return Some(vec!["blender".into()]);
+    }
+    // Flatpak app (grymmjack's install). `flatpak info` is a cheap no-launch existence check.
+    if ok(Command::new("flatpak").args(["info", "org.blender.Blender"])) {
+        return Some(vec![
+            "flatpak".into(),
+            "run".into(),
+            "org.blender.Blender".into(),
+        ]);
+    }
+    None
+}
+
+/// Render `blend`'s scene (frame 1) with headless Blender (native or Flatpak), copying the
+/// result to `out_png`. Returns `out_png` on success, else a human-readable error.
+///
+/// Renders into the **model's own directory** (a hidden `.pvblendrender_*` file, cleaned up),
+/// NOT `/tmp` — the Flatpak sandbox can't reach the host `/tmp` but *can* reach the folder the
+/// `.blend` lives in (the user already opens it from there). Blender appends the frame number
+/// to `-o`, so the produced file is `<prefix>0001.png`.
+fn run_blender_render(blend: &Path, out_png: &Path) -> Result<PathBuf, String> {
+    use std::process::Command;
+    let Some(argv) = blender_invocation() else {
+        return Err(
+            "Blender not found — install it on PATH, or as Flatpak `org.blender.Blender`".into(),
+        );
+    };
+    let dir = blend.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = dir.join(format!(".pvblendrender_{}_", std::process::id())); // → …_0001.png
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .arg("-b")
+        .arg(blend)
+        .arg("-o")
+        .arg(&prefix)
+        .args(["-F", "PNG", "-f", "1"]);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("couldn't launch {}: {e}", argv.join(" ")))?;
+
+    // Locate anything Blender wrote with our prefix (whether it succeeded or not, so we clean up).
+    let produced: Option<PathBuf> = std::fs::read_dir(dir).ok().and_then(|rd| {
+        rd.flatten().map(|e| e.path()).find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".pvblendrender_") && n.ends_with(".png"))
+        })
+    });
+    let result = if let Some(p) = &produced {
+        if let Some(parent) = out_png.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::copy(p, out_png)
+            .map(|_| out_png.to_path_buf())
+            .map_err(|e| format!("saving render: {e}"))
+    } else if out.status.success() {
+        Err("Blender rendered no image (does the scene have a camera + render output?)".into())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().join(" · ");
+        Err(format!(
+            "render failed ({}){}",
+            out.status,
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {tail}")
+            }
+        ))
+    };
+    if let Some(p) = produced {
+        let _ = std::fs::remove_file(p); // tidy the temp render out of the model folder
+    }
+    result
+}
+
+// Tiny f32-vec helpers for the 3D viewport's orbit/pivot math.
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn norm3(a: [f32; 3]) -> f32 {
+    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    norm3(sub3(a, b))
+}
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalize3(a: [f32; 3]) -> [f32; 3] {
+    let l = norm3(a);
+    if l < 1e-8 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [a[0] / l, a[1] / l, a[2] / l]
+    }
+}
+
+/// A cheap directory change-signature: entry count folded with the newest mtime (unix
+/// secs). Catches additions/removals (count) and modifications (mtime) without hashing
+/// names. Used by the auto-refresh poll.
+fn dir_signature(dir: &Path) -> u64 {
+    let (mut count, mut newest) = (0u64, 0u64);
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            count += 1;
+            if let Ok(secs) = e.metadata().and_then(|m| m.modified()).and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            }) {
+                newest = newest.max(secs.as_secs());
+            }
+        }
+    }
+    count.wrapping_mul(1_000_003).wrapping_add(newest)
+}
+
+/// Is `p` a Blender file (`.blend` / `.blend1`)?
+fn is_blend_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| e == "blend" || e == "blend1")
+}
+
+/// Is `p` a 3D model the mesh viewer handles (obj/stl/ply/gltf/glb/dae)?
+fn is_mesh_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::mesh3d::MESH_EXTS.contains(&e.as_str()))
+}
+
 /// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.
 fn is_kit_ext(p: &Path) -> bool {
     p.extension()
@@ -25714,6 +26918,8 @@ enum TilePick {
     Folder(FolderActPick), // "Open folder in…" → run a folder action on this dir
     CompareSource,         // "Compare ▸ Set as source" — this file becomes the left pane
     CompareDiff,           // "Compare ▸ Set as diff" — this file becomes the right pane
+    RenderBlend,           // ".blend" → render frame 1 with headless Blender → becomes its tile
+    ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -26196,6 +27402,33 @@ fn entry_context_menu(
                 ui.close();
             }
         });
+        // .blend: render frame 1 headless with Blender → becomes this tile's thumbnail.
+        if ext == "blend" || ext == "blend1" {
+            if ui
+                .button("🎬 Render with Blender")
+                .on_hover_text(
+                    "Render this .blend's scene (frame 1) with headless Blender; the result \
+                     becomes the file's thumbnail (cached). Uses `blender` on PATH or the \
+                     Flatpak org.blender.Blender.",
+                )
+                .clicked()
+            {
+                pick = Some(TilePick::RenderBlend);
+                ui.close();
+            }
+            // Only offer to export the render once one has been cached.
+            let has_render =
+                crate::decode::mesh3d::blend_render_path(&entry.path).is_some_and(|p| p.is_file());
+            if has_render
+                && ui
+                    .button("⬇ Export render as PNG")
+                    .on_hover_text("Save this .blend's cached render as a PNG next to the file")
+                    .clicked()
+            {
+                pick = Some(TilePick::ExportBlendRender);
+                ui.close();
+            }
+        }
         ui.separator();
     }
     // 16colo.rs piece: save the single file or the whole pack .zip to disk.
@@ -26400,7 +27633,7 @@ fn table_cell_text(
         ColKind::Group => piece.map(|p| p.group.clone()).unwrap_or_default(),
         ColKind::Pack => piece.map(|p| p.pack.clone()).unwrap_or_default(),
         // Painted/handled by the caller, not text:
-        ColKind::Thumb | ColKind::Rating | ColKind::Download => String::new(),
+        ColKind::Thumb | ColKind::Rating | ColKind::Download | ColKind::Git => String::new(),
     }
 }
 
@@ -26975,6 +28208,8 @@ fn is_image_ext(p: &std::path::Path) -> bool {
             EXTS.contains(&x.as_str())
                 || crate::decode::CODE_EXTS.contains(&x.as_str())
                 || crate::decode::AUDIO_EXTS.contains(&x.as_str())
+                || crate::decode::mesh3d::MESH_EXTS.contains(&x.as_str())
+                || crate::decode::mesh3d::AUX_EXTS.contains(&x.as_str())
         }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.
@@ -27305,8 +28540,12 @@ fn search_walk(
                 return; // receiver dropped (search closed)
             }
         }
-        dirs.sort();
-        queue.extend(dirs);
+        // Recurse into subfolders only when the [x] Recursive box is checked. Off = the
+        // first (root) directory is the only one ever popped, so it's this-folder-only.
+        if spec.recursive {
+            dirs.sort();
+            queue.extend(dirs);
+        }
     }
     let _ = tx.send(SearchMsg::Done(count));
 }
@@ -29043,6 +30282,15 @@ mod tests {
         });
         assert_eq!(n, vec!["dragon-deep.ans"]);
 
+        // Non-recursive: "dragon" now matches ONLY the top-level png, not the one two
+        // levels down (recursive box unchecked = this-folder-only).
+        let n = run(SearchSpec {
+            name: "dragon".into(),
+            recursive: false,
+            ..Default::default()
+        });
+        assert_eq!(n, vec!["dragon.png"]);
+
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -29230,10 +30478,7 @@ mod tests {
         std::fs::create_dir_all(base.join(".hidden_dir")).unwrap();
         std::fs::create_dir_all(base.join("visible_dir")).unwrap();
         // Hidden off: only the visible subdir is seen, and it drives the triangle.
-        assert_eq!(
-            subdirs_sorted(&base, false),
-            vec![base.join("visible_dir")]
-        );
+        assert_eq!(subdirs_sorted(&base, false), vec![base.join("visible_dir")]);
         assert!(has_subdirs(&base, false));
         // Hidden on: the dot-dir shows up too (sorted before "visible_dir").
         assert_eq!(
