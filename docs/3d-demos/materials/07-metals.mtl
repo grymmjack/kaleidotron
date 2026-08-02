@@ -1,0 +1,55 @@
+newmtl gold
+Ka 0.2 0.2 0.2
+Kd 0.831 0.686 0.216
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl silver
+Ka 0.2 0.2 0.2
+Kd 0.753 0.753 0.753
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl copper
+Ka 0.2 0.2 0.2
+Kd 0.722 0.451 0.200
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl bronze
+Ka 0.2 0.2 0.2
+Kd 0.804 0.498 0.196
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl steel
+Ka 0.2 0.2 0.2
+Kd 0.443 0.475 0.494
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl brass
+Ka 0.2 0.2 0.2
+Kd 0.710 0.651 0.259
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl rose_gold
+Ka 0.2 0.2 0.2
+Kd 0.718 0.431 0.475
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gunmetal
+Ka 0.2 0.2 0.2
+Kd 0.165 0.204 0.224
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

@@ -1,0 +1,55 @@
+newmtl blush
+Ka 0.2 0.2 0.2
+Kd 1.000 0.820 0.863
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl peach
+Ka 0.2 0.2 0.2
+Kd 1.000 0.855 0.725
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl lemon
+Ka 0.2 0.2 0.2
+Kd 1.000 0.980 0.804
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl mint
+Ka 0.2 0.2 0.2
+Kd 0.741 0.988 0.788
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl sky
+Ka 0.2 0.2 0.2
+Kd 0.702 0.898 0.988
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl periwinkle
+Ka 0.2 0.2 0.2
+Kd 0.800 0.800 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl lilac
+Ka 0.2 0.2 0.2
+Kd 0.867 0.745 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl rose
+Ka 0.2 0.2 0.2
+Kd 1.000 0.753 0.796
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

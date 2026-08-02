@@ -1,0 +1,55 @@
+newmtl soil
+Ka 0.2 0.2 0.2
+Kd 0.400 0.290 0.204
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl clay
+Ka 0.2 0.2 0.2
+Kd 0.710 0.396 0.267
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl moss
+Ka 0.2 0.2 0.2
+Kd 0.541 0.604 0.357
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl olive
+Ka 0.2 0.2 0.2
+Kd 0.502 0.502 0.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl sand
+Ka 0.2 0.2 0.2
+Kd 0.761 0.698 0.502
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl bark
+Ka 0.2 0.2 0.2
+Kd 0.314 0.227 0.165
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl forest
+Ka 0.2 0.2 0.2
+Kd 0.133 0.333 0.133
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl stone
+Ka 0.2 0.2 0.2
+Kd 0.533 0.549 0.553
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
