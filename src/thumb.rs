@@ -494,10 +494,9 @@ pub fn dither_pass(
                 diffuse(rgba, w, h, p, amount, ATKINSON);
             }
         }
-        DITHER_CUSTOM
-            if custom_n >= 1 && custom.len() >= custom_n * custom_n => {
-                ordered_bias(rgba, w, h, custom, custom_n, sx, sy, amount);
-            }
+        DITHER_CUSTOM if custom_n >= 1 && custom.len() >= custom_n * custom_n => {
+            ordered_bias(rgba, w, h, custom, custom_n, sx, sy, amount);
+        }
         _ => {}
     }
 }
@@ -653,7 +652,6 @@ pub fn make_thumb(img: &PixImage, max_dim: u32) -> (usize, usize, Vec<u8>) {
             let o = (y * dw + x) * 4;
             // Guard-then-divide the alpha-weighted sums: clearer than four `checked_div`
             // chains for what is one averaging block over the same divisor.
-            #[allow(clippy::manual_checked_ops)]
             if sa > 0 {
                 out[o] = (sr / sa) as u8;
                 out[o + 1] = (sg / sa) as u8;
@@ -697,7 +695,6 @@ pub fn box_downscale(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> 
             let o = (y * dw + x) * 4;
             // Guard-then-divide the alpha-weighted sums: clearer than four `checked_div`
             // chains for what is one averaging block over the same divisor.
-            #[allow(clippy::manual_checked_ops)]
             if sa > 0 {
                 out[o] = (sr / sa) as u8;
                 out[o + 1] = (sg / sa) as u8;
