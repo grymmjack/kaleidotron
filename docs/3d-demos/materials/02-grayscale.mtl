@@ -1,0 +1,55 @@
+newmtl gray_000
+Ka 0.2 0.2 0.2
+Kd 0.000 0.000 0.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_014
+Ka 0.2 0.2 0.2
+Kd 0.141 0.141 0.141
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_028
+Ka 0.2 0.2 0.2
+Kd 0.282 0.282 0.282
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_042
+Ka 0.2 0.2 0.2
+Kd 0.427 0.427 0.427
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_057
+Ka 0.2 0.2 0.2
+Kd 0.569 0.569 0.569
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_071
+Ka 0.2 0.2 0.2
+Kd 0.714 0.714 0.714
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_085
+Ka 0.2 0.2 0.2
+Kd 0.855 0.855 0.855
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gray_100
+Ka 0.2 0.2 0.2
+Kd 1.000 1.000 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

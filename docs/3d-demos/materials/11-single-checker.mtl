@@ -1,0 +1,7 @@
+newmtl checker
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/checker.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

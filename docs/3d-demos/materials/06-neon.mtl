@@ -1,0 +1,55 @@
+newmtl neon_pink
+Ka 0.2 0.2 0.2
+Kd 1.000 0.078 0.576
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_green
+Ka 0.2 0.2 0.2
+Kd 0.224 1.000 0.078
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_cyan
+Ka 0.2 0.2 0.2
+Kd 0.000 1.000 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_yellow
+Ka 0.2 0.2 0.2
+Kd 1.000 1.000 0.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_orange
+Ka 0.2 0.2 0.2
+Kd 1.000 0.373 0.122
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_magenta
+Ka 0.2 0.2 0.2
+Kd 1.000 0.000 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_blue
+Ka 0.2 0.2 0.2
+Kd 0.122 0.318 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_lime
+Ka 0.2 0.2 0.2
+Kd 0.749 1.000 0.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

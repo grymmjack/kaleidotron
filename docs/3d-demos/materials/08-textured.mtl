@@ -1,0 +1,103 @@
+newmtl checker
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/checker.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hexagons
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/hexagons.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl dots
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/dots.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl weave
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/weave.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl scales
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/scales.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl stripes_h
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/stripes_h.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl stripes_v
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/stripes_v.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl diagonal
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/diagonal.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gradient
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/gradient.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl sun
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/sun.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl plasma
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/plasma.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl noise
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/noise.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl bricks
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/bricks.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

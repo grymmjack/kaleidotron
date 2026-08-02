@@ -47,11 +47,17 @@ silent buffer; symphonia's AIFF reader also **over-reads** (SSND size not minus 
 offset/blockSize header → ~2 garbage frames from the next chunk = a pop after the audio), so
 `decode_audio` trims to the `COMM` frame count via `parse_aiff_frames` — else a
 music-note icon for trackers/voc/au/midi; duration/rate/channels/codec in Details, plus an
-**in-app play/pause/seek preview** via `rodio`). These three are **toggleable plugins**
-(Preferences → "Format plugins" checkboxes; a runtime atomic flag on the `Registry` — off
-drops the type from the listing + skips decoding). **All three default OFF** (a fresh install:
-`load_bool(PLUGIN_*_KEY, false)` in `new()` — they're the heaviest decode paths; an existing
-user keeps whatever they persisted); enable them in Preferences. **Any** file also gets "Open in default
+**in-app play/pause/seek preview** via `rodio`), and **3D models** (`decode/mesh3d.rs`:
+`.obj`/`.stl`/`.ply`/`.gltf`/`.glb`/`.dae` — geometry loaded via `mesh-loader` (OBJ/STL/
+COLLADA, resolving an OBJ's `.mtl`), a hand-rolled PLY loader, + the `gltf` crate (glTF/GLB,
+embedded/external `.bin`),
+flattened to one triangle mesh + bounding sphere, then **CPU-rasterized** (z-buffered flat-shaded
+orthographic — no GPU context on the thumbnailer thread) to a tile; opening one enters an
+**interactive `Mode::ThreeD` viewer** — see "3D model viewer" below). These **four** are
+**toggleable plugins** (Preferences → "Format plugins" checkboxes; a runtime atomic flag on the
+`Registry` — off drops the type from the listing + skips decoding). **All four default OFF** (a
+fresh install: `load_bool(PLUGIN_*_KEY, false)` in `new()` — they're the heaviest decode paths; an
+existing user keeps whatever they persisted); enable them in Preferences. **Any** file also gets "Open in default
 app" (xdg-open/open/explorer) in the right-click "Open in…" menu, the Details pane, and via
 **Enter** in the viewer — so a source file drops into its associated editor.
 **Animated GIFs** play (autoplay + seek in the viewer,
@@ -95,6 +101,9 @@ src/
                      and the SAUCE panel ("fetching…") show one too.
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
+  git.rs             per-folder git status (shells out to `git status --porcelain -z`);
+                     parses to an abs-path→GitStatus map; surfaced as grid badge / table
+                     column / Details line / filename tint. Inert outside a repo. See below.
   anim.rs            decode animated GIF frames + per-frame delays
   soundfont.rs       .sf2 as a virtual folder: rustysynth parse → each sample extracted
                      to a WAV in a temp dir (mounted like an archive) + preset/instr counts
@@ -121,6 +130,12 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     opl3.rs          OPL3 FM-synth chip emulator (public-domain "Opal" port) — for .rad
     rad.rs           Reality Adlib Tracker replayer (public-domain RADPlayer port) — .rad
     mod.rs           Decoder trait + Registry (sniff-then-extension dispatch)
+    mesh3d.rs        3D models (obj/stl/ply/gltf/glb/dae) — mesh-loader + gltf → a flat
+                     triangle Mesh3D (+ UVs/texture) + bounding sphere; a unified CPU z-buffer
+                     rasterizer (`render`: orbit-ortho / fly-perspective, solid|textured +
+                     wireframe overlay + lighting) for the thumbnail AND the interactive viewer.
+                     Also `.mtl` swatch + `.blend` tile (cached Blender render / placeholder).
+                     `MESH_EXTS`/`AUX_EXTS` routed by extension in `decode_bytes` (need the PATH)
     builtin.rs       image-crate decoder: png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi/ico/draw
     pcx.rs           hand-written, palette-preserving PCX decoder
     aseprite.rs      .aseprite/.ase via the asefile crate (composited frame 0)
@@ -217,7 +232,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 243 tests (233 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
+cargo test               # 252 tests (242 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -330,7 +345,8 @@ and apply it *after* the closure returns.
 
 **Advanced recursive search (`ui_search`, Ctrl+F / Edit menu)** — a `SearchSpec`
 (filename / extension list / W·H min-max / **size KB min-max** / **modified-date
-range** / **min ★** / SAUCE text; all optional) drives `search_walk`, which BFS-walks
+range** / **min ★** / SAUCE text; all optional, plus a **`recursive` bool** — the `[x]
+Recursive` checkbox, default ON) drives `search_walk`, which BFS-walks
 the current folder's subtree on a **background thread** (mirrors the 16colo `mpsc`
 pattern: `search_rx` + an `AtomicBool` cancel, `Send`ing a `SearchMsg::Hit(Entry)` per
 match then `Done(n)`). Filters run cheapest-first: name/type (path strings) → size/date
@@ -346,12 +362,16 @@ the grid, thumbnailer, sort/filter and open-in-viewer all work on results for fr
 navigation (`show_folder`) cancels the search and drops the results. Colors filtering is
 deferred (needs a full decode of every candidate). Result tiles get an extra caption
 line — the match's folder relative to `search_root` (`result_folder_label`; `📁 ·` =
-directly in the root), so you can see *where* a hit lives.
+directly in the root), so you can see *where* a hit lives. **Recursion is a single gate**:
+`search_walk` only `queue.extend(dirs)` when `spec.recursive` — off = the root dir is the
+only one popped (this-folder-only), leaving every per-file filter untouched.
 
 **Smart filters (saved searches)** — `save_filter` stores the current `SearchSpec`
-under its `summary()` label (e.g. `*.ans · sauce:acid`) in `saved_filters`, persisted
+under its `summary()` label (e.g. `*.ans · sauce:acid`; `· this folder` appended when
+non-recursive) in `saved_filters`, persisted
 as `Vec<Vec<String>>` (`[name, ...record]`; no serde-derive on `SearchSpec` — it
-flattens via `record`/`from_record`). They render in the Places dock under "Smart
+flattens via `record`/`from_record`; `recursive` is appended at **record index 12**,
+defaulting ON for a pre-toggle saved filter). They render in the Places dock under "Smart
 filters" with a 🔍 prefix; click → `recall_filter` (load spec + `start_search` from the
 *current* folder), right-click → remove. Both deferred out of the `ui_explorer` closure
 (`recall` / `remove_filter` locals applied after) since it can't borrow `self` twice.
@@ -820,6 +840,15 @@ rematch**, and the *order* of all of it is user-controlled.
   `black bg` toggle (`black_bg`) fills the viewer background black instead of grey-28.
   (Barrel-curvature and vignette modes existed briefly but were dropped as not-useful.)
   Effects skipped for multi-tile (huge) images → plain blit.
+- **Transparency backdrop** (`paint_transparency_backdrop`, Preferences → Transparency,
+  persisted) — what shows THROUGH an image's transparent pixels: a **checkerboard**
+  (`transp_checker_a`/`_b` colours, Small/Medium/Large `transp_checker_size` cell) or a
+  **solid colour** (`transp_color`), picked by `transp_solid`. Painted into the image's
+  on-screen rect *before* the art blits over it (opaque pixels cover it). The checkerboard is
+  a **2×2 `TextureWrapMode::Repeat` texture** (`checker_tex`, rebuilt only when the colours
+  change) tiled via one UV-> N `painter.image` — O(1) regardless of image size; the UV origin
+  is anchored to the image rect so the checker pans WITH the art. Cell size is device-px (a
+  screen-space backdrop, constant across zoom).
 - **Pixel-perfect blit (accuracy — read before touching `draw_image_view`).**
   Nearest-neighbor only stays undistorted when one source pixel maps to a **whole
   number of *device* pixels** — and integer `zoom` is not enough, because what counts
@@ -899,6 +928,95 @@ entry; the **Recall ▾** combo restores its settings + re-enters the comparison
 deletes). Everything persists: `COMPARE_SAVED_KEY` for the list, and
 `COMPARE_COLOR/OPACITY/TOLERANCE/SYNC_KEY` for the live overlay settings. Defaults: diff
 colour magenta `[255,0,255]`, opacity `0.6`, tolerance `0`, sync on.
+
+## 3D models & the interactive viewer (`decode/mesh3d.rs` + `Mode::ThreeD`)
+
+The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF/audio; a
+`plugin_3d` bool synced to the registry via `set_plugin("3d", …)`). Handles `.obj .stl .ply
+.gltf .glb .dae` (geometry) plus companion `.mtl` / `.blend` previews.
+
+- **Loading (`mesh3d::load`).** OBJ/STL/COLLADA via the `mesh-loader` crate (resolves an
+  OBJ's `.mtl` relative to the path; de-indexes faces — a vertex per corner); glTF/GLB via the
+  `gltf` crate (`import`, embedded + external `.bin`); **PLY via a hand-rolled `load_ply`**
+  (ASCII + binary LE/BE, arbitrary vertex props, `uint` indices, s/t UVs — `mesh-loader` 0.1
+  has NO PLY parser, and Blender exports PLY with `uint` indices other parsers reject).
+  Flattened into one `Mesh3D` (`positions`
+  + triangle `indices` + **`texcoords`** parallel to positions + AABB `center`/`radius`), plus
+  the first material's **`base_rgb`** (Kd / glTF base-colour factor) and diffuse **`texture`**
+  (`map_Kd` / glTF base-colour image, loaded via the `image` crate). No full PBR — geometry +
+  one diffuse map + one flat colour.
+- **CPU rasterizer (`render`).** A z-buffered software renderer — **because the thumbnailer
+  runs off the UI thread with no GPU context** (the same invariant as `thumb.rs`). Takes a
+  `View` (`Orbit(Camera)` ortho, or `Fly(FlyCam)` **perspective**) + `RenderOpts`. One unified
+  triangle raster: projects every vertex once to an `SVert {x,y,depth,wp,uz,vz}` (perspective-
+  correct via `wp=1/z`, `uz=u/z`), two-sided **view-space** diffuse lighting (world face normal
+  → view space, flipped toward the viewer, dotted with a screen-relative key light). Base = flat
+  `base_rgb` or a **textured** UV sample; an optional **wireframe overlay** recolours edge
+  pixels (screen-space distance to the nearest edge < ~1px) on top of the shaded surface, still
+  depth-tested ⇒ hidden-line. Same `render` drives BOTH the grid thumbnail (`decode_thumb`,
+  transparent bg) and the interactive viewport. **CPU, not GPU** because this app runs on
+  eframe's **wgpu** backend (NOT glow — `eframe` 0.34's default; verify `cargo tree -e normal |
+  grep egui-wgpu`), so a glow `PaintCallback` would need a global renderer switch; the CPU path
+  is zero-risk, testable headless, and matches the RIP/ANSI hand-rolled ethos.
+- **Extension routing.** `MESH_EXTS` is routed in `decode_bytes` **before** the sniff loop
+  (OBJ/PLY are plain text another decoder might sniff; loaders need the PATH for `.mtl`/`.bin`)
+  → `mesh3d::decode_thumb(path, 512)`. `.blend`/`.blend1` are likewise path-routed →
+  `mesh3d::decode_blend(path)`. Gated by `plugin_disabled` (mesh_on) for `MESH_EXTS` + `AUX_EXTS`.
+- **`Mode::ThreeD` (`ui_three_d`) + cameras.** `load_full`'s `is_mesh_path` branch decodes via
+  `resolve_local` (archive/16colo virtual paths work) into a `ThreeDView { mesh, orbit, fly,
+  pre_fly, tex, sig, fps }`. **`load_full` OWNS the view mode** (defaults to Single at the top,
+  the mesh branch overrides to ThreeD) — callers must NOT set `self.mode = Single` *after*
+  `load_full` (that clobbered ThreeD → "Nothing loaded"; the old `activate`/`poll_colo_open`
+  bug). Re-rasterizes only when the camera / scene-opts / viewport px change (`three_d_sig`
+  hashes the active View + `RenderOpts` + w/h), uploaded LINEAR.
+  - **Orbit (default):** drag / middle-drag = rotate, wheel/pinch = zoom, Space+drag = pan,
+    W/S dolly, A/D turn, ←/→ = prev/next, Esc / ‹ Grid = back.
+  - **Right-click toggles FPS free-fly** (Blender walk-mode). `FlyCam { eye, yaw, pitch }`
+    (perspective): mouse motion (`pointer.delta`) looks, WASD moves (A/D **strafe**), **Q/E**
+    down/up (world Y), wheel dollies, cursor hidden, continuous repaint. Entering seeds the fly
+    cam from the orbit view (`FlyCam::from_orbit`, no jump) and stashes `pre_fly`; **leaving
+    carries the fly pose back into the orbit cam** (`Camera::from_fly`, the exact yaw/pitch
+    inverse) so the view stays put; **Home** restores `pre_fly`.
+- **Scene setup (`RenderOpts`, persisted `td_*`).** Top-bar controls: **`[x] Textured`** +
+  **`[x] Wireframe`** (independent — bits 0/1 of `td_shade`; wireframe is an OVERLAY, composes
+  with flat AND textured) + a **wireframe colour chip** (`td_wire_color`); a **`Scene…`** menu
+  with named **light presets** (`SCENE_PRESETS`: Studio/Product/Top/Left/Right/Rim/Dramatic —
+  each a view-space key-light azimuth/elevation + background) + manual light sliders + a
+  background colour picker; and a **`⬇ PNG`** export (`export_three_d_png`) that renders the
+  current view (orbit or fly) at the **exact viewport size** with a **transparent** background
+  to `<model-dir>/<stem>_view[_N].png` (auto-named, no dialog).
+- **Companion previews (`AUX_EXTS = mtl/blend/blend1`).** `.mtl` → a swatch grid of each
+  material's `Kd` diffuse colour captioned with its `newmtl` name (`MtlDecoder`, bytes-based).
+  `.blend` → **path-aware `decode_blend`**: a **cached headless-Blender render** if one exists
+  (see below), else a branded placeholder. **No Rust crate reads a modern Blender 4.x `.blend`**
+  (new `BLENDER17-01` header + multi-frame zstd + attribute-based mesh storage; `blend`/
+  `blend-rs`/`blr` all cap at ≤3.x uncompressed), so real geometry is out — instead:
+- **`.blend` render-in-place (right-click → 🎬 Render with Blender).** `start_blend_render`
+  spawns `blender -b <file> -F PNG -f 1` on a background thread (`run_blender_render`; graceful
+  "`blender` not found on PATH" when absent; folds into `net_busy`). The frame is cached at
+  `mesh3d::blend_render_path` = `<cache>/blend/<hash-of-abs-path>.png`; `poll_blend_render` then
+  drops the file's `thumb_tex`/`thumb_rgba`/`img_meta` + `thumbs.forget` so the grid re-decodes
+  and `decode_blend` now returns the render — i.e. **the render becomes the `.blend`'s
+  thumbnail**, cached across restarts. The `.blend` still opens externally / rates / etc.
+- Adding a scene-format extension: `MESH_EXTS`/`AUX_EXTS` + `is_image_ext` + `is_mesh_path`
+  are the parallel lists (like `CODE_EXTS`/`AUDIO_EXTS`).
+
+## Git status in the browser (`git.rs`)
+
+`start_git_status` (on every `show_folder`, off-thread so a big monorepo can't hitch nav) runs
+`git status --porcelain=v1 -z --ignored=matching --untracked-files=all` for the current LOCAL
+folder's repo (skipped for remote/archive-mount/virtual paths, or when `git_enabled` is off —
+Preferences toggle). `parse_porcelain_z` → an **absolute-path → `GitStatus` map**
+(`Conflict/Modified/New/Ignored`; `Clean` is never stored — an absent in-repo path reads as
+clean); a rename record's origin field is consumed so it isn't a bogus entry. `poll_git_status`
+(each frame) claims the result only if `self.folder` still matches (a fast click-through
+discards a stale job). `git_status_of(path)` is the single lookup feeding **four surfaces**:
+a grid **corner badge** (top-LEFT, never colliding with the top-right viewed check), a **table
+`Git` column** (`ColKind::Git` + `TC_GIT` bitmask, non-sortable), a **Details "Git" line**, and
+a **filename tint** (grid caption + table Name cell) — new=green, modified=orange, conflict=red,
+ignored=grey. Everything degrades to inert (no `git` / not a repo / error ⇒ `None`), never an
+error. Shelling out (not libgit2) is deliberate — one stable porcelain read, no heavy dep.
+Parsing is unit-tested (`git::tests`); the CLI is trusted for the rest.
 
 ## Font glyph gotcha (solved — two embedded fallbacks + an icon set)
 
@@ -1677,7 +1795,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 243 tests, all headless (233 unit + 10 GUI; plus 13 `#[ignore]`
+`cargo test` runs 252 tests, all headless (242 unit + 10 GUI; plus 13 `#[ignore]`
 network / real-trash / PSD-dump tests that hit the live 16colo.rs API, the system trash,
 or write a sample `.psd` to `/tmp`):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,

@@ -1,0 +1,66 @@
+newmtl ruby
+Ka 0.2 0.2 0.2
+Kd 0.878 0.067 0.373
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl checker
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/checker.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl gold
+Ka 0.2 0.2 0.2
+Kd 0.831 0.686 0.216
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl plasma
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/plasma.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl emerald
+Ka 0.2 0.2 0.2
+Kd 0.000 0.608 0.467
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl bricks
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/bricks.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl neon_cyan
+Ka 0.2 0.2 0.2
+Kd 0.000 1.000 1.000
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl sun
+Ka 0.2 0.2 0.2
+Kd 1 1 1
+map_Kd tex/sun.png
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl stone
+Ka 0.2 0.2 0.2
+Kd 0.533 0.549 0.553
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

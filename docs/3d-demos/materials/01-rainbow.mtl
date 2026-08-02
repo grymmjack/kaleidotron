@@ -1,0 +1,83 @@
+newmtl hue_00
+Ka 0.2 0.2 0.2
+Kd 0.949 0.094 0.094
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_01
+Ka 0.2 0.2 0.2
+Kd 0.949 0.522 0.094
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_02
+Ka 0.2 0.2 0.2
+Kd 0.949 0.949 0.094
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_03
+Ka 0.2 0.2 0.2
+Kd 0.522 0.949 0.094
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_04
+Ka 0.2 0.2 0.2
+Kd 0.094 0.949 0.094
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_05
+Ka 0.2 0.2 0.2
+Kd 0.094 0.949 0.522
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_06
+Ka 0.2 0.2 0.2
+Kd 0.094 0.949 0.949
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_07
+Ka 0.2 0.2 0.2
+Kd 0.094 0.522 0.949
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_08
+Ka 0.2 0.2 0.2
+Kd 0.094 0.094 0.949
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_09
+Ka 0.2 0.2 0.2
+Kd 0.522 0.094 0.949
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_10
+Ka 0.2 0.2 0.2
+Kd 0.949 0.094 0.949
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
+
+newmtl hue_11
+Ka 0.2 0.2 0.2
+Kd 0.949 0.094 0.522
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2

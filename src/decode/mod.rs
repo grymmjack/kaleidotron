@@ -15,6 +15,7 @@ mod code;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
+pub mod mesh3d; // 3D models (OBJ/STL/PLY/glTF/GLB/DAE) → CPU-rendered thumbnail + geometry
 pub mod opl3; // OPL3 FM-synth chip emulator (Opal port) — drives RAD playback
 mod pcx;
 mod pdf;
@@ -93,6 +94,7 @@ pub struct Registry {
     pdf_on: std::sync::atomic::AtomicBool,
     audio_on: std::sync::atomic::AtomicBool,
     code_on: std::sync::atomic::AtomicBool,
+    mesh_on: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
@@ -102,6 +104,7 @@ impl Registry {
             pdf_on: std::sync::atomic::AtomicBool::new(true),
             audio_on: std::sync::atomic::AtomicBool::new(true),
             code_on: std::sync::atomic::AtomicBool::new(true),
+            mesh_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
@@ -121,6 +124,9 @@ impl Registry {
                 Box::new(pdf::PdfDecoder),         // .pdf placeholder page tile + metadata (lopdf)
                 Box::new(audio::SoundDecoder), // audio waveform / icon tile + metadata (symphonia)
                 Box::new(code::CodeDecoder),   // source code / text (CP437 + hand-rolled highlight)
+                Box::new(mesh3d::MeshDecoder), // .obj/.stl/.ply/.gltf/.glb/.dae → CPU-shaded tile
+                Box::new(mesh3d::MtlDecoder),  // .mtl → material colour swatches
+                Box::new(mesh3d::BlendDecoder), // .blend/.blend1 → placeholder (open in Blender)
                 Box::new(builtin::ImageCrateDecoder), // png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi
             ],
         }
@@ -134,6 +140,7 @@ impl Registry {
             "pdf" => self.pdf_on.store(on, Relaxed),
             "audio" => self.audio_on.store(on, Relaxed),
             "code" => self.code_on.store(on, Relaxed),
+            "3d" => self.mesh_on.store(on, Relaxed),
             _ => {}
         }
     }
@@ -144,6 +151,8 @@ impl Registry {
         (!self.pdf_on.load(Relaxed) && ext == "pdf")
             || (!self.audio_on.load(Relaxed) && audio::AUDIO_EXTS.contains(&ext))
             || (!self.code_on.load(Relaxed) && code::CODE_EXTS.contains(&ext))
+            || (!self.mesh_on.load(Relaxed)
+                && (mesh3d::MESH_EXTS.contains(&ext) || mesh3d::AUX_EXTS.contains(&ext)))
     }
 
     /// Does any decoder claim this extension? Used to filter a folder listing. A disabled
@@ -169,8 +178,24 @@ impl Registry {
         // A switched-off plugin doesn't decode its types at all (even on a direct open),
         // so nothing sneaks past the listing filter via the sniff/PDF-magic path.
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if self.plugin_disabled(&ext.to_ascii_lowercase()) {
+            let ext = ext.to_ascii_lowercase();
+            if self.plugin_disabled(&ext) {
                 return Err(DecodeError::Unsupported);
+            }
+            // 3D models are routed by extension *before* the sniff loop: OBJ/PLY are plain
+            // text another decoder might otherwise sniff, and the loaders need the PATH
+            // (for an OBJ's .mtl / a glTF's .bin), which `decode(bytes)` can't provide.
+            if mesh3d::MESH_EXTS.contains(&ext.as_str()) {
+                return caught(|| mesh3d::decode_thumb(path, 512));
+            }
+            // .blend / .mtl are path-routed too: `.blend`'s tile is a cached Blender render
+            // if one exists (right-click → Render), else a placeholder; `.mtl` renders a
+            // lit material ball per material with its `map_Kd` texture — both need the PATH.
+            if ext == "blend" || ext == "blend1" {
+                return caught(|| mesh3d::decode_blend(path));
+            }
+            if ext == "mtl" {
+                return caught(|| mesh3d::decode_mtl_path(path));
             }
         }
 

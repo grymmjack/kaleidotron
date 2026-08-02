@@ -6,6 +6,7 @@ mod colo_thumb;
 mod decode;
 mod dls;
 mod format_color;
+mod git;
 mod image_types;
 mod libxmp;
 mod palettes_builtin;

@@ -1,0 +1,6 @@
+newmtl crimson
+Ka 0.2 0.2 0.2
+Kd 0.863 0.078 0.235
+Ks 0.3 0.3 0.3
+Ns 50
+illum 2
