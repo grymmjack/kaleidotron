@@ -6140,6 +6140,7 @@ impl PixelView {
         let mut want_seek: Option<f32> = None;
         let mut want_speed: Option<f32> = None;
         let mut want_frame_png: Option<bool> = None; // Some(recolor?) — export the current frame
+        let mut want_open_frame: Option<Option<usize>> = None; // Some(idx)=opener, Some(None)=default
         let mut want_extract: Option<bool> = None; // Some(open_after)
         let mut want_add_marker = false;
         let mut want_marker_click: Option<usize> = None; // a marker chip was clicked (seek + toggle notes)
@@ -6230,6 +6231,39 @@ impl PixelView {
                 {
                     want_frame_png = Some(false);
                 }
+                // Extract the current frame and open it in an image editor (recolored if the
+                // Recolor pane is active, else the source frame) — edit it live in DRAW/Aseprite/GIMP.
+                ui.menu_button("Open frame in ▾", |ui| {
+                    let editors: Vec<(usize, String)> = self
+                        .openers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| {
+                            o.ext_list().iter().any(|e| e == "png" || e == "*" || e == "jpg")
+                        })
+                        .map(|(i, o)| (i, o.name.clone()))
+                        .collect();
+                    if editors.is_empty() {
+                        ui.weak("No image editors registered.");
+                        ui.weak("Add them in View → Associations…");
+                        ui.separator();
+                    }
+                    for (i, name) in editors {
+                        if ui.button(name).clicked() {
+                            want_open_frame = Some(Some(i));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Default app").clicked() {
+                        want_open_frame = Some(None);
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Extract the current frame (recolored if the Recolor pane is active) and open \
+                     it in an image editor",
+                );
                 ui.add_enabled_ui(has_audio, |ui| {
                     ui.menu_button("Audio ▾", |ui| {
                         if ui
@@ -6533,6 +6567,9 @@ impl PixelView {
         if let Some(recolor) = want_frame_png {
             self.export_video_frame_png(recolor);
         }
+        if let Some(op) = want_open_frame {
+            self.open_video_frame_in(op);
+        }
         match want_extract {
             Some(true) => {
                 // Extract → open in pixelview's OWN sampler/waveform editor. This leaves the
@@ -6627,18 +6664,19 @@ impl PixelView {
 
     /// Save the current video frame as a PNG at **native** resolution (re-grabbed at the current
     /// timestamp, so it's full quality, not the downscaled display frame). Auto-named beside the video.
-    fn export_video_frame_png(&mut self, recolor: bool) {
-        let Some((src, pts)) = self
+    /// Grab the current video frame at **native** resolution, recolored if `recolor` && the pane
+    /// is active. Returns `(src, pts, w, h, rgba, was_recolored)`. Shared by the PNG export + the
+    /// "open frame in an editor" path.
+    #[allow(clippy::type_complexity)]
+    fn grab_video_frame_now(
+        &mut self,
+        recolor: bool,
+    ) -> Option<(PathBuf, f32, usize, usize, Vec<u8>, bool)> {
+        let (src, pts) = self
             .video_player
             .as_ref()
-            .map(|vp| (vp.path.clone(), vp.cur_pts))
-        else {
-            return;
-        };
-        let Some(img) = crate::decode::grab_video_frame(&src, pts, None) else {
-            self.status = "PNG export failed (is ffmpeg installed?)".into();
-            return;
-        };
+            .map(|vp| (vp.path.clone(), vp.cur_pts))?;
+        let img = crate::decode::grab_video_frame(&src, pts, None)?;
         let (w, h) = (img.width as usize, img.height as usize);
         let mut rgba = img.rgba_bytes();
         // Bake the Recolor pipeline into the full-res grab so the saved frame matches what's on
@@ -6652,6 +6690,14 @@ impl PixelView {
             let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
             apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         }
+        Some((src, pts, w, h, rgba, recolored))
+    }
+
+    fn export_video_frame_png(&mut self, recolor: bool) {
+        let Some((src, pts, w, h, rgba, recolored)) = self.grab_video_frame_now(recolor) else {
+            self.status = "PNG export failed (is ffmpeg installed?)".into();
+            return;
+        };
         let dir = src.parent().unwrap_or_else(|| Path::new("."));
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
         let tc = format_timecode(pts).replace(':', "-");
@@ -6665,6 +6711,37 @@ impl PixelView {
         match image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
             Ok(()) => self.status = format!("Saved {}", short_name(&out)),
             Err(e) => self.status = format!("PNG failed: {e}"),
+        }
+    }
+
+    /// Extract the current frame to a temp PNG (recolored if the Recolor pane is active, else the
+    /// source frame — the user's rule) and open it in an image editor: `opener` = an index into
+    /// `openers` (DRAW / Aseprite / GIMP …), or `None` for the OS default app. Edit the frame live.
+    fn open_video_frame_in(&mut self, opener: Option<usize>) {
+        let Some((src, pts, w, h, rgba, recolored)) = self.grab_video_frame_now(true) else {
+            self.status = "Frame extract failed (is ffmpeg installed?)".into();
+            return;
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+        let tc = format_timecode(pts).replace(':', "-");
+        let tag = if recolored { "_recolored" } else { "" };
+        let out = std::env::temp_dir().join(format!("pv_{stem}_{tc}{tag}.png"));
+        if let Err(e) = image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8)
+        {
+            self.status = format!("Frame save failed: {e}");
+            return;
+        }
+        match opener {
+            Some(idx) => {
+                if let Some(o) = self.openers.get(idx).cloned() {
+                    self.launch_external(&o.exec, &o.args, &o.env, &out);
+                    self.status = format!("Opened frame in {}", o.name);
+                }
+            }
+            None => {
+                self.open_in_default_app(&out);
+                self.status = "Opened frame in default app".into();
+            }
         }
     }
 
@@ -7629,6 +7706,23 @@ impl PixelView {
             }
             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
+            // Drag-to-pad handle (big view): drag it onto a sample pad to load the current
+            // waveform SELECTION (trimmed at the selection), else the whole sample. Reuses the
+            // per-pad "⟲ load" path (load_pad → current_region_buf).
+            if big {
+                ui.separator();
+                let sel = format!("{} → {}", mm(sel_lo), mm(sel_hi));
+                let r = ui
+                    .add(egui::Button::new("⠿ → pad").sense(egui::Sense::click_and_drag()))
+                    .on_hover_text(format!(
+                        "Drag onto a sample pad to load the selection ({sel}).\n\
+                         (No selection = the whole sample.)"
+                    ));
+                if r.dragged() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Selection);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
         });
         // Two CONDITIONAL control rows live between the transport and the waveform: an "Editing:
         // <source>" row (when editing a sample/pad that has an external file) and the per-pad
@@ -10571,10 +10665,13 @@ impl PixelView {
         }
         if let Some((i, drop)) = want_drop {
             // A sample load drills into the pad afterwards (below); a pad move/swap/clone doesn't.
-            let sample_load = matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_));
+            let sample_load =
+                matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection);
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
+                // The current waveform selection (trimmed) — reuses the "⟲ load" path.
+                PadDrop::Selection => self.load_pad(i),
                 // Alt = clone the whole pad; plain = move/swap.
                 PadDrop::Pad(src) if alt_down => self.clone_pad(src, i),
                 PadDrop::Pad(src) => self.move_pad(src, i),
@@ -27487,6 +27584,7 @@ enum PadDrop {
     File(PathBuf),  // a sample file (Samples explorer)
     Tracker(usize), // a tracker/bank sample index in the current player
     Pad(usize),     // another pad (drag one pad onto another to move/swap them)
+    Selection,      // the current waveform-editor selection (drag the ⠿ handle onto a pad)
 }
 
 /// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
