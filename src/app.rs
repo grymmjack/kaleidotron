@@ -1340,6 +1340,8 @@ pub struct PixelView {
     compare_name: String,              // "save as…" name buffer (transient)
     compare: Compare,                  // transient runtime (textures, per-pane view, overlay)
     saved_compares: Vec<SavedCompare>, // saved, recallable comparisons (persisted)
+    video_lists: Vec<VideoList>,       // Watch Later + custom video lists (persisted); shown in Places
+    list_rename: Option<(String, String)>, // (list being renamed, edit buffer) — transient
 
     anim: Option<AnimState>,         // Some when viewing an animated GIF
     hover_anim: Option<AnimState>,   // the hovered grid GIF, playing in its tile
@@ -1808,6 +1810,9 @@ impl PixelView {
     const COMPARE_TOLERANCE_KEY: &'static str = "compare_tolerance";
     const COMPARE_SYNC_KEY: &'static str = "compare_sync";
     const COMPARE_SAVED_KEY: &'static str = "saved_compares";
+    const VIDEO_LISTS_KEY: &'static str = "video_lists";
+    /// Virtual root for user video lists (Watch Later + custom). `<lists>/<name>` browses a list.
+    const LIST_ROOT: &'static str = "<lists>";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2005,6 +2010,10 @@ impl PixelView {
         let saved_compares = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<SavedCompare>>(s, Self::COMPARE_SAVED_KEY))
+            .unwrap_or_default();
+        let video_lists = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<VideoList>>(s, Self::VIDEO_LISTS_KEY))
             .unwrap_or_default();
         let table_columns = cc
             .storage
@@ -2475,6 +2484,8 @@ impl PixelView {
             compare_name: String::new(),
             compare: Compare::default(),
             saved_compares,
+            video_lists,
+            list_rename: None,
             kit_editor: false,
             midi_follow: get_bool(Self::MIDI_FOLLOW_KEY).unwrap_or(false),
             kit_map_lock: get_bool(Self::KIT_MAP_LOCK_KEY).unwrap_or(false),
@@ -2824,6 +2835,11 @@ impl PixelView {
         // The virtual Steam library (installed games → find YouTube videos).
         if crate::steam::is_remote(&dir) {
             self.open_steam(dir);
+            return;
+        }
+        // A user video list (`<lists>/<name>`): show its videos in add-order.
+        if dir.starts_with(Self::LIST_ROOT) {
+            self.open_video_list(&dir);
             return;
         }
         // An archive path is a *virtual* folder: extract it once, then browse the
@@ -14178,6 +14194,133 @@ impl PixelView {
         self.open_folder(dir);
     }
 
+    /// Append a video entry to a named list (created if missing), capturing its title + thumbnail
+    /// so it renders + opens later without a live search. De-dupes by path. Persisted on exit.
+    fn add_to_video_list(&mut self, list_name: &str, entry_path: &Path) {
+        let path_s = entry_path.to_string_lossy().into_owned();
+        // Capture metadata from the live YouTube result if we have it, else the filename.
+        let (title, thumb_url) = if let Some(v) = self.yt_videos.get(entry_path) {
+            (v.title.clone(), v.thumb_url.clone())
+        } else {
+            (short_name(entry_path), String::new())
+        };
+        let item = ListItem {
+            path: path_s.clone(),
+            title,
+            thumb_url,
+        };
+        let list = if let Some(l) = self.video_lists.iter_mut().find(|l| l.name == list_name) {
+            l
+        } else {
+            self.video_lists.push(VideoList {
+                name: list_name.to_string(),
+                items: Vec::new(),
+            });
+            self.video_lists.last_mut().unwrap()
+        };
+        if list.items.iter().any(|i| i.path == path_s) {
+            self.status = format!("Already in “{list_name}”");
+            return;
+        }
+        list.items.push(item);
+        self.status = format!("Added to “{list_name}” ({} items)", list.items.len());
+    }
+
+    /// Open a user list (`<lists>/<name>`) as a folder of its videos, in add-order. Re-seeds
+    /// `yt_videos` from stored metadata so thumbnails + opening work after a restart.
+    fn open_video_list(&mut self, dir: &Path) {
+        let name = dir
+            .strip_prefix(Self::LIST_ROOT)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .trim_matches('/')
+            .to_string();
+        let Some(list) = self.video_lists.iter().find(|l| l.name == name).cloned() else {
+            self.show_folder(dir.to_path_buf(), Vec::new());
+            self.status = format!("List “{name}” not found");
+            return;
+        };
+        let mut entries = Vec::new();
+        for it in &list.items {
+            let path = PathBuf::from(&it.path);
+            // Re-seed the YouTube metadata so the tile shows its thumbnail + opens.
+            if crate::youtube::is_remote(&path) && !self.yt_videos.contains_key(&path) {
+                if let Some(id) = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                {
+                    self.yt_videos.insert(
+                        path.clone(),
+                        crate::youtube::YtVideo {
+                            id,
+                            title: it.title.clone(),
+                            thumb_url: it.thumb_url.clone(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            let rating = self.read_rating(&path);
+            entries.push(Entry {
+                path,
+                is_dir: false,
+                is_archive: false,
+                size: 0,
+                mtime: None,
+                ctime: None,
+                rating,
+            });
+        }
+        let n = entries.len();
+        self.show_folder(dir.to_path_buf(), entries);
+        self.status = format!("List “{name}” — {n} video(s)");
+    }
+
+    /// Remove a named list entirely.
+    fn delete_video_list(&mut self, name: &str) {
+        self.video_lists.retain(|l| l.name != name);
+        self.status = format!("Deleted list “{name}”");
+    }
+
+    /// Is `path` a video tile (a local video file, or a YouTube video result)?
+    fn is_video_entry(&self, path: &Path) -> bool {
+        is_video_ext(path)
+            || (crate::youtube::is_remote(path)
+                && path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                    .is_some())
+    }
+
+    /// A fresh, unique list name ("New list", "New list 2", …).
+    fn fresh_list_name(&self) -> String {
+        let base = "New list";
+        if !self.video_lists.iter().any(|l| l.name == base) {
+            return base.to_string();
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|n| !self.video_lists.iter().any(|l| l.name == *n))
+            .unwrap_or_else(|| base.to_string())
+    }
+
+    /// Apply an "Add to list" / "New list…" tile pick (shared by grid + table). A new list gets an
+    /// auto name (rename it in Places) so no modal text dialog is needed.
+    fn apply_add_to_list(&mut self, pick: &TilePick, entry_path: &Path) {
+        match pick {
+            TilePick::AddToList(name) => self.add_to_video_list(name, entry_path),
+            TilePick::AddToNewList => {
+                let name = self.fresh_list_name();
+                self.add_to_video_list(&name, entry_path);
+                self.status = format!("Added to new list “{name}” — rename it in Places");
+            }
+            _ => {}
+        }
+    }
+
     fn ui_details(&mut self, ui: &mut egui::Ui) {
         // In a Steam game's detail view the "entries" are screenshots/trailers; the pane should
         // describe the GAME itself (name/genres/description/links/rating), not a hovered tile.
@@ -16300,6 +16443,7 @@ impl PixelView {
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None; // "Pin to Places" on a folder tile
         let mut smart_on: Option<(usize, SmartCriterion)> = None; // "Smart filter on…"
+        let mut add_to_list: Option<(PathBuf, TilePick)> = None; // "Add to list ▸" on a video tile
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
@@ -16831,6 +16975,9 @@ impl PixelView {
                             let facts = self.folder_action_items();
                             let local_dir = Self::is_local_path(&entry.path);
                             let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
+                            let list_names: Vec<String> =
+                                self.video_lists.iter().map(|l| l.name.clone()).collect();
+                            let is_vid = self.is_video_entry(&entry.path);
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -16844,8 +16991,13 @@ impl PixelView {
                                 local_dir,
                                 bulk_dir,
                                 selected_videos,
+                                is_vid,
+                                &list_names,
                             ) {
                                 match pick {
+                                    p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
+                                        add_to_list = Some((entry.path.clone(), p))
+                                    }
                                     TilePick::Pin => pin_dir = Some(idx),
                                     TilePick::PinFolder => pin_current = true,
                                     TilePick::Smart(c) => smart_on = Some((idx, c)),
@@ -16905,6 +17057,9 @@ impl PixelView {
                 }
             }
             self.do_file_action(a);
+        }
+        if let Some((path, pick)) = add_to_list.take() {
+            self.apply_add_to_list(&pick, &path);
         }
         if let Some(idx) = pin_dir {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
@@ -17284,6 +17439,7 @@ impl PixelView {
         let mut ctx_action: Option<(usize, FileAction)> = None;
         let mut pin_dir: Option<usize> = None;
         let mut smart_on: Option<(usize, SmartCriterion)> = None;
+        let mut add_to_list: Option<(PathBuf, TilePick)> = None;
         let mut toggle_viewed: Option<(usize, bool)> = None; // "Mark as (not) viewed"
         let mut rate_to: Option<(usize, u8)> = None; // "Rating ▸ N" context-menu choice
         let mut open_with: Option<(usize, usize)> = None; // (entry idx, opener idx)
@@ -17791,6 +17947,9 @@ impl PixelView {
                         let facts = self.folder_action_items();
                         let local_dir = Self::is_local_path(&entry.path);
                         let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
+                        let list_names: Vec<String> =
+                            self.video_lists.iter().map(|l| l.name.clone()).collect();
+                        let is_vid = self.is_video_entry(&entry.path);
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -17804,8 +17963,13 @@ impl PixelView {
                             local_dir,
                             bulk_dir,
                             selected_videos,
+                            is_vid,
+                            &list_names,
                         ) {
                             match pick {
+                                p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
+                                    add_to_list = Some((entry.path.clone(), p))
+                                }
                                 TilePick::Pin => pin_dir = Some(idx),
                                 TilePick::PinFolder => pin_current = true,
                                 TilePick::Smart(c) => smart_on = Some((idx, c)),
@@ -17913,6 +18077,9 @@ impl PixelView {
                 }
             }
             self.do_file_action(a);
+        }
+        if let Some((path, pick)) = add_to_list.take() {
+            self.apply_add_to_list(&pick, &path);
         }
         if let Some(idx) = pin_dir {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
@@ -21945,6 +22112,11 @@ impl PixelView {
         let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
         let mut save_yt_search = false; // "Save this search" clicked in the YouTube tab
+        let mut list_open: Option<String> = None; // clicked a video list to open it
+        let mut list_delete: Option<String> = None; // delete a video list
+        let mut list_new = false; // create a new empty list
+        let mut list_rename_commit: Option<(String, String)> = None; // (old, new) rename
+        let mut list_rename_start: Option<String> = None; // begin renaming this list
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
@@ -22130,6 +22302,61 @@ impl PixelView {
                             false,
                         ) {
                             nav = Some(p);
+                        }
+                        // Video lists (Watch Later + custom): open / rename / delete / new.
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.weak("Lists");
+                            if ui.small_button("＋ New").on_hover_text("Create an empty list").clicked() {
+                                list_new = true;
+                            }
+                        });
+                        // Snapshot names+counts so the loop doesn't borrow `self.video_lists`
+                        // while the rename buffer mutates `self.list_rename`.
+                        let lists: Vec<(String, usize)> = self
+                            .video_lists
+                            .iter()
+                            .map(|l| (l.name.clone(), l.items.len()))
+                            .collect();
+                        for (name, count) in &lists {
+                            let renaming = self
+                                .list_rename
+                                .as_ref()
+                                .map(|(n, _)| n == name)
+                                .unwrap_or(false);
+                            if renaming {
+                                ui.horizontal(|ui| {
+                                    let buf = &mut self.list_rename.as_mut().unwrap().1;
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(buf).desired_width(120.0),
+                                    );
+                                    if (r.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                        || ui.small_button("✔").clicked()
+                                    {
+                                        list_rename_commit = Some((name.clone(), buf.clone()));
+                                    }
+                                    if ui.small_button("✕").clicked() {
+                                        list_rename_commit = Some((name.clone(), name.clone()));
+                                    }
+                                });
+                            } else {
+                                let resp = ui.button(format!("📃 {name} ({count})"));
+                                if resp.clicked() {
+                                    list_open = Some(name.clone());
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("✎ Rename").clicked() {
+                                        list_rename_start = Some(name.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("🗑 Delete").clicked() {
+                                        list_delete = Some(name.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                     } else if self.places_tab == 6 {
                         // SteamTube: browse games → detail view / find videos.
@@ -22820,6 +23047,33 @@ impl PixelView {
                 }
             }
             self.pixelfx_rename = None;
+        }
+        // Video-list actions (create / rename / delete / open).
+        if list_new {
+            let name = self.fresh_list_name();
+            self.video_lists.push(VideoList {
+                name: name.clone(),
+                items: Vec::new(),
+            });
+            self.list_rename = Some((name.clone(), name)); // start renaming it immediately
+        }
+        if let Some(name) = list_rename_start {
+            self.list_rename = Some((name.clone(), name));
+        }
+        if let Some((old, new)) = list_rename_commit {
+            let new = new.trim().to_string();
+            if !new.is_empty() && new != old && !self.video_lists.iter().any(|l| l.name == new) {
+                if let Some(l) = self.video_lists.iter_mut().find(|l| l.name == old) {
+                    l.name = new;
+                }
+            }
+            self.list_rename = None;
+        }
+        if let Some(name) = list_delete {
+            self.delete_video_list(&name);
+        }
+        if let Some(name) = list_open {
+            self.open_folder(Path::new(Self::LIST_ROOT).join(&name));
         }
         // Load a kit (item 14): adopt it into the pads without navigating into the file, and show
         // the pads (item 15). Clicking the Kits tab also opens the pad editor.
@@ -24372,6 +24626,7 @@ impl eframe::App for PixelView {
         );
         eframe::set_value(storage, Self::COMPARE_SYNC_KEY, &self.compare_sync);
         eframe::set_value(storage, Self::COMPARE_SAVED_KEY, &self.saved_compares);
+        eframe::set_value(storage, Self::VIDEO_LISTS_KEY, &self.video_lists);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
@@ -25433,6 +25688,24 @@ type FxRow = (
 /// `postfx` = record) so the struct survives adding new ops/params (`with_order` /
 /// `from_record` fill the gaps). `#[serde(default)]` fills any field a newer layout
 /// added, so an older saved preset still loads.
+/// One video in a user list (Watch Later / custom lists). Stores enough to render + open the tile
+/// after a restart without a live search: the virtual/local path + title + thumbnail URL.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct ListItem {
+    path: String,      // virtual (`<youtube>/…`) or local path, as a string
+    title: String,     // display title
+    thumb_url: String, // remote thumbnail URL ("" for a local video → decoded)
+}
+
+/// A named, ordered video list (Watch Later + user lists) shown in Places, browsable as a folder.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct VideoList {
+    name: String,
+    items: Vec<ListItem>, // in add-order
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct FxPreset {
@@ -30621,6 +30894,8 @@ enum TilePick {
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
     YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
+    AddToList(String),     // add this video to the named list (Watch Later / a custom list)
+    AddToNewList,          // add this video to a brand-new list (prompt for its name)
 }
 
 /// Which slice of the Steam library to list.
@@ -31082,6 +31357,8 @@ fn entry_context_menu(
     local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
     bulk_dir: bool, // a 16colo artist/group/pack folder → offer "Download all pieces…"
     selected_videos: usize, // count of currently-selected local video files (≥2 → offer Join)
+    is_video: bool,         // a video (youtube or local) → offer "Add to list ▸"
+    video_lists: &[String], // existing list names (for the "Add to list" submenu)
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -31270,6 +31547,32 @@ fn entry_context_menu(
             item(ui, "Store page", SteamAct::Store);
             item(ui, "Community hub", SteamAct::Hub);
             item(ui, "Discussions", SteamAct::Discussions);
+        });
+        ui.separator();
+    }
+    // Add a video (YouTube or local) to a list (Watch Later / a custom list).
+    if is_video {
+        ui.menu_button("＋ Add to list", |ui| {
+            if ui.button("⏰ Watch Later").clicked() {
+                pick = Some(TilePick::AddToList("Watch Later".to_string()));
+                ui.close();
+            }
+            if ui.button("＋ New list…").clicked() {
+                pick = Some(TilePick::AddToNewList);
+                ui.close();
+            }
+            if !video_lists.is_empty() {
+                ui.separator();
+                for name in video_lists {
+                    if name == "Watch Later" {
+                        continue; // shown above
+                    }
+                    if ui.button(name).clicked() {
+                        pick = Some(TilePick::AddToList(name.clone()));
+                        ui.close();
+                    }
+                }
+            }
         });
         ui.separator();
     }

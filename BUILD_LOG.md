@@ -35,3 +35,12 @@ merge each so the next builds on clean main. Order: quick-ish → medium → lar
   Channel/Playlists/Playlist segment labels.
 - ✅ **Videos | Playlists** switcher on the breadcrumb row while in a channel.
 - ✅ Playlist tiles fetch their cover thumbnail (poll_yt + grid request).
+
+### Medium: video lists / Watch Later (branch `video-lists`)
+- ✅ `VideoList`/`ListItem` (serde, persisted `VIDEO_LISTS_KEY`); a `<lists>/<name>` virtual root.
+- ✅ Right-click a video (YouTube or local) → **＋ Add to list** → ⏰ Watch Later / ＋ New list… /
+  existing lists. Captures title + thumb_url so it renders/opens after a restart (add_to_video_list).
+- ✅ Places → YouTube tab **Lists** section: click a list to open it (videos in add-order,
+  yt_videos re-seeded), ＋ New, right-click Rename (inline) / Delete.
+- ✅ `open_folder` routes `<lists>/…` → `open_video_list`; `is_video_entry` gates the menu; picks
+  deferred through both grid + table (`apply_add_to_list`).
