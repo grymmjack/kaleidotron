@@ -279,12 +279,78 @@ pub fn stream_url(id: &str) -> Option<String> {
         .map(|l| l.to_string())
 }
 
+/// A live download-progress update parsed from yt-dlp's `--progress-template` output.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct DlProgress {
+    pub pct: f32,      // 0..100 (resets per merged stream — video then audio)
+    pub eta: String,   // "mm:ss" (or "" when unknown)
+    pub speed: String, // e.g. "1.23MiB/s" (or "" when unknown)
+}
+
+impl DlProgress {
+    pub fn pct_str(&self) -> String {
+        format!("{:.0}%", self.pct)
+    }
+}
+
+/// Parse one `PV|<pct>|<eta>|<speed>` line from our `--progress-template`. `None` for other lines.
+fn parse_progress(line: &str) -> Option<DlProgress> {
+    let rest = line.strip_prefix("PV|")?;
+    let mut it = rest.split('|');
+    let pct = it.next()?.trim().trim_end_matches('%').trim().parse::<f32>().ok()?;
+    let clean = |s: &str| {
+        let s = s.trim();
+        if s.is_empty() || s.contains("Unknown") || s == "N/A" {
+            String::new()
+        } else {
+            s.to_string()
+        }
+    };
+    Some(DlProgress {
+        pct,
+        eta: clean(it.next().unwrap_or("")),
+        speed: clean(it.next().unwrap_or("")),
+    })
+}
+
+/// Remove a video's partial download artifacts (`<id>.*.part`, fragments, `.ytdl`) so an aborted
+/// download isn't mistaken for a finished file on the next cache-hit scan.
+fn remove_partials(dir: &std::path::Path, id: &str) {
+    let prefix = format!("{id}.");
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && (name.ends_with(".part")
+                    || name.contains(".part-")
+                    || name.ends_with(".ytdl")
+                    || name.contains(".f")) // per-stream temp files (e.g. id.f137.mp4)
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 /// Download a video **in place** to `dir` as `<id>.<ext>` and return the produced file path — so
 /// it plays via the normal local `VideoPlayer` (streaming via `-g` is unreliable under YouTube
 /// SABR). `max_height` caps the resolution (0 = best available; video+audio are merged via ffmpeg
-/// so 1080p+ works). Cache-first: an existing `<id>.*` is reused with no network. `None` if yt-dlp
-/// can't produce a file (absent / too old / SABR-blocked → caller shows a hint).
-pub fn download(id: &str, dir: &std::path::Path, max_height: u32) -> Option<std::path::PathBuf> {
+/// so 1080p+ works). Cache-first: an existing `<id>.*` is reused with no network.
+///
+/// `cancel` is polled between yt-dlp progress lines — setting it kills yt-dlp and cleans up the
+/// partial download (returns `None`). `on_progress` is called for each progress update (percent /
+/// ETA / speed) so the UI can show a live readout. `None` if yt-dlp can't produce a file
+/// (absent / too old / SABR-blocked / aborted → caller shows a hint).
+pub fn download(
+    id: &str,
+    dir: &std::path::Path,
+    max_height: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(DlProgress),
+) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::Ordering::Relaxed;
     // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -308,16 +374,43 @@ pub fn download(id: &str, dir: &std::path::Path, max_height: u32) -> Option<std:
             h = max_height
         )
     };
-    let ok = Command::new("yt-dlp")
-        .args(["-f", &fmt, "--no-warnings", "-o"])
+    // `--newline` + a machine-readable progress template on stdout → parse per-line for the ETA.
+    let mut child = Command::new("yt-dlp")
+        .args([
+            "-f",
+            &fmt,
+            "--no-warnings",
+            "--newline",
+            "--progress-template",
+            "PV|%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s",
+            "-o",
+        ])
         .arg(&out_tmpl)
         .arg(&watch)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
+        .spawn()
+        .ok()?;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            if cancel.load(Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                remove_partials(dir, id);
+                return None;
+            }
+            let Ok(line) = line else { break };
+            if let Some(p) = parse_progress(&line) {
+                on_progress(p);
+            }
+        }
+    }
+    let status = child.wait().ok()?;
+    if cancel.load(Relaxed) {
+        remove_partials(dir, id);
+        return None;
+    }
+    if !status.success() {
         return None;
     }
     // Find the produced `<id>.<ext>`.
@@ -394,6 +487,22 @@ mod tests {
         assert_eq!(m.likes_short(), "45.0K");
         assert_eq!((m.width, m.height), (1920, 1080));
         assert_eq!(m.filesize, 123456789);
+    }
+
+    #[test]
+    fn parses_download_progress() {
+        let p = parse_progress("PV|  0.0%|00:11|   4.24MiB/s").unwrap();
+        assert_eq!(p.pct, 0.0);
+        assert_eq!(p.eta, "00:11");
+        assert_eq!(p.speed, "4.24MiB/s");
+        assert_eq!(p.pct_str(), "0%");
+        // "Unknown" fields collapse to empty.
+        let u = parse_progress("PV| 12.5%|Unknown| Unknown B/s").unwrap();
+        assert_eq!(u.pct, 12.5);
+        assert_eq!(u.eta, "");
+        assert_eq!(u.speed, "");
+        // Non-progress lines are ignored.
+        assert!(parse_progress("[download] Destination: foo.mp4").is_none());
     }
 
     #[test]

@@ -240,6 +240,12 @@ enum YtMsg {
     Done(usize),
 }
 
+/// Messages from a YouTube **download** worker (`start_yt_open`): live progress, then the result.
+enum YtOpenMsg {
+    Progress(crate::youtube::DlProgress),
+    Done(Result<(PathBuf, PathBuf), String>), // Ok((virtual path, local file)) | Err(status text)
+}
+
 /// What a 16colo.rs flat-piece listing is built from (see
 /// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
@@ -1529,8 +1535,10 @@ pub struct PixelView {
     yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
     yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     yt_files: HashMap<PathBuf, PathBuf>,
-    // A video downloading in place so we can open it once ready: (virtual path, local file).
-    yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // A video downloading in place so we can open it once ready: live progress + the result.
+    yt_open_rx: Option<std::sync::mpsc::Receiver<YtOpenMsg>>,
+    yt_open_cancel: Option<Arc<std::sync::atomic::AtomicBool>>, // set → kills yt-dlp (Abort button)
+    yt_dl_progress: Option<crate::youtube::DlProgress>, // live %/ETA/speed for the status bar
     // Rich per-video metadata (channel/likes/comments/date/dims) for the Details pane, fetched
     // lazily on a worker (`yt-dlp --dump-json`) when a video is opened. `yt_meta_pending` guards
     // against re-spawning while one fetch is in flight.
@@ -2675,6 +2683,8 @@ impl PixelView {
             yt_cancel: None,
             yt_files: HashMap::new(),
             yt_open_rx: None,
+            yt_open_cancel: None,
+            yt_dl_progress: None,
             yt_meta: HashMap::new(),
             yt_meta_rx: None,
             yt_meta_pending: None,
@@ -3742,47 +3752,94 @@ impl PixelView {
         let height = self.yt_max_height;
         let (tx, rx) = std::sync::mpsc::channel();
         self.yt_open_rx = Some(rx);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.yt_open_cancel = Some(cancel.clone());
+        self.yt_dl_progress = None;
         self.status = "Downloading from YouTube…".into();
         std::thread::spawn(move || {
-            let res = match crate::youtube::download(&id, &dir, height) {
+            let tx_prog = tx.clone();
+            let mut on_progress =
+                move |p: crate::youtube::DlProgress| {
+                    let _ = tx_prog.send(YtOpenMsg::Progress(p));
+                };
+            let res = match crate::youtube::download(&id, &dir, height, &cancel, &mut on_progress) {
                 Some(local) => Ok((vpath, local)),
                 None => Err(
                     "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
                         .to_string(),
                 ),
             };
-            let _ = tx.send(res);
+            let _ = tx.send(YtOpenMsg::Done(res));
         });
     }
 
-    /// Finish a YouTube download (each frame): map the virtual path → the local file and open it.
+    /// Abort an in-flight YouTube download (the Abort button in the status bar): flag yt-dlp to die
+    /// and drop the receiver so the worker's late `Done(Err)` is ignored.
+    fn abort_yt_open(&mut self) {
+        if let Some(c) = self.yt_open_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.yt_open_rx = None;
+        self.yt_dl_progress = None;
+        self.status = "Download aborted".into();
+    }
+
+    /// Finish a YouTube download (each frame): drain live progress, then on completion map the
+    /// virtual path → the local file and open it.
     fn poll_yt_open(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.yt_open_rx else { return };
-        match rx.try_recv() {
-            Ok(Ok((vpath, local))) => {
-                if let Some(id) = vpath
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .and_then(parse_yt_id)
-                {
-                    self.yt_downloaded_ids.insert(id);
+        // Drain everything queued this frame — many Progress updates + at most one Done.
+        loop {
+            let Some(rx) = &self.yt_open_rx else { return };
+            match rx.try_recv() {
+                Ok(YtOpenMsg::Progress(p)) => {
+                    // Show a live readout in the status text too (the status bar also draws %/ETA).
+                    self.status = if p.eta.is_empty() {
+                        format!("Downloading {}…", p.pct_str())
+                    } else {
+                        format!("Downloading {} · ETA {} · {}", p.pct_str(), p.eta, p.speed)
+                    };
+                    self.yt_dl_progress = Some(p);
+                    self.want_repaint = true;
                 }
-                self.yt_files.insert(vpath.clone(), local.clone());
-                self.yt_open_rx = None;
-                // Optional: pop the containing folder in the OS file manager (Preferences /
-                // the "Open folder after download" checkbox in the video controls).
-                if self.yt_open_folder_after {
-                    self.reveal_in_file_manager(&local);
+                Ok(YtOpenMsg::Done(Ok((vpath, local)))) => {
+                    if let Some(id) = vpath
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .and_then(parse_yt_id)
+                    {
+                        self.yt_downloaded_ids.insert(id);
+                    }
+                    self.yt_files.insert(vpath.clone(), local.clone());
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    // Optional: pop the containing folder in the OS file manager (Preferences /
+                    // the "Open folder after download" checkbox in the video controls).
+                    if self.yt_open_folder_after {
+                        self.reveal_in_file_manager(&local);
+                    }
+                    self.start_yt_meta(&vpath); // rich Details (channel/likes/comments/date/dims)
+                    self.load_full(ctx, vpath);
+                    return;
                 }
-                self.start_yt_meta(&vpath); // rich Details (channel/likes/comments/date/dims)
-                self.load_full(ctx, vpath);
+                Ok(YtOpenMsg::Done(Err(e))) => {
+                    self.status = e;
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    return;
+                }
             }
-            Ok(Err(e)) => {
-                self.status = e;
-                self.yt_open_rx = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.yt_open_rx = None,
         }
     }
 
@@ -20660,6 +20717,26 @@ impl PixelView {
                     if self.net_busy() || self.search_running {
                         ui.add(egui::Spinner::new().size(15.0))
                             .on_hover_text("Working… (network / search in progress)");
+                        self.want_repaint = true;
+                    }
+                    // A YouTube download in flight: live %/ETA/speed + an Abort button.
+                    if self.yt_open_rx.is_some() {
+                        let label = match &self.yt_dl_progress {
+                            Some(p) if !p.eta.is_empty() => {
+                                format!("⬇ {} · ETA {} · {}", p.pct_str(), p.eta, p.speed)
+                            }
+                            Some(p) => format!("⬇ {}", p.pct_str()),
+                            None => "⬇ Starting…".to_string(),
+                        };
+                        ui.label(label);
+                        if ui
+                            .button("✕ Abort")
+                            .on_hover_text("Cancel the YouTube download")
+                            .clicked()
+                        {
+                            self.abort_yt_open();
+                        }
+                        ui.separator();
                         self.want_repaint = true;
                     }
                     match self.mode {
