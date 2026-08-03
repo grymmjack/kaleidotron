@@ -20,6 +20,28 @@ use std::process::{Command, Stdio};
 pub const ROOT: &str = "<youtube>";
 /// Sub-root: search results live at `<youtube>/search/<query>`.
 pub const SEARCH: &str = "search";
+/// Sub-root: a channel's videos at `<youtube>/channel/<id>`, its playlists at
+/// `<youtube>/channel/<id>/playlists`.
+pub const CHANNEL: &str = "channel";
+/// Sub-leaf under a channel path: the channel's playlists listing.
+pub const PLAYLISTS: &str = "playlists";
+/// Sub-root: a playlist's videos at `<youtube>/playlist/<id>`.
+pub const PLAYLIST: &str = "playlist";
+
+/// The UC… channel id from a channel URL (`…/channel/UC…`) or a bare id. `""` if not found.
+pub fn channel_id_from_url(url: &str) -> String {
+    if let Some(i) = url.find("/channel/") {
+        url[i + 9..]
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else if url.starts_with("UC") {
+        url.to_string()
+    } else {
+        String::new()
+    }
+}
 
 /// Is `path` a YouTube virtual path?
 pub fn is_remote(path: &Path) -> bool {
@@ -44,7 +66,8 @@ pub struct YtVideo {
     pub id: String,
     pub title: String,
     pub channel: String,
-    pub duration: f32, // seconds; 0 = unknown (e.g. a live stream)
+    pub channel_id: String, // the UC… id (for "Go to channel"); "" when yt-dlp omits it
+    pub duration: f32,      // seconds; 0 = unknown (e.g. a live stream)
     pub views: u64,
     pub thumb_url: String,
 }
@@ -73,6 +96,303 @@ impl YtVideo {
             format!("{m}:{s:02}")
         }
     }
+}
+
+/// Rich per-video metadata — a full `yt-dlp --dump-json` of ONE video (slower than the flat
+/// search, so it's fetched lazily when a video's Details pane is shown). Absent JSON fields stay
+/// 0 / "". NB YouTube removed public **dislikes** in 2021, so there's no dislike count to show.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtMeta {
+    pub id: String,
+    pub title: String,
+    pub channel: String,
+    pub channel_url: String,
+    pub upload_date: String, // raw "YYYYMMDD"
+    pub views: u64,
+    pub likes: u64,
+    pub comments: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub ext: String,
+    pub filesize: u64, // bytes (exact or approx)
+    pub description: String,
+}
+
+impl YtMeta {
+    pub fn watch_url(&self) -> String {
+        format!("https://www.youtube.com/watch?v={}", self.id)
+    }
+    pub fn views_short(&self) -> String {
+        human_count(self.views)
+    }
+    pub fn likes_short(&self) -> String {
+        human_count(self.likes)
+    }
+    pub fn comments_short(&self) -> String {
+        human_count(self.comments)
+    }
+    /// "YYYY-MM-DD" from the raw "YYYYMMDD" (else the raw value).
+    pub fn upload_date_fmt(&self) -> String {
+        let d = &self.upload_date;
+        if d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()) {
+            format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
+        } else {
+            d.clone()
+        }
+    }
+}
+
+/// Fetch one video's full metadata via `yt-dlp --dump-json` (no download). `None` if yt-dlp
+/// fails / is absent — the caller degrades to whatever the flat search already had.
+pub fn fetch_video_meta(id: &str, cookies: Option<&str>) -> Option<YtMeta> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--dump-json", "--no-warnings", "--skip-download", "--"])
+        .arg(&watch)
+        .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_video_meta(&out.stdout)
+}
+
+/// Parse a `yt-dlp --dump-json` blob into [`YtMeta`]. Split out so it's unit-testable offline.
+pub fn parse_video_meta(bytes: &[u8]) -> Option<YtMeta> {
+    let d: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let s = |k: &str| {
+        d.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let u = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let first_nonempty = |a: &str, b: &str| {
+        let x = s(a);
+        if x.is_empty() {
+            s(b)
+        } else {
+            x
+        }
+    };
+    Some(YtMeta {
+        id: s("id"),
+        title: s("title"),
+        channel: first_nonempty("channel", "uploader"),
+        channel_url: first_nonempty("channel_url", "uploader_url"),
+        upload_date: s("upload_date"),
+        views: u("view_count"),
+        likes: u("like_count"),
+        comments: u("comment_count"),
+        width: u("width") as u32,
+        height: u("height") as u32,
+        fps: d.get("fps").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        ext: s("ext"),
+        filesize: d
+            .get("filesize")
+            .and_then(|v| v.as_u64())
+            .or_else(|| d.get("filesize_approx").and_then(|v| v.as_u64()))
+            .unwrap_or(0),
+        description: s("description"),
+    })
+}
+
+/// One playlist from a channel's Playlists tab.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtPlaylist {
+    pub id: String,
+    pub title: String,
+    pub count: u64, // video count (0 = unknown in flat mode)
+    pub thumb_url: String,
+}
+
+/// Parse one `--flat-playlist --dump-json` line from a channel's *playlists* listing into a
+/// [`YtPlaylist`]. `None` for non-playlist lines.
+pub fn parse_playlist_entry(line: &str) -> Option<YtPlaylist> {
+    let d: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = d.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+    let thumb_url = d
+        .get("thumbnails")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.iter().rev().find_map(|t| t.get("url").and_then(|v| v.as_str())))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    Some(YtPlaylist {
+        id: id.to_string(),
+        title: d
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(playlist)")
+            .to_string(),
+        count: d
+            .get("playlist_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        thumb_url,
+    })
+}
+
+/// One top-level comment (for the video info / LLM export).
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtComment {
+    pub author: String,
+    pub text: String,
+    pub likes: u64,
+}
+
+/// Fetch up to `n` top-level comments via `yt-dlp --write-comments`. Empty on error/none.
+pub fn fetch_comments(id: &str, n: usize, cookies: Option<&str>) -> Vec<YtComment> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--skip-download",
+        "--write-comments",
+        "--extractor-args",
+        &format!("youtube:max_comments={},all,0", n.max(1)),
+        "--dump-json",
+        "--no-warnings",
+        "--",
+    ])
+    .arg(&watch)
+    .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let Ok(out) = cmd.output() else {
+        return Vec::new();
+    };
+    parse_comments(&out.stdout, n)
+}
+
+/// Parse the `comments` array out of a `yt-dlp --write-comments --dump-json` blob (top-level only).
+pub fn parse_comments(bytes: &[u8], n: usize) -> Vec<YtComment> {
+    let Ok(d) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(arr) = d.get("comments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        // Top-level only (replies have a parent other than "root").
+        .filter(|c| {
+            c.get("parent")
+                .and_then(|v| v.as_str())
+                .map(|p| p == "root")
+                .unwrap_or(true)
+        })
+        .take(n)
+        .map(|c| YtComment {
+            author: c
+                .get("author")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            text: c
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            likes: c.get("like_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Fetch a video's English captions as a plain-text transcript (auto-captions included). Downloads
+/// the VTT to a temp dir, parses it, cleans up. `None` if there are no captions / yt-dlp errors.
+pub fn fetch_captions(id: &str, cookies: Option<&str>) -> Option<String> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let dir = std::env::temp_dir().join(format!("pv_subs_{id}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let out_tmpl = dir.join("%(id)s.%(ext)s");
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--skip-download",
+        "--write-auto-subs",
+        "--write-subs",
+        "--sub-langs",
+        "en.*",
+        "--sub-format",
+        "vtt",
+        "--no-warnings",
+        "-o",
+    ])
+    .arg(&out_tmpl)
+    .arg(&watch)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let _ = cmd.status();
+    // Pick the best English VTT: prefer `<id>.en.vtt`, then `en-orig`, then any `.en*.vtt`.
+    let mut best: Option<(u8, std::path::PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.ends_with(".vtt") {
+                continue;
+            }
+            let rank = if name.ends_with(".en.vtt") {
+                0
+            } else if name.contains(".en-orig") {
+                1
+            } else if name.contains(".en") {
+                2
+            } else {
+                3
+            };
+            if best.as_ref().map(|(r, _)| rank < *r).unwrap_or(true) {
+                best = Some((rank, p));
+            }
+        }
+    }
+    let text = best.and_then(|(_, p)| std::fs::read_to_string(p).ok());
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+    let transcript = parse_vtt(&text?);
+    (!transcript.trim().is_empty()).then_some(transcript)
+}
+
+/// Strip a WebVTT file down to a plain-text transcript: drop the header / timestamp cues / inline
+/// `<...>` tags, and collapse the rolling-window duplicate lines auto-captions emit.
+pub fn parse_vtt(vtt: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in vtt.lines() {
+        let l = raw.trim();
+        if l.is_empty()
+            || l == "WEBVTT"
+            || l.starts_with("Kind:")
+            || l.starts_with("Language:")
+            || l.starts_with("NOTE")
+            || l.contains("-->")
+        {
+            continue;
+        }
+        // Strip inline tags: <00:00:00.000>, <c>, </c>, etc.
+        let mut clean = String::with_capacity(l.len());
+        let mut in_tag = false;
+        for ch in l.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => clean.push(ch),
+                _ => {}
+            }
+        }
+        let clean = clean.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        // Auto-captions roll: each cue repeats the previous line then adds one. Drop a line that
+        // just repeats the last kept line (or is contained by it).
+        if lines
+            .last()
+            .map(|prev| prev == clean || prev.ends_with(clean))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        lines.push(clean.to_string());
+    }
+    lines.join("\n")
 }
 
 /// Abbreviate a count the YouTube way: 1_234_567 → "1.2M".
@@ -126,30 +446,71 @@ pub fn parse_entry(line: &str) -> Option<YtVideo> {
     Some(YtVideo {
         id: id.to_string(),
         title: str_of(&["title"]),
-        channel: str_of(&["channel", "uploader", "channel_id"]),
+        channel: str_of(&["channel", "uploader"]),
+        channel_id: str_of(&["channel_id", "uploader_id"]),
         duration: d.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
         views: d.get("view_count").and_then(|v| v.as_u64()).unwrap_or(0),
         thumb_url,
     })
 }
 
-/// Run a YouTube search (`ytsearch<n>:<query>`) via yt-dlp's flat/fast mode. Empty vec if yt-dlp
-/// is absent or errors — the caller shows a "not installed / no results" status.
-pub fn search(query: &str, n: usize) -> Vec<YtVideo> {
-    let spec = format!("ytsearch{}:{}", n.max(1), query);
-    let out = Command::new("yt-dlp")
-        .args(["--dump-json", "--flat-playlist", "--no-warnings", &spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let Ok(out) = out else { return Vec::new() };
+/// Run `yt-dlp --flat-playlist --dump-json` over a `target` (a `ytsearchN:q` spec OR a channel/
+/// playlist URL), capped to `n` entries, and map each JSON line with `f`. The shared engine behind
+/// search / channel-videos / playlist-videos / channel-playlists. Empty vec on absence/error.
+fn flat_list<T>(target: &str, n: usize, cookies: Option<&str>, f: impl Fn(&str) -> Option<T>) -> Vec<T> {
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--flat-playlist",
+        "--dump-json",
+        "--no-warnings",
+        "-I",
+        &format!("1:{}", n.max(1)),
+        target,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let Ok(out) = cmd.output() else {
+        return Vec::new();
+    };
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_entry)
-        .collect()
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(f).collect()
+}
+
+/// Run a YouTube search (`ytsearch<n>:<query>`). Empty vec if yt-dlp is absent or errors.
+pub fn search(query: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    flat_list(&format!("ytsearch{}:{}", n.max(1), query), n, cookies, parse_entry)
+}
+
+/// A channel's uploaded videos (newest first), by UC… id.
+pub fn channel_videos(channel_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    let url = format!("https://www.youtube.com/channel/{channel_id}/videos");
+    flat_list(&url, n, cookies, parse_entry)
+}
+
+/// A playlist's videos (in order), by playlist id.
+pub fn playlist_videos(playlist_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    let url = format!("https://www.youtube.com/playlist?list={playlist_id}");
+    flat_list(&url, n, cookies, parse_entry)
+}
+
+/// A channel's playlists, by UC… id.
+pub fn channel_playlists(channel_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtPlaylist> {
+    let url = format!("https://www.youtube.com/channel/{channel_id}/playlists");
+    flat_list(&url, n, cookies, parse_playlist_entry)
+}
+
+/// Append `--cookies-from-browser <b>` when a browser is configured (Preferences → YouTube
+/// cookies) — authenticates yt-dlp as the signed-in user, which clears YouTube's "confirm you're
+/// not a bot" gate + reaches age-restricted / members' videos. Empty ⇒ no cookies (anonymous).
+fn push_cookie_args(cmd: &mut Command, cookies: Option<&str>) {
+    if let Some(b) = cookies {
+        if !b.trim().is_empty() {
+            cmd.args(["--cookies-from-browser", b.trim()]);
+        }
+    }
 }
 
 /// Resolve a **single** direct stream URL for `id` — a progressive/muxed format ≤720p so it's one
@@ -178,60 +539,192 @@ pub fn stream_url(id: &str) -> Option<String> {
         .map(|l| l.to_string())
 }
 
-/// Download a video **in place** to `dir` as `<id>.<ext>` (progressive ≤720p) and return the
-/// produced file path — so it plays via the normal local `VideoPlayer` (streaming via `-g` is
-/// unreliable under YouTube SABR). Cache-first: an existing `<id>.*` is reused with no network.
-/// `None` if yt-dlp can't produce a file (absent / too old / SABR-blocked → caller shows a hint).
-pub fn download(id: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
+/// A live download-progress update parsed from yt-dlp's `--progress-template` output.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct DlProgress {
+    pub pct: f32,      // 0..100 (resets per merged stream — video then audio)
+    pub eta: String,   // "mm:ss" (or "" when unknown)
+    pub speed: String, // e.g. "1.23MiB/s" (or "" when unknown)
+}
+
+impl DlProgress {
+    pub fn pct_str(&self) -> String {
+        format!("{:.0}%", self.pct)
+    }
+}
+
+/// Parse one `PV|<pct>|<eta>|<speed>` line from our `--progress-template`. `None` for other lines.
+fn parse_progress(line: &str) -> Option<DlProgress> {
+    let rest = line.strip_prefix("PV|")?;
+    let mut it = rest.split('|');
+    let pct = it.next()?.trim().trim_end_matches('%').trim().parse::<f32>().ok()?;
+    let clean = |s: &str| {
+        let s = s.trim();
+        if s.is_empty() || s.contains("Unknown") || s == "N/A" {
+            String::new()
+        } else {
+            s.to_string()
+        }
+    };
+    Some(DlProgress {
+        pct,
+        eta: clean(it.next().unwrap_or("")),
+        speed: clean(it.next().unwrap_or("")),
+    })
+}
+
+/// Remove a video's partial download artifacts (`<id>.*.part`, fragments, `.ytdl`) so an aborted
+/// download isn't mistaken for a finished file on the next cache-hit scan.
+fn remove_partials(dir: &std::path::Path, id: &str) {
+    let prefix = format!("{id}.");
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            let p = e.path();
-            if p.file_stem().and_then(|s| s.to_str()) == Some(id)
-                && p.extension().is_some_and(|x| x != "part")
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && (name.ends_with(".part")
+                    || name.contains(".part-")
+                    || name.ends_with(".ytdl")
+                    || name.contains(".f")) // per-stream temp files (e.g. id.f137.mp4)
             {
-                return Some(p);
+                let _ = std::fs::remove_file(e.path());
             }
         }
+    }
+}
+
+/// Download a video **in place** to `dir` as `<id>.<ext>` and return the produced file path — so
+/// it plays via the normal local `VideoPlayer` (streaming via `-g` is unreliable under YouTube
+/// SABR). `max_height` caps the resolution (0 = best available; video+audio are merged via ffmpeg
+/// so 1080p+ works). Cache-first: an existing `<id>.*` is reused with no network.
+///
+/// `cancel` is polled between yt-dlp progress lines — setting it kills yt-dlp and cleans up the
+/// partial download (returns `None`). `on_progress` is called for each progress update (percent /
+/// ETA / speed) so the UI can show a live readout. `None` if yt-dlp can't produce a file
+/// (absent / too old / SABR-blocked / aborted → caller shows a hint).
+pub fn download(
+    id: &str,
+    dir: &std::path::Path,
+    max_height: u32,
+    cookies: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: &mut dyn FnMut(DlProgress),
+) -> Result<std::path::PathBuf, String> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::Ordering::Relaxed;
+    let found = |dir: &std::path::Path| -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let p = e.path();
+            (p.file_stem().and_then(|s| s.to_str()) == Some(id)
+                && p.extension().is_some_and(|x| x != "part"))
+            .then_some(p)
+        })
+    };
+    // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
+    if let Some(p) = found(dir) {
+        return Ok(p);
     }
     let _ = std::fs::create_dir_all(dir);
     let watch = format!("https://www.youtube.com/watch?v={id}");
     let out_tmpl = dir.join(format!("{id}.%(ext)s"));
-    let ok = Command::new("yt-dlp")
-        .args([
-            "-f",
-            "best[height<=720][ext=mp4]/best[height<=720]/best",
-            "--no-warnings",
-            "-o",
-        ])
-        .arg(&out_tmpl)
-        .arg(&watch)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        return None;
+    // Merge the best video+audio at/under the cap (falls back to a progressive stream, then best).
+    let fmt = if max_height == 0 {
+        "bestvideo+bestaudio/best".to_string()
+    } else {
+        format!(
+            "bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
+            h = max_height
+        )
+    };
+    // `--newline` + a machine-readable progress template on stdout → parse per-line for the ETA.
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "-f",
+        &fmt,
+        "--no-warnings",
+        "--newline",
+        "--progress-template",
+        "PV|%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s",
+        "-o",
+    ])
+    .arg(&out_tmpl)
+    .arg(&watch)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    push_cookie_args(&mut cmd, cookies);
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| "yt-dlp not found on PATH — install it (see the README).".to_string())?;
+    // Drain stderr on a thread (so a full pipe can't deadlock the download) and keep it for a
+    // precise failure message — the "confirm you're not a bot" gate needs a very different hint
+    // than "update yt-dlp".
+    let stderr = child.stderr.take();
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            if cancel.load(Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = err_thread.join();
+                remove_partials(dir, id);
+                return Err("aborted".to_string());
+            }
+            let Ok(line) = line else { break };
+            if let Some(p) = parse_progress(&line) {
+                on_progress(p);
+            }
+        }
     }
-    // Find the produced `<id>.<ext>`.
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-        let p = e.path();
-        (p.file_stem().and_then(|s| s.to_str()) == Some(id)
-            && p.extension().is_some_and(|x| x != "part"))
-        .then_some(p)
-    })
+    let status = child.wait().ok();
+    let stderr_text = err_thread.join().unwrap_or_default();
+    if cancel.load(Relaxed) {
+        remove_partials(dir, id);
+        return Err("aborted".to_string());
+    }
+    if status.map(|s| s.success()).unwrap_or(false) {
+        return found(dir).ok_or_else(|| "yt-dlp finished but produced no file".to_string());
+    }
+    // Failure: map the stderr to an actionable hint.
+    let low = stderr_text.to_lowercase();
+    if low.contains("not a bot")
+        || low.contains("sign in to confirm")
+        || low.contains("http error 429")
+        || low.contains("rate limit")
+        || low.contains("too many requests")
+    {
+        Err("YouTube is rate-limiting this IP (bot check). Set “YouTube cookies from browser” \
+             in Preferences, or wait a while."
+            .to_string())
+    } else if low.contains("age") && low.contains("confirm") {
+        Err("Age-restricted — set “YouTube cookies from browser” in Preferences.".to_string())
+    } else {
+        Err("YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp).".to_string())
+    }
 }
 
 /// Is `yt-dlp` on PATH? (Gates the YouTube UI / shows a "install yt-dlp" hint.)
 pub fn available() -> bool {
-    Command::new("yt-dlp")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // MEMOIZED: this spawns `yt-dlp --version` — a Python process (~100 ms startup). It used to
+    // be called every UI frame from the Places → YouTube tab, so with a video playing (continuous
+    // repaint) the app spawned yt-dlp 60×/s and dropped to ~9 fps. Check once per process instead.
+    // (Cost: a freshly-installed yt-dlp isn't detected until the next launch — an acceptable trade.)
+    use std::sync::OnceLock;
+    static AVAIL: OnceLock<bool> = OnceLock::new();
+    *AVAIL.get_or_init(|| {
+        Command::new("yt-dlp")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -273,5 +766,70 @@ mod tests {
         let v = parse_entry(line).unwrap();
         assert_eq!(v.duration_str(), "1:02:05");
         assert_eq!(v.views_short(), "56.3M");
+    }
+
+    #[test]
+    fn parses_full_video_meta() {
+        let json = r#"{"id":"abc","title":"Cool","channel":"Chan","channel_url":"https://youtube.com/@chan",
+            "upload_date":"20240115","view_count":1234567,"like_count":45000,"comment_count":890,
+            "width":1920,"height":1080,"fps":30.0,"ext":"mp4","filesize_approx":123456789}"#;
+        let m = parse_video_meta(json.as_bytes()).unwrap();
+        assert_eq!(m.channel, "Chan");
+        assert_eq!(m.channel_url, "https://youtube.com/@chan");
+        assert_eq!(m.upload_date_fmt(), "2024-01-15");
+        assert_eq!(m.views_short(), "1.2M");
+        assert_eq!(m.likes_short(), "45.0K");
+        assert_eq!((m.width, m.height), (1920, 1080));
+        assert_eq!(m.filesize, 123456789);
+    }
+
+    #[test]
+    fn parses_download_progress() {
+        let p = parse_progress("PV|  0.0%|00:11|   4.24MiB/s").unwrap();
+        assert_eq!(p.pct, 0.0);
+        assert_eq!(p.eta, "00:11");
+        assert_eq!(p.speed, "4.24MiB/s");
+        assert_eq!(p.pct_str(), "0%");
+        // "Unknown" fields collapse to empty.
+        let u = parse_progress("PV| 12.5%|Unknown| Unknown B/s").unwrap();
+        assert_eq!(u.pct, 12.5);
+        assert_eq!(u.eta, "");
+        assert_eq!(u.speed, "");
+        // Non-progress lines are ignored.
+        assert!(parse_progress("[download] Destination: foo.mp4").is_none());
+    }
+
+    #[test]
+    fn vtt_parses_to_plain_transcript() {
+        let vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n\
+                   00:00:01.000 --> 00:00:03.000\n<00:00:01.000><c>Hello</c> world\n\n\
+                   00:00:03.000 --> 00:00:05.000\nHello world\n\n\
+                   00:00:05.000 --> 00:00:07.000\nsecond line\n";
+        let t = parse_vtt(vtt);
+        // Dedupes the rolling repeat; strips tags/timestamps/header.
+        assert_eq!(t, "Hello world\nsecond line");
+    }
+
+    #[test]
+    fn comments_parse_top_level_only() {
+        let json = r#"{"id":"x","comments":[
+            {"author":"A","text":"top","like_count":5,"parent":"root"},
+            {"author":"B","text":"reply","parent":"UgxABC"},
+            {"author":"C","text":"top2","parent":"root"}
+        ]}"#;
+        let cs = parse_comments(json.as_bytes(), 10);
+        assert_eq!(cs.len(), 2); // reply excluded
+        assert_eq!(cs[0].author, "A");
+        assert_eq!(cs[0].likes, 5);
+        assert_eq!(cs[1].text, "top2");
+    }
+
+    #[test]
+    fn video_meta_falls_back_to_uploader() {
+        let json = r#"{"id":"x","title":"t","uploader":"UpChan","uploader_url":"https://u/url"}"#;
+        let m = parse_video_meta(json.as_bytes()).unwrap();
+        assert_eq!(m.channel, "UpChan");
+        assert_eq!(m.channel_url, "https://u/url");
+        assert_eq!(m.upload_date_fmt(), ""); // no date → empty
     }
 }

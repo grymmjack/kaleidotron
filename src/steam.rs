@@ -25,6 +25,15 @@ pub fn rel_parts(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// If `path` is a game **detail folder** (`<steam>/game/<appid>`), return its appid.
+/// Used to friendly-name the breadcrumb + gate the Details-pane game info.
+pub fn detail_appid(path: &Path) -> Option<u32> {
+    match rel_parts(path).as_slice() {
+        [g, appid] if g == "game" => appid.parse().ok(),
+        _ => None,
+    }
+}
+
 /// One installed Steam game.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct SteamGame {
@@ -58,6 +67,216 @@ impl SteamGame {
     pub fn discussions_url(&self) -> String {
         format!("https://steamcommunity.com/app/{}/discussions/", self.appid)
     }
+}
+
+/// A screenshot or trailer from a game's Steam store page (see [`fetch_app_media`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaItem {
+    pub is_video: bool,    // trailer (streamed) vs screenshot (image)
+    pub name: String,      // trailer name; "" for screenshots
+    pub thumb_url: String, // tile thumbnail
+    pub open_url: String,  // full image (jpg) or trailer stream (HLS .m3u8)
+}
+
+/// Fetched game media: display name, short description, and the screenshot/trailer list.
+#[derive(Clone, Default, Debug)]
+pub struct AppMedia {
+    pub name: String,
+    pub description: String,
+    pub genres: Vec<String>,
+    pub media: Vec<MediaItem>, // trailers first, then screenshots
+}
+
+/// Fetch a game's store media (screenshots + trailers) via the **public** `store/appdetails` API
+/// (no key), through the HTTP cache (1-day TTL). Trailers use the HLS stream URL (ffmpeg reads it).
+/// `None` if the request/parse fails or the app has no store page.
+pub fn fetch_app_media(appid: u32) -> Option<AppMedia> {
+    let url = format!(
+        "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic,screenshots,movies,genres"
+    );
+    let bytes = crate::cache::get_bytes(&url, Some(86_400)).ok()?;
+    parse_app_media(appid, &bytes)
+}
+
+/// Parse an `appdetails` JSON blob for `appid` into [`AppMedia`]. Split out for unit testing.
+pub fn parse_app_media(appid: u32, bytes: &[u8]) -> Option<AppMedia> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let data = json.get(appid.to_string())?.get("data")?;
+    let mut out = AppMedia {
+        name: data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        description: data
+            .get("short_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        genres: data
+            .get("genres")
+            .and_then(|g| g.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| {
+                        g.get("description")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        media: Vec::new(),
+    };
+    // Trailers first (HLS stream so ffmpeg can play them directly).
+    if let Some(movies) = data.get("movies").and_then(|m| m.as_array()) {
+        for m in movies {
+            let stream = m
+                .get("hls_h264")
+                .and_then(|v| v.as_str())
+                .or_else(|| m.get("dash_h264").and_then(|v| v.as_str()));
+            if let Some(stream) = stream {
+                out.media.push(MediaItem {
+                    is_video: true,
+                    name: m
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Trailer")
+                        .to_string(),
+                    thumb_url: m
+                        .get("thumbnail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    open_url: stream.to_string(),
+                });
+            }
+        }
+    }
+    // Then screenshots.
+    if let Some(shots) = data.get("screenshots").and_then(|s| s.as_array()) {
+        for s in shots {
+            if let Some(full) = s.get("path_full").and_then(|v| v.as_str()) {
+                out.media.push(MediaItem {
+                    is_video: false,
+                    name: String::new(),
+                    thumb_url: s
+                        .get("path_thumbnail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(full)
+                        .to_string(),
+                    open_url: full.to_string(),
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// One game from the Steam Web API's owned-games list (installed OR not).
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct OwnedGame {
+    pub appid: u32,
+    pub name: String,
+    pub playtime_min: u64, // total minutes played (0 = never played)
+    pub last_played: u64,  // unix seconds (0 = never)
+}
+
+/// The signed-in account's SteamID64 — read from `loginusers.vdf` (the first `7656…` key), else
+/// computed from the `userdata/<accountid>` dir (`accountid + 76561197960265728`). `None` if absent.
+pub fn steam_id64() -> Option<u64> {
+    let root = steam_root()?;
+    // 1) loginusers.vdf holds the full SteamID64 as a section key.
+    if let Ok(text) = std::fs::read_to_string(root.join("config/loginusers.vdf")) {
+        for line in text.lines() {
+            if let Some(id) = line
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+            {
+                if id.len() == 17 && id.starts_with("7656") {
+                    if let Ok(n) = id.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    // 2) Fallback: the userdata dir name is the 32-bit accountid.
+    std::fs::read_dir(root.join("userdata"))
+        .ok()?
+        .flatten()
+        .find_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|acc| acc + 76_561_197_960_265_728)
+        })
+}
+
+/// Fetch the account's **full owned-games list** (installed + not) via the Steam Web API
+/// `GetOwnedGames` — needs a free API key (steamcommunity.com/dev/apikey) + the SteamID64. Cached
+/// (1-hour TTL). Empty on any failure (no key / private profile / network).
+pub fn owned_games(api_key: &str, steamid: u64) -> Vec<OwnedGame> {
+    if api_key.trim().is_empty() {
+        return Vec::new();
+    }
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key={}&steamid={}&include_appinfo=1&include_played_free_games=1&format=json",
+        api_key.trim(),
+        steamid
+    );
+    let Ok(bytes) = crate::cache::get_bytes(&url, Some(3600)) else {
+        return Vec::new();
+    };
+    parse_owned_games(&bytes)
+}
+
+/// Parse a `GetOwnedGames` JSON response. Split out for unit testing (no network).
+pub fn parse_owned_games(bytes: &[u8]) -> Vec<OwnedGame> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(games) = json
+        .get("response")
+        .and_then(|r| r.get("games"))
+        .and_then(|g| g.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<OwnedGame> = games
+        .iter()
+        .filter_map(|g| {
+            let appid = g.get("appid").and_then(|v| v.as_u64())? as u32;
+            let name = g
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() || is_nongame(&name) {
+                return None;
+            }
+            Some(OwnedGame {
+                appid,
+                name,
+                playtime_min: g
+                    .get("playtime_forever")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                last_played: g
+                    .get("rtime_last_played")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+/// The set of installed appids (from appmanifests) — to flag owned games as installed-or-not.
+pub fn installed_appids() -> std::collections::HashSet<u32> {
+    installed_games().into_iter().map(|g| g.appid).collect()
 }
 
 /// Candidate Steam data roots: native, classic `.steam`, Flatpak, Snap.
@@ -265,6 +484,43 @@ mod tests {
             }
             None => eprintln!("no Steam install on this machine — skipping"),
         }
+    }
+
+    #[test]
+    fn parses_owned_games() {
+        let json = r#"{"response":{"game_count":3,"games":[
+            {"appid":1245620,"name":"ELDEN RING","playtime_forever":8520,"rtime_last_played":1700000000},
+            {"appid":367520,"name":"Hollow Knight","playtime_forever":0,"rtime_last_played":0},
+            {"appid":228980,"name":"Steamworks Common Redistributables","playtime_forever":0}
+        ]}}"#;
+        let g = parse_owned_games(json.as_bytes());
+        assert_eq!(g.len(), 2); // redistributables filtered out
+                                // sorted by name: ELDEN RING, Hollow Knight
+        assert_eq!(g[0].name, "ELDEN RING");
+        assert_eq!(g[0].playtime_min, 8520);
+        assert_eq!(g[1].name, "Hollow Knight");
+        assert_eq!(g[1].playtime_min, 0); // never played
+    }
+
+    #[test]
+    fn parses_app_media() {
+        let json = r#"{"620":{"success":true,"data":{
+            "name":"Portal 2","short_description":"co-op puzzler",
+            "genres":[{"description":"Action"},{"description":"Puzzle"}],
+            "movies":[{"id":1,"name":"Trailer","thumbnail":"http://t/mv.jpg",
+                       "hls_h264":"http://v/master.m3u8","dash_h264":"http://v/x.mpd"}],
+            "screenshots":[{"id":0,"path_thumbnail":"http://s/1t.jpg","path_full":"http://s/1.jpg"}]
+        }}}"#;
+        let m = parse_app_media(620, json.as_bytes()).expect("parses");
+        assert_eq!(m.name, "Portal 2");
+        assert_eq!(m.genres, vec!["Action", "Puzzle"]);
+        assert_eq!(m.media.len(), 2);
+        // Trailer first (HLS), streamed.
+        assert!(m.media[0].is_video);
+        assert_eq!(m.media[0].open_url, "http://v/master.m3u8");
+        // Then the screenshot (full jpg).
+        assert!(!m.media[1].is_video);
+        assert_eq!(m.media[1].open_url, "http://s/1.jpg");
     }
 
     #[test]

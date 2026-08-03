@@ -17,7 +17,9 @@ use std::process::{Command, Stdio};
 /// Container extensions we treat as video. Routed to the [`VideoDecoder`] plugin.
 pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mpg", "mpeg", "mts", "m2ts", "ts",
-    "ogv", "3gp",
+    "ogv",
+    "3gp", // HLS/DASH manifests — Steam trailers etc. (ffmpeg reads them like a file):
+    "m3u8", "mpd",
 ];
 
 /// Parsed video metadata for the Details pane and the player. `duration` is seconds, `fps`

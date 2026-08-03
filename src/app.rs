@@ -240,6 +240,20 @@ enum YtMsg {
     Done(usize),
 }
 
+/// Messages from a YouTube **download** worker (`start_yt_open`): live progress, then the result.
+enum YtOpenMsg {
+    Progress(crate::youtube::DlProgress),
+    Done(Result<(PathBuf, PathBuf), String>), // Ok((virtual path, local file)) | Err(status text)
+}
+
+/// A video's fetched extras (transcript + comments), for the Details pane + the "Copy for LLM"
+/// export. Fetched lazily on demand (both are slow yt-dlp calls).
+#[derive(Clone, Default)]
+struct YtInfo {
+    transcript: Option<String>,
+    comments: Vec<crate::youtube::YtComment>,
+}
+
 /// What a 16colo.rs flat-piece listing is built from (see
 /// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
@@ -739,11 +753,15 @@ enum SortKey {
     Group,
     Year,
     Pack,
+    // YouTube result columns — sort by the `yt_videos` map (duration / view count). Offered
+    // in the sort combo only while browsing YouTube (appended to `ALL` for persistence stability).
+    Duration,
+    Views,
 }
 
 impl SortKey {
     // New keys are appended so persisted indices (`to_u8`) stay valid across upgrades.
-    const ALL: [SortKey; 12] = [
+    const ALL: [SortKey; 14] = [
         SortKey::Name,
         SortKey::Type,
         SortKey::Modified,
@@ -756,7 +774,11 @@ impl SortKey {
         SortKey::Group,
         SortKey::Year,
         SortKey::Pack,
+        SortKey::Duration,
+        SortKey::Views,
     ];
+    /// The extra sort keys offered while browsing YouTube (appended to `COMMON` in the combo).
+    const YOUTUBE: [SortKey; 2] = [SortKey::Duration, SortKey::Views];
     /// The keys offered in the sort-bar combo (the scene-only keys are excluded —
     /// they're only meaningful in a 16colo.rs flat listing and set via the table).
     const COMMON: [SortKey; 8] = [
@@ -783,6 +805,8 @@ impl SortKey {
             SortKey::Group => "Group",
             SortKey::Year => "Year",
             SortKey::Pack => "Pack",
+            SortKey::Duration => "Duration",
+            SortKey::Views => "Views",
         }
     }
     fn to_u8(self) -> u8 {
@@ -1314,6 +1338,18 @@ pub struct PixelView {
     video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
+    video_recolor_key: Option<String>, // recolor pipeline key last applied → re-colorize a PAUSED frame when it changes
+    recolor_playback: bool, // apply the recolor pipeline to live video frames? off = raw = faster fps (persisted)
+    show_fps: bool,         // overlay a UI-fps / video-fps meter on the video (persisted)
+    // FPS meter accumulators (not persisted): UI repaints + displayed video frames per window.
+    fps_accum_t: f32,
+    fps_ui_frames: u32,
+    fps_video_frames: u32,
+    fps_ui_val: f32,
+    fps_video_val: f32,
+    fps_upload_ms: f32, // ms spent building+uploading the frame texture (last frame)
+    fps_blit_ms: f32,   // ms spent in draw_image_view (last frame)
+    fps_total_ms: f32,  // ms spent in draw_video_ui total (last frame)
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
     video_md_header: String,         // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
@@ -1525,20 +1561,58 @@ pub struct PixelView {
     // keyed by virtual display path (`<youtube>/search/<q>/<title> [id].mp4`); `yt_files` maps
     // that path to the downloaded local file (so `resolve_local` + the player find it).
     yt_videos: HashMap<PathBuf, crate::youtube::YtVideo>,
+    // Last completed YouTube search (path → its result entries + video metadata), so navigating
+    // BACK to a search (breadcrumb / back button) restores the results instead of re-running the
+    // search. Cleared by F5 so an explicit refresh still re-fetches.
+    #[allow(clippy::type_complexity)]
+    yt_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::youtube::YtVideo>)>,
     yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
     yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     yt_files: HashMap<PathBuf, PathBuf>,
-    // A video downloading in place so we can open it once ready: (virtual path, local file).
-    yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // A video downloading in place so we can open it once ready: live progress + the result.
+    yt_open_rx: Option<std::sync::mpsc::Receiver<YtOpenMsg>>,
+    yt_open_cancel: Option<Arc<std::sync::atomic::AtomicBool>>, // set → kills yt-dlp (Abort button)
+    yt_dl_progress: Option<crate::youtube::DlProgress>, // live %/ETA/speed for the status bar
+    // Rich per-video metadata (channel/likes/comments/date/dims) for the Details pane, fetched
+    // lazily on a worker (`yt-dlp --dump-json`) when a video is opened. `yt_meta_pending` guards
+    // against re-spawning while one fetch is in flight.
+    yt_meta: HashMap<PathBuf, crate::youtube::YtMeta>,
+    #[allow(clippy::type_complexity)]
+    yt_meta_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::youtube::YtMeta)>>,
+    yt_meta_pending: Option<PathBuf>,
+    // Transcript (captions) + comments, fetched on demand for the "Copy for LLM" export.
+    yt_info: HashMap<PathBuf, YtInfo>,
+    yt_info_rx: Option<std::sync::mpsc::Receiver<(PathBuf, YtInfo)>>,
+    yt_info_pending: Option<PathBuf>,
     yt_search: String, // the YouTube Places-tab search box text
+    // Browser to pull YouTube cookies from (Preferences) — passed to yt-dlp as
+    // `--cookies-from-browser` to clear the "confirm you're not a bot" gate + reach age-gated
+    // videos. "" = anonymous (no cookies).
+    yt_cookies_browser: String,
     yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
+    steam_uninstalled: std::collections::HashSet<PathBuf>, // owned-but-not-installed tiles (→ badge)
+    steam_api_key: String, // Steam Web API key (Preferences) for the full owned-games list
+    // A game's detail view = a virtual folder of media tiles (screenshots + trailers), keyed by
+    // virtual path. Screenshots download to `steam_files`; trailers stream from their HLS URL.
+    steam_media: HashMap<PathBuf, crate::steam::MediaItem>,
+    steam_files: HashMap<PathBuf, PathBuf>, // downloaded screenshot vpath → local file
+    #[allow(clippy::type_complexity)]
+    steam_media_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::steam::AppMedia)>>,
+    steam_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // The currently-open game detail (appid + its fetched media) — powers the Details-pane
+    // game info block. `steam_names` maps appid → display name so the breadcrumb shows the
+    // game's NAME instead of its numeric appid (seeded from the list + the media fetch).
+    steam_detail: Option<(u32, crate::steam::AppMedia)>,
+    steam_names: HashMap<u32, String>,
     // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
     yt_download_dir: Option<PathBuf>,
+    yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
+    yt_open_folder_after: bool, // reveal the file in the OS file manager once a download finishes
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
     // cache-first). `None` when idle; a progress window shows while `Some`.
     bulk_dl: Option<BulkDownload>,
@@ -1584,6 +1658,12 @@ impl PixelView {
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
+    const YT_QUALITY_KEY: &'static str = "yt_max_height";
+    const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
+    const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
+    const RECOLOR_PLAYBACK_KEY: &'static str = "recolor_playback";
+    const SHOW_FPS_KEY: &'static str = "show_fps";
+    const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1750,7 +1830,20 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::YT_DIR_KEY))
             .flatten();
+        let yt_max_height = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::YT_QUALITY_KEY))
+            .unwrap_or(1080);
+        let steam_api_key = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::STEAM_KEY_KEY))
+            .unwrap_or_default();
+        let yt_cookies_browser = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::YT_COOKIES_KEY))
+            .unwrap_or_default();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
+        let yt_open_folder_after = load_bool(Self::YT_OPEN_FOLDER_KEY, false);
         let audio_volume = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_VOLUME_KEY))
@@ -2492,6 +2585,17 @@ impl PixelView {
             video_player: None,
             video_loading: None,
             video_tex: None,
+            video_recolor_key: None,
+            recolor_playback: load_bool(Self::RECOLOR_PLAYBACK_KEY, true),
+            show_fps: load_bool(Self::SHOW_FPS_KEY, false),
+            fps_accum_t: 0.0,
+            fps_ui_frames: 0,
+            fps_video_frames: 0,
+            fps_ui_val: 0.0,
+            fps_video_val: 0.0,
+            fps_upload_ms: 0.0,
+            fps_blit_ms: 0.0,
+            fps_total_ms: 0.0,
             video_markers: Vec::new(),
             video_md_header: String::new(),
             video_marker_sel: None,
@@ -2634,14 +2738,34 @@ impl PixelView {
             pending_external: None,
             colo_save_rx: None,
             yt_videos: HashMap::new(),
+            yt_search_cache: None,
             yt_rx: None,
             yt_cancel: None,
             yt_files: HashMap::new(),
             yt_open_rx: None,
+            yt_open_cancel: None,
+            yt_dl_progress: None,
+            yt_meta: HashMap::new(),
+            yt_meta_rx: None,
+            yt_meta_pending: None,
+            yt_info: HashMap::new(),
+            yt_info_rx: None,
+            yt_info_pending: None,
             yt_search: String::new(),
+            yt_cookies_browser,
             yt_downloaded_ids: std::collections::HashSet::new(),
             steam_games: HashMap::new(),
+            steam_uninstalled: std::collections::HashSet::new(),
+            steam_api_key,
+            steam_media: HashMap::new(),
+            steam_files: HashMap::new(),
+            steam_media_rx: None,
+            steam_open_rx: None,
+            steam_detail: None,
+            steam_names: HashMap::new(),
             yt_download_dir,
+            yt_max_height,
+            yt_open_folder_after,
             bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -3517,11 +3641,21 @@ impl PixelView {
     /// piece resolves to its cached `raw` file, a downloaded YouTube video to its local
     /// `.mp4`; anything else is already real on disk.
     fn resolve_local(&self, path: &Path) -> PathBuf {
-        self.colo_files
+        if let Some(f) = self
+            .colo_files
             .get(path)
             .or_else(|| self.yt_files.get(path))
-            .cloned()
-            .unwrap_or_else(|| path.to_path_buf())
+            .or_else(|| self.steam_files.get(path))
+        {
+            return f.clone();
+        }
+        // A Steam trailer streams straight from its HLS URL (ffmpeg reads it like a file).
+        if let Some(m) = self.steam_media.get(path) {
+            if m.is_video {
+                return PathBuf::from(&m.open_url);
+            }
+        }
+        path.to_path_buf()
     }
 
     /// Where downloaded YouTube videos live: the user's configured path, else `<data>/youtube`.
@@ -3568,6 +3702,17 @@ impl PixelView {
                 self.status = "YouTube — search from the Places panel".into();
             }
             [s, q] if s == crate::youtube::SEARCH => {
+                // Navigating back to a search we already ran → restore the cached results
+                // instead of re-fetching (F5 clears the cache, so refresh still re-runs).
+                if let Some((cdir, entries, videos)) = &self.yt_search_cache {
+                    if *cdir == dir && !entries.is_empty() {
+                        let (entries, videos) = (entries.clone(), videos.clone());
+                        self.yt_videos = videos;
+                        self.show_folder(dir, entries);
+                        self.status = format!("{} YouTube result(s)", self.all_entries.len());
+                        return;
+                    }
+                }
                 let q = q.clone();
                 self.start_yt_search(dir, q);
             }
@@ -3595,7 +3740,8 @@ impl PixelView {
         self.yt_rx = Some(rx);
         self.yt_cancel = Some(cancel.clone());
         self.status = format!("Searching YouTube: {query}");
-        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx));
+        let cookies = self.yt_cookies_browser.clone();
+        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx, cookies));
     }
 
     /// Drain the YouTube search worker each frame (mirrors `poll_colo_pieces`): append hits to
@@ -3616,6 +3762,11 @@ impl PixelView {
                 }
                 Ok(YtMsg::Done(n)) => {
                     self.status = format!("{n} YouTube result(s)");
+                    // Cache the completed results so navigating back restores them (no re-search).
+                    if let Some(f) = self.folder.clone() {
+                        self.yt_search_cache =
+                            Some((f, self.all_entries.clone(), self.yt_videos.clone()));
+                    }
                     done = true;
                     break;
                 }
@@ -3634,6 +3785,28 @@ impl PixelView {
             self.rebuild_view();
         }
         self.want_repaint = true;
+    }
+
+    /// Right-click "Download quality" → set the resolution cap, drop any cached copy so the chosen
+    /// resolution actually (re)downloads, then open. `height` 0 = best available.
+    fn start_yt_open_quality(&mut self, vpath: PathBuf, height: u32) {
+        self.yt_max_height = height;
+        if let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        {
+            if let Ok(rd) = std::fs::read_dir(self.yt_cache_dir()) {
+                for e in rd.flatten() {
+                    if e.path().file_stem().and_then(|s| s.to_str()) == Some(id.as_str()) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            self.yt_files.remove(&vpath);
+            self.yt_downloaded_ids.remove(&id);
+        }
+        self.start_yt_open(vpath);
     }
 
     /// Download a YouTube video in place (to `yt_cache_dir`), then open it in the video player.
@@ -3657,43 +3830,233 @@ impl PixelView {
             self.registry.set_plugin("video", true);
         }
         let dir = self.yt_cache_dir();
+        let height = self.yt_max_height;
+        let cookies = self.yt_cookies_browser.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.yt_open_rx = Some(rx);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.yt_open_cancel = Some(cancel.clone());
+        self.yt_dl_progress = None;
         self.status = "Downloading from YouTube…".into();
         std::thread::spawn(move || {
-            let res = match crate::youtube::download(&id, &dir) {
-                Some(local) => Ok((vpath, local)),
-                None => Err(
-                    "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
-                        .to_string(),
-                ),
+            let tx_prog = tx.clone();
+            let mut on_progress = move |p: crate::youtube::DlProgress| {
+                let _ = tx_prog.send(YtOpenMsg::Progress(p));
             };
-            let _ = tx.send(res);
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            let res = crate::youtube::download(&id, &dir, height, cookies, &cancel, &mut on_progress)
+                .map(|local| (vpath, local));
+            let _ = tx.send(YtOpenMsg::Done(res));
         });
     }
 
-    /// Finish a YouTube download (each frame): map the virtual path → the local file and open it.
+    /// Abort an in-flight YouTube download (the Abort button in the status bar): flag yt-dlp to die
+    /// and drop the receiver so the worker's late `Done(Err)` is ignored.
+    fn abort_yt_open(&mut self) {
+        if let Some(c) = self.yt_open_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.yt_open_rx = None;
+        self.yt_dl_progress = None;
+        self.status = "Download aborted".into();
+    }
+
+    /// Finish a YouTube download (each frame): drain live progress, then on completion map the
+    /// virtual path → the local file and open it.
     fn poll_yt_open(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.yt_open_rx else { return };
-        match rx.try_recv() {
-            Ok(Ok((vpath, local))) => {
-                if let Some(id) = vpath
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .and_then(parse_yt_id)
-                {
-                    self.yt_downloaded_ids.insert(id);
+        // Drain everything queued this frame — many Progress updates + at most one Done.
+        loop {
+            let Some(rx) = &self.yt_open_rx else { return };
+            match rx.try_recv() {
+                Ok(YtOpenMsg::Progress(p)) => {
+                    // Show a live readout in the status text too (the status bar also draws %/ETA).
+                    self.status = if p.eta.is_empty() {
+                        format!("Downloading {}…", p.pct_str())
+                    } else {
+                        format!("Downloading {} · ETA {} · {}", p.pct_str(), p.eta, p.speed)
+                    };
+                    self.yt_dl_progress = Some(p);
+                    self.want_repaint = true;
                 }
-                self.yt_files.insert(vpath.clone(), local);
-                self.yt_open_rx = None;
-                self.load_full(ctx, vpath);
+                Ok(YtOpenMsg::Done(Ok((vpath, local)))) => {
+                    if let Some(id) = vpath
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .and_then(parse_yt_id)
+                    {
+                        self.yt_downloaded_ids.insert(id);
+                    }
+                    self.yt_files.insert(vpath.clone(), local.clone());
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    // Optional: pop the containing folder in the OS file manager (Preferences /
+                    // the "Open folder after download" checkbox in the video controls).
+                    if self.yt_open_folder_after {
+                        self.reveal_in_file_manager(&local);
+                    }
+                    self.start_yt_meta(&vpath); // rich Details (channel/likes/comments/date/dims)
+                    self.load_full(ctx, vpath);
+                    return;
+                }
+                Ok(YtOpenMsg::Done(Err(e))) => {
+                    self.status = e;
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.yt_open_rx = None;
+                    self.yt_open_cancel = None;
+                    self.yt_dl_progress = None;
+                    return;
+                }
             }
-            Ok(Err(e)) => {
-                self.status = e;
-                self.yt_open_rx = None;
+        }
+    }
+
+    /// Kick off a lazy full-metadata fetch for a YouTube video (channel/likes/comments/date/dims)
+    /// on a worker thread — drained by `poll_yt_meta`. No-op if already fetched / in flight / not
+    /// a YouTube video. Called when a video opens and from the Details pane.
+    fn start_yt_meta(&mut self, vpath: &Path) {
+        if !crate::youtube::is_remote(vpath)
+            || self.yt_meta.contains_key(vpath)
+            || self.yt_meta_pending.is_some()
+        {
+            return;
+        }
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_meta_rx = Some(rx);
+        self.yt_meta_pending = Some(vpath.to_path_buf());
+        let vpath = vpath.to_path_buf();
+        let cookies = self.yt_cookies_browser.clone();
+        std::thread::spawn(move || {
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            if let Some(meta) = crate::youtube::fetch_video_meta(&id, cookies) {
+                let _ = tx.send((vpath, meta));
+            }
+        });
+    }
+
+    /// Fetch a video's transcript (captions) + top comments on a worker (both slow yt-dlp calls),
+    /// for the Details pane + "Copy for LLM". No-op if already fetched / in flight / not YouTube.
+    fn start_yt_info(&mut self, vpath: &Path) {
+        if !crate::youtube::is_remote(vpath)
+            || self.yt_info.contains_key(vpath)
+            || self.yt_info_pending.is_some()
+        {
+            return;
+        }
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_info_rx = Some(rx);
+        self.yt_info_pending = Some(vpath.to_path_buf());
+        self.status = "Fetching transcript + comments…".into();
+        let vpath = vpath.to_path_buf();
+        let cookies = self.yt_cookies_browser.clone();
+        std::thread::spawn(move || {
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            let info = YtInfo {
+                transcript: crate::youtube::fetch_captions(&id, cookies),
+                comments: crate::youtube::fetch_comments(&id, 50, cookies),
+            };
+            let _ = tx.send((vpath, info));
+        });
+    }
+
+    /// Drain a finished transcript/comments fetch into `yt_info`.
+    fn poll_yt_info(&mut self) {
+        let Some(rx) = &self.yt_info_rx else { return };
+        match rx.try_recv() {
+            Ok((vpath, info)) => {
+                let n = info.comments.len();
+                let has_t = info.transcript.is_some();
+                self.yt_info.insert(vpath, info);
+                self.yt_info_rx = None;
+                self.yt_info_pending = None;
+                self.status = format!(
+                    "Loaded {}{} comments",
+                    if has_t { "transcript · " } else { "no transcript · " },
+                    n
+                );
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.yt_open_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.yt_info_rx = None;
+                self.yt_info_pending = None;
+            }
+        }
+    }
+
+    /// Assemble a plain-text dump of everything known about a video (title, channel, stats,
+    /// description, transcript, comments) for pasting into an LLM.
+    fn yt_llm_text(&self, path: &Path) -> String {
+        let mut s = String::new();
+        if let Some(m) = self.yt_meta.get(path) {
+            s.push_str(&format!("Title: {}\n", m.title));
+            if !m.channel.is_empty() {
+                s.push_str(&format!("Channel: {}\n", m.channel));
+            }
+            s.push_str(&format!("URL: {}\n", m.watch_url()));
+            if !m.upload_date_fmt().is_empty() {
+                s.push_str(&format!("Published: {}\n", m.upload_date_fmt()));
+            }
+            s.push_str(&format!(
+                "Views: {} · Likes: {} · Comments: {}\n",
+                m.views, m.likes, m.comments
+            ));
+            if !m.description.is_empty() {
+                s.push_str(&format!("\nDescription:\n{}\n", m.description));
+            }
+        } else if let Some(v) = self.yt_videos.get(path) {
+            s.push_str(&format!("Title: {}\nChannel: {}\n", v.title, v.channel));
+        }
+        if let Some(info) = self.yt_info.get(path) {
+            if let Some(t) = &info.transcript {
+                s.push_str(&format!("\nTranscript:\n{t}\n"));
+            }
+            if !info.comments.is_empty() {
+                s.push_str("\nTop comments:\n");
+                for c in &info.comments {
+                    s.push_str(&format!("- {} ({}👍): {}\n", c.author, c.likes, c.text));
+                }
+            }
+        }
+        s
+    }
+
+    /// Drain a finished metadata fetch (each frame) into `yt_meta`.
+    fn poll_yt_meta(&mut self) {
+        let Some(rx) = &self.yt_meta_rx else { return };
+        match rx.try_recv() {
+            Ok((vpath, meta)) => {
+                self.yt_meta.insert(vpath, meta);
+                self.yt_meta_rx = None;
+                self.yt_meta_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.yt_meta_rx = None;
+                self.yt_meta_pending = None;
+            }
         }
     }
 
@@ -3723,18 +4086,91 @@ impl PixelView {
         self.launch_external(&o.exec, &o.args, &o.env, Path::new(url));
     }
 
+    /// Open a file's **containing folder** in the OS file manager (xdg-open / open / explorer).
+    /// Falls back to the path itself if it has no parent.
+    fn reveal_in_file_manager(&mut self, file: &Path) {
+        let dir = file.parent().unwrap_or(file);
+        let o = os_file_manager();
+        self.launch_external(&o.exec, &o.args, &o.env, dir);
+        self.status = format!("Opened folder: {}", dir.display());
+    }
+
     /// SteamTube: list installed Steam games as grid tiles (root only; deeper browsing later).
     /// Each game is a virtual `<steam>/<Name>` entry; clicking it finds YouTube videos for it.
     fn open_steam(&mut self, dir: PathBuf) {
-        if !crate::steam::rel_parts(&dir).is_empty() {
-            self.show_folder(dir, Vec::new()); // only the root lists games (for now)
-            return;
+        let parts = crate::steam::rel_parts(&dir);
+        // A game detail view: `<steam>/game/<appid>` → its screenshots + trailers.
+        if let [g, appid] = parts.as_slice() {
+            if g == "game" {
+                if let Ok(id) = appid.parse::<u32>() {
+                    self.open_game_detail(id, dir);
+                    return;
+                }
+            }
         }
+        let filter = match parts.as_slice() {
+            [] => SteamFilter::Installed, // default root = installed (fast, no key needed)
+            [f] if f == "all" => SteamFilter::All,
+            [f] if f == "notinstalled" => SteamFilter::NotInstalled,
+            [f] if f == "neverplayed" => SteamFilter::NeverPlayed,
+            _ => {
+                self.show_folder(dir, Vec::new());
+                return;
+            }
+        };
+        self.list_steam_games(dir, filter);
+    }
+
+    /// Build the Steam game grid for a filter. `Installed` uses the fast local appmanifest scan;
+    /// the others need the Web API key (full owned library + playtime). Each game → a virtual
+    /// `<steam>/<Name>` tile; `steam_uninstalled` marks the not-installed ones for a badge.
+    fn list_steam_games(&mut self, dir: PathBuf, filter: SteamFilter) {
         self.steam_games.clear();
-        let games = crate::steam::installed_games();
+        self.steam_uninstalled.clear();
+        // (game, installed, playtime_min) rows.
+        let rows: Vec<(crate::steam::SteamGame, bool, u64)> = if filter == SteamFilter::Installed {
+            crate::steam::installed_games()
+                .into_iter()
+                .map(|g| (g, true, 0))
+                .collect()
+        } else {
+            let key = self.steam_api_key.clone();
+            match crate::steam::steam_id64() {
+                Some(id) if !key.trim().is_empty() => {
+                    let installed = crate::steam::installed_appids();
+                    crate::steam::owned_games(&key, id)
+                        .into_iter()
+                        .map(|o| {
+                            let inst = installed.contains(&o.appid);
+                            let g = crate::steam::SteamGame {
+                                appid: o.appid,
+                                name: o.name,
+                                last_played: o.last_played,
+                                size: 0,
+                            };
+                            (g, inst, o.playtime_min)
+                        })
+                        .collect()
+                }
+                _ => {
+                    self.show_folder(dir, Vec::new());
+                    self.status =
+                        "Add a Steam Web API key in Preferences to see your full library".into();
+                    return;
+                }
+            }
+        };
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for g in games {
+        for (g, installed, playtime) in rows {
+            let keep = match filter {
+                SteamFilter::All | SteamFilter::Installed => true,
+                SteamFilter::NotInstalled => !installed,
+                SteamFilter::NeverPlayed => playtime == 0,
+            };
+            if !keep {
+                continue;
+            }
             let mut name = sanitize_filename(&g.name);
             if name.is_empty() {
                 name = format!("app {}", g.appid);
@@ -3743,6 +4179,9 @@ impl PixelView {
             if !seen.insert(path.clone()) {
                 path = Path::new(crate::steam::ROOT).join(format!("{name} ({})", g.appid));
                 seen.insert(path.clone());
+            }
+            if !installed {
+                self.steam_uninstalled.insert(path.clone());
             }
             let rating = self.read_rating(&path);
             entries.push(Entry {
@@ -3754,15 +4193,31 @@ impl PixelView {
                 ctime: None,
                 rating,
             });
+            self.steam_names.insert(g.appid, g.name.clone());
             self.steam_games.insert(path, g);
         }
         let n = entries.len();
         self.show_folder(dir, entries);
         self.status = if n == 0 {
-            "No Steam library found (is Steam installed?)".into()
+            match filter {
+                SteamFilter::Installed => "No Steam library found (is Steam installed?)".into(),
+                _ => "No games (add a Steam Web API key in Preferences?)".into(),
+            }
         } else {
-            format!("{n} Steam games — click one to find videos")
+            format!("{n} {} Steam games — click one for details", filter.label())
         };
+    }
+
+    /// Open a YouTube search for a game's videos. Biases the query toward game content
+    /// (`"<name>" gameplay`) so a short/ambiguous title doesn't drag in unrelated videos
+    /// (the "random game → all kinds of non-game videos" bug).
+    fn steam_find_videos(&mut self, name: &str) {
+        let query = format!("\"{}\" gameplay", name.trim());
+        let p = Path::new(crate::youtube::ROOT)
+            .join(crate::youtube::SEARCH)
+            .join(&query);
+        self.status = format!("🎬 {name} → videos");
+        self.open_folder(p);
     }
 
     /// Run a right-click Steam action on a game tile.
@@ -3771,12 +4226,7 @@ impl PixelView {
             return;
         };
         match act {
-            SteamAct::Videos => {
-                let p = Path::new(crate::youtube::ROOT)
-                    .join(crate::youtube::SEARCH)
-                    .join(&g.name);
-                self.open_folder(p);
-            }
+            SteamAct::Videos => self.steam_find_videos(&g.name),
             SteamAct::Launch => {
                 self.open_url(&g.run_url());
                 self.status = format!("Launching {} via Steam…", g.name);
@@ -3799,11 +4249,171 @@ impl PixelView {
             .map(|d| d.subsec_nanos() as usize)
             .unwrap_or(0);
         let g = games[seed % games.len()].clone();
+        self.steam_find_videos(&g.name);
         self.status = format!("🎲 {} → videos", g.name);
-        let p = Path::new(crate::youtube::ROOT)
-            .join(crate::youtube::SEARCH)
-            .join(&g.name);
-        self.open_folder(p);
+    }
+
+    /// Play a random result from the current YouTube search (download-in-place → play).
+    fn yt_play_random(&mut self) {
+        let paths: Vec<PathBuf> = self.yt_videos.keys().cloned().collect();
+        if paths.is_empty() {
+            self.status = "No YouTube results — search first".into();
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let p = paths[seed % paths.len()].clone();
+        self.start_yt_open(p);
+    }
+
+    /// Pick a random game from whatever's currently on screen (any Steam filter — installed, all,
+    /// not-installed, never-played) and open its detail view. Falls back to the installed list.
+    fn steam_random_from_view(&mut self) {
+        let mut appids: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|e| self.steam_games.get(&e.path).map(|g| g.appid))
+            .collect();
+        if appids.is_empty() {
+            appids = crate::steam::installed_games()
+                .iter()
+                .map(|g| g.appid)
+                .collect();
+        }
+        if appids.is_empty() {
+            self.status = "No Steam games to pick from".into();
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let appid = appids[seed % appids.len()];
+        let detail = Path::new(crate::steam::ROOT)
+            .join("game")
+            .join(appid.to_string());
+        self.open_folder(detail);
+    }
+
+    /// Open a game's **detail view**: a virtual folder of its Steam-store screenshots + trailers.
+    /// Fetches media on a worker (`poll_steam_media` fills the grid when it lands).
+    fn open_game_detail(&mut self, appid: u32, dir: PathBuf) {
+        self.steam_media.clear();
+        self.steam_detail = None; // cleared until the fetch lands (Details pane shows "loading")
+        self.show_folder(dir.clone(), Vec::new());
+        self.status = "Loading game media…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.steam_media_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Some(media) = crate::steam::fetch_app_media(appid) {
+                let _ = tx.send((dir, media));
+            }
+        });
+    }
+
+    /// Drain a finished game-media fetch: build screenshot + trailer tiles (each fetches its
+    /// thumbnail via the HTTP pool; opening a screenshot downloads it, a trailer streams).
+    fn poll_steam_media(&mut self) {
+        let Some(rx) = &self.steam_media_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((dir, media)) => {
+                self.steam_media_rx = None;
+                // Only apply if we're still on that game (a fast click-through discards it).
+                if self.folder.as_deref() != Some(dir.as_path()) {
+                    return;
+                }
+                let mut entries = Vec::new();
+                for (i, m) in media.media.iter().enumerate() {
+                    let fname = if m.is_video {
+                        format!("{:02} {}.m3u8", i, sanitize_filename(&m.name))
+                    } else {
+                        format!("{i:02} screenshot.jpg")
+                    };
+                    let path = dir.join(fname);
+                    entries.push(Entry {
+                        path: path.clone(),
+                        is_dir: false,
+                        is_archive: false,
+                        size: 0,
+                        mtime: None,
+                        ctime: None,
+                        rating: 0,
+                    });
+                    self.steam_media.insert(path, m.clone());
+                }
+                let n = entries.len();
+                // Remember the name (breadcrumb) + the whole media blob (Details pane).
+                if let Some(appid) = crate::steam::detail_appid(&dir) {
+                    if !media.name.is_empty() {
+                        self.steam_names.insert(appid, media.name.clone());
+                    }
+                    self.steam_detail = Some((appid, media.clone()));
+                }
+                self.show_folder(dir, entries);
+                let genres = if media.genres.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ·  {}", media.genres.join(", "))
+                };
+                self.status = if n == 0 {
+                    format!("{} — no store media{genres}", media.name)
+                } else if media.description.is_empty() {
+                    format!("{} · {} media{genres}", media.name, n)
+                } else {
+                    format!("{} — {}{genres}", media.name, media.description)
+                };
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.steam_media_rx = None,
+        }
+    }
+
+    /// Download a screenshot (its full jpg) to the cache, then view it (mirrors `start_yt_open`).
+    fn start_steam_open(&mut self, vpath: PathBuf) {
+        let Some(url) = self.steam_media.get(&vpath).map(|m| m.open_url.clone()) else {
+            return;
+        };
+        if self.steam_open_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.steam_open_rx = Some(rx);
+        self.status = "Loading screenshot…".into();
+        let fname = format!(
+            "steam_{}.jpg",
+            vpath.file_stem().and_then(|s| s.to_str()).unwrap_or("shot")
+        );
+        std::thread::spawn(move || {
+            let res = match crate::cache::get_file(&url, &fname) {
+                Ok(local) => Ok((vpath, local)),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish a screenshot download → map the virtual path to the local file and view it.
+    fn poll_steam_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.steam_open_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                self.steam_files.insert(vpath.clone(), local);
+                self.steam_open_rx = None;
+                self.load_full(ctx, vpath);
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Screenshot failed: {e}");
+                self.steam_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.steam_open_rx = None,
+        }
     }
 
     /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
@@ -3929,6 +4539,14 @@ impl PixelView {
         }
     }
 
+    /// Pause the video player (silences its soundtrack + halts frame advance) without tearing it
+    /// down, so re-opening the same video resumes. Wired to leaving the viewer + the global stop.
+    fn stop_video(&mut self) {
+        if let Some(vp) = &mut self.video_player {
+            vp.set_playing(false);
+        }
+    }
+
     /// PANIC — stop the main player AND every sample-pad voice at once (all sound off, incl. a
     /// runaway looping pad). Since MIDI keys only ever start pad voices, this is also the
     /// "all notes off". Bound to the transport Panic button + Shift+Esc.
@@ -3936,6 +4554,9 @@ impl PixelView {
         self.pad_assign = None; // also cancel a pending MIDI-learn
         if let Some(ap) = &mut self.audio_player {
             ap.panic();
+        }
+        if let Some(vp) = &mut self.video_player {
+            vp.set_playing(false); // panic also silences the video soundtrack
         }
         self.status = "Panic — all sound stopped".into();
     }
@@ -5423,6 +6044,19 @@ impl PixelView {
     fn draw_video_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<bool> {
         let dt = ctx.input(|i| i.stable_dt);
         let (vol, muted) = (self.audio_volume, self.audio_muted);
+        let t_total = std::time::Instant::now();
+
+        // FPS meter: this call = one UI repaint; a displayed video frame is counted at upload.
+        // Recomputed each ~0.5 s window so the numbers are readable.
+        self.fps_ui_frames += 1;
+        self.fps_accum_t += dt;
+        if self.fps_accum_t >= 0.5 {
+            self.fps_ui_val = self.fps_ui_frames as f32 / self.fps_accum_t;
+            self.fps_video_val = self.fps_video_frames as f32 / self.fps_accum_t;
+            self.fps_accum_t = 0.0;
+            self.fps_ui_frames = 0;
+            self.fps_video_frames = 0;
+        }
 
         // Advance the clock/frames and push the master volume.
         let (dw, dh) = {
@@ -5432,18 +6066,43 @@ impl PixelView {
             (vp.disp_w, vp.disp_h)
         };
 
-        // Upload the frame texture on the UI thread when it changed.
+        // Upload the frame texture on the UI thread when it changed — OR when the Recolor
+        // pipeline changed while PAUSED (no new frames arrive, but `vp.cur` persists, so we can
+        // re-colorize what's on screen live). Turning recolor off re-uploads the raw frame.
+        // `recolor_key_all` (not `pipeline_active`) so a **palette-only** recolor applies too.
+        // The "Recolor" toggle skips it entirely for full-fps playback (settings kept for the
+        // preview / PNG export). When recolor is neutral this is already None (no per-frame cost).
+        let pipe_key = if self.recolor_playback {
+            self.recolor_key_all()
+        } else {
+            None
+        };
+        let recolor_changed = pipe_key != self.video_recolor_key;
         let frame = {
             let vp = self.video_player.as_mut()?;
-            if vp.tex_dirty {
-                vp.tex_dirty = false;
+            let dirty = vp.tex_dirty;
+            vp.tex_dirty = false;
+            if dirty || recolor_changed {
                 vp.cur.clone()
             } else {
                 None
             }
         };
-        if let Some(bytes) = frame {
+        let t_upload = std::time::Instant::now();
+        if let Some(mut bytes) = frame {
             if bytes.len() == (dw as usize) * (dh as usize) * 4 {
+                // Recolor the LIVE frame when ANY recolor is active (value pipeline OR palette snap).
+                if pipe_key.is_some() {
+                    if let Some(vpath) = self.video_player.as_ref().map(|vp| vp.path.clone()) {
+                        let (w, h) = (dw as usize, dh as usize);
+                        let palette = self.tile_palette(&vpath);
+                        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+                        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+                        let (tw, th) = self.resize_target(w, h);
+                        let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+                        apply_pipeline_resized(&mut bytes, w, h, tw, th, &self.adjust, &aux);
+                    }
+                }
                 let color =
                     egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &bytes);
                 match &mut self.video_tex {
@@ -5453,8 +6112,13 @@ impl PixelView {
                             Some(ctx.load_texture("video_frame", color, view_tex_opts()))
                     }
                 }
+                self.fps_video_frames += 1; // a real new displayed frame
             }
+            // Remember which pipeline we just baked in, so a paused re-tweak (or turning recolor
+            // off) re-uploads once instead of every frame.
+            self.video_recolor_key = pipe_key;
         }
+        self.fps_upload_ms = t_upload.elapsed().as_secs_f32() * 1000.0;
 
         // Snapshot state for the controls.
         let (pos, dur, playing, speed, frame_idx, frame_cnt, has_audio) = {
@@ -5475,7 +6139,7 @@ impl PixelView {
         let mut want_toggle = false;
         let mut want_seek: Option<f32> = None;
         let mut want_speed: Option<f32> = None;
-        let mut want_export = false;
+        let mut want_frame_png: Option<bool> = None; // Some(recolor?) — export the current frame
         let mut want_extract: Option<bool> = None; // Some(open_after)
         let mut want_add_marker = false;
         let mut want_marker_click: Option<usize> = None; // a marker chip was clicked (seek + toggle notes)
@@ -5536,12 +6200,35 @@ impl PixelView {
                     }
                 }
                 ui.separator();
-                if ui
+                // With the Recolor pane active, offer the frame recolored-as-shown OR original;
+                // otherwise a plain one-click PNG.
+                if self.any_recolor_active() {
+                    ui.menu_button(format!("{} PNG ▾", icons::DOWNLOAD), |ui| {
+                        if ui
+                            .button("Recolored (as shown)")
+                            .on_hover_text("Save the current frame with the Recolor pipeline baked in")
+                            .clicked()
+                        {
+                            want_frame_png = Some(true);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Original")
+                            .on_hover_text("Save the untouched source frame")
+                            .clicked()
+                        {
+                            want_frame_png = Some(false);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Save the current frame as a PNG (native resolution)");
+                } else if ui
                     .button(format!("{} PNG", icons::DOWNLOAD))
                     .on_hover_text("Save the current frame as a PNG (native resolution)")
                     .clicked()
                 {
-                    want_export = true;
+                    want_frame_png = Some(false);
                 }
                 ui.add_enabled_ui(has_audio, |ui| {
                     ui.menu_button("Audio ▾", |ui| {
@@ -5610,6 +6297,20 @@ impl PixelView {
                 {
                     want_trim_clear = true;
                 }
+                ui.separator();
+                ui.checkbox(&mut self.recolor_playback, "Recolor")
+                    .on_hover_text(
+                        "Apply the Recolor pane to live playback. Turn OFF for faster fps — the \
+                         preview + PNG export still recolor. Persisted.",
+                    );
+                ui.checkbox(&mut self.show_fps, "FPS")
+                    .on_hover_text("Overlay a UI-fps + video-fps meter on the video");
+                ui.separator();
+                ui.checkbox(&mut self.yt_open_folder_after, "Open folder after download")
+                    .on_hover_text(
+                        "When a downloaded video finishes (YouTube), pop its folder in your \
+                         file manager. Persisted.",
+                    );
             });
 
             // Seek bar with marker ticks (seeks on release only — each seek respawns ffmpeg).
@@ -5829,8 +6530,8 @@ impl PixelView {
                 vp.seek(t);
             }
         }
-        if want_export {
-            self.export_video_frame_png();
+        if let Some(recolor) = want_frame_png {
+            self.export_video_frame_png(recolor);
         }
         match want_extract {
             Some(true) => {
@@ -5870,8 +6571,11 @@ impl PixelView {
             .video_tex
             .as_ref()
             .map(|h| TiledTexture::single(h.clone(), [dw as usize, dh as usize]));
+        let t_blit = std::time::Instant::now();
         let forward = if let Some(tex) = tex {
-            self.draw_image_view(ui, &tex)
+            let f = self.draw_image_view(ui, &tex);
+            self.fps_blit_ms = t_blit.elapsed().as_secs_f32() * 1000.0;
+            f
         } else {
             let r = ui.available_rect_before_wrap();
             paint_spinner(
@@ -5886,12 +6590,44 @@ impl PixelView {
         if playing || self.video_loading.is_some() {
             self.want_repaint = true;
         }
+        // FPS overlay (top-left of the viewport): UI repaints vs actual displayed video frames,
+        // against the source fps + the display size + a per-frame ms breakdown (so a low number
+        // is interpretable AND we can see WHERE the time goes: upload vs blit vs the rest).
+        self.fps_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
+        if self.show_fps {
+            let r = ui.min_rect();
+            let src_fps = self.video_player.as_ref().map(|v| v.info.fps).unwrap_or(0.0);
+            let other = (self.fps_total_ms - self.fps_upload_ms - self.fps_blit_ms).max(0.0);
+            let text = format!(
+                "UI {:.0} · video {:.0}/{:.0} fps · {}×{}\nvideo_ui {:.0}ms (upload {:.0} · blit {:.0} · rest {:.0})",
+                self.fps_ui_val,
+                self.fps_video_val,
+                src_fps,
+                dw,
+                dh,
+                self.fps_total_ms,
+                self.fps_upload_ms,
+                self.fps_blit_ms,
+                other,
+            );
+            let pos = r.left_top() + egui::vec2(8.0, 8.0);
+            let painter = ui.painter();
+            let galley = painter.layout_no_wrap(
+                text,
+                egui::FontId::monospace(13.0),
+                egui::Color32::from_rgb(120, 255, 140),
+            );
+            let bg = egui::Rect::from_min_size(pos, galley.size())
+                .expand2(egui::vec2(6.0, 4.0));
+            painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(190));
+            painter.galley(pos, galley, egui::Color32::WHITE);
+        }
         forward
     }
 
     /// Save the current video frame as a PNG at **native** resolution (re-grabbed at the current
     /// timestamp, so it's full quality, not the downscaled display frame). Auto-named beside the video.
-    fn export_video_frame_png(&mut self) {
+    fn export_video_frame_png(&mut self, recolor: bool) {
         let Some((src, pts)) = self
             .video_player
             .as_ref()
@@ -5903,22 +6639,30 @@ impl PixelView {
             self.status = "PNG export failed (is ffmpeg installed?)".into();
             return;
         };
+        let (w, h) = (img.width as usize, img.height as usize);
+        let mut rgba = img.rgba_bytes();
+        // Bake the Recolor pipeline into the full-res grab so the saved frame matches what's on
+        // screen. Uses the same palette/aux as the live view (`tile_palette` on the source).
+        let recolored = recolor && self.any_recolor_active();
+        if recolored {
+            let palette = self.tile_palette(&src);
+            let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+            let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+            let (tw, th) = self.resize_target(w, h);
+            let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        }
         let dir = src.parent().unwrap_or_else(|| Path::new("."));
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
         let tc = format_timecode(pts).replace(':', "-");
-        let mut out = dir.join(format!("{stem}_{tc}.png"));
+        let tag = if recolored { "_recolored" } else { "" };
+        let mut out = dir.join(format!("{stem}_{tc}{tag}.png"));
         let mut n = 1;
         while out.exists() {
-            out = dir.join(format!("{stem}_{tc}_{n}.png"));
+            out = dir.join(format!("{stem}_{tc}{tag}_{n}.png"));
             n += 1;
         }
-        match image::save_buffer(
-            &out,
-            &img.rgba_bytes(),
-            img.width,
-            img.height,
-            image::ColorType::Rgba8,
-        ) {
+        match image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
             Ok(()) => self.status = format!("Saved {}", short_name(&out)),
             Err(e) => self.status = format!("PNG failed: {e}"),
         }
@@ -6063,9 +6807,13 @@ impl PixelView {
         self.status = format!("Trim Out {}", format_timecode(secs));
     }
 
-    /// Export the In→Out range as a **lossless** clip via ffmpeg stream-copy (`-c copy`, so no
-    /// re-encode — the cut snaps to the nearest keyframe at/before In). Falls back to a re-encode
-    /// if copy fails (e.g. the chosen container can't hold the source codecs).
+    /// Export the In→Out range as a clip that **plays with audio everywhere**. Video is stream-
+    /// copied (lossless, keyframe-aligned start) but the audio is re-encoded to **AAC** in an
+    /// **MP4** container — a YouTube download is h264+**opus/mkv**, and opus-in-mkv is silent in
+    /// many players (browsers / Totem / QuickTime), which read as "the export has no audio" even
+    /// though the stream is there. `-ss` sits before `-i` so all streams seek together (A/V stay
+    /// in sync); `-map 0:a:0?` keeps a silent video working. Falls back to a full re-encode when
+    /// the source video can't be copied into MP4 (e.g. VP9/webm).
     fn export_video_clip(&mut self) {
         let (src, a, b) = match (
             self.video_player.as_ref().map(|v| v.path.clone()),
@@ -6079,33 +6827,43 @@ impl PixelView {
             }
         };
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-        let Some(dest) = rfd::FileDialog::new()
-            .set_file_name(format!("{stem}_clip.{ext}"))
+        let Some(mut dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_clip.mp4"))
             .save_file()
         else {
             return;
         };
+        // Force an MP4 container so the AAC audio + h264 video are universally playable.
+        if dest.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
+            != Some("mp4".into())
+        {
+            dest.set_extension("mp4");
+        }
         let ss = format!("{a:.3}");
         let t = format!("{:.3}", b - a);
-        let run = |copy: bool| -> bool {
+        // mode 0 = copy video + AAC audio (fast, lossless video); mode 1 = full re-encode.
+        let run = |mode: u8| -> bool {
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.args(["-v", "quiet", "-nostdin", "-y", "-ss", &ss])
                 .arg("-i")
                 .arg(&src)
-                .args(["-t", &t]);
-            if copy {
-                cmd.args(["-c", "copy", "-avoid_negative_ts", "make_zero"]);
-            }
-            // else: re-encode with the container defaults (a frame-accurate cut).
-            cmd.arg(&dest)
+                .args(["-t", &t, "-map", "0:v:0", "-map", "0:a:0?"]);
+            match mode {
+                0 => cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+                _ => cmd.args([
+                    "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-c:a", "aac",
+                    "-b:a", "192k",
+                ]),
+            };
+            cmd.args(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
+                .arg(&dest)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        let ok = run(true) || run(false);
+        let ok = run(0) || run(1);
         self.status = if ok {
             format!("Exported clip {}–{} → {}", ss, t, short_name(&dest))
         } else {
@@ -10273,6 +11031,7 @@ impl PixelView {
             self.search.as_deref(),
             &self.img_meta,
             &self.colo_pieces,
+            &self.yt_videos,
         );
     }
 
@@ -10734,6 +11493,14 @@ impl PixelView {
     /// Re-scan the current folder after a file op, without recording history.
     fn refresh(&mut self) {
         if let Some(f) = self.folder.clone() {
+            // F5 on a YouTube search should re-fetch, not restore the cache.
+            if self
+                .yt_search_cache
+                .as_ref()
+                .is_some_and(|(cdir, ..)| *cdir == f)
+            {
+                self.yt_search_cache = None;
+            }
             self.suppress_history = true;
             self.open_folder(f);
         }
@@ -11340,10 +12107,27 @@ impl PixelView {
             // A YouTube result not yet downloaded → download in place, then play (poll_yt_open).
             self.selected = idx;
             self.start_yt_open(entry.path);
-        } else if self.steam_games.contains_key(&entry.path) {
-            // A Steam game tile → find YouTube videos for it (SteamTube).
+        } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
+            // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
-            self.steam_action(&entry.path, SteamAct::Videos);
+            let detail = Path::new(crate::steam::ROOT)
+                .join("game")
+                .join(g.appid.to_string());
+            self.open_folder(detail);
+        } else if let Some(m) = self.steam_media.get(&entry.path).cloned() {
+            // A screenshot (download → view) or trailer (stream via the video player).
+            self.selected = idx;
+            if m.is_video {
+                if !self.plugin_video {
+                    self.plugin_video = true;
+                    self.registry.set_plugin("video", true);
+                }
+                self.load_full(ctx, entry.path);
+            } else if self.steam_files.contains_key(&entry.path) {
+                self.load_full(ctx, entry.path);
+            } else {
+                self.start_steam_open(entry.path);
+            }
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -11434,9 +12218,18 @@ impl PixelView {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| a.to_string_lossy().into_owned());
-                        // Show the virtual 16colo.rs root by its friendly name.
+                        // Show virtual roots by their friendly names, and a Steam game's
+                        // detail folder (`<steam>/game/<appid>`) by the game's NAME.
                         let label = if label == crate::sixteen::ROOT {
                             "16colo.rs".to_string()
+                        } else if label == crate::steam::ROOT {
+                            "Steam".to_string()
+                        } else if label == crate::youtube::ROOT {
+                            "YouTube".to_string()
+                        } else if let Some(name) = crate::steam::detail_appid(a)
+                            .and_then(|id| self.steam_names.get(&id).cloned())
+                        {
+                            name
                         } else {
                             label
                         };
@@ -11852,18 +12645,32 @@ impl PixelView {
             }
             ui.separator();
             ui.label("Sort:");
+            // While browsing YouTube, add Duration + Views to the combo.
+            let on_youtube = self
+                .folder
+                .as_ref()
+                .is_some_and(|f| crate::youtube::is_remote(f));
+            let keys: Vec<SortKey> = if on_youtube {
+                SortKey::COMMON
+                    .iter()
+                    .chain(SortKey::YOUTUBE.iter())
+                    .copied()
+                    .collect()
+            } else {
+                SortKey::COMMON.to_vec()
+            };
             let cr = egui::ComboBox::from_id_salt("sort_key")
                 .selected_text(key.label())
                 .show_ui(ui, |ui| {
-                    for k in SortKey::COMMON {
-                        ui.selectable_value(&mut key, k, k.label());
+                    for k in &keys {
+                        ui.selectable_value(&mut key, *k, k.label());
                     }
                 });
-            // Wheel-cycle within the common keys; a scene key (set via the table) maps
-            // to its position if present, else stays put.
-            let mut ki = SortKey::COMMON.iter().position(|&k| k == key).unwrap_or(0);
-            if wheel_cycle(ui, &cr.response, &mut ki, SortKey::COMMON.len()) {
-                key = SortKey::COMMON[ki];
+            // Wheel-cycle within the offered keys; a key not in the list maps to its
+            // position if present, else stays put.
+            let mut ki = keys.iter().position(|&k| k == key).unwrap_or(0);
+            if wheel_cycle(ui, &cr.response, &mut ki, keys.len()) {
+                key = keys[ki];
             }
             let asc_lbl = format!("{} Asc", icons::SORT_ASC);
             let desc_lbl = format!("{} Desc", icons::SORT_DESC);
@@ -12287,6 +13094,36 @@ impl PixelView {
             || self.scale_algo != crate::scale::Scaler::None
     }
 
+    /// Is ANY recolor active — the value pipeline (`pipeline_active`) OR a **palette snap**
+    /// (custom/selected/reduce)? `pipeline_active` alone misses palette-only recolors (CGA /
+    /// Gameboy / most PixelFX presets), so the *video* view must gate on this broader check or a
+    /// palette-only recolor silently affects the little preview but not the actual playback.
+    fn any_recolor_active(&self) -> bool {
+        self.pipeline_active()
+            || self.custom_palette.is_some()
+            || self.selected_palette.is_some()
+            || self.quantize_on
+    }
+
+    /// A cache key for the currently-active recolor (value pipeline + palette snap), or `None`
+    /// when nothing is active. Used by the video view to re-bake a paused frame only when the
+    /// recolor changes (mirrors `grid_recolor_key` without the "Apply to grid" gate).
+    fn recolor_key_all(&self) -> Option<String> {
+        if !self.any_recolor_active() {
+            return None;
+        }
+        let rkey = if let Some(cp) = &self.custom_palette {
+            format!("custom:{}", palette_hash(cp))
+        } else if let Some(pp) = &self.selected_palette {
+            format!("pal:{}", pp.display())
+        } else if self.quantize_on {
+            format!("reduce:{}", self.quantize_n)
+        } else {
+            "none".to_string()
+        };
+        Some(format!("{}|{rkey}", self.pipeline_key()))
+    }
+
     /// True when the Resize/resample actually downsamples (on + a factor below 1).
     fn resize_active(&self) -> bool {
         self.resize_on && (self.resize_fx < 1.0 || self.resize_fy < 1.0)
@@ -12487,6 +13324,18 @@ impl PixelView {
     /// A thumbnail texture of the inspected image remapped to `palette` (the live
     /// recolor preview), keyed by `key`. Source pixels are decoded once per path;
     /// the remapped texture is rebuilt only when the path or recolor changes.
+    /// If `path` is the currently-playing video, its live on-screen frame (`disp_w`,`disp_h`,RGBA,
+    /// pts). Lets the Recolor preview mirror what's actually playing instead of a decode of frame 0.
+    fn live_preview_frame(&self, path: &Path) -> Option<(usize, usize, Vec<u8>, f32)> {
+        let vp = self.video_player.as_ref()?;
+        if vp.path != *path && self.resolve_local(path) != vp.path {
+            return None;
+        }
+        let (w, h) = (vp.disp_w as usize, vp.disp_h as usize);
+        let bytes = vp.cur.clone()?;
+        (bytes.len() == w * h * 4).then_some((w, h, bytes, vp.cur_pts))
+    }
+
     fn make_preview(
         &mut self,
         ctx: &egui::Context,
@@ -12494,6 +13343,26 @@ impl PixelView {
         key: &str,
         palette: Option<&[[u8; 4]]>,
     ) -> Option<egui::TextureHandle> {
+        // A currently-playing video: recolor the LIVE frame (what's on screen), not a decode of
+        // the file (which yields frame 0). Keyed by pts so it refreshes each frame AND each tweak.
+        if let Some((w, h, rgba, pts)) = self.live_preview_frame(path) {
+            let vkey = format!("{key}@{pts:.3}");
+            if let Some((p, k, tex)) = &self.preview_tex {
+                if p == path && *k == vkey {
+                    return Some(tex.clone());
+                }
+            }
+            let (w, h, mut rgba) = self.scale_source(w, h, rgba);
+            let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+            let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+            let (tw, th) = self.resize_target(w, h);
+            let aux = self.pipe_aux(palette, dsx, dsy);
+            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
+            self.preview_tex = Some((path.to_path_buf(), vkey, tex.clone()));
+            return Some(tex);
+        }
         if let Some((p, k, tex)) = &self.preview_tex {
             if p == path && k == key {
                 return Some(tex.clone());
@@ -12744,7 +13613,340 @@ impl PixelView {
         new_h
     }
 
+    /// Details-pane content for a Steam game detail view (`<steam>/game/<appid>`): the game's
+    /// name, genres, short description, media counts, a ★ rating row, and quick links (Launch via
+    /// Steam / Find videos / Store / Community hub / Discussions). URL/nav actions are deferred out
+    /// of the scroll closure (it borrows `self` immutably) and applied at the end.
+    fn ui_steam_detail(&mut self, ui: &mut egui::Ui, appid: u32) {
+        ui.strong("Details");
+        ui.separator();
+        // The media may still be loading (fetched on a worker) — show a note until it lands.
+        let Some((_, media)) = self.steam_detail.clone().filter(|(id, _)| *id == appid) else {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.weak("Loading game details…");
+            });
+            self.want_repaint = true;
+            return;
+        };
+        let g = crate::steam::SteamGame {
+            appid,
+            name: media.name.clone(),
+            last_played: 0,
+            size: 0,
+        };
+        let cur_rating = self
+            .folder
+            .clone()
+            .map(|f| self.read_rating(&f))
+            .unwrap_or(0);
+        let mut want_url: Option<String> = None;
+        let mut want_videos = false;
+        let mut want_rate: Option<u8> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("steam_detail")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(&media.name).heading());
+                if !media.genres.is_empty() {
+                    ui.add_space(2.0);
+                    ui.weak(media.genres.join(" · "));
+                }
+                ui.add_space(8.0);
+                if !media.description.is_empty() {
+                    ui.label(&media.description);
+                    ui.add_space(10.0);
+                }
+                let vids = media.media.iter().filter(|m| m.is_video).count();
+                let shots = media.media.len() - vids;
+                ui.weak(format!("{shots} screenshots · {vids} trailers"));
+                ui.add_space(10.0);
+                // ★ rating row (click a star to set, ✕ to clear) — stored on the stable
+                // `<steam>/game/<appid>` display path via the ratings sidecar.
+                ui.horizontal(|ui| {
+                    ui.weak("Rating");
+                    for s in 1..=5u8 {
+                        let filled = s <= cur_rating;
+                        let star = if filled { "★" } else { "☆" };
+                        if ui.button(star).clicked() {
+                            want_rate = Some(s);
+                        }
+                    }
+                    if cur_rating > 0 && ui.button("✕").on_hover_text("Clear rating").clicked() {
+                        want_rate = Some(0);
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if ui.button("▶ Launch via Steam").clicked() {
+                    want_url = Some(g.run_url());
+                }
+                if ui.button("🎬 Find videos").clicked() {
+                    want_videos = true;
+                }
+                if ui.button("🛒 Store page").clicked() {
+                    want_url = Some(g.store_url());
+                }
+                if ui.button("👥 Community hub").clicked() {
+                    want_url = Some(g.hub_url());
+                }
+                if ui.button("💬 Discussions").clicked() {
+                    want_url = Some(g.discussions_url());
+                }
+            });
+        if let Some(u) = want_url {
+            self.open_url(&u);
+            if u.starts_with("steam://") {
+                self.status = format!("Launching {} via Steam…", media.name);
+            }
+        }
+        if want_videos {
+            self.steam_find_videos(&media.name);
+        }
+        if let Some(r) = want_rate {
+            if let Some(f) = self.folder.clone() {
+                self.set_rating(&f, r);
+            }
+        }
+    }
+
+    /// Details-pane content for an open YouTube video: title, channel + watch links, published
+    /// date, views/likes/comments, and the local file's size/dimensions/format. The rich fields
+    /// come from a lazy `yt-dlp --dump-json` (`start_yt_meta`); until it lands we show the flat
+    /// search data + a spinner. (YouTube removed public dislikes in 2021 — none to show.)
+    fn ui_youtube_detail(&mut self, ui: &mut egui::Ui, path: &Path) {
+        ui.strong("Details");
+        ui.separator();
+        self.start_yt_meta(path); // lazy; no-op if cached / in flight
+        let flat = self.yt_videos.get(path).cloned();
+        let meta = self.yt_meta.get(path).cloned();
+        // Local file (size + a format hint) once downloaded.
+        let local = self.yt_files.get(path).cloned();
+        let size_on_disk = local
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        let local_ext = local
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_uppercase());
+        let title = meta
+            .as_ref()
+            .map(|m| m.title.clone())
+            .or_else(|| flat.as_ref().map(|f| f.title.clone()))
+            .unwrap_or_else(|| "YouTube video".into());
+        let channel = meta
+            .as_ref()
+            .map(|m| m.channel.clone())
+            .or_else(|| flat.as_ref().map(|f| f.channel.clone()))
+            .unwrap_or_default();
+        let watch_url = meta
+            .as_ref()
+            .map(|m| m.watch_url())
+            .or_else(|| flat.as_ref().map(|f| f.watch_url()))
+            .unwrap_or_default();
+        let description = meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+        let info = self.yt_info.get(path).cloned();
+        let info_pending = self.yt_info_pending.as_deref() == Some(path);
+        let mut want_url: Option<String> = None;
+        let mut want_browser = false;
+        let mut want_fetch_info = false;
+        let mut want_copy_llm = false;
+        egui::ScrollArea::vertical()
+            .id_salt("yt_detail")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(&title).heading());
+                if !channel.is_empty() {
+                    ui.add_space(2.0);
+                    let ch_url = meta.as_ref().map(|m| m.channel_url.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.weak("Channel");
+                        if !ch_url.is_empty() {
+                            if ui.link(&channel).clicked() {
+                                want_url = Some(ch_url.clone());
+                            }
+                        } else {
+                            ui.label(&channel);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                if ui
+                    .button(format!("{} Watch on YouTube", icons::GLOBE))
+                    .clicked()
+                {
+                    want_browser = true;
+                }
+                ui.add_space(10.0);
+
+                egui::Grid::new("yt_detail_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            if !v.is_empty() {
+                                ui.weak(k);
+                                ui.label(v);
+                                ui.end_row();
+                            }
+                        };
+                        if let Some(m) = &meta {
+                            row(ui, "Published", m.upload_date_fmt());
+                            row(ui, "Views", format!("{} ({})", m.views, m.views_short()));
+                            if m.likes > 0 {
+                                row(ui, "Likes", format!("{} ({})", m.likes, m.likes_short()));
+                            }
+                            if m.comments > 0 {
+                                row(
+                                    ui,
+                                    "Comments",
+                                    format!("{} ({})", m.comments, m.comments_short()),
+                                );
+                            }
+                            if m.width > 0 && m.height > 0 {
+                                row(ui, "Dimensions", format!("{}×{}", m.width, m.height));
+                            }
+                            if m.fps > 0.0 {
+                                row(ui, "FPS", format!("{:.0}", m.fps));
+                            }
+                        } else if let Some(f) = &flat {
+                            row(ui, "Views", format!("{} ({})", f.views, f.views_short()));
+                            row(ui, "Duration", f.duration_str());
+                        }
+                        // Local file facts (once downloaded).
+                        if let Some(sz) = size_on_disk {
+                            row(ui, "Size on disk", human_size(sz));
+                        }
+                        if let Some(ext) = &local_ext {
+                            row(ui, "Format", ext.clone());
+                        } else if let Some(m) = &meta {
+                            row(ui, "Format", m.ext.to_ascii_uppercase());
+                        }
+                    });
+
+                // Still fetching the rich fields → a small spinner cue.
+                if meta.is_none() && self.yt_meta_pending.as_deref() == Some(path) {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak("Loading full details…");
+                    });
+                }
+
+                // Description.
+                if !description.is_empty() {
+                    ui.add_space(10.0);
+                    ui.weak("Description");
+                    ui.label(&description);
+                }
+
+                // Transcript + comments — fetched on demand (for feeding an LLM).
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if info.is_none() && !info_pending {
+                        if ui
+                            .button("📝 Get transcript + comments")
+                            .on_hover_text("Fetch the captions transcript + top comments")
+                            .clicked()
+                        {
+                            want_fetch_info = true;
+                        }
+                    }
+                    if ui
+                        .button("📋 Copy for LLM")
+                        .on_hover_text(
+                            "Copy title + description + stats + transcript + comments to the \
+                             clipboard (fetch transcript/comments first for the full dump)",
+                        )
+                        .clicked()
+                    {
+                        want_copy_llm = true;
+                    }
+                });
+                if info_pending {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak("Fetching transcript + comments…");
+                    });
+                }
+                if let Some(info) = &info {
+                    ui.add_space(4.0);
+                    match &info.transcript {
+                        Some(t) => {
+                            egui::CollapsingHeader::new("Transcript")
+                                .id_salt("yt_transcript")
+                                .show(ui, |ui| {
+                                    ui.label(t);
+                                });
+                        }
+                        None => {
+                            ui.weak("No captions available for this video.");
+                        }
+                    }
+                    if !info.comments.is_empty() {
+                        egui::CollapsingHeader::new(format!("Comments ({})", info.comments.len()))
+                            .id_salt("yt_comments")
+                            .show(ui, |ui| {
+                                for c in &info.comments {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(&c.author).strong());
+                                        if c.likes > 0 {
+                                            ui.weak(format!("· {} 👍", c.likes));
+                                        }
+                                    });
+                                    ui.label(&c.text);
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    }
+                }
+            });
+        if let Some(u) = want_url {
+            self.open_url(&u);
+        }
+        if want_browser {
+            self.open_url(&watch_url);
+        }
+        if want_fetch_info {
+            self.start_yt_info(path);
+        }
+        if want_copy_llm {
+            let text = self.yt_llm_text(path);
+            ui.ctx().copy_text(text);
+            self.status = "Copied video info to clipboard".into();
+        }
+    }
+
     fn ui_details(&mut self, ui: &mut egui::Ui) {
+        // In a Steam game's detail view the "entries" are screenshots/trailers; the pane should
+        // describe the GAME itself (name/genres/description/links/rating), not a hovered tile.
+        if let Some(appid) = self.folder.as_deref().and_then(crate::steam::detail_appid) {
+            self.ui_steam_detail(ui, appid);
+            return;
+        }
+        // An open YouTube video: show its channel/links/stats/size instead of the generic file
+        // details. Only in the single view (the opened video), so a grid hover doesn't spam fetches.
+        if self.mode == Mode::Single {
+            if let Some(entry) = self.inspected_entry() {
+                let is_yt_video = crate::youtube::is_remote(&entry.path)
+                    && (self.yt_videos.contains_key(&entry.path)
+                        || entry
+                            .path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .and_then(parse_yt_id)
+                            .is_some());
+                if is_yt_video {
+                    self.ui_youtube_detail(ui, &entry.path);
+                    return;
+                }
+            }
+        }
         ui.strong("Details");
         ui.separator();
         let Some(entry) = self.inspected_entry() else {
@@ -14669,10 +15871,40 @@ impl PixelView {
         }
     }
 
+    /// Any async listing/media fetch that should paint a spinner (+ the status line) in an
+    /// otherwise-empty grid/table — 16colo streams, a Steam game's media, a YouTube search, or a
+    /// pending open. Keeps `ui_grid`/`ui_table`'s empty states in sync.
+    fn empty_view_loading(&self) -> bool {
+        self.remote_rx.is_some()
+            || self.colo_rx.is_some()
+            || self.steam_media_rx.is_some()
+            || self.yt_rx.is_some()
+            || self.steam_open_rx.is_some()
+            || self.yt_open_rx.is_some()
+    }
+
+    /// Paint the centered empty-view content: a spinner + the current status while something is
+    /// loading (so entering a Steam game shows "Loading game media…", matching the status bar),
+    /// else the plain "open a folder" hint.
+    fn empty_view_body(&self, ui: &mut egui::Ui, loading: bool) {
+        if loading {
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(40.0));
+                if !self.status.is_empty() {
+                    ui.add_space(10.0);
+                    ui.weak(&self.status);
+                }
+            });
+        } else {
+            ui.label("Nothing here. Open a folder.");
+        }
+    }
+
     fn ui_grid(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            // A 16colo listing / pack download in flight → spinner, else the empty hint.
-            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // A 16colo listing / pack download / Steam-media / YouTube fetch in flight → spinner
+            // + status, else the empty hint.
+            let loading = self.empty_view_loading();
             // Still allow the empty-area menu (paste / new folder) in an empty local folder.
             // The sensor must be registered *after* the centered label — that label is
             // justified to fill the whole rect, so a sensor placed *before* it is fully
@@ -14680,11 +15912,7 @@ impl PixelView {
             // nothing else needs the clicks, so an on-top full-rect sensor is what we want.
             let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
-                if loading {
-                    ui.add(egui::Spinner::new().size(40.0));
-                } else {
-                    ui.label("Nothing here. Open a folder.");
-                }
+                self.empty_view_body(ui, loading);
             });
             let empty_bg = (!loading && self.is_local_dir())
                 .then(|| ui.interact(full, ui.id().with("grid_empty_bg"), egui::Sense::click()));
@@ -14829,6 +16057,7 @@ impl PixelView {
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
+        let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -15138,6 +16367,10 @@ impl PixelView {
                                         THUMB_PX,
                                         false,
                                     );
+                                } else if let Some(m) = self.steam_media.get(path) {
+                                    // A game's screenshot / trailer thumbnail.
+                                    self.colo_thumbs
+                                        .request(path, &m.thumb_url, THUMB_PX, false);
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -15153,25 +16386,43 @@ impl PixelView {
                                 self.want_repaint = true;
                             }
 
-                            // Video tiles show a real frame; mark them with a ▶ pill
-                            // (bottom-right, the one free corner) so they read as video.
+                            // Video tiles: a YouTube result shows its duration (a bottom-right
+                            // pill, YouTube-style); any other video shows a ▶ pill.
                             if !entry.is_dir && is_video_ext(path) {
                                 let p = ui.painter_at(rect);
                                 let r = (tile * 0.10).clamp(9.0, 15.0);
                                 let c = rect.right_bottom() + egui::vec2(-(r + 5.0), -(r + 5.0));
-                                p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
-                                p.text(
-                                    c + egui::vec2(r * 0.12, 0.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    "▶",
-                                    egui::FontId::proportional(r * 1.15),
-                                    egui::Color32::from_white_alpha(235),
-                                );
-                                // A YouTube result that's already downloaded → a green ⬇ badge
-                                // (bottom-left of the ▶) so you can see what's cached locally.
+                                if let Some(v) =
+                                    self.yt_videos.get(path).filter(|v| v.duration > 0.0)
+                                {
+                                    let font =
+                                        egui::FontId::proportional((tile * 0.085).clamp(9.0, 13.0));
+                                    let galley = p.layout_no_wrap(
+                                        v.duration_str(),
+                                        font,
+                                        egui::Color32::WHITE,
+                                    );
+                                    let pad = egui::vec2(5.0, 2.0);
+                                    let sz = galley.size() + pad * 2.0;
+                                    let br = rect.right_bottom() - egui::vec2(5.0, 5.0);
+                                    let pill = egui::Rect::from_min_max(br - sz, br);
+                                    p.rect_filled(pill, 3.0, egui::Color32::from_black_alpha(190));
+                                    p.galley(pill.min + pad, galley, egui::Color32::WHITE);
+                                } else {
+                                    p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+                                    p.text(
+                                        c + egui::vec2(r * 0.12, 0.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        "▶",
+                                        egui::FontId::proportional(r * 1.15),
+                                        egui::Color32::from_white_alpha(235),
+                                    );
+                                }
+                                // A downloaded YouTube result → a green ⬇ badge (top-left, a free
+                                // corner for YouTube tiles) so you can see what's cached locally.
                                 if self.yt_videos.contains_key(path) && self.yt_is_downloaded(path)
                                 {
-                                    let dc = c + egui::vec2(-(2.0 * r + 4.0), 0.0);
+                                    let dc = rect.left_top() + egui::vec2(r + 5.0, r + 5.0);
                                     p.circle_filled(dc, r, egui::Color32::from_rgb(40, 160, 70));
                                     p.text(
                                         dc,
@@ -15182,6 +16433,25 @@ impl PixelView {
                                     );
                                 }
                             }
+                        }
+
+                        // "Not installed" badge for owned-but-not-installed Steam games (top-right).
+                        if self.steam_uninstalled.contains(path) {
+                            let p = ui.painter_at(rect);
+                            let font = egui::FontId::proportional((tile * 0.075).clamp(8.0, 12.0));
+                            let g = p.layout_no_wrap(
+                                "not installed".into(),
+                                font,
+                                egui::Color32::from_gray(220),
+                            );
+                            let pad = egui::vec2(5.0, 2.0);
+                            let tr = rect.right_top() + egui::vec2(-5.0, 5.0);
+                            let pill = egui::Rect::from_min_max(
+                                egui::pos2(tr.x - g.size().x - pad.x * 2.0, tr.y),
+                                egui::pos2(tr.x, tr.y + g.size().y + pad.y * 2.0),
+                            );
+                            p.rect_filled(pill, 3.0, egui::Color32::from_black_alpha(190));
+                            p.galley(pill.min + pad, g, egui::Color32::from_gray(220));
                         }
 
                         // Star-rating overlay (bottom-left of the tile).
@@ -15333,6 +16603,7 @@ impl PixelView {
                                     TilePick::JoinVideos => join_sel = true,
                                     TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                     TilePick::Steam(a) => steam_act = Some((idx, a)),
+                                    TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                                 }
                             }
                         });
@@ -15438,6 +16709,11 @@ impl PixelView {
                 self.steam_action(&p, a);
             }
         }
+        if let Some((i, h)) = yt_quality {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.start_yt_open_quality(p, h);
+            }
+        }
         if pin_current {
             self.pin_current_folder();
         }
@@ -15486,17 +16762,13 @@ impl PixelView {
     /// year / group / pack + a per-row download menu); elsewhere, file columns.
     fn ui_table(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            // A 16colo listing in flight (artist/group/search streams in) → spinner.
-            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // A 16colo listing / Steam-media / YouTube fetch in flight → spinner + status.
+            let loading = self.empty_view_loading();
             // Sensor registered *after* the justified full-rect label so it isn't occluded
             // (see the matching note in `ui_grid`'s empty path).
             let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
-                if loading {
-                    ui.add(egui::Spinner::new().size(40.0));
-                } else {
-                    ui.label("Nothing here. Open a folder.");
-                }
+                self.empty_view_body(ui, loading);
             });
             let empty_bg = (!loading && self.is_local_dir())
                 .then(|| ui.interact(full, ui.id().with("table_empty_bg"), egui::Sense::click()));
@@ -15763,6 +17035,7 @@ impl PixelView {
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
+        let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -16290,6 +17563,7 @@ impl PixelView {
                                 TilePick::JoinVideos => join_sel = true,
                                 TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                 TilePick::Steam(a) => steam_act = Some((idx, a)),
+                                TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                             }
                         }
                     });
@@ -16441,6 +17715,11 @@ impl PixelView {
         if let Some((i, a)) = steam_act {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.steam_action(&p, a);
+            }
+        }
+        if let Some((i, h)) = yt_quality {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.start_yt_open_quality(p, h);
             }
         }
         if pin_current {
@@ -18461,7 +19740,10 @@ impl PixelView {
         // Use the *stretched* height (`sh * aspect_y`) so the minimap matches the main
         // view's CRT aspect — otherwise text-mode art looks squished in the strip
         // relative to what it's previewing.
-        let nav = (!self.immersive && (overflow_x || overflow_y)).then(|| {
+        // No navigator/minimap while a video is playing (the user doesn't want it there, and it
+        // avoids any per-frame minimap work over live frames).
+        let nav = (!self.immersive && self.video_player.is_none() && (overflow_x || overflow_y))
+            .then(|| {
             const M: f32 = 8.0;
             const MAX_W: f32 = 120.0;
             let max_h = (resp.rect.height() - 2.0 * M).max(16.0);
@@ -19813,6 +21095,26 @@ impl PixelView {
                             .on_hover_text("Working… (network / search in progress)");
                         self.want_repaint = true;
                     }
+                    // A YouTube download in flight: live %/ETA/speed + an Abort button.
+                    if self.yt_open_rx.is_some() {
+                        let label = match &self.yt_dl_progress {
+                            Some(p) if !p.eta.is_empty() => {
+                                format!("⬇ {} · ETA {} · {}", p.pct_str(), p.eta, p.speed)
+                            }
+                            Some(p) => format!("⬇ {}", p.pct_str()),
+                            None => "⬇ Starting…".to_string(),
+                        };
+                        ui.label(label);
+                        if ui
+                            .button("✕ Abort")
+                            .on_hover_text("Cancel the YouTube download")
+                            .clicked()
+                        {
+                            self.abort_yt_open();
+                        }
+                        ui.separator();
+                        self.want_repaint = true;
+                    }
                     match self.mode {
                         Mode::Single => {
                             if ui.button("⬅ Grid").clicked() {
@@ -20288,6 +21590,7 @@ impl PixelView {
         }
         if audio_stop {
             self.stop_audio();
+            self.stop_video(); // the global stop halts video sound too
         }
         if audio_panic_now {
             self.audio_panic();
@@ -20377,6 +21680,9 @@ impl PixelView {
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
+        let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
+        let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
+        let mut save_yt_search = false; // "Save this search" clicked in the YouTube tab
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
@@ -20508,6 +21814,53 @@ impl PixelView {
                         if !crate::youtube::available() {
                             ui.weak("yt-dlp not found — install it for playback");
                         }
+                        // Save the current search to Places (a pinned search re-runs on click).
+                        let cur_search = self.folder.as_ref().filter(|f| {
+                            crate::youtube::is_remote(f)
+                                && matches!(
+                                    crate::youtube::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::youtube::SEARCH
+                                )
+                        });
+                        let saved = cur_search.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur_search {
+                            let label = crate::youtube::rel_parts(f)
+                                .get(1)
+                                .cloned()
+                                .unwrap_or_default();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                let btn = ui.button(if saved {
+                                    "★ Saved".to_string()
+                                } else {
+                                    format!("★ Save “{label}”")
+                                });
+                                if btn
+                                    .on_hover_text(
+                                        "Pin this search to Places — click the pin later to re-run it",
+                                    )
+                                    .clicked()
+                                {
+                                    save_yt_search = true;
+                                }
+                            });
+                        }
+                        // Random helpers: play a random current result, or roll a new random game.
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("{} Play random", icons::SHUFFLE))
+                                .on_hover_text("Play a random video from the current results")
+                                .clicked()
+                            {
+                                yt_play_random = true;
+                            }
+                            if ui
+                                .button("🎲 Random game")
+                                .on_hover_text("Pick a random Steam game and search for it")
+                                .clicked()
+                            {
+                                steam_random = true;
+                            }
+                        });
                         if let Some(p) = self.favorites_buttons(
                             ui,
                             icons::GLOBE,
@@ -20517,13 +21870,33 @@ impl PixelView {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
-                        // SteamTube: browse installed games → find YouTube videos for them.
+                        // SteamTube: browse games → detail view / find videos.
                         if ui
-                            .button("🎮 My Steam games")
-                            .on_hover_text("List installed Steam games — click one to find videos")
+                            .button("🎮 Installed games")
+                            .on_hover_text("Installed Steam games (fast — no API key needed)")
                             .clicked()
                         {
                             nav = Some(PathBuf::from(crate::steam::ROOT));
+                        }
+                        // Full-library filters (need the Web API key in Preferences).
+                        let have_key = !self.steam_api_key.trim().is_empty();
+                        ui.add_enabled_ui(have_key, |ui| {
+                            for (label, sub, hover) in [
+                                ("📚 All owned", "all", "Your entire owned library"),
+                                ("⬇ Not installed", "notinstalled", "Owned but not installed"),
+                                ("💤 Never played", "neverplayed", "Owned with zero playtime"),
+                            ] {
+                                if ui.button(label).on_hover_text(hover).clicked() {
+                                    nav = Some(Path::new(crate::steam::ROOT).join(sub));
+                                }
+                            }
+                        });
+                        if ui
+                            .button("🎲 Random (from this list)")
+                            .on_hover_text("Open a random game from whatever's shown above (any filter)")
+                            .clicked()
+                        {
+                            steam_random_view = true;
                         }
                         if ui
                             .button(format!("{} Random game → videos", icons::SHUFFLE))
@@ -20534,6 +21907,8 @@ impl PixelView {
                         }
                         if crate::steam::steam_root().is_none() {
                             ui.weak("No Steam library found");
+                        } else if !have_key {
+                            ui.weak("Add a Steam Web API key in Preferences for your full library");
                         }
                         if let Some(p) =
                             self.favorites_buttons(ui, "🎮", crate::steam::is_remote, false)
@@ -21195,6 +22570,17 @@ impl PixelView {
             self.recall_filter(i);
         } else if steam_random {
             self.steam_random_videos();
+        } else if steam_random_view {
+            self.steam_random_from_view();
+        } else if yt_play_random {
+            self.yt_play_random();
+        } else if save_yt_search {
+            if let Some(f) = self.folder.clone() {
+                if !self.favorites.contains(&f) {
+                    self.favorites.push(f);
+                    self.status = "Saved search to Places (click it to re-run)".into();
+                }
+            }
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
@@ -21501,6 +22887,10 @@ impl eframe::App for PixelView {
         self.poll_colo_open(&ctx);
         self.poll_yt();
         self.poll_yt_open(&ctx);
+        self.poll_yt_meta();
+        self.poll_yt_info();
+        self.poll_steam_media();
+        self.poll_steam_open(&ctx);
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();
@@ -21689,6 +23079,7 @@ impl eframe::App for PixelView {
                 self.apply_rating(stars);
             }
             if esc && self.mode == Mode::Single {
+                self.stop_video(); // don't leave a video's soundtrack playing in the grid
                 self.mode = Mode::Grid;
             }
             if back {
@@ -22192,6 +23583,87 @@ impl eframe::App for PixelView {
                                             self.yt_download_dir = None;
                                         }
                                     });
+                                    // YouTube download quality (also on a per-video right-click).
+                                    ui.horizontal(|ui| {
+                                        ui.label("Quality");
+                                        let cur = match self.yt_max_height {
+                                            0 => "Best".to_string(),
+                                            h => format!("{h}p"),
+                                        };
+                                        egui::ComboBox::from_id_salt("yt_quality")
+                                            .selected_text(cur)
+                                            .show_ui(ui, |ui| {
+                                                for (lbl, h) in [
+                                                    ("480p", 480u32),
+                                                    ("720p", 720),
+                                                    ("1080p", 1080),
+                                                    ("1440p", 1440),
+                                                    ("4K", 2160),
+                                                    ("Best", 0),
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut self.yt_max_height,
+                                                        h,
+                                                        lbl,
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    // Cookies from a browser → clears YouTube's "confirm you're
+                                    // not a bot" gate (rate-limit) + reaches age-gated videos.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Cookies");
+                                        let cur = if self.yt_cookies_browser.is_empty() {
+                                            "None (anonymous)".to_string()
+                                        } else {
+                                            self.yt_cookies_browser.clone()
+                                        };
+                                        egui::ComboBox::from_id_salt("yt_cookies")
+                                            .selected_text(cur)
+                                            .show_ui(ui, |ui| {
+                                                for b in [
+                                                    "", "firefox", "chrome", "chromium", "brave",
+                                                    "edge", "vivaldi", "opera",
+                                                ] {
+                                                    let lbl = if b.is_empty() {
+                                                        "None (anonymous)"
+                                                    } else {
+                                                        b
+                                                    };
+                                                    ui.selectable_value(
+                                                        &mut self.yt_cookies_browser,
+                                                        b.to_string(),
+                                                        lbl,
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.weak(
+                                        "Pick your browser if YouTube says \"confirm you're not a \
+                                         bot\" or a video is age-restricted (uses that browser's \
+                                         login cookies).",
+                                    );
+                                }
+
+                                // Steam Web API key → your full owned library (Installed / Not
+                                // installed / Never played). Free from steamcommunity.com/dev/apikey.
+                                if crate::steam::steam_root().is_some() {
+                                    ui.add_space(8.0);
+                                    ui.label("Steam Web API key");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.steam_api_key)
+                                                .password(true)
+                                                .hint_text("32-hex key")
+                                                .desired_width(220.0),
+                                        );
+                                        if ui.button("Get key…").clicked() {
+                                            self.open_url("https://steamcommunity.com/dev/apikey");
+                                        }
+                                    });
+                                    ui.weak(
+                                        "Stored locally only. Enables the full owned-games library.",
+                                    );
                                 }
 
                                 // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
@@ -22577,6 +24049,16 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
+        eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
+        eframe::set_value(
+            storage,
+            Self::YT_OPEN_FOLDER_KEY,
+            &self.yt_open_folder_after,
+        );
+        eframe::set_value(storage, Self::YT_COOKIES_KEY, &self.yt_cookies_browser);
+        eframe::set_value(storage, Self::RECOLOR_PLAYBACK_KEY, &self.recolor_playback);
+        eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
+        eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -24724,6 +26206,7 @@ fn sorted_filtered_view(
     name_filter: Option<&str>,
     meta: &HashMap<PathBuf, ImgMeta>,
     pieces: &HashMap<PathBuf, ColoPiece>,
+    yt: &HashMap<PathBuf, crate::youtube::YtVideo>,
 ) -> Vec<Entry> {
     use std::cmp::Ordering;
     let needle = name_filter
@@ -24757,6 +26240,9 @@ fn sorted_filtered_view(
     let group = |e: &Entry| piece(e).map(|p| p.group.to_ascii_lowercase());
     let year = |e: &Entry| piece(e).map(|p| p.year);
     let pack = |e: &Entry| piece(e).map(|p| p.pack.to_ascii_lowercase());
+    // YouTube result metadata (duration seconds / view count), from the flat search.
+    let duration = |e: &Entry| yt.get(&e.path).map(|v| v.duration);
+    let views = |e: &Entry| yt.get(&e.path).map(|v| v.views);
 
     // Archives sort alongside folders (they're navigated into like folders).
     let folder_like = |e: &Entry| e.is_dir || e.is_archive;
@@ -24807,10 +26293,41 @@ fn sorted_filtered_view(
             SortKey::Group => group(a).cmp(&group(b)),
             SortKey::Year => year(a).cmp(&year(b)),
             SortKey::Pack => pack(a).cmp(&pack(b)),
+            // YouTube: unknown (non-result) sorts last in both directions, like Colors.
+            SortKey::Duration => match (duration(a), duration(b)) {
+                (Some(x), Some(y)) => {
+                    let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            SortKey::Views => match (views(a), views(b)) {
+                (Some(x), Some(y)) => {
+                    let ord = x.cmp(&y);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
         };
-        // Colors/Dimensions already applied their own direction (so unknowns stay
-        // last); the other keys flip here.
-        let primary = if desc && !matches!(key, SortKey::Colors | SortKey::Dimensions) {
+        // Colors/Dimensions/Duration/Views already applied their own direction (so
+        // unknowns stay last); the other keys flip here.
+        let primary = if desc
+            && !matches!(
+                key,
+                SortKey::Colors | SortKey::Dimensions | SortKey::Duration | SortKey::Views
+            ) {
             primary.reverse()
         } else {
             primary
@@ -27732,9 +29249,11 @@ fn yt_walk(
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<YtMsg>,
+    cookies: String,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let vids = crate::youtube::search(query, 40);
+    let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+    let vids = crate::youtube::search(query, 40, cookies);
     let mut seen = std::collections::HashSet::new();
     let mut n = 0usize;
     for v in vids {
@@ -28795,6 +30314,26 @@ enum TilePick {
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
+    YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
+}
+
+/// Which slice of the Steam library to list.
+#[derive(Clone, Copy, PartialEq)]
+enum SteamFilter {
+    Installed,    // fast local scan (no key)
+    All,          // full owned library (Web API key)
+    NotInstalled, // owned but not installed
+    NeverPlayed,  // owned with 0 playtime
+}
+impl SteamFilter {
+    fn label(self) -> &'static str {
+        match self {
+            SteamFilter::Installed => "installed",
+            SteamFilter::All => "owned",
+            SteamFilter::NotInstalled => "not-installed",
+            SteamFilter::NeverPlayed => "never-played",
+        }
+    }
 }
 
 /// A right-click action on a Steam game tile.
@@ -29438,6 +30977,21 @@ fn entry_context_menu(
             pick = Some(TilePick::OpenInBrowser);
             ui.close();
         }
+        ui.menu_button(format!("{} Download quality", icons::DOWNLOAD), |ui| {
+            for (label, h) in [
+                ("480p", 480u32),
+                ("720p", 720),
+                ("1080p", 1080),
+                ("1440p", 1440),
+                ("4K", 2160),
+                ("Best", 0),
+            ] {
+                if ui.button(label).clicked() {
+                    pick = Some(TilePick::YtQuality(h));
+                    ui.close();
+                }
+            }
+        });
         ui.separator();
     }
     // Compare (files only): mark this file as the "source" (left) or "diff" (right)
@@ -31874,6 +33428,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["z_dir", "a.png", "b.png"]);
@@ -31895,6 +33450,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["d", "high.png"]);
@@ -31914,6 +33470,7 @@ mod tests {
             false,
             0,
             None,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -31953,6 +33510,7 @@ mod tests {
             None,
             &meta,
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["few.png", "mid.png", "many.png", "unknown.png"]);
@@ -31965,6 +33523,7 @@ mod tests {
             0,
             None,
             &meta,
+            &HashMap::new(),
             &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
@@ -31985,6 +33544,7 @@ mod tests {
             true,
             0,
             Some("cat"),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -32045,6 +33605,7 @@ mod tests {
             None,
             &HashMap::new(),
             &pieces,
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["a.ans", "b.ans", "c.ans"]);
@@ -32059,6 +33620,7 @@ mod tests {
             None,
             &HashMap::new(),
             &pieces,
+            &HashMap::new(),
         );
         let years: Vec<_> = v.iter().map(|e| pieces[&e.path].year).collect::<Vec<_>>();
         assert_eq!(years, vec![2002, 1994, 1991]);

@@ -24,10 +24,12 @@ use std::sync::Arc;
 
 use crate::decode::VideoInfo;
 
-/// Longest side (px) of decoded display frames. Streaming *raw* RGBA is bandwidth-heavy, so we
-/// let ffmpeg downscale before the pipe — a 1600px frame is ~10 MB, ×`FRAME_BUF` ≈ 60 MB max.
-/// PNG *export* re-grabs at native resolution, so this only bounds the on-screen preview.
-const DISPLAY_CAP: u32 = 1600;
+/// Longest side (px) of decoded display frames. Streaming *raw* RGBA is bandwidth-heavy (a
+/// 1280×720 frame is ~3.7 MB; every displayed frame is both piped AND uploaded to a GPU texture),
+/// so we let ffmpeg downscale before the pipe to keep playback smooth — dropping from 1600→1280
+/// cuts ~36% of per-frame bandwidth. PNG/clip *export* re-grabs at native resolution, so this
+/// only bounds the on-screen preview.
+const DISPLAY_CAP: u32 = 1280;
 /// Frames buffered ahead of the playhead (the backpressure window).
 const FRAME_BUF: usize = 8;
 
@@ -329,6 +331,11 @@ pub struct VideoPlayer {
     pub speed: f32,
     /// Wall-clock playhead used only when there's no audio track to sync to.
     wall: f32,
+    /// When paused, the frozen clip time the frame clock holds at. `None` while playing. This is
+    /// authoritative because rodio's `get_pos()` (which `Sound::pos()` reads) keeps advancing even
+    /// while the sink is paused — without freezing it here the audio pauses but the *video* keeps
+    /// playing (frames chase the still-advancing clock).
+    paused_clock: Option<f32>,
     pub ended: bool,
 }
 
@@ -359,12 +366,14 @@ impl VideoPlayer {
             playing: false,
             speed: 1.0,
             wall: 0.0,
+            paused_clock: Some(0.0), // starts paused at 0 until `play_from`/autoplay clears it
             ended: false,
         };
         if let Some(s) = vp.sound.as_mut() {
             s.play_from(0.0, autoplay);
         }
         vp.playing = autoplay;
+        vp.paused_clock = if autoplay { None } else { Some(0.0) };
         vp
     }
 
@@ -375,6 +384,10 @@ impl VideoPlayer {
     /// The master playback clock in clip seconds: the audio position when there's a soundtrack,
     /// else the wall-clock accumulator. This is what the frame selection below chases.
     fn clock(&self) -> f32 {
+        // While paused the clock is frozen (see `paused_clock`) so frames don't advance.
+        if let Some(t) = self.paused_clock {
+            return t;
+        }
         match &self.sound {
             Some(s) => s.pos(),
             None => self.wall,
@@ -425,6 +438,7 @@ impl VideoPlayer {
             if self.playing && st.finished && st.pending.is_none() && t > self.cur_pts + 0.25 {
                 self.playing = false;
                 self.ended = true;
+                self.paused_clock = Some(t); // freeze the clock at the end
                 if let Some(s) = self.sound.as_ref() {
                     s.pause();
                 }
@@ -443,15 +457,22 @@ impl VideoPlayer {
     }
 
     pub fn set_playing(&mut self, play: bool) {
-        self.playing = play;
         self.ended = false;
-        if let Some(s) = self.sound.as_ref() {
-            if play {
-                s.resume();
-            } else {
+        if play {
+            // Resume from the frozen clock. Re-cue the soundtrack there (rather than a bare
+            // `resume`) so audio realigns to the video even though `get_pos` drifted while paused.
+            let at = self.paused_clock.take().unwrap_or_else(|| self.clock());
+            self.wall = at;
+            if let Some(s) = self.sound.as_mut() {
+                s.play_from(at, true);
+            }
+        } else {
+            self.paused_clock = Some(self.clock()); // freeze here
+            if let Some(s) = self.sound.as_ref() {
                 s.pause();
             }
         }
+        self.playing = play;
     }
 
     /// Seek to `secs`: respawn the frame stream there and re-cue the soundtrack, preserving the
@@ -460,6 +481,10 @@ impl VideoPlayer {
         let t = secs.clamp(0.0, self.duration().max(0.0));
         self.ended = false;
         self.wall = t;
+        // Move the frozen clock too so a seek-while-paused cues (and holds) the sought frame.
+        if self.paused_clock.is_some() {
+            self.paused_clock = Some(t);
+        }
         // Drop the old stream (kills ffmpeg) and start a fresh one at the seek point.
         self.stream = FrameStream::spawn(&self.path, self.disp_w, self.disp_h, self.info.fps, t);
         if let Some(s) = self.sound.as_mut() {
@@ -475,6 +500,10 @@ impl VideoPlayer {
         let t = secs.clamp(0.0, self.duration().max(0.0));
         self.ended = false;
         self.wall = t;
+        // Cue the frame to `t` even while paused (so scrubbing shows the frame under the playhead).
+        if self.paused_clock.is_some() {
+            self.paused_clock = Some(t);
+        }
         self.stream = FrameStream::spawn(&self.path, self.disp_w, self.disp_h, self.info.fps, t);
         if let Some(s) = self.sound.as_mut() {
             s.play_from(t, true); // audible while scrubbing, regardless of play/pause
@@ -501,10 +530,11 @@ impl VideoPlayer {
     pub fn set_speed(&mut self, speed: f32) {
         let sp = speed.clamp(0.25, 4.0);
         self.speed = sp;
+        let at = self.clock(); // respects the paused-freeze
+        let playing = self.playing;
         if let Some(s) = self.sound.as_mut() {
             s.speed = sp;
-            let at = s.pos();
-            s.play_from(at, self.playing);
+            s.play_from(at, playing);
         }
     }
 
@@ -539,10 +569,10 @@ mod tests {
 
     #[test]
     fn display_dims_caps_and_evens() {
-        // 4K → capped to 1600 longest side, even dims, aspect preserved.
+        // 4K → capped to DISPLAY_CAP (1280) longest side, even dims, aspect preserved.
         let (w, h) = display_dims(&info(3840, 2160));
-        assert_eq!(w, 1600);
-        assert_eq!(h, 900);
+        assert_eq!(w, DISPLAY_CAP);
+        assert_eq!(h, 720);
         assert_eq!(w % 2, 0);
         assert_eq!(h % 2, 0);
         // Small video is not upscaled.
