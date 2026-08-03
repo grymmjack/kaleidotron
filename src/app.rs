@@ -3929,6 +3929,14 @@ impl PixelView {
         }
     }
 
+    /// Pause the video player (silences its soundtrack + halts frame advance) without tearing it
+    /// down, so re-opening the same video resumes. Wired to leaving the viewer + the global stop.
+    fn stop_video(&mut self) {
+        if let Some(vp) = &mut self.video_player {
+            vp.set_playing(false);
+        }
+    }
+
     /// PANIC — stop the main player AND every sample-pad voice at once (all sound off, incl. a
     /// runaway looping pad). Since MIDI keys only ever start pad voices, this is also the
     /// "all notes off". Bound to the transport Panic button + Shift+Esc.
@@ -3936,6 +3944,9 @@ impl PixelView {
         self.pad_assign = None; // also cancel a pending MIDI-learn
         if let Some(ap) = &mut self.audio_player {
             ap.panic();
+        }
+        if let Some(vp) = &mut self.video_player {
+            vp.set_playing(false); // panic also silences the video soundtrack
         }
         self.status = "Panic — all sound stopped".into();
     }
@@ -20288,6 +20299,7 @@ impl PixelView {
         }
         if audio_stop {
             self.stop_audio();
+            self.stop_video(); // the global stop halts video sound too
         }
         if audio_panic_now {
             self.audio_panic();
@@ -21689,6 +21701,7 @@ impl eframe::App for PixelView {
                 self.apply_rating(stars);
             }
             if esc && self.mode == Mode::Single {
+                self.stop_video(); // don't leave a video's soundtrack playing in the grid
                 self.mode = Mode::Grid;
             }
             if back {
