@@ -1,0 +1,275 @@
+//! "SteamTube": introspect the local Steam library (installed games) so pixelview can list them,
+//! search them, and — clicking a game — find related YouTube videos (routes to the YouTube source).
+//!
+//! Pure (no egui): reads Steam's VDF/ACF KeyValues config files off disk + a tiny field parser.
+//! Detects native, `.steam`, Flatpak and Snap installs. Empty if Steam isn't installed.
+
+use std::path::{Path, PathBuf};
+
+/// Virtual root for the Steam library (mirrors `sixteen::ROOT` / `youtube::ROOT`).
+pub const ROOT: &str = "<steam>";
+
+pub fn is_remote(path: &Path) -> bool {
+    path.starts_with(ROOT)
+}
+
+/// Path components below [`ROOT`].
+pub fn rel_parts(path: &Path) -> Vec<String> {
+    path.strip_prefix(ROOT)
+        .ok()
+        .map(|rest| {
+            rest.components()
+                .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One installed Steam game.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct SteamGame {
+    pub appid: u32,
+    pub name: String,
+    pub last_played: u64, // unix seconds (0 = never)
+    pub size: u64,        // bytes on disk
+}
+
+impl SteamGame {
+    /// Steam CDN header image (460×215) — the grid-tile thumbnail. Universal across games.
+    pub fn header_url(&self) -> String {
+        format!(
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/{}/header.jpg",
+            self.appid
+        )
+    }
+    /// The store page (for a right-click "Open store page").
+    pub fn store_url(&self) -> String {
+        format!("https://store.steampowered.com/app/{}/", self.appid)
+    }
+    /// `steam://` deep-link that launches the game through the Steam client (via xdg-open).
+    pub fn run_url(&self) -> String {
+        format!("steam://rungameid/{}", self.appid)
+    }
+    /// The community hub web page.
+    pub fn hub_url(&self) -> String {
+        format!("https://steamcommunity.com/app/{}", self.appid)
+    }
+    /// The community discussions web page.
+    pub fn discussions_url(&self) -> String {
+        format!("https://steamcommunity.com/app/{}/discussions/", self.appid)
+    }
+}
+
+/// Candidate Steam data roots: native, classic `.steam`, Flatpak, Snap.
+fn steam_roots() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    [
+        ".local/share/Steam",
+        ".steam/steam",
+        ".steam/root",
+        ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        "snap/steam/common/.local/share/Steam",
+    ]
+    .iter()
+    .map(|r| home.join(r))
+    .collect()
+}
+
+/// The first Steam root that actually has a `steamapps` dir, or `None` (Steam not installed).
+pub fn steam_root() -> Option<PathBuf> {
+    steam_roots()
+        .into_iter()
+        .find(|p| p.join("steamapps").is_dir())
+}
+
+/// Every `steamapps` dir across libraries (follows `libraryfolders.vdf` to other drives).
+fn steamapps_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.join("steamapps")];
+    let lf = root.join("steamapps/libraryfolders.vdf");
+    if let Ok(text) = std::fs::read_to_string(&lf) {
+        for path in vdf_values(&text, "path") {
+            let d = Path::new(&path).join("steamapps");
+            if d.is_dir() && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs
+}
+
+/// Names that are tools/runtimes, not games — skipped from the listing.
+fn is_nongame(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("proton")
+        || n.starts_with("steam linux runtime")
+        || n.starts_with("steamworks common")
+        || n == "steamvr"
+}
+
+/// All installed games across every library, de-duped, sorted by name. Empty if Steam is absent.
+pub fn installed_games() -> Vec<SteamGame> {
+    let mut games: Vec<SteamGame> = Vec::new();
+    let Some(root) = steam_root() else {
+        return games;
+    };
+    for sa in steamapps_dirs(&root) {
+        let Ok(rd) = std::fs::read_dir(&sa) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let manifest = p
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|n| n.starts_with("appmanifest_") && n.ends_with(".acf"));
+            if !manifest {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Some(g) = parse_manifest(&text) {
+                    if !is_nongame(&g.name) {
+                        games.push(g);
+                    }
+                }
+            }
+        }
+    }
+    games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    games.dedup_by_key(|g| g.appid);
+    games
+}
+
+/// Parse one `appmanifest_*.acf` into a [`SteamGame`]. `None` without a valid appid + name.
+pub fn parse_manifest(text: &str) -> Option<SteamGame> {
+    let appid: u32 = vdf_value(text, "appid")?.parse().ok()?;
+    let name = vdf_value(text, "name").unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    Some(SteamGame {
+        appid,
+        name,
+        last_played: vdf_value(text, "LastPlayed")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        size: vdf_value(text, "SizeOnDisk")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
+}
+
+/// The value of the first `"<key>"  "<value>"` line in a VDF/ACF blob (the line must *start* with
+/// the quoted key, so `"name"` won't match a nested `"gamename"`).
+fn vdf_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&needle)
+            .and_then(|rest| quoted(rest.trim_start()))
+    })
+}
+
+/// Every value for `"<key>"` (e.g. all `"path"` entries in `libraryfolders.vdf`).
+fn vdf_values(text: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(&needle)
+                .and_then(|rest| quoted(rest.trim_start()))
+        })
+        .collect()
+}
+
+/// The contents of the first `"…"` quoted token at the start of `s`.
+fn quoted(s: &str) -> Option<String> {
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(s[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACF: &str = r#"
+"AppState"
+{
+	"appid"		"339400"
+	"name"		"Runestone Keeper"
+	"StateFlags"		"4"
+	"installdir"		"Runestone Keeper"
+	"LastPlayed"		"1700000000"
+	"SizeOnDisk"		"227208092"
+}
+"#;
+
+    #[test]
+    fn parses_a_manifest() {
+        let g = parse_manifest(ACF).expect("parses");
+        assert_eq!(g.appid, 339400);
+        assert_eq!(g.name, "Runestone Keeper");
+        assert_eq!(g.last_played, 1700000000);
+        assert_eq!(g.size, 227208092);
+        assert_eq!(
+            g.header_url(),
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/339400/header.jpg"
+        );
+    }
+
+    #[test]
+    fn nongames_are_flagged() {
+        assert!(is_nongame("Proton 9.0"));
+        assert!(is_nongame("Steam Linux Runtime 3.0 (sniper)"));
+        assert!(is_nongame("Steamworks Common Redistributables"));
+        assert!(!is_nongame("Elden Ring"));
+    }
+
+    #[test]
+    fn libraryfolders_paths_extracted() {
+        let vdf = r#"
+"libraryfolders"
+{
+	"0"
+	{
+		"path"		"/home/u/.local/share/Steam"
+	}
+	"1"
+	{
+		"path"		"/mnt/games/SteamLibrary"
+	}
+}
+"#;
+        let paths = vdf_values(vdf, "path");
+        assert_eq!(
+            paths,
+            vec!["/home/u/.local/share/Steam", "/mnt/games/SteamLibrary"]
+        );
+    }
+
+    /// Reads the machine's REAL Steam library (native/flatpak/…). `#[ignore]` — machine-specific,
+    /// like the network tests. Run with `cargo test steam -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn lists_real_library() {
+        match steam_root() {
+            Some(root) => {
+                let games = installed_games();
+                eprintln!("steam root: {}\n{} games:", root.display(), games.len());
+                for g in games.iter().take(8) {
+                    eprintln!("  [{}] {}  → {}", g.appid, g.name, g.header_url());
+                }
+                assert!(!games.is_empty(), "found a Steam root but no games");
+            }
+            None => eprintln!("no Steam install on this machine — skipping"),
+        }
+    }
+
+    #[test]
+    fn missing_fields_reject() {
+        assert!(parse_manifest("\"appid\" \"1\"").is_none()); // no name
+        assert!(parse_manifest("\"name\" \"x\"").is_none()); // no appid
+    }
+}

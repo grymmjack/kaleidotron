@@ -17,6 +17,7 @@ mod scale;
 mod sfz;
 mod sixteen;
 mod soundfont;
+mod steam;
 mod thumb;
 mod video;
 mod viewdb;
