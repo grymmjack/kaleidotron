@@ -1547,6 +1547,10 @@ pub struct PixelView {
     yt_meta_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::youtube::YtMeta)>>,
     yt_meta_pending: Option<PathBuf>,
     yt_search: String, // the YouTube Places-tab search box text
+    // Browser to pull YouTube cookies from (Preferences) — passed to yt-dlp as
+    // `--cookies-from-browser` to clear the "confirm you're not a bot" gate + reach age-gated
+    // videos. "" = anonymous (no cookies).
+    yt_cookies_browser: String,
     yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
@@ -1618,6 +1622,7 @@ impl PixelView {
     const YT_DIR_KEY: &'static str = "yt_download_dir";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
+    const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
@@ -1792,6 +1797,10 @@ impl PixelView {
         let steam_api_key = cc
             .storage
             .and_then(|s| eframe::get_value::<String>(s, Self::STEAM_KEY_KEY))
+            .unwrap_or_default();
+        let yt_cookies_browser = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::YT_COOKIES_KEY))
             .unwrap_or_default();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let yt_open_folder_after = load_bool(Self::YT_OPEN_FOLDER_KEY, false);
@@ -2689,6 +2698,7 @@ impl PixelView {
             yt_meta_rx: None,
             yt_meta_pending: None,
             yt_search: String::new(),
+            yt_cookies_browser,
             yt_downloaded_ids: std::collections::HashSet::new(),
             steam_games: HashMap::new(),
             steam_uninstalled: std::collections::HashSet::new(),
@@ -3665,7 +3675,8 @@ impl PixelView {
         self.yt_rx = Some(rx);
         self.yt_cancel = Some(cancel.clone());
         self.status = format!("Searching YouTube: {query}");
-        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx));
+        let cookies = self.yt_cookies_browser.clone();
+        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx, cookies));
     }
 
     /// Drain the YouTube search worker each frame (mirrors `poll_colo_pieces`): append hits to
@@ -3750,6 +3761,7 @@ impl PixelView {
         }
         let dir = self.yt_cache_dir();
         let height = self.yt_max_height;
+        let cookies = self.yt_cookies_browser.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.yt_open_rx = Some(rx);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3758,17 +3770,12 @@ impl PixelView {
         self.status = "Downloading from YouTube…".into();
         std::thread::spawn(move || {
             let tx_prog = tx.clone();
-            let mut on_progress =
-                move |p: crate::youtube::DlProgress| {
-                    let _ = tx_prog.send(YtOpenMsg::Progress(p));
-                };
-            let res = match crate::youtube::download(&id, &dir, height, &cancel, &mut on_progress) {
-                Some(local) => Ok((vpath, local)),
-                None => Err(
-                    "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
-                        .to_string(),
-                ),
+            let mut on_progress = move |p: crate::youtube::DlProgress| {
+                let _ = tx_prog.send(YtOpenMsg::Progress(p));
             };
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            let res = crate::youtube::download(&id, &dir, height, cookies, &cancel, &mut on_progress)
+                .map(|local| (vpath, local));
             let _ = tx.send(YtOpenMsg::Done(res));
         });
     }
@@ -3864,8 +3871,10 @@ impl PixelView {
         self.yt_meta_rx = Some(rx);
         self.yt_meta_pending = Some(vpath.to_path_buf());
         let vpath = vpath.to_path_buf();
+        let cookies = self.yt_cookies_browser.clone();
         std::thread::spawn(move || {
-            if let Some(meta) = crate::youtube::fetch_video_meta(&id) {
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            if let Some(meta) = crate::youtube::fetch_video_meta(&id, cookies) {
                 let _ = tx.send((vpath, meta));
             }
         });
@@ -23194,6 +23203,40 @@ impl eframe::App for PixelView {
                                                 }
                                             });
                                     });
+                                    // Cookies from a browser → clears YouTube's "confirm you're
+                                    // not a bot" gate (rate-limit) + reaches age-gated videos.
+                                    ui.horizontal(|ui| {
+                                        ui.label("Cookies");
+                                        let cur = if self.yt_cookies_browser.is_empty() {
+                                            "None (anonymous)".to_string()
+                                        } else {
+                                            self.yt_cookies_browser.clone()
+                                        };
+                                        egui::ComboBox::from_id_salt("yt_cookies")
+                                            .selected_text(cur)
+                                            .show_ui(ui, |ui| {
+                                                for b in [
+                                                    "", "firefox", "chrome", "chromium", "brave",
+                                                    "edge", "vivaldi", "opera",
+                                                ] {
+                                                    let lbl = if b.is_empty() {
+                                                        "None (anonymous)"
+                                                    } else {
+                                                        b
+                                                    };
+                                                    ui.selectable_value(
+                                                        &mut self.yt_cookies_browser,
+                                                        b.to_string(),
+                                                        lbl,
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.weak(
+                                        "Pick your browser if YouTube says \"confirm you're not a \
+                                         bot\" or a video is age-restricted (uses that browser's \
+                                         login cookies).",
+                                    );
                                 }
 
                                 // Steam Web API key → your full owned library (Installed / Not
@@ -23606,6 +23649,7 @@ impl eframe::App for PixelView {
             Self::YT_OPEN_FOLDER_KEY,
             &self.yt_open_folder_after,
         );
+        eframe::set_value(storage, Self::YT_COOKIES_KEY, &self.yt_cookies_browser);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
@@ -28762,9 +28806,11 @@ fn yt_walk(
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<YtMsg>,
+    cookies: String,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let vids = crate::youtube::search(query, 40);
+    let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+    let vids = crate::youtube::search(query, 40, cookies);
     let mut seen = std::collections::HashSet::new();
     let mut n = 0usize;
     for v in vids {

@@ -122,14 +122,14 @@ impl YtMeta {
 
 /// Fetch one video's full metadata via `yt-dlp --dump-json` (no download). `None` if yt-dlp
 /// fails / is absent — the caller degrades to whatever the flat search already had.
-pub fn fetch_video_meta(id: &str) -> Option<YtMeta> {
+pub fn fetch_video_meta(id: &str, cookies: Option<&str>) -> Option<YtMeta> {
     let watch = format!("https://www.youtube.com/watch?v={id}");
-    let out = Command::new("yt-dlp")
-        .args(["--dump-json", "--no-warnings", "--skip-download", "--"])
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--dump-json", "--no-warnings", "--skip-download", "--"])
         .arg(&watch)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -236,14 +236,16 @@ pub fn parse_entry(line: &str) -> Option<YtVideo> {
 
 /// Run a YouTube search (`ytsearch<n>:<query>`) via yt-dlp's flat/fast mode. Empty vec if yt-dlp
 /// is absent or errors — the caller shows a "not installed / no results" status.
-pub fn search(query: &str, n: usize) -> Vec<YtVideo> {
+pub fn search(query: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
     let spec = format!("ytsearch{}:{}", n.max(1), query);
-    let out = Command::new("yt-dlp")
-        .args(["--dump-json", "--flat-playlist", "--no-warnings", &spec])
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--dump-json", "--flat-playlist", "--no-warnings", &spec])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let Ok(out) = out else { return Vec::new() };
+        .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let Ok(out) = cmd.output() else {
+        return Vec::new();
+    };
     if !out.status.success() {
         return Vec::new();
     }
@@ -251,6 +253,17 @@ pub fn search(query: &str, n: usize) -> Vec<YtVideo> {
         .lines()
         .filter_map(parse_entry)
         .collect()
+}
+
+/// Append `--cookies-from-browser <b>` when a browser is configured (Preferences → YouTube
+/// cookies) — authenticates yt-dlp as the signed-in user, which clears YouTube's "confirm you're
+/// not a bot" gate + reaches age-restricted / members' videos. Empty ⇒ no cookies (anonymous).
+fn push_cookie_args(cmd: &mut Command, cookies: Option<&str>) {
+    if let Some(b) = cookies {
+        if !b.trim().is_empty() {
+            cmd.args(["--cookies-from-browser", b.trim()]);
+        }
+    }
 }
 
 /// Resolve a **single** direct stream URL for `id` — a progressive/muxed format ≤720p so it's one
@@ -346,21 +359,23 @@ pub fn download(
     id: &str,
     dir: &std::path::Path,
     max_height: u32,
+    cookies: Option<&str>,
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: &mut dyn FnMut(DlProgress),
-) -> Option<std::path::PathBuf> {
-    use std::io::{BufRead, BufReader};
+) -> Result<std::path::PathBuf, String> {
+    use std::io::{BufRead, BufReader, Read};
     use std::sync::atomic::Ordering::Relaxed;
-    // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
+    let found = |dir: &std::path::Path| -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
             let p = e.path();
-            if p.file_stem().and_then(|s| s.to_str()) == Some(id)
-                && p.extension().is_some_and(|x| x != "part")
-            {
-                return Some(p);
-            }
-        }
+            (p.file_stem().and_then(|s| s.to_str()) == Some(id)
+                && p.extension().is_some_and(|x| x != "part"))
+            .then_some(p)
+        })
+    };
+    // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
+    if let Some(p) = found(dir) {
+        return Ok(p);
     }
     let _ = std::fs::create_dir_all(dir);
     let watch = format!("https://www.youtube.com/watch?v={id}");
@@ -375,29 +390,43 @@ pub fn download(
         )
     };
     // `--newline` + a machine-readable progress template on stdout → parse per-line for the ETA.
-    let mut child = Command::new("yt-dlp")
-        .args([
-            "-f",
-            &fmt,
-            "--no-warnings",
-            "--newline",
-            "--progress-template",
-            "PV|%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s",
-            "-o",
-        ])
-        .arg(&out_tmpl)
-        .arg(&watch)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "-f",
+        &fmt,
+        "--no-warnings",
+        "--newline",
+        "--progress-template",
+        "PV|%(progress._percent_str)s|%(progress._eta_str)s|%(progress._speed_str)s",
+        "-o",
+    ])
+    .arg(&out_tmpl)
+    .arg(&watch)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    push_cookie_args(&mut cmd, cookies);
+    let mut child = cmd
         .spawn()
-        .ok()?;
+        .map_err(|_| "yt-dlp not found on PATH — install it (see the README).".to_string())?;
+    // Drain stderr on a thread (so a full pipe can't deadlock the download) and keep it for a
+    // precise failure message — the "confirm you're not a bot" gate needs a very different hint
+    // than "update yt-dlp".
+    let stderr = child.stderr.take();
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
     if let Some(out) = child.stdout.take() {
         for line in BufReader::new(out).lines() {
             if cancel.load(Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = err_thread.join();
                 remove_partials(dir, id);
-                return None;
+                return Err("aborted".to_string());
             }
             let Ok(line) = line else { break };
             if let Some(p) = parse_progress(&line) {
@@ -405,21 +434,31 @@ pub fn download(
             }
         }
     }
-    let status = child.wait().ok()?;
+    let status = child.wait().ok();
+    let stderr_text = err_thread.join().unwrap_or_default();
     if cancel.load(Relaxed) {
         remove_partials(dir, id);
-        return None;
+        return Err("aborted".to_string());
     }
-    if !status.success() {
-        return None;
+    if status.map(|s| s.success()).unwrap_or(false) {
+        return found(dir).ok_or_else(|| "yt-dlp finished but produced no file".to_string());
     }
-    // Find the produced `<id>.<ext>`.
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-        let p = e.path();
-        (p.file_stem().and_then(|s| s.to_str()) == Some(id)
-            && p.extension().is_some_and(|x| x != "part"))
-        .then_some(p)
-    })
+    // Failure: map the stderr to an actionable hint.
+    let low = stderr_text.to_lowercase();
+    if low.contains("not a bot")
+        || low.contains("sign in to confirm")
+        || low.contains("http error 429")
+        || low.contains("rate limit")
+        || low.contains("too many requests")
+    {
+        Err("YouTube is rate-limiting this IP (bot check). Set “YouTube cookies from browser” \
+             in Preferences, or wait a while."
+            .to_string())
+    } else if low.contains("age") && low.contains("confirm") {
+        Err("Age-restricted — set “YouTube cookies from browser” in Preferences.".to_string())
+    } else {
+        Err("YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp).".to_string())
+    }
 }
 
 /// Is `yt-dlp` on PATH? (Gates the YouTube UI / shows a "install yt-dlp" hint.)
