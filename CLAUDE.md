@@ -1107,10 +1107,14 @@ audio toggle doesn't gate it.
   -safe 0 -i list -c copy` = lossless (re-encode fallback). Works when the clips share codec/size
   (splits of one source, same-camera takes); differing clips would need the concat *filter* (scaling),
   out of scope. rfd dialog, default `joined.<ext>`.
-- **Still TODO** (follow-ups, deferred): **hover-scrub thumbnails** (grid tile + Details preview —
-  needs an async frame-strip generator, since one-off `ffmpeg -ss` per hover-x is too slow; precompute
-  N frames on hover-start + map pointer-x → nearest, like a YouTube storyboard), and the **YouTube
-  browser** (Phase 3 — `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` +
+- **Hover-scrub thumbnails (grid).** Hovering a video tile extracts a strip of ~12 evenly-spaced
+  frames (`VideoStrip`, `start_video_strip` → `extract_video_strip` on a worker: **one** ffmpeg pass,
+  `-vf fps=N/duration` → numbered PNGs in a temp dir, read back), uploaded once ready; moving the
+  pointer horizontally across the tile maps x → a frame (YouTube-storyboard style), with a thin
+  scrub-position bar. Mirrors the GIF `hover_anim` structure (`video_hover` field, detect at the top
+  of `ui_grid`, a paint branch before the GIF one). Verified scrubbing by the user.
+- **Still TODO** (follow-ups, deferred): hover-scrub in the **Details preview** too (grid done), and
+  the **YouTube browser** (Phase 3 — `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` +
   `RemoteThumbs` + this same ffmpeg frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
 
 ## Git status in the browser (`git.rs`)

@@ -364,6 +364,88 @@ struct AnimState {
     acc_ms: f32, // elapsed time accumulated toward the current frame's delay
 }
 
+/// A hovered video's **scrub strip**: N evenly-spaced frames extracted by one background ffmpeg
+/// call, so moving the pointer horizontally across the tile previews the clip over time (like a
+/// file manager / YouTube storyboard). `rx` delivers the raw frames; once uploaded to `frames`
+/// (textures) the strip is ready. `path` is the tile's (display) identity.
+struct VideoStrip {
+    path: PathBuf,
+    frames: Vec<egui::TextureHandle>,
+    rx: Option<std::sync::mpsc::Receiver<Vec<(u32, u32, Vec<u8>)>>>,
+}
+
+/// Extract a hover-scrub strip of `~12` frames for `real` (the resolved local file) on a worker
+/// thread, in ONE ffmpeg pass (`-vf fps=N/duration` → numbered PNGs in a temp dir). `id` is the
+/// display path kept for identity. Empty result if ffmpeg/probe fail — the tile keeps its thumb.
+fn start_video_strip(real: &Path, id: PathBuf) -> VideoStrip {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let real = real.to_path_buf();
+    std::thread::spawn(move || {
+        let out = extract_video_strip(&real).unwrap_or_default();
+        let _ = tx.send(out);
+    });
+    VideoStrip {
+        path: id,
+        frames: Vec::new(),
+        rx: Some(rx),
+    }
+}
+
+/// The worker body: probe duration, then one ffmpeg pass emitting `N` evenly-spaced PNGs into a
+/// temp dir, read back as `(w, h, rgba)`. Cleans up the temp dir. `None`/empty on any failure.
+fn extract_video_strip(real: &Path) -> Option<Vec<(u32, u32, Vec<u8>)>> {
+    const N: usize = 12;
+    let dur = crate::decode::probe_video(real)
+        .map(|i| i.duration)
+        .unwrap_or(0.0);
+    if dur <= 0.1 {
+        // Unknown length — just grab the first frame so hover still shows something.
+        let img = crate::decode::grab_video_frame(real, 0.0, Some(256))?;
+        return Some(vec![(img.width, img.height, img.rgba_bytes())]);
+    }
+    // A unique temp dir (no Math.random / time in-process here — key off the path bytes).
+    let mut h: u64 = 1469598103934665603;
+    for b in real.to_string_lossy().bytes() {
+        h = (h ^ b as u64).wrapping_mul(1099511628211);
+    }
+    let dir = std::env::temp_dir().join(format!("pv_strip_{h:016x}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let pattern = dir.join("f_%03d.png");
+    let fps = format!("{:.6}", N as f32 / dur);
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "quiet", "-nostdin", "-y", "-i"])
+        .arg(real)
+        .args([
+            "-vf",
+            &format!("fps={fps},scale=256:-1:flags=bilinear"),
+            "-frames:v",
+            &N.to_string(),
+        ])
+        .arg(&pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    let mut out = Vec::new();
+    if status.success() {
+        for i in 1..=N {
+            let f = dir.join(format!("f_{i:03}.png"));
+            let Ok(bytes) = std::fs::read(&f) else { break };
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let img = img.to_rgba8();
+                let (w, hh) = img.dimensions();
+                out.push((w, hh, img.into_raw()));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Simulated modem baud rate for "type-out" / "watch-it-draw" playback of text-mode
 /// (ANSI/ANSImation) and RIP art. `None` renders instantly (no animation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1218,8 +1300,9 @@ pub struct PixelView {
     compare: Compare,                  // transient runtime (textures, per-pane view, overlay)
     saved_compares: Vec<SavedCompare>, // saved, recallable comparisons (persisted)
 
-    anim: Option<AnimState>,       // Some when viewing an animated GIF
-    hover_anim: Option<AnimState>, // the hovered grid GIF, playing in its tile
+    anim: Option<AnimState>,         // Some when viewing an animated GIF
+    hover_anim: Option<AnimState>,   // the hovered grid GIF, playing in its tile
+    video_hover: Option<VideoStrip>, // the hovered grid video's scrub strip (pointer-x → frame)
     video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
@@ -2373,6 +2456,7 @@ impl PixelView {
             full_reduced: None,
             anim: None,
             hover_anim: None,
+            video_hover: None,
             video_player: None,
             video_loading: None,
             video_tex: None,
@@ -14320,6 +14404,51 @@ impl PixelView {
             self.want_repaint = true;
         }
 
+        // Hover-scrub: for a hovered video tile, extract a frame strip (once) so moving the
+        // pointer across the tile previews the clip over time.
+        let vhov = self
+            .hovered
+            .and_then(|i| self.entries.get(i))
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+            .filter(|p| self.plugin_video && is_video_ext(p));
+        match vhov {
+            Some(p)
+                if self
+                    .video_hover
+                    .as_ref()
+                    .map(|s| s.path != p)
+                    .unwrap_or(true) =>
+            {
+                let real = self.resolve_local(&p);
+                self.video_hover = Some(start_video_strip(&real, p));
+            }
+            None => self.video_hover = None,
+            _ => {}
+        }
+        // Upload the strip's frames once the worker delivers them.
+        if let Some(s) = self.video_hover.as_mut() {
+            if let Some(rx) = &s.rx {
+                match rx.try_recv() {
+                    Ok(frames) => {
+                        s.frames = frames
+                            .iter()
+                            .map(|(w, h, px)| {
+                                let img = egui::ColorImage::from_rgba_unmultiplied(
+                                    [*w as usize, *h as usize],
+                                    px,
+                                );
+                                ctx.load_texture("vstrip", img, egui::TextureOptions::LINEAR)
+                            })
+                            .collect();
+                        s.rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => s.rx = None,
+                }
+            }
+        }
+
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut hovered: Option<usize> = None;
         // Right-click file ops are deferred out of the row closure (which holds
@@ -14515,6 +14644,52 @@ impl PixelView {
                                     crate::format_color::color32(ext),
                                 );
                             }
+                        } else if self
+                            .video_hover
+                            .as_ref()
+                            .is_some_and(|s| &s.path == path && !s.frames.is_empty())
+                        {
+                            // Hover-scrub: pointer x across the tile → a frame in the strip.
+                            let (tex, sz, frac) = {
+                                let s = self.video_hover.as_ref().unwrap();
+                                let n = s.frames.len();
+                                let frac = ui
+                                    .input(|i| i.pointer.hover_pos())
+                                    .map(|p| {
+                                        ((p.x - rect.left()) / rect.width().max(1.0))
+                                            .clamp(0.0, 1.0)
+                                    })
+                                    .unwrap_or(0.5);
+                                let idx = ((frac * (n as f32 - 1.0)).round() as usize).min(n - 1);
+                                (s.frames[idx].clone(), s.frames[idx].size_vec2(), frac)
+                            };
+                            let fit = fit_centered(rect.shrink(8.0), sz);
+                            let ppp = ctx.pixels_per_point();
+                            let bp = ui.painter_at(rect);
+                            self.paint_transparency_backdrop(&bp, fit, ppp);
+                            ui.painter().image(
+                                tex.id(),
+                                fit,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                            // A thin scrub-position bar along the tile bottom.
+                            let pr = ui.painter_at(rect);
+                            let y = rect.bottom() - 6.0;
+                            let (lx, rx2) = (rect.left() + 8.0, rect.right() - 8.0);
+                            pr.line_segment(
+                                [egui::pos2(lx, y), egui::pos2(rx2, y)],
+                                egui::Stroke::new(2.0, egui::Color32::from_gray(70)),
+                            );
+                            let px = lx + (rx2 - lx) * frac;
+                            pr.line_segment(
+                                [egui::pos2(px, y - 3.0), egui::pos2(px, y + 3.0)],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 235)),
+                            );
+                            self.want_repaint = true;
                         } else if self.hover_anim.as_ref().is_some_and(|a| &a.path == path) {
                             // Play the hovered GIF in its own tile.
                             let a = self.hover_anim.as_ref().unwrap();
