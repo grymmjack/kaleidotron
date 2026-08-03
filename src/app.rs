@@ -1314,6 +1314,7 @@ pub struct PixelView {
     video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
+    video_recolor_key: Option<String>, // recolor pipeline key last applied → re-colorize a PAUSED frame when it changes
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
     video_md_header: String,         // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
@@ -2520,6 +2521,7 @@ impl PixelView {
             video_player: None,
             video_loading: None,
             video_tex: None,
+            video_recolor_key: None,
             video_markers: Vec::new(),
             video_md_header: String::new(),
             video_marker_sel: None,
@@ -5766,11 +5768,16 @@ impl PixelView {
             (vp.disp_w, vp.disp_h)
         };
 
-        // Upload the frame texture on the UI thread when it changed.
+        // Upload the frame texture on the UI thread when it changed — OR when the Recolor
+        // pipeline changed while PAUSED (no new frames arrive, but `vp.cur` persists, so we can
+        // re-colorize what's on screen live). Turning recolor off re-uploads the raw frame.
+        let pipe_key = self.pipeline_active().then(|| self.pipeline_key());
+        let recolor_changed = pipe_key != self.video_recolor_key;
         let frame = {
             let vp = self.video_player.as_mut()?;
-            if vp.tex_dirty {
-                vp.tex_dirty = false;
+            let dirty = vp.tex_dirty;
+            vp.tex_dirty = false;
+            if dirty || recolor_changed {
                 vp.cur.clone()
             } else {
                 None
@@ -5800,6 +5807,9 @@ impl PixelView {
                     }
                 }
             }
+            // Remember which pipeline we just baked in, so a paused re-tweak (or turning recolor
+            // off) re-uploads once instead of every frame.
+            self.video_recolor_key = pipe_key;
         }
 
         // Snapshot state for the controls.
@@ -5821,7 +5831,7 @@ impl PixelView {
         let mut want_toggle = false;
         let mut want_seek: Option<f32> = None;
         let mut want_speed: Option<f32> = None;
-        let mut want_export = false;
+        let mut want_frame_png: Option<bool> = None; // Some(recolor?) — export the current frame
         let mut want_extract: Option<bool> = None; // Some(open_after)
         let mut want_add_marker = false;
         let mut want_marker_click: Option<usize> = None; // a marker chip was clicked (seek + toggle notes)
@@ -5882,12 +5892,35 @@ impl PixelView {
                     }
                 }
                 ui.separator();
-                if ui
+                // With the Recolor pane active, offer the frame recolored-as-shown OR original;
+                // otherwise a plain one-click PNG.
+                if self.pipeline_active() {
+                    ui.menu_button(format!("{} PNG ▾", icons::DOWNLOAD), |ui| {
+                        if ui
+                            .button("Recolored (as shown)")
+                            .on_hover_text("Save the current frame with the Recolor pipeline baked in")
+                            .clicked()
+                        {
+                            want_frame_png = Some(true);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Original")
+                            .on_hover_text("Save the untouched source frame")
+                            .clicked()
+                        {
+                            want_frame_png = Some(false);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Save the current frame as a PNG (native resolution)");
+                } else if ui
                     .button(format!("{} PNG", icons::DOWNLOAD))
                     .on_hover_text("Save the current frame as a PNG (native resolution)")
                     .clicked()
                 {
-                    want_export = true;
+                    want_frame_png = Some(false);
                 }
                 ui.add_enabled_ui(has_audio, |ui| {
                     ui.menu_button("Audio ▾", |ui| {
@@ -6181,8 +6214,8 @@ impl PixelView {
                 vp.seek(t);
             }
         }
-        if want_export {
-            self.export_video_frame_png();
+        if let Some(recolor) = want_frame_png {
+            self.export_video_frame_png(recolor);
         }
         match want_extract {
             Some(true) => {
@@ -6243,7 +6276,7 @@ impl PixelView {
 
     /// Save the current video frame as a PNG at **native** resolution (re-grabbed at the current
     /// timestamp, so it's full quality, not the downscaled display frame). Auto-named beside the video.
-    fn export_video_frame_png(&mut self) {
+    fn export_video_frame_png(&mut self, recolor: bool) {
         let Some((src, pts)) = self
             .video_player
             .as_ref()
@@ -6255,22 +6288,30 @@ impl PixelView {
             self.status = "PNG export failed (is ffmpeg installed?)".into();
             return;
         };
+        let (w, h) = (img.width as usize, img.height as usize);
+        let mut rgba = img.rgba_bytes();
+        // Bake the Recolor pipeline into the full-res grab so the saved frame matches what's on
+        // screen. Uses the same palette/aux as the live view (`tile_palette` on the source).
+        let recolored = recolor && self.pipeline_active();
+        if recolored {
+            let palette = self.tile_palette(&src);
+            let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+            let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+            let (tw, th) = self.resize_target(w, h);
+            let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        }
         let dir = src.parent().unwrap_or_else(|| Path::new("."));
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
         let tc = format_timecode(pts).replace(':', "-");
-        let mut out = dir.join(format!("{stem}_{tc}.png"));
+        let tag = if recolored { "_recolored" } else { "" };
+        let mut out = dir.join(format!("{stem}_{tc}{tag}.png"));
         let mut n = 1;
         while out.exists() {
-            out = dir.join(format!("{stem}_{tc}_{n}.png"));
+            out = dir.join(format!("{stem}_{tc}{tag}_{n}.png"));
             n += 1;
         }
-        match image::save_buffer(
-            &out,
-            &img.rgba_bytes(),
-            img.width,
-            img.height,
-            image::ColorType::Rgba8,
-        ) {
+        match image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
             Ok(()) => self.status = format!("Saved {}", short_name(&out)),
             Err(e) => self.status = format!("PNG failed: {e}"),
         }
@@ -6415,9 +6456,13 @@ impl PixelView {
         self.status = format!("Trim Out {}", format_timecode(secs));
     }
 
-    /// Export the In→Out range as a **lossless** clip via ffmpeg stream-copy (`-c copy`, so no
-    /// re-encode — the cut snaps to the nearest keyframe at/before In). Falls back to a re-encode
-    /// if copy fails (e.g. the chosen container can't hold the source codecs).
+    /// Export the In→Out range as a clip that **plays with audio everywhere**. Video is stream-
+    /// copied (lossless, keyframe-aligned start) but the audio is re-encoded to **AAC** in an
+    /// **MP4** container — a YouTube download is h264+**opus/mkv**, and opus-in-mkv is silent in
+    /// many players (browsers / Totem / QuickTime), which read as "the export has no audio" even
+    /// though the stream is there. `-ss` sits before `-i` so all streams seek together (A/V stay
+    /// in sync); `-map 0:a:0?` keeps a silent video working. Falls back to a full re-encode when
+    /// the source video can't be copied into MP4 (e.g. VP9/webm).
     fn export_video_clip(&mut self) {
         let (src, a, b) = match (
             self.video_player.as_ref().map(|v| v.path.clone()),
@@ -6431,33 +6476,43 @@ impl PixelView {
             }
         };
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-        let Some(dest) = rfd::FileDialog::new()
-            .set_file_name(format!("{stem}_clip.{ext}"))
+        let Some(mut dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_clip.mp4"))
             .save_file()
         else {
             return;
         };
+        // Force an MP4 container so the AAC audio + h264 video are universally playable.
+        if dest.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
+            != Some("mp4".into())
+        {
+            dest.set_extension("mp4");
+        }
         let ss = format!("{a:.3}");
         let t = format!("{:.3}", b - a);
-        let run = |copy: bool| -> bool {
+        // mode 0 = copy video + AAC audio (fast, lossless video); mode 1 = full re-encode.
+        let run = |mode: u8| -> bool {
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.args(["-v", "quiet", "-nostdin", "-y", "-ss", &ss])
                 .arg("-i")
                 .arg(&src)
-                .args(["-t", &t]);
-            if copy {
-                cmd.args(["-c", "copy", "-avoid_negative_ts", "make_zero"]);
-            }
-            // else: re-encode with the container defaults (a frame-accurate cut).
-            cmd.arg(&dest)
+                .args(["-t", &t, "-map", "0:v:0", "-map", "0:a:0?"]);
+            match mode {
+                0 => cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+                _ => cmd.args([
+                    "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-c:a", "aac",
+                    "-b:a", "192k",
+                ]),
+            };
+            cmd.args(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
+                .arg(&dest)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        let ok = run(true) || run(false);
+        let ok = run(0) || run(1);
         self.status = if ok {
             format!("Exported clip {}–{} → {}", ss, t, short_name(&dest))
         } else {
@@ -12865,6 +12920,18 @@ impl PixelView {
     /// A thumbnail texture of the inspected image remapped to `palette` (the live
     /// recolor preview), keyed by `key`. Source pixels are decoded once per path;
     /// the remapped texture is rebuilt only when the path or recolor changes.
+    /// If `path` is the currently-playing video, its live on-screen frame (`disp_w`,`disp_h`,RGBA,
+    /// pts). Lets the Recolor preview mirror what's actually playing instead of a decode of frame 0.
+    fn live_preview_frame(&self, path: &Path) -> Option<(usize, usize, Vec<u8>, f32)> {
+        let vp = self.video_player.as_ref()?;
+        if vp.path != *path && self.resolve_local(path) != vp.path {
+            return None;
+        }
+        let (w, h) = (vp.disp_w as usize, vp.disp_h as usize);
+        let bytes = vp.cur.clone()?;
+        (bytes.len() == w * h * 4).then_some((w, h, bytes, vp.cur_pts))
+    }
+
     fn make_preview(
         &mut self,
         ctx: &egui::Context,
@@ -12872,6 +12939,26 @@ impl PixelView {
         key: &str,
         palette: Option<&[[u8; 4]]>,
     ) -> Option<egui::TextureHandle> {
+        // A currently-playing video: recolor the LIVE frame (what's on screen), not a decode of
+        // the file (which yields frame 0). Keyed by pts so it refreshes each frame AND each tweak.
+        if let Some((w, h, rgba, pts)) = self.live_preview_frame(path) {
+            let vkey = format!("{key}@{pts:.3}");
+            if let Some((p, k, tex)) = &self.preview_tex {
+                if p == path && *k == vkey {
+                    return Some(tex.clone());
+                }
+            }
+            let (w, h, mut rgba) = self.scale_source(w, h, rgba);
+            let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+            let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+            let (tw, th) = self.resize_target(w, h);
+            let aux = self.pipe_aux(palette, dsx, dsy);
+            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
+            self.preview_tex = Some((path.to_path_buf(), vkey, tex.clone()));
+            return Some(tex);
+        }
         if let Some((p, k, tex)) = &self.preview_tex {
             if p == path && k == key {
                 return Some(tex.clone());
