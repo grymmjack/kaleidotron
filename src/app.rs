@@ -745,11 +745,15 @@ enum SortKey {
     Group,
     Year,
     Pack,
+    // YouTube result columns — sort by the `yt_videos` map (duration / view count). Offered
+    // in the sort combo only while browsing YouTube (appended to `ALL` for persistence stability).
+    Duration,
+    Views,
 }
 
 impl SortKey {
     // New keys are appended so persisted indices (`to_u8`) stay valid across upgrades.
-    const ALL: [SortKey; 12] = [
+    const ALL: [SortKey; 14] = [
         SortKey::Name,
         SortKey::Type,
         SortKey::Modified,
@@ -762,7 +766,11 @@ impl SortKey {
         SortKey::Group,
         SortKey::Year,
         SortKey::Pack,
+        SortKey::Duration,
+        SortKey::Views,
     ];
+    /// The extra sort keys offered while browsing YouTube (appended to `COMMON` in the combo).
+    const YOUTUBE: [SortKey; 2] = [SortKey::Duration, SortKey::Views];
     /// The keys offered in the sort-bar combo (the scene-only keys are excluded —
     /// they're only meaningful in a 16colo.rs flat listing and set via the table).
     const COMMON: [SortKey; 8] = [
@@ -789,6 +797,8 @@ impl SortKey {
             SortKey::Group => "Group",
             SortKey::Year => "Year",
             SortKey::Pack => "Pack",
+            SortKey::Duration => "Duration",
+            SortKey::Views => "Views",
         }
     }
     fn to_u8(self) -> u8 {
@@ -1532,6 +1542,11 @@ pub struct PixelView {
     // keyed by virtual display path (`<youtube>/search/<q>/<title> [id].mp4`); `yt_files` maps
     // that path to the downloaded local file (so `resolve_local` + the player find it).
     yt_videos: HashMap<PathBuf, crate::youtube::YtVideo>,
+    // Last completed YouTube search (path → its result entries + video metadata), so navigating
+    // BACK to a search (breadcrumb / back button) restores the results instead of re-running the
+    // search. Cleared by F5 so an explicit refresh still re-fetches.
+    #[allow(clippy::type_complexity)]
+    yt_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::youtube::YtVideo>)>,
     yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
     yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     yt_files: HashMap<PathBuf, PathBuf>,
@@ -2688,6 +2703,7 @@ impl PixelView {
             pending_external: None,
             colo_save_rx: None,
             yt_videos: HashMap::new(),
+            yt_search_cache: None,
             yt_rx: None,
             yt_cancel: None,
             yt_files: HashMap::new(),
@@ -3648,6 +3664,17 @@ impl PixelView {
                 self.status = "YouTube — search from the Places panel".into();
             }
             [s, q] if s == crate::youtube::SEARCH => {
+                // Navigating back to a search we already ran → restore the cached results
+                // instead of re-fetching (F5 clears the cache, so refresh still re-runs).
+                if let Some((cdir, entries, videos)) = &self.yt_search_cache {
+                    if *cdir == dir && !entries.is_empty() {
+                        let (entries, videos) = (entries.clone(), videos.clone());
+                        self.yt_videos = videos;
+                        self.show_folder(dir, entries);
+                        self.status = format!("{} YouTube result(s)", self.all_entries.len());
+                        return;
+                    }
+                }
                 let q = q.clone();
                 self.start_yt_search(dir, q);
             }
@@ -3697,6 +3724,11 @@ impl PixelView {
                 }
                 Ok(YtMsg::Done(n)) => {
                     self.status = format!("{n} YouTube result(s)");
+                    // Cache the completed results so navigating back restores them (no re-search).
+                    if let Some(f) = self.folder.clone() {
+                        self.yt_search_cache =
+                            Some((f, self.all_entries.clone(), self.yt_videos.clone()));
+                    }
                     done = true;
                     break;
                 }
@@ -10803,6 +10835,7 @@ impl PixelView {
             self.search.as_deref(),
             &self.img_meta,
             &self.colo_pieces,
+            &self.yt_videos,
         );
     }
 
@@ -11264,6 +11297,14 @@ impl PixelView {
     /// Re-scan the current folder after a file op, without recording history.
     fn refresh(&mut self) {
         if let Some(f) = self.folder.clone() {
+            // F5 on a YouTube search should re-fetch, not restore the cache.
+            if self
+                .yt_search_cache
+                .as_ref()
+                .is_some_and(|(cdir, ..)| *cdir == f)
+            {
+                self.yt_search_cache = None;
+            }
             self.suppress_history = true;
             self.open_folder(f);
         }
@@ -12408,18 +12449,32 @@ impl PixelView {
             }
             ui.separator();
             ui.label("Sort:");
+            // While browsing YouTube, add Duration + Views to the combo.
+            let on_youtube = self
+                .folder
+                .as_ref()
+                .is_some_and(|f| crate::youtube::is_remote(f));
+            let keys: Vec<SortKey> = if on_youtube {
+                SortKey::COMMON
+                    .iter()
+                    .chain(SortKey::YOUTUBE.iter())
+                    .copied()
+                    .collect()
+            } else {
+                SortKey::COMMON.to_vec()
+            };
             let cr = egui::ComboBox::from_id_salt("sort_key")
                 .selected_text(key.label())
                 .show_ui(ui, |ui| {
-                    for k in SortKey::COMMON {
-                        ui.selectable_value(&mut key, k, k.label());
+                    for k in &keys {
+                        ui.selectable_value(&mut key, *k, k.label());
                     }
                 });
-            // Wheel-cycle within the common keys; a scene key (set via the table) maps
-            // to its position if present, else stays put.
-            let mut ki = SortKey::COMMON.iter().position(|&k| k == key).unwrap_or(0);
-            if wheel_cycle(ui, &cr.response, &mut ki, SortKey::COMMON.len()) {
-                key = SortKey::COMMON[ki];
+            // Wheel-cycle within the offered keys; a key not in the list maps to its
+            // position if present, else stays put.
+            let mut ki = keys.iter().position(|&k| k == key).unwrap_or(0);
+            if wheel_cycle(ui, &cr.response, &mut ki, keys.len()) {
+                key = keys[ki];
             }
             let asc_lbl = format!("{} Asc", icons::SORT_ASC);
             let desc_lbl = format!("{} Desc", icons::SORT_DESC);
@@ -25829,6 +25884,7 @@ fn sorted_filtered_view(
     name_filter: Option<&str>,
     meta: &HashMap<PathBuf, ImgMeta>,
     pieces: &HashMap<PathBuf, ColoPiece>,
+    yt: &HashMap<PathBuf, crate::youtube::YtVideo>,
 ) -> Vec<Entry> {
     use std::cmp::Ordering;
     let needle = name_filter
@@ -25862,6 +25918,9 @@ fn sorted_filtered_view(
     let group = |e: &Entry| piece(e).map(|p| p.group.to_ascii_lowercase());
     let year = |e: &Entry| piece(e).map(|p| p.year);
     let pack = |e: &Entry| piece(e).map(|p| p.pack.to_ascii_lowercase());
+    // YouTube result metadata (duration seconds / view count), from the flat search.
+    let duration = |e: &Entry| yt.get(&e.path).map(|v| v.duration);
+    let views = |e: &Entry| yt.get(&e.path).map(|v| v.views);
 
     // Archives sort alongside folders (they're navigated into like folders).
     let folder_like = |e: &Entry| e.is_dir || e.is_archive;
@@ -25912,10 +25971,41 @@ fn sorted_filtered_view(
             SortKey::Group => group(a).cmp(&group(b)),
             SortKey::Year => year(a).cmp(&year(b)),
             SortKey::Pack => pack(a).cmp(&pack(b)),
+            // YouTube: unknown (non-result) sorts last in both directions, like Colors.
+            SortKey::Duration => match (duration(a), duration(b)) {
+                (Some(x), Some(y)) => {
+                    let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            SortKey::Views => match (views(a), views(b)) {
+                (Some(x), Some(y)) => {
+                    let ord = x.cmp(&y);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
         };
-        // Colors/Dimensions already applied their own direction (so unknowns stay
-        // last); the other keys flip here.
-        let primary = if desc && !matches!(key, SortKey::Colors | SortKey::Dimensions) {
+        // Colors/Dimensions/Duration/Views already applied their own direction (so
+        // unknowns stay last); the other keys flip here.
+        let primary = if desc
+            && !matches!(
+                key,
+                SortKey::Colors | SortKey::Dimensions | SortKey::Duration | SortKey::Views
+            ) {
             primary.reverse()
         } else {
             primary
@@ -33016,6 +33106,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["z_dir", "a.png", "b.png"]);
@@ -33037,6 +33128,7 @@ mod tests {
             None,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["d", "high.png"]);
@@ -33056,6 +33148,7 @@ mod tests {
             false,
             0,
             None,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -33095,6 +33188,7 @@ mod tests {
             None,
             &meta,
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["few.png", "mid.png", "many.png", "unknown.png"]);
@@ -33107,6 +33201,7 @@ mod tests {
             0,
             None,
             &meta,
+            &HashMap::new(),
             &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
@@ -33127,6 +33222,7 @@ mod tests {
             true,
             0,
             Some("cat"),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -33187,6 +33283,7 @@ mod tests {
             None,
             &HashMap::new(),
             &pieces,
+            &HashMap::new(),
         );
         let names: Vec<_> = v.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["a.ans", "b.ans", "c.ans"]);
@@ -33201,6 +33298,7 @@ mod tests {
             None,
             &HashMap::new(),
             &pieces,
+            &HashMap::new(),
         );
         let years: Vec<_> = v.iter().map(|e| pieces[&e.path].year).collect::<Vec<_>>();
         assert_eq!(years, vec![2002, 1994, 1991]);
