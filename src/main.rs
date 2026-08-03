@@ -1,4 +1,5 @@
 mod anim;
+mod ai;
 mod app;
 mod archive;
 mod cache;

@@ -241,6 +241,13 @@ enum YtMsg {
     Done(usize),
 }
 
+/// Messages from an AI-generation worker (`start_ai_job`): one produced file per batch item, then
+/// the final result.
+enum AiJobMsg {
+    Item(u32, PathBuf),        // (1-based index in the batch, produced file path)
+    Done(Result<u32, String>), // Ok(total produced) | Err(status)
+}
+
 /// What a `yt_walk` worker should list (search / a channel's videos / a playlist's videos / a
 /// channel's playlists). The video sources emit `YtMsg::Hit`; `Playlists` emits `PlaylistHit`.
 enum YtSource {
@@ -1252,6 +1259,32 @@ pub struct PixelView {
     plugin_code: bool,
     plugin_3d: bool, // 3D models (.obj/.stl/.ply/.gltf/.glb/.dae) → thumbnail + 3D viewer
     plugin_video: bool, // video (mp4/mkv/webm/…) → ffmpeg frame thumbnail + in-app player
+    // AI generation plugin (external generators; pixelmon/soundmon/ansimon — see ai.rs).
+    plugin_ai: bool,
+    ai_tools: Vec<crate::ai::AiTool>,
+    ai_styles: Vec<crate::ai::AiStyle>,
+    ai_prompts: Vec<crate::ai::AiPrompt>,
+    // Generate dialog state.
+    ai_gen_open: bool,
+    ai_gen_tool: usize,
+    ai_gen_style: usize,      // index+1 into ai_styles (0 = none)
+    ai_gen_prompt_sel: usize, // index+1 into ai_prompts (0 = none)
+    ai_gen_prompt: String,
+    ai_gen_w: u32,
+    ai_gen_h: u32,
+    ai_gen_count: u32,
+    ai_gen_seed: i64,
+    ai_gen_target: Option<PathBuf>, // folder to import generated files into
+    ai_gen_pad: Option<usize>,      // Some(i) = load the (audio) result into pad i
+    // AI editor inline selections.
+    ai_tool_sel: usize,
+    ai_style_sel: usize,
+    ai_prompt_sel: usize,
+    // Async generation job.
+    ai_job_rx: Option<std::sync::mpsc::Receiver<AiJobMsg>>,
+    ai_job_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ai_job_total: u32,
+    ai_job_done: u32,
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
     assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
@@ -1813,6 +1846,10 @@ impl PixelView {
     const VIDEO_LISTS_KEY: &'static str = "video_lists";
     /// Virtual root for user video lists (Watch Later + custom). `<lists>/<name>` browses a list.
     const LIST_ROOT: &'static str = "<lists>";
+    const PLUGIN_AI_KEY: &'static str = "plugin_ai";
+    const AI_TOOLS_KEY: &'static str = "ai_tools";
+    const AI_STYLES_KEY: &'static str = "ai_styles";
+    const AI_PROMPTS_KEY: &'static str = "ai_prompts";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2014,6 +2051,23 @@ impl PixelView {
         let video_lists = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<VideoList>>(s, Self::VIDEO_LISTS_KEY))
+            .unwrap_or_default();
+        let plugin_ai = load_bool(Self::PLUGIN_AI_KEY, false);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let ai_tools = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<crate::ai::AiTool>>(s, Self::AI_TOOLS_KEY))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| crate::ai::starter_tools(&home));
+        let ai_styles = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<crate::ai::AiStyle>>(s, Self::AI_STYLES_KEY))
+            .unwrap_or_default();
+        let ai_prompts = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<crate::ai::AiPrompt>>(s, Self::AI_PROMPTS_KEY))
             .unwrap_or_default();
         let table_columns = cc
             .storage
@@ -2486,6 +2540,28 @@ impl PixelView {
             saved_compares,
             video_lists,
             list_rename: None,
+            plugin_ai,
+            ai_tools,
+            ai_styles,
+            ai_prompts,
+            ai_gen_open: false,
+            ai_gen_tool: 0,
+            ai_gen_style: 0,
+            ai_gen_prompt_sel: 0,
+            ai_gen_prompt: String::new(),
+            ai_gen_w: 320,
+            ai_gen_h: 200,
+            ai_gen_count: 1,
+            ai_gen_seed: 0,
+            ai_gen_target: None,
+            ai_gen_pad: None,
+            ai_tool_sel: 0,
+            ai_style_sel: 0,
+            ai_prompt_sel: 0,
+            ai_job_rx: None,
+            ai_job_cancel: None,
+            ai_job_total: 0,
+            ai_job_done: 0,
             kit_editor: false,
             midi_follow: get_bool(Self::MIDI_FOLLOW_KEY).unwrap_or(false),
             kit_map_lock: get_bool(Self::KIT_MAP_LOCK_KEY).unwrap_or(false),
@@ -14185,6 +14261,524 @@ impl PixelView {
         }
     }
 
+    /// Fresh output dir for an AI run (`run` diffs before/after, so reuse is fine).
+    fn ai_out_dir(&self) -> PathBuf {
+        std::env::temp_dir().join("pixelview_ai_out")
+    }
+
+    /// Kick off an AI generation batch on a worker: run the selected tool `count` times (seeds
+    /// `seed..seed+count`), applying the selected style (prefix/suffix/args/seed-lock). Each result
+    /// is imported by `poll_ai_job` (copied into the target folder, or loaded onto a pad). Refuses
+    /// a second run while one is in flight.
+    fn start_ai_job(&mut self) {
+        if self.ai_job_rx.is_some() {
+            self.status = "A generation is already running".into();
+            return;
+        }
+        let Some(tool) = self.ai_tools.get(self.ai_gen_tool).cloned() else {
+            self.status = "No AI tool configured (add one in the AI tab)".into();
+            return;
+        };
+        let style = if self.ai_gen_style > 0 {
+            self.ai_styles.get(self.ai_gen_style - 1).cloned()
+        } else {
+            None
+        };
+        let final_prompt = match &style {
+            Some(s) => {
+                let mut p = String::new();
+                if !s.prefix.trim().is_empty() {
+                    p.push_str(s.prefix.trim());
+                    p.push_str(", ");
+                }
+                p.push_str(self.ai_gen_prompt.trim());
+                if !s.suffix.trim().is_empty() {
+                    p.push_str(", ");
+                    p.push_str(s.suffix.trim());
+                }
+                p
+            }
+            None => self.ai_gen_prompt.trim().to_string(),
+        };
+        let extra_args = style.as_ref().map(|s| s.args_extra.clone()).unwrap_or_default();
+        let style_name = style.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+        // Seed: the dialog's, else wall-clock; a style may lock its own.
+        let mut seed0 = if self.ai_gen_seed != 0 {
+            self.ai_gen_seed
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.as_nanos() & 0x7fff_ffff) as i64)
+                .unwrap_or(1)
+                .max(1)
+        };
+        if let Some(s) = style.as_ref().filter(|s| s.seed != 0) {
+            seed0 = s.seed;
+        }
+        let count = self.ai_gen_count.clamp(1, 20);
+        let (w, h) = (self.ai_gen_w.max(8), self.ai_gen_h.max(8));
+        let outdir = self.ai_out_dir();
+        let pal = self
+            .selected_palette
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.ai_job_cancel = Some(cancel.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ai_job_rx = Some(rx);
+        self.ai_job_total = count;
+        self.ai_job_done = 0;
+        self.status = format!("Generating with {} (0/{count})…", tool.name);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut produced = 0u32;
+            for i in 0..count {
+                if cancel.load(Relaxed) {
+                    break;
+                }
+                let ctx = crate::ai::AiCtx {
+                    prompt: final_prompt.clone(),
+                    style: style_name.clone(),
+                    seed: seed0 + i as i64,
+                    outdir: outdir.to_string_lossy().into_owned(),
+                    outname: format!("pv-{:04}", i + 1),
+                    iw: w,
+                    ih: h,
+                    sw: w,
+                    sh: h,
+                    pal: pal.clone(),
+                    ..Default::default()
+                };
+                match crate::ai::run(&tool, &extra_args, &ctx, &cancel) {
+                    Ok(files) => {
+                        if let Some(f) = files.into_iter().next() {
+                            produced += 1;
+                            let _ = tx.send(AiJobMsg::Item(i + 1, f));
+                        }
+                    }
+                    Err(e) if e == "cancelled" => break,
+                    Err(e) => {
+                        let _ = tx.send(AiJobMsg::Done(Err(e)));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(AiJobMsg::Done(Ok(produced)));
+        });
+    }
+
+    /// Drain the AI worker each frame: import each produced file + track progress; on completion
+    /// re-scan the folder so the new files appear.
+    fn poll_ai_job(&mut self) {
+        // Drain pending messages first (holds the rx borrow), then process (needs &mut self).
+        let mut msgs = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.ai_job_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+        for m in msgs {
+            match m {
+                AiJobMsg::Item(idx, file) => {
+                    self.ai_job_done = idx;
+                    self.import_ai_file(&file);
+                    self.status = format!("Generated {}/{}…", idx, self.ai_job_total);
+                    self.want_repaint = true;
+                }
+                AiJobMsg::Done(res) => {
+                    self.ai_job_rx = None;
+                    self.ai_job_cancel = None;
+                    match res {
+                        Ok(0) => self.status = "Generation produced nothing".into(),
+                        Ok(n) => self.status = format!("Generated {n} item(s)"),
+                        Err(e) if e == "cancelled" => self.status = "Generation cancelled".into(),
+                        Err(e) => self.status = format!("Generation failed: {e}"),
+                    }
+                    if self.ai_gen_pad.is_none() {
+                        self.refresh(); // re-scan so imported files show
+                    }
+                    return;
+                }
+            }
+        }
+        if disconnected {
+            self.ai_job_rx = None;
+            self.ai_job_cancel = None;
+        } else {
+            self.want_repaint = true;
+        }
+    }
+
+    /// Import one produced file: onto a pad (audio) if `ai_gen_pad` is set, else copy it into the
+    /// target folder (uniquely named).
+    fn import_ai_file(&mut self, produced: &Path) {
+        if let Some(pad) = self.ai_gen_pad {
+            self.load_pad_from_file(pad, produced);
+            return;
+        }
+        let Some(dir) = self.ai_gen_target.clone().or_else(|| self.folder.clone()) else {
+            return;
+        };
+        if !dir.is_dir() {
+            return;
+        }
+        let stem = produced.file_stem().and_then(|s| s.to_str()).unwrap_or("ai");
+        let ext = produced.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        let mut dest = dir.join(format!("{stem}.{ext}"));
+        let mut n = 1;
+        while dest.exists() {
+            dest = dir.join(format!("{stem}_{n}.{ext}"));
+            n += 1;
+        }
+        let _ = std::fs::copy(produced, &dest);
+    }
+
+    /// Ctrl+Alt+K — abort an in-flight generation (kills the generator process).
+    fn cancel_ai_job(&mut self) {
+        if let Some(c) = self.ai_job_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.status = "Cancelling generation…".into();
+        }
+    }
+
+    /// Open the Generate dialog targeting `folder` (a folder right-click → "Generate here…").
+    fn open_ai_generate(&mut self, folder: Option<PathBuf>, pad: Option<usize>) {
+        if self.ai_tools.is_empty() {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            self.ai_tools = crate::ai::starter_tools(&home);
+        }
+        self.ai_gen_target = folder;
+        self.ai_gen_pad = pad;
+        // Prefer an audio tool when generating onto a pad.
+        if pad.is_some() {
+            if let Some(i) = self.ai_tools.iter().position(|t| t.audio) {
+                self.ai_gen_tool = i;
+            }
+        }
+        self.ai_gen_open = true;
+    }
+
+    /// The Generate dialog (a window): pick tool / style / prompt preset / size / count / seed and
+    /// run. Shows batch progress + a Cancel while a job is in flight.
+    fn ui_ai_generate(&mut self, ctx: &egui::Context) {
+        if !self.ai_gen_open {
+            return;
+        }
+        // Snapshots so the combos don't borrow self fields we also mutate.
+        let tool_names: Vec<String> = self.ai_tools.iter().map(|t| t.name.clone()).collect();
+        let cur_tool = self.ai_tools.get(self.ai_gen_tool).map(|t| t.name.clone()).unwrap_or_default();
+        let styles: Vec<(String, String)> =
+            self.ai_styles.iter().map(|s| (s.name.clone(), s.tool.clone())).collect();
+        let prompts: Vec<(String, String)> =
+            self.ai_prompts.iter().map(|p| (p.name.clone(), p.text.clone())).collect();
+        let running = self.ai_job_rx.is_some();
+        let mut open = self.ai_gen_open;
+        let mut do_gen = false;
+        let mut do_cancel = false;
+        egui::Window::new("🤖 AI — Generate")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("ai_gen_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Tool");
+                        egui::ComboBox::from_id_salt("ai_gen_tool")
+                            .selected_text(&cur_tool)
+                            .show_ui(ui, |ui| {
+                                for (i, n) in tool_names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.ai_gen_tool, i, n);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Style");
+                        let st = if self.ai_gen_style == 0 {
+                            "(none)".to_string()
+                        } else {
+                            styles.get(self.ai_gen_style - 1).map(|s| s.0.clone()).unwrap_or_default()
+                        };
+                        egui::ComboBox::from_id_salt("ai_gen_style")
+                            .selected_text(st)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.ai_gen_style, 0, "(none)");
+                                for (i, (name, scope)) in styles.iter().enumerate() {
+                                    if scope.is_empty() || *scope == cur_tool {
+                                        ui.selectable_value(&mut self.ai_gen_style, i + 1, name);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Preset");
+                        let pt = if self.ai_gen_prompt_sel == 0 {
+                            "(none)".to_string()
+                        } else {
+                            prompts.get(self.ai_gen_prompt_sel - 1).map(|p| p.0.clone()).unwrap_or_default()
+                        };
+                        let mut load_preset: Option<String> = None;
+                        egui::ComboBox::from_id_salt("ai_gen_preset")
+                            .selected_text(pt)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.ai_gen_prompt_sel, 0, "(none)");
+                                for (i, (name, text)) in prompts.iter().enumerate() {
+                                    if ui
+                                        .selectable_value(&mut self.ai_gen_prompt_sel, i + 1, name)
+                                        .clicked()
+                                    {
+                                        load_preset = Some(text.clone());
+                                    }
+                                }
+                            });
+                        if let Some(t) = load_preset {
+                            self.ai_gen_prompt = t;
+                        }
+                        ui.end_row();
+                    });
+                ui.label("Prompt");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.ai_gen_prompt)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Size");
+                    ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut self.ai_gen_h).range(8..=4096));
+                    if ui.small_button("From image").on_hover_text("Use the open image's size").clicked() {
+                        if let Some((w, h)) = self.img_meta.values().next().map(|m| (m.w, m.h)) {
+                            self.ai_gen_w = w;
+                            self.ai_gen_h = h;
+                        }
+                    }
+                    ui.separator();
+                    ui.label("Count");
+                    ui.add(egui::DragValue::new(&mut self.ai_gen_count).range(1..=20));
+                    ui.separator();
+                    ui.label("Seed");
+                    ui.add(egui::DragValue::new(&mut self.ai_gen_seed));
+                    if ui.small_button("🎲").on_hover_text("Random each run (seed 0)").clicked() {
+                        self.ai_gen_seed = 0;
+                    }
+                });
+                match self.ai_gen_pad {
+                    Some(p) => {
+                        ui.weak(format!("→ load result onto pad {}", p + 1));
+                    }
+                    None => {
+                        let t = self.ai_gen_target.clone().or_else(|| self.folder.clone());
+                        ui.weak(format!(
+                            "→ {}",
+                            t.map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "(open a folder first)".into())
+                        ));
+                    }
+                }
+                ui.separator();
+                if running {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(format!("{}/{}", self.ai_job_done, self.ai_job_total));
+                        if ui.button("✕ Cancel").on_hover_text("Ctrl+Alt+K").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                } else {
+                    let can = !cur_tool.is_empty() && !self.ai_gen_prompt.trim().is_empty();
+                    if ui
+                        .add_enabled(can, egui::Button::new("✨ Generate"))
+                        .on_disabled_hover_text("Pick a tool and type a prompt")
+                        .clicked()
+                    {
+                        do_gen = true;
+                    }
+                }
+            });
+        self.ai_gen_open = open;
+        if do_gen {
+            self.start_ai_job();
+        }
+        if do_cancel {
+            self.cancel_ai_job();
+        }
+    }
+
+    /// The AI Places tab: a Generate launcher + editors for tools / styles / prompts (DRAW-style).
+    fn ui_ai_tab(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button("✨ Generate…")
+            .on_hover_text("Generate into the current folder")
+            .clicked()
+        {
+            let f = self.folder.clone();
+            self.open_ai_generate(f, None);
+        }
+        if self.ai_job_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.weak(format!("Generating {}/{}", self.ai_job_done, self.ai_job_total));
+                if ui.small_button("✕").clicked() {
+                    self.cancel_ai_job();
+                }
+            });
+        }
+        ui.add_space(4.0);
+        ui.separator();
+
+        // Tools.
+        egui::CollapsingHeader::new(format!("Tools ({})", self.ai_tools.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut remove = None;
+                for i in 0..self.ai_tools.len() {
+                    ui.horizontal(|ui| {
+                        let sel = self.ai_tool_sel == i;
+                        if ui.selectable_label(sel, &self.ai_tools[i].name).clicked() {
+                            self.ai_tool_sel = i;
+                        }
+                        if self.ai_tools[i].audio {
+                            ui.weak("🔊");
+                        }
+                        if ui.small_button("🗑").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.ai_tools.remove(i);
+                    self.ai_tool_sel = self.ai_tool_sel.saturating_sub(1);
+                }
+                if ui.small_button("＋ Add tool").clicked() {
+                    self.ai_tools.push(crate::ai::AiTool {
+                        name: "new tool".into(),
+                        ..Default::default()
+                    });
+                    self.ai_tool_sel = self.ai_tools.len() - 1;
+                }
+                if let Some(t) = self.ai_tools.get_mut(self.ai_tool_sel) {
+                    ui.add_space(4.0);
+                    egui::Grid::new("ai_tool_edit").num_columns(2).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut t.name);
+                        ui.end_row();
+                        ui.label("Exe");
+                        ui.text_edit_singleline(&mut t.exe);
+                        ui.end_row();
+                        ui.label("Dir");
+                        ui.text_edit_singleline(&mut t.dir);
+                        ui.end_row();
+                        ui.label("Args");
+                        ui.text_edit_singleline(&mut t.args);
+                        ui.end_row();
+                    });
+                    ui.checkbox(&mut t.audio, "Audio generator (offer on pads)");
+                    ui.weak("Macros: {prompt} {style} {seed} {outdir} {outname} {sw} {sh} {pal}");
+                }
+            });
+
+        // Styles.
+        egui::CollapsingHeader::new(format!("Styles ({})", self.ai_styles.len()))
+            .show(ui, |ui| {
+                let mut remove = None;
+                for i in 0..self.ai_styles.len() {
+                    ui.horizontal(|ui| {
+                        let sel = self.ai_style_sel == i;
+                        let lbl = format!("{} [{}]", self.ai_styles[i].name,
+                            if self.ai_styles[i].tool.is_empty() { "any" } else { &self.ai_styles[i].tool });
+                        if ui.selectable_label(sel, lbl).clicked() {
+                            self.ai_style_sel = i;
+                        }
+                        if ui.small_button("🗑").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.ai_styles.remove(i);
+                    self.ai_style_sel = self.ai_style_sel.saturating_sub(1);
+                }
+                if ui.small_button("＋ Add style").clicked() {
+                    self.ai_styles.push(crate::ai::AiStyle {
+                        name: "new style".into(),
+                        ..Default::default()
+                    });
+                    self.ai_style_sel = self.ai_styles.len() - 1;
+                }
+                if let Some(s) = self.ai_styles.get_mut(self.ai_style_sel) {
+                    ui.add_space(4.0);
+                    egui::Grid::new("ai_style_edit").num_columns(2).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut s.name);
+                        ui.end_row();
+                        ui.label("Tool");
+                        ui.text_edit_singleline(&mut s.tool).on_hover_text("empty = any tool");
+                        ui.end_row();
+                        ui.label("Prefix");
+                        ui.text_edit_singleline(&mut s.prefix);
+                        ui.end_row();
+                        ui.label("Suffix");
+                        ui.text_edit_singleline(&mut s.suffix);
+                        ui.end_row();
+                        ui.label("Args");
+                        ui.text_edit_singleline(&mut s.args_extra).on_hover_text("CLI flags (e.g. --style ega)");
+                        ui.end_row();
+                        ui.label("Seed lock");
+                        ui.add(egui::DragValue::new(&mut s.seed)).on_hover_text("0 = don't force");
+                        ui.end_row();
+                    });
+                }
+            });
+
+        // Prompts.
+        egui::CollapsingHeader::new(format!("Prompts ({})", self.ai_prompts.len()))
+            .show(ui, |ui| {
+                let mut remove = None;
+                for i in 0..self.ai_prompts.len() {
+                    ui.horizontal(|ui| {
+                        let sel = self.ai_prompt_sel == i;
+                        if ui.selectable_label(sel, &self.ai_prompts[i].name).clicked() {
+                            self.ai_prompt_sel = i;
+                        }
+                        if ui.small_button("🗑").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.ai_prompts.remove(i);
+                    self.ai_prompt_sel = self.ai_prompt_sel.saturating_sub(1);
+                }
+                if ui.small_button("＋ Add prompt").clicked() {
+                    self.ai_prompts.push(crate::ai::AiPrompt {
+                        name: "new prompt".into(),
+                        ..Default::default()
+                    });
+                    self.ai_prompt_sel = self.ai_prompts.len() - 1;
+                }
+                if let Some(p) = self.ai_prompts.get_mut(self.ai_prompt_sel) {
+                    ui.add_space(4.0);
+                    ui.text_edit_singleline(&mut p.name);
+                    ui.add(egui::TextEdit::multiline(&mut p.text).desired_rows(2).desired_width(f32::INFINITY));
+                }
+            });
+    }
+
     /// Navigate to a YouTube channel's videos listing (`<youtube>/channel/<id>`). Pin it from the
     /// ★ toolbar to save the channel to Places.
     fn go_to_channel(&mut self, channel_id: &str) {
@@ -17155,10 +17749,27 @@ impl PixelView {
         let Some(bg) = bg else { return };
         let can_paste = self.clipboard.is_some();
         let facts = self.folder_action_items();
+        let ai_on = self.plugin_ai && self.folder.is_some();
         let mut pick = None;
+        let mut want_gen = false;
         bg.context_menu(|ui| {
+            if ai_on {
+                if ui
+                    .button("🤖 Generate images here…")
+                    .on_hover_text("Run an AI generator and import the results into this folder")
+                    .clicked()
+                {
+                    want_gen = true;
+                    ui.close();
+                }
+                ui.separator();
+            }
             pick = empty_area_context_menu(ui, can_paste, &facts);
         });
+        if want_gen {
+            let f = self.folder.clone();
+            self.open_ai_generate(f, None);
+        }
         match pick {
             Some(EmptyPick::Paste) => self.paste(),
             Some(EmptyPick::NewFolder) => self.new_folder(),
@@ -22163,10 +22774,14 @@ impl PixelView {
                             (1, "16colo"),
                             (5, "YouTube"),
                             (6, "Steam"),
+                            (7, "AI"),
                             (2, "Kits"),
                             (3, "Samples"),
                         ] {
                             if (idx == 2 || idx == 3) && !self.plugin_audio {
+                                continue;
+                            }
+                            if idx == 7 && !self.plugin_ai {
                                 continue;
                             }
                             if ui.selectable_label(self.places_tab == idx, label).clicked() {
@@ -22404,6 +23019,9 @@ impl PixelView {
                         {
                             nav = Some(p);
                         }
+                    } else if self.places_tab == 7 {
+                        // AI generation: Generate launcher + tools/styles/prompts editors.
+                        self.ui_ai_tab(ui);
                     } else if self.places_tab == 2 {
                         // Kits: click a saved `.pvkit` to LOAD it into the current pad kit (it does
                         // NOT navigate into the file — the pads stay put and just adopt the kit).
@@ -23173,6 +23791,12 @@ impl eframe::App for PixelView {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
         }
+        // Ctrl+Alt+K — abort an in-flight AI generation (kills the generator process).
+        if self.ai_job_rx.is_some()
+            && ctx.input(|i| i.modifiers.ctrl && i.modifiers.alt && i.key_pressed(egui::Key::K))
+        {
+            self.cancel_ai_job();
+        }
         // F5 — refresh the folder view: re-scan the current folder from disk so on-disk
         // changes (files added/removed/renamed outside the app) show up. `refresh` reopens
         // `self.folder` (suppressing a spurious history entry); the path-keyed thumb/meta
@@ -23405,6 +24029,7 @@ impl eframe::App for PixelView {
         self.poll_yt_open(&ctx);
         self.poll_yt_meta();
         self.poll_yt_info();
+        self.poll_ai_job();
         self.poll_steam_media();
         self.poll_steam_open(&ctx);
         self.poll_colo_save();
@@ -23824,6 +24449,7 @@ impl eframe::App for PixelView {
         self.paint_audio_loading_overlay(&ctx);
         self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
+        self.ui_ai_generate(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -24071,6 +24697,12 @@ impl eframe::App for PixelView {
                                          Needs ffmpeg on PATH.",
                                     )
                                     .changed();
+                                ui.checkbox(&mut self.plugin_ai, "AI generation")
+                                    .on_hover_text(
+                                        "Generate images/sound from a prompt via an external \
+                                         generator you configure (pixelmon / soundmon / ansimon). \
+                                         Adds the AI tab in Places + folder/pad 'Generate…' actions.",
+                                    );
                                 if plug_changed {
                                     self.registry.set_plugin("code", self.plugin_code);
                                     self.registry.set_plugin("pdf", self.plugin_pdf);
@@ -24627,6 +25259,10 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::COMPARE_SYNC_KEY, &self.compare_sync);
         eframe::set_value(storage, Self::COMPARE_SAVED_KEY, &self.saved_compares);
         eframe::set_value(storage, Self::VIDEO_LISTS_KEY, &self.video_lists);
+        eframe::set_value(storage, Self::PLUGIN_AI_KEY, &self.plugin_ai);
+        eframe::set_value(storage, Self::AI_TOOLS_KEY, &self.ai_tools);
+        eframe::set_value(storage, Self::AI_STYLES_KEY, &self.ai_styles);
+        eframe::set_value(storage, Self::AI_PROMPTS_KEY, &self.ai_prompts);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);

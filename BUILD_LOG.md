@@ -44,3 +44,20 @@ merge each so the next builds on clean main. Order: quick-ish → medium → lar
   yt_videos re-seeded), ＋ New, right-click Rename (inline) / Delete.
 - ✅ `open_folder` routes `<lists>/…` → `open_video_list`; `is_video_entry` gates the menu; picks
   deferred through both grid + table (`apply_add_to_list`).
+
+### Large: AI generation plugin (branch `ai-plugin`)
+Mirrors grymmjack's DRAW AI system. **New `src/ai.rs`**: `AiTool`/`AiStyle`/`AiPrompt` (serde),
+`{macro}` expansion (`{prompt}` `{seed}` `{outdir}` `{sw}` `{pal}` … + UPPERCASE→upper, `:slug`,
+whitespace-trim — unit-tested), a quote-aware `tokenize`, and `run()` (spawn the tool, poll so
+Ctrl+Alt+K can kill it, import the NEW files that land in `{outdir}`, skipping `_`/hidden).
+- ✅ Preferences → Format plugins → **AI generation** toggle (default off); starter tools seeded
+  (echo test + pixelmon + soundmon + ansimon, pointed at sibling `~/git/*` repos — editable).
+- ✅ Places **AI tab**: ✨ Generate… launcher + Tools / Styles / Prompts editors (add/remove/inline-edit).
+- ✅ **Generate dialog**: tool / style / prompt-preset / prompt / size / count (batch, seeds
+  seed..seed+count) / seed; runs async, imports each result into the target folder (or a pad),
+  live N/M progress + Cancel. Style prefix/suffix/args/seed-lock applied.
+- ✅ Folder right-click empty space → **🤖 Generate images here…**. Ctrl+Alt+K aborts.
+- ✅ Verified end-to-end with the DRAW echo tool (macro-expanded args → PNG imported).
+- **Deferred** (follow-ups): a per-pad "🤖 Generate sound…" button (backend + dialog already
+  support `ai_gen_pad`), the `[?]` live macro-reference, steering images ({limg}/{dimg}), and
+  saved generation batches beyond `count`.
