@@ -212,9 +212,6 @@ impl Sound {
     fn resume(&self) {
         self.player.play();
     }
-    fn is_paused(&self) -> bool {
-        self.player.is_paused()
-    }
     fn apply_volume(&self) {
         self.player.set_volume(self.effective_volume());
     }

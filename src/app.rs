@@ -1223,12 +1223,17 @@ pub struct PixelView {
     video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
-    video_markers: Vec<(f32, String)>,      // chapter markers from the `.md` sidecar (secs, label)
-    video_speed: f32,                       // remembered video playback speed (this session)
-    video_scrub: Option<f32>, // seek-bar drag position (Some while dragging the scrubber)
-    video_scrub_t: f64,       // last scrub-preview time (throttles ffmpeg respawns while dragging)
+    video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
+    video_md_header: String,         // any `.md` text before the first marker (preserved on save)
+    video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
+    video_marker_focus: bool,        // request focus on a freshly-added marker's title field
+    video_speed: f32,                // remembered video playback speed (this session)
+    video_scrub: Option<f32>,        // seek-bar drag position (Some while dragging the scrubber)
+    video_scrub_t: f64, // last scrub-preview time (throttles ffmpeg respawns while dragging)
     video_seek_input: String, // the "go to time" text field (mm:ss / hh:mm:ss)
-    player: Option<Player>,   // baud-rate playback for the open text/RIP art (ANSImation)
+    video_trim_in: Option<f32>, // trim/export In point (seconds); i-key or ⟦In
+    video_trim_out: Option<f32>, // trim/export Out point (seconds); o-key or Out⟧
+    player: Option<Player>, // baud-rate playback for the open text/RIP art (ANSImation)
     zoom: f32,
     zoom_lock: bool, // viewer: snap zoom to 100% steps (¼ steps below 100%)
     offset: egui::Vec2,
@@ -2372,10 +2377,15 @@ impl PixelView {
             video_loading: None,
             video_tex: None,
             video_markers: Vec::new(),
+            video_md_header: String::new(),
+            video_marker_sel: None,
+            video_marker_focus: false,
             video_speed: 1.0,
             video_scrub: None,
             video_scrub_t: 0.0,
             video_seek_input: String::new(),
+            video_trim_in: None,
+            video_trim_out: None,
             player: None,
             zoom: img_zoom,
             zoom_lock,
@@ -5028,7 +5038,7 @@ impl PixelView {
         }
 
         // Snapshot state for the controls.
-        let (pos, dur, playing, speed, frame_idx, frame_cnt) = {
+        let (pos, dur, playing, speed, frame_idx, frame_cnt, has_audio) = {
             let vp = self.video_player.as_ref()?;
             (
                 vp.position(),
@@ -5037,6 +5047,7 @@ impl PixelView {
                 vp.speed,
                 vp.frame_index(),
                 vp.frame_count(),
+                vp.has_audio(),
             )
         };
         let immersive = self.immersive;
@@ -5048,6 +5059,11 @@ impl PixelView {
         let mut want_export = false;
         let mut want_extract: Option<bool> = None; // Some(open_after)
         let mut want_add_marker = false;
+        let mut want_marker_click: Option<usize> = None; // a marker chip was clicked (seek + toggle notes)
+        let mut want_set_in = false;
+        let mut want_set_out = false;
+        let mut want_trim_clear = false;
+        let mut want_trim_export = false;
 
         if !immersive {
             let play_lbl = |p: bool| {
@@ -5108,30 +5124,72 @@ impl PixelView {
                 {
                     want_export = true;
                 }
-                ui.menu_button("Audio ▾", |ui| {
-                    if ui
-                        .button("Extract & edit in sampler")
-                        .on_hover_text("Extract the audio and open it in pixelview's built-in sampler/waveform editor")
-                        .clicked()
-                    {
-                        want_extract = Some(true);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .button("Extract audio to file…")
-                        .on_hover_text("Save the audio track to disk (lossless copy, or WAV)")
-                        .clicked()
-                    {
-                        want_extract = Some(false);
-                        ui.close_menu();
-                    }
+                ui.add_enabled_ui(has_audio, |ui| {
+                    ui.menu_button("Audio ▾", |ui| {
+                        if ui
+                            .button("Extract & edit in sampler")
+                            .on_hover_text("Extract the audio and open it in pixelview's built-in sampler/waveform editor")
+                            .clicked()
+                        {
+                            want_extract = Some(true);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Extract audio to file…")
+                            .on_hover_text("Save the audio track to disk (lossless copy, or WAV)")
+                            .clicked()
+                        {
+                            want_extract = Some(false);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text("This video has no audio track");
                 });
                 if ui
-                    .button("＋ Marker")
-                    .on_hover_text("Append a marker at the current time to the .md sidecar")
+                    .button("+ Marker")
+                    .on_hover_text("Add a marker at the current time to the .md sidecar (m)")
                     .clicked()
                 {
                     want_add_marker = true;
+                }
+                // Trim / lossless clip export.
+                ui.separator();
+                if ui
+                    .button("Set In")
+                    .on_hover_text("Set trim In at the current time (i)")
+                    .clicked()
+                {
+                    want_set_in = true;
+                }
+                if ui
+                    .button("Set Out")
+                    .on_hover_text("Set trim Out at the current time (o)")
+                    .clicked()
+                {
+                    want_set_out = true;
+                }
+                let tc = |o: Option<f32>| o.map(format_timecode).unwrap_or_else(|| "—".into());
+                ui.label(format!(
+                    "{}–{}",
+                    tc(self.video_trim_in),
+                    tc(self.video_trim_out)
+                ));
+                let can_export = matches!(
+                    (self.video_trim_in, self.video_trim_out),
+                    (Some(a), Some(b)) if b > a
+                );
+                if ui
+                    .add_enabled(can_export, egui::Button::new("Export clip…"))
+                    .on_hover_text("Lossless trim (ffmpeg -c copy; snaps to a keyframe)")
+                    .clicked()
+                {
+                    want_trim_export = true;
+                }
+                if (self.video_trim_in.is_some() || self.video_trim_out.is_some())
+                    && ui.button("Clear").on_hover_text("Clear In/Out").clicked()
+                {
+                    want_trim_clear = true;
                 }
             });
 
@@ -5154,12 +5212,44 @@ impl PixelView {
                 egui::pos2(bar.min.x + bar.width() * frac, bar.max.y),
             );
             p.rect_filled(played, 3.0, egui::Color32::from_rgb(90, 150, 235));
-            for (t, _) in &self.video_markers {
-                if dur > 0.0 {
-                    let x = rect.min.x + rect.width() * (t / dur).clamp(0.0, 1.0);
+            // Trim region shading + green In/Out ticks.
+            if dur > 0.0 {
+                let x_at = |t: f32| rect.min.x + rect.width() * (t / dur).clamp(0.0, 1.0);
+                if let (Some(a), Some(b)) = (self.video_trim_in, self.video_trim_out) {
+                    if b > a {
+                        p.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x_at(a), rect.top()),
+                                egui::pos2(x_at(b), rect.bottom()),
+                            ),
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(90, 235, 150, 60),
+                        );
+                    }
+                }
+                for t in [self.video_trim_in, self.video_trim_out]
+                    .into_iter()
+                    .flatten()
+                {
+                    let x = x_at(t);
                     p.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 60)),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 235, 150)),
+                    );
+                }
+            }
+            for (i, m) in self.video_markers.iter().enumerate() {
+                if dur > 0.0 {
+                    let x = rect.min.x + rect.width() * (m.secs / dur).clamp(0.0, 1.0);
+                    // The selected marker's tick is brighter/thicker.
+                    let (w, c) = if self.video_marker_sel == Some(i) {
+                        (2.5, egui::Color32::from_rgb(255, 235, 120))
+                    } else {
+                        (1.5, egui::Color32::from_rgb(255, 200, 60))
+                    };
+                    p.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(w, c),
                     );
                 }
             }
@@ -5202,25 +5292,104 @@ impl PixelView {
                 }
             }
 
-            // Marker jump list (click to seek).
+            // Marker jump list: click a chip to seek + toggle its notes editor.
             if !self.video_markers.is_empty() {
+                let sel = self.video_marker_sel;
+                let chips: Vec<(usize, f32, String)> = self
+                    .video_markers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let txt = if m.title.trim().is_empty() {
+                            format_timecode(m.secs)
+                        } else {
+                            format!("{} {}", format_timecode(m.secs), m.title.trim())
+                        };
+                        (i, m.secs, txt)
+                    })
+                    .collect();
                 egui::ScrollArea::horizontal()
                     .id_salt("vid_markers")
                     .max_height(24.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for (t, label) in self.video_markers.clone() {
-                                let txt = if label.is_empty() {
-                                    format_timecode(t)
-                                } else {
-                                    format!("{} {}", format_timecode(t), label)
-                                };
-                                if ui.small_button(txt).clicked() {
-                                    want_seek = Some(t);
+                            for (i, t, txt) in &chips {
+                                if ui.selectable_label(sel == Some(*i), txt).clicked() {
+                                    want_seek = Some(*t);
+                                    want_marker_click = Some(*i);
                                 }
                             }
                         });
                     });
+            }
+
+            // Apply the marker click now (before the notes editor) so selection is current: a
+            // click seeks AND toggles that marker's notes open/closed.
+            if let Some(i) = want_marker_click {
+                self.video_marker_sel = if self.video_marker_sel == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+            }
+
+            // Notes editor for the selected marker: an editable title + a multiline notes field,
+            // saved to the `.md` on every change (so you can type while logging footage).
+            if let Some(sel) = self.video_marker_sel {
+                if sel < self.video_markers.len() {
+                    let take_focus = std::mem::take(&mut self.video_marker_focus);
+                    let mut md_dirty = false;
+                    let mut want_delete = false;
+                    let mut want_close = false;
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format_timecode(self.video_markers[sel].secs))
+                                    .monospace()
+                                    .strong(),
+                            );
+                            let tr = ui.add(
+                                egui::TextEdit::singleline(&mut self.video_markers[sel].title)
+                                    .hint_text("marker title")
+                                    .desired_width(220.0),
+                            );
+                            if take_focus {
+                                tr.request_focus();
+                            }
+                            if tr.changed() {
+                                md_dirty = true;
+                            }
+                            if ui.button("🗑").on_hover_text("Delete this marker").clicked() {
+                                want_delete = true;
+                            }
+                            if ui.button("×").on_hover_text("Close notes").clicked() {
+                                want_close = true;
+                            }
+                        });
+                        let nr = ui.add(
+                            egui::TextEdit::multiline(&mut self.video_markers[sel].notes)
+                                .hint_text("notes… (logged to the .md sidecar)")
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if nr.changed() {
+                            md_dirty = true;
+                        }
+                    });
+                    if md_dirty {
+                        self.save_markers();
+                    }
+                    if want_delete {
+                        self.video_markers.remove(sel);
+                        self.video_marker_sel = None;
+                        self.save_markers();
+                    }
+                    if want_close {
+                        self.video_marker_sel = None;
+                    }
+                } else {
+                    self.video_marker_sel = None;
+                }
             }
         }
 
@@ -5262,6 +5431,19 @@ impl PixelView {
         }
         if want_add_marker {
             self.append_video_marker(pos);
+        }
+        if want_set_in {
+            self.set_trim_in(pos);
+        }
+        if want_set_out {
+            self.set_trim_out(pos);
+        }
+        if want_trim_clear {
+            self.video_trim_in = None;
+            self.video_trim_out = None;
+        }
+        if want_trim_export {
+            self.export_video_clip();
         }
 
         // Blit the frame through the image viewer (zoom/pan/fit/transparency for free).
@@ -5416,27 +5598,100 @@ impl PixelView {
         }
     }
 
-    /// Append a marker at `secs` to the video's `.md` sidecar (YouTube-chapter format), then reload.
-    /// The label is left blank for you to fill in — the whole point of "log the footage" quickly.
+    /// Write the current markers (+ header) back to the video's `.md` sidecar. No-op if no video.
+    fn save_markers(&self) {
+        if let Some(vp) = self.video_player.as_ref() {
+            let _ = save_video_markers(&vp.path, &self.video_md_header, &self.video_markers);
+        }
+    }
+
+    /// Add a blank marker at `secs` (kept time-sorted), select it, and focus its title field so
+    /// you can type immediately — the "log the footage" quick-capture. Persists to the `.md`.
     fn append_video_marker(&mut self, secs: f32) {
-        let Some(src) = self.video_player.as_ref().map(|vp| vp.path.clone()) else {
+        if self.video_player.is_none() {
+            return;
+        }
+        let idx = self.video_markers.partition_point(|m| m.secs <= secs);
+        self.video_markers.insert(
+            idx,
+            VideoMarker {
+                secs,
+                title: String::new(),
+                notes: String::new(),
+            },
+        );
+        self.video_marker_sel = Some(idx);
+        self.video_marker_focus = true; // request focus on the new marker's title next frame
+        self.save_markers();
+        self.status = format!("Marker at {}", format_timecode(secs));
+    }
+
+    /// Set the trim In point (drops a stale Out that's now ≤ In).
+    fn set_trim_in(&mut self, secs: f32) {
+        self.video_trim_in = Some(secs);
+        if self.video_trim_out.is_some_and(|o| o <= secs) {
+            self.video_trim_out = None;
+        }
+        self.status = format!("Trim In {}", format_timecode(secs));
+    }
+
+    /// Set the trim Out point (drops a stale In that's now ≥ Out).
+    fn set_trim_out(&mut self, secs: f32) {
+        self.video_trim_out = Some(secs);
+        if self.video_trim_in.is_some_and(|i| i >= secs) {
+            self.video_trim_in = None;
+        }
+        self.status = format!("Trim Out {}", format_timecode(secs));
+    }
+
+    /// Export the In→Out range as a **lossless** clip via ffmpeg stream-copy (`-c copy`, so no
+    /// re-encode — the cut snaps to the nearest keyframe at/before In). Falls back to a re-encode
+    /// if copy fails (e.g. the chosen container can't hold the source codecs).
+    fn export_video_clip(&mut self) {
+        let (src, a, b) = match (
+            self.video_player.as_ref().map(|v| v.path.clone()),
+            self.video_trim_in,
+            self.video_trim_out,
+        ) {
+            (Some(s), Some(a), Some(b)) if b > a => (s, a, b),
+            _ => {
+                self.status = "Set trim In and Out first".into();
+                return;
+            }
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_clip.{ext}"))
+            .save_file()
+        else {
             return;
         };
-        let md = video_markers_path(&src);
-        let line = format!("{} \n", format_timecode(secs));
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&md)
-        {
-            Ok(mut f) => {
-                let _ = f.write_all(line.as_bytes());
-                self.video_markers = load_video_markers(&src);
-                self.status = format!("Marker at {} → {}", format_timecode(secs), short_name(&md));
+        let ss = format!("{a:.3}");
+        let t = format!("{:.3}", b - a);
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-v", "quiet", "-nostdin", "-y", "-ss", &ss])
+                .arg("-i")
+                .arg(&src)
+                .args(["-t", &t]);
+            if copy {
+                cmd.args(["-c", "copy", "-avoid_negative_ts", "make_zero"]);
             }
-            Err(e) => self.status = format!("Marker write failed: {e}"),
-        }
+            // else: re-encode with the container defaults (a frame-accurate cut).
+            cmd.arg(&dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let ok = run(true) || run(false);
+        self.status = if ok {
+            format!("Exported clip {}–{} → {}", ss, t, short_name(&dest))
+        } else {
+            "Clip export failed (is ffmpeg installed?)".into()
+        };
     }
 
     /// Enter the standalone **Sample-Pads** editor (item 15): the pad grid + keyboard + a silent
@@ -10281,6 +10536,10 @@ impl PixelView {
         self.video_loading = None;
         self.video_tex = None;
         self.video_markers.clear();
+        self.video_md_header.clear();
+        self.video_marker_sel = None;
+        self.video_trim_in = None;
+        self.video_trim_out = None;
         self.pdf_view = None;
         self.xmind_view = None;
         self.three_d = None;
@@ -10370,7 +10629,10 @@ impl PixelView {
         // whole-track audio extract) runs on a background thread; `poll_video_load` builds
         // the player when ready. Independent of the audio plugin — video always has sound.
         if self.plugin_video && is_video_ext(&path) {
-            self.video_markers = load_video_markers(&src);
+            let (header, markers) = load_video_markers(&src);
+            self.video_md_header = header;
+            self.video_markers = markers;
+            self.video_marker_sel = None;
             self.ensure_video_loaded(src.clone());
             return;
         }
@@ -20418,14 +20680,22 @@ impl eframe::App for PixelView {
                 }
                 self.want_repaint = true;
             }
-            // m = place a marker at the current position (logs to the .md sidecar).
+            // m = place a marker; i / o = set trim In / Out — all at the current position.
+            let pos_now = self
+                .video_player
+                .as_ref()
+                .map(|vp| vp.position())
+                .unwrap_or(0.0);
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M)) {
-                let pos = self
-                    .video_player
-                    .as_ref()
-                    .map(|vp| vp.position())
-                    .unwrap_or(0.0);
-                self.append_video_marker(pos);
+                self.append_video_marker(pos_now);
+                self.want_repaint = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
+                self.set_trim_in(pos_now);
+                self.want_repaint = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O)) {
+                self.set_trim_out(pos_now);
                 self.want_repaint = true;
             }
         }
@@ -26709,23 +26979,104 @@ fn video_markers_path(video: &Path) -> PathBuf {
     video.with_extension("md")
 }
 
-/// Load YouTube-style chapter markers from the video's `.md` sidecar: each line starting with a
-/// timecode (after optional `-`/`*`/`#` list bullets) followed by text → a `(seconds, label)`.
-/// Missing/unreadable sidecar → no markers.
-fn load_video_markers(video: &Path) -> Vec<(f32, String)> {
+/// One chapter marker: a timecode + a title (the YouTube-chapter line) plus free-form **notes**
+/// (the lines beneath it in the `.md`, for logging footage). See `load_video_markers`.
+#[derive(Clone, Default)]
+struct VideoMarker {
+    secs: f32,
+    title: String,
+    notes: String,
+}
+
+/// A line counts as a marker (not a note) when it has **no leading whitespace** and its first
+/// token (after optional `-`/`*`/`#` bullets) parses as a timecode. Returns `(secs, title)`.
+fn parse_marker_line(line: &str) -> Option<(f32, String)> {
+    if line.starts_with([' ', '\t']) {
+        return None; // indented → a note, not a marker
+    }
+    let stripped = line.trim_start_matches(['-', '*', '#', ' ']);
+    let mut it = stripped.splitn(2, char::is_whitespace);
+    let secs = it.next().and_then(parse_timecode)?;
+    Some((secs, it.next().unwrap_or("").trim().to_string()))
+}
+
+/// Load markers from the video's `.md` sidecar. A timecode line starts a marker (its title = the
+/// rest); the lines beneath it (until the next timecode line) are that marker's **notes**. Any
+/// text before the first marker is returned as the `header` (preserved on save). YouTube-chapter
+/// compatible: the timecode lines paste straight into a video description.
+fn load_video_markers(video: &Path) -> (String, Vec<VideoMarker>) {
     let Ok(text) = std::fs::read_to_string(video_markers_path(video)) else {
-        return Vec::new();
+        return (String::new(), Vec::new());
     };
-    let mut out = Vec::new();
+    let mut header: Vec<&str> = Vec::new();
+    let mut markers: Vec<VideoMarker> = Vec::new();
+    let mut notes: Vec<&str> = Vec::new();
     for line in text.lines() {
-        let line = line.trim().trim_start_matches(['-', '*', '#', ' ']).trim();
-        let mut it = line.splitn(2, char::is_whitespace);
-        if let Some(secs) = it.next().and_then(parse_timecode) {
-            out.push((secs, it.next().unwrap_or("").trim().to_string()));
+        if let Some((secs, title)) = parse_marker_line(line) {
+            // Flush the previous marker's notes (trimmed of surrounding blanks).
+            if let Some(m) = markers.last_mut() {
+                while notes.first().is_some_and(|l| l.trim().is_empty()) {
+                    notes.remove(0);
+                }
+                while notes.last().is_some_and(|l| l.trim().is_empty()) {
+                    notes.pop();
+                }
+                m.notes = notes.join("\n");
+            }
+            notes.clear();
+            markers.push(VideoMarker {
+                secs,
+                title,
+                notes: String::new(),
+            });
+        } else if markers.is_empty() {
+            header.push(line);
+        } else {
+            notes.push(line);
         }
     }
-    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    out
+    if let Some(m) = markers.last_mut() {
+        while notes.first().is_some_and(|l| l.trim().is_empty()) {
+            notes.remove(0);
+        }
+        while notes.last().is_some_and(|l| l.trim().is_empty()) {
+            notes.pop();
+        }
+        m.notes = notes.join("\n");
+    }
+    markers.sort_by(|a, b| {
+        a.secs
+            .partial_cmp(&b.secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (header.join("\n").trim().to_string(), markers)
+}
+
+/// Write markers back to the `.md` sidecar (YouTube-chapter format + notes beneath each). The
+/// preserved `header` (if any) leads. Called on every marker edit so the log stays on disk.
+fn save_video_markers(video: &Path, header: &str, markers: &[VideoMarker]) -> std::io::Result<()> {
+    let mut s = String::new();
+    let h = header.trim_end();
+    if !h.is_empty() {
+        s.push_str(h);
+        s.push_str("\n\n");
+    }
+    for m in markers {
+        s.push_str(&format_timecode(m.secs));
+        let title = m.title.trim();
+        if !title.is_empty() {
+            s.push(' ');
+            s.push_str(title);
+        }
+        s.push('\n');
+        let notes = m.notes.trim_end();
+        if !notes.is_empty() {
+            s.push_str(notes);
+            s.push('\n');
+        }
+        s.push('\n'); // blank line between markers
+    }
+    std::fs::write(video_markers_path(video), s)
 }
 
 /// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.

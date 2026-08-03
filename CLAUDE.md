@@ -1079,22 +1079,33 @@ audio toggle doesn't gate it.
   with a re-encode fallback). **Both honor the current playback speed**: at any speed ≠ 1× it
   re-encodes with an `asetrate` resample filter matching what the player *sounds* like (pitch tracks
   speed, like the live rodio `.speed()` — not the pitch-preserving `atempo`).
-- **Chapter markers via a `.md` sidecar** (the user's "log the footage" workflow). `clip.mp4` →
-  `clip.md`, YouTube-chapter format (`0:00 Intro` / `00:01:23 Title`), parsed by `load_video_markers`
-  (`parse_timecode` handles `ss`/`mm:ss`/`hh:mm:ss`, tolerates `-`/`*`/`#` bullets) into
-  `video_markers: Vec<(secs, label)>` → seek-bar ticks + a clickable jump list. `append_video_marker`
-  writes a blank-label line at the current time (`format_timecode`). Because the `.md` *is* the
-  YouTube chapter format, logging footage and building the description chapters are one action.
+- **Chapter markers + notes via a `.md` sidecar** (the "log the footage" workflow). `clip.mp4` →
+  `clip.md`. A timecode line (`0:00 Intro` / `00:01:23 Title`, `parse_marker_line`: no leading
+  whitespace, first token a timecode) starts a marker; the lines beneath it (until the next timecode)
+  are its **notes**. Text before the first marker is the preserved **header**. `load_video_markers` →
+  `(header, Vec<VideoMarker{secs,title,notes}>)`; `save_video_markers` rewrites the file on every
+  edit (YouTube-chapter-compatible — the timecode lines paste straight into a description). UI: the
+  seek-bar shows marker ticks (the selected one brighter) + a clickable jump list; clicking a chip
+  seeks AND toggles that marker's **notes editor** (an editable title field + a multiline notes box,
+  saved on every change — type while you log). `m` / `+ Marker` inserts a blank marker at the current
+  time (kept time-sorted), selects it, and focuses its title (`video_marker_focus`). 🗑 deletes, ×
+  closes. So logging footage and building the description chapters are one action.
+- **Lossless trim/export.** `Set In`/`Set Out` (or `i`/`o` keys) mark a range (`video_trim_in/out`,
+  shown shaded + green ticks on the seek bar; each setter drops a now-invalid opposite point).
+  `Export clip…` (enabled only when Out > In) runs `export_video_clip`: `ffmpeg -ss <in> -i src -t
+  <dur> -c copy` — a **lossless** stream copy (cut snaps to the nearest keyframe at/before In), with a
+  re-encode fallback if the container can't hold the source codecs. rfd save dialog, default
+  `<stem>_clip.<ext>`.
 - **Player state fields** (`PixelView`): `video_player` / `video_loading` / `video_tex` /
-  `video_markers` / `video_speed` / `video_scrub` / `video_scrub_t` / `video_seek_input`, reset in
-  `load_full`'s teardown block. Master volume/mute pushed each frame via `set_volume`.
+  `video_markers` / `video_md_header` / `video_marker_sel` / `video_marker_focus` / `video_speed` /
+  `video_scrub` / `video_scrub_t` / `video_seek_input` / `video_trim_in` / `video_trim_out`, all reset
+  in `load_full`'s teardown. Master volume/mute pushed each frame via `set_volume`.
 - **Still TODO** (follow-ups, deferred): **hover-scrub thumbnails** (grid tile + Details preview —
   needs an async frame-strip generator, since one-off `ffmpeg -ss` per hover-x is too slow; precompute
   N frames on hover-start + map pointer-x → nearest, like a YouTube storyboard), lossless
-  **trim/export** (mark in/out → `ffmpeg -ss/-to -c copy`, keyframe-snapped unless re-encoded),
-  lossless **join/concat** (`-f concat -c copy`), and the **YouTube browser** (Phase 3 — `yt-dlp` as
-  the "API" mirroring `sixteen.rs`, reusing `cache.rs` + `RemoteThumbs` + this same ffmpeg frame pipe,
-  since `ffmpeg -i <stream-url>` reads URLs like files).
+  **join/concat** (`-f concat -c copy` over a multi-selection), and the **YouTube browser** (Phase 3 —
+  `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` + `RemoteThumbs` + this same ffmpeg
+  frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
 
 ## Git status in the browser (`git.rs`)
 
