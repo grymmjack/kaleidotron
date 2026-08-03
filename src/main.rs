@@ -21,6 +21,7 @@ mod thumb;
 mod video;
 mod viewdb;
 mod xi;
+mod youtube;
 
 use eframe::egui;
 
