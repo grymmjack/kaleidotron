@@ -25,6 +25,15 @@ pub fn rel_parts(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// If `path` is a game **detail folder** (`<steam>/game/<appid>`), return its appid.
+/// Used to friendly-name the breadcrumb + gate the Details-pane game info.
+pub fn detail_appid(path: &Path) -> Option<u32> {
+    match rel_parts(path).as_slice() {
+        [g, appid] if g == "game" => appid.parse().ok(),
+        _ => None,
+    }
+}
+
 /// One installed Steam game.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct SteamGame {

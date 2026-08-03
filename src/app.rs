@@ -1544,11 +1544,17 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     steam_media_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::steam::AppMedia)>>,
     steam_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // The currently-open game detail (appid + its fetched media) — powers the Details-pane
+    // game info block. `steam_names` maps appid → display name so the breadcrumb shows the
+    // game's NAME instead of its numeric appid (seeded from the list + the media fetch).
+    steam_detail: Option<(u32, crate::steam::AppMedia)>,
+    steam_names: HashMap<u32, String>,
     // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
     yt_download_dir: Option<PathBuf>,
     yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
+    yt_open_folder_after: bool, // reveal the file in the OS file manager once a download finishes
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
     // cache-first). `None` when idle; a progress window shows while `Some`.
     bulk_dl: Option<BulkDownload>,
@@ -1595,6 +1601,7 @@ impl PixelView {
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
+    const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
@@ -1771,6 +1778,7 @@ impl PixelView {
             .and_then(|s| eframe::get_value::<String>(s, Self::STEAM_KEY_KEY))
             .unwrap_or_default();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
+        let yt_open_folder_after = load_bool(Self::YT_OPEN_FOLDER_KEY, false);
         let audio_volume = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::AUDIO_VOLUME_KEY))
@@ -2667,8 +2675,11 @@ impl PixelView {
             steam_files: HashMap::new(),
             steam_media_rx: None,
             steam_open_rx: None,
+            steam_detail: None,
+            steam_names: HashMap::new(),
             yt_download_dir,
             yt_max_height,
+            yt_open_folder_after,
             bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -3744,8 +3755,13 @@ impl PixelView {
                 {
                     self.yt_downloaded_ids.insert(id);
                 }
-                self.yt_files.insert(vpath.clone(), local);
+                self.yt_files.insert(vpath.clone(), local.clone());
                 self.yt_open_rx = None;
+                // Optional: pop the containing folder in the OS file manager (Preferences /
+                // the "Open folder after download" checkbox in the video controls).
+                if self.yt_open_folder_after {
+                    self.reveal_in_file_manager(&local);
+                }
                 self.load_full(ctx, vpath);
             }
             Ok(Err(e)) => {
@@ -3781,6 +3797,15 @@ impl PixelView {
     fn open_url(&mut self, url: &str) {
         let o = os_file_manager();
         self.launch_external(&o.exec, &o.args, &o.env, Path::new(url));
+    }
+
+    /// Open a file's **containing folder** in the OS file manager (xdg-open / open / explorer).
+    /// Falls back to the path itself if it has no parent.
+    fn reveal_in_file_manager(&mut self, file: &Path) {
+        let dir = file.parent().unwrap_or(file);
+        let o = os_file_manager();
+        self.launch_external(&o.exec, &o.args, &o.env, dir);
+        self.status = format!("Opened folder: {}", dir.display());
     }
 
     /// SteamTube: list installed Steam games as grid tiles (root only; deeper browsing later).
@@ -3881,6 +3906,7 @@ impl PixelView {
                 ctime: None,
                 rating,
             });
+            self.steam_names.insert(g.appid, g.name.clone());
             self.steam_games.insert(path, g);
         }
         let n = entries.len();
@@ -3895,18 +3921,25 @@ impl PixelView {
         };
     }
 
+    /// Open a YouTube search for a game's videos. Biases the query toward game content
+    /// (`"<name>" gameplay`) so a short/ambiguous title doesn't drag in unrelated videos
+    /// (the "random game → all kinds of non-game videos" bug).
+    fn steam_find_videos(&mut self, name: &str) {
+        let query = format!("\"{}\" gameplay", name.trim());
+        let p = Path::new(crate::youtube::ROOT)
+            .join(crate::youtube::SEARCH)
+            .join(&query);
+        self.status = format!("🎬 {name} → videos");
+        self.open_folder(p);
+    }
+
     /// Run a right-click Steam action on a game tile.
     fn steam_action(&mut self, path: &Path, act: SteamAct) {
         let Some(g) = self.steam_games.get(path).cloned() else {
             return;
         };
         match act {
-            SteamAct::Videos => {
-                let p = Path::new(crate::youtube::ROOT)
-                    .join(crate::youtube::SEARCH)
-                    .join(&g.name);
-                self.open_folder(p);
-            }
+            SteamAct::Videos => self.steam_find_videos(&g.name),
             SteamAct::Launch => {
                 self.open_url(&g.run_url());
                 self.status = format!("Launching {} via Steam…", g.name);
@@ -3929,11 +3962,8 @@ impl PixelView {
             .map(|d| d.subsec_nanos() as usize)
             .unwrap_or(0);
         let g = games[seed % games.len()].clone();
+        self.steam_find_videos(&g.name);
         self.status = format!("🎲 {} → videos", g.name);
-        let p = Path::new(crate::youtube::ROOT)
-            .join(crate::youtube::SEARCH)
-            .join(&g.name);
-        self.open_folder(p);
     }
 
     /// Play a random result from the current YouTube search (download-in-place → play).
@@ -3984,6 +4014,7 @@ impl PixelView {
     /// Fetches media on a worker (`poll_steam_media` fills the grid when it lands).
     fn open_game_detail(&mut self, appid: u32, dir: PathBuf) {
         self.steam_media.clear();
+        self.steam_detail = None; // cleared until the fetch lands (Details pane shows "loading")
         self.show_folder(dir.clone(), Vec::new());
         self.status = "Loading game media…".into();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4028,6 +4059,13 @@ impl PixelView {
                     self.steam_media.insert(path, m.clone());
                 }
                 let n = entries.len();
+                // Remember the name (breadcrumb) + the whole media blob (Details pane).
+                if let Some(appid) = crate::steam::detail_appid(&dir) {
+                    if !media.name.is_empty() {
+                        self.steam_names.insert(appid, media.name.clone());
+                    }
+                    self.steam_detail = Some((appid, media.clone()));
+                }
                 self.show_folder(dir, entries);
                 let genres = if media.genres.is_empty() {
                     String::new()
@@ -5918,6 +5956,12 @@ impl PixelView {
                 {
                     want_trim_clear = true;
                 }
+                ui.separator();
+                ui.checkbox(&mut self.yt_open_folder_after, "Open folder after download")
+                    .on_hover_text(
+                        "When a downloaded video finishes (YouTube), pop its folder in your \
+                         file manager. Persisted.",
+                    );
             });
 
             // Seek bar with marker ticks (seeks on release only — each seek respawns ffmpeg).
@@ -11759,9 +11803,18 @@ impl PixelView {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| a.to_string_lossy().into_owned());
-                        // Show the virtual 16colo.rs root by its friendly name.
+                        // Show virtual roots by their friendly names, and a Steam game's
+                        // detail folder (`<steam>/game/<appid>`) by the game's NAME.
                         let label = if label == crate::sixteen::ROOT {
                             "16colo.rs".to_string()
+                        } else if label == crate::steam::ROOT {
+                            "Steam".to_string()
+                        } else if label == crate::youtube::ROOT {
+                            "YouTube".to_string()
+                        } else if let Some(name) = crate::steam::detail_appid(a)
+                            .and_then(|id| self.steam_names.get(&id).cloned())
+                        {
+                            name
                         } else {
                             label
                         };
@@ -13069,7 +13122,112 @@ impl PixelView {
         new_h
     }
 
+    /// Details-pane content for a Steam game detail view (`<steam>/game/<appid>`): the game's
+    /// name, genres, short description, media counts, a ★ rating row, and quick links (Launch via
+    /// Steam / Find videos / Store / Community hub / Discussions). URL/nav actions are deferred out
+    /// of the scroll closure (it borrows `self` immutably) and applied at the end.
+    fn ui_steam_detail(&mut self, ui: &mut egui::Ui, appid: u32) {
+        ui.strong("Details");
+        ui.separator();
+        // The media may still be loading (fetched on a worker) — show a note until it lands.
+        let Some((_, media)) = self.steam_detail.clone().filter(|(id, _)| *id == appid) else {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.weak("Loading game details…");
+            });
+            self.want_repaint = true;
+            return;
+        };
+        let g = crate::steam::SteamGame {
+            appid,
+            name: media.name.clone(),
+            last_played: 0,
+            size: 0,
+        };
+        let cur_rating = self
+            .folder
+            .clone()
+            .map(|f| self.read_rating(&f))
+            .unwrap_or(0);
+        let mut want_url: Option<String> = None;
+        let mut want_videos = false;
+        let mut want_rate: Option<u8> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("steam_detail")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(&media.name).heading());
+                if !media.genres.is_empty() {
+                    ui.add_space(2.0);
+                    ui.weak(media.genres.join(" · "));
+                }
+                ui.add_space(8.0);
+                if !media.description.is_empty() {
+                    ui.label(&media.description);
+                    ui.add_space(10.0);
+                }
+                let vids = media.media.iter().filter(|m| m.is_video).count();
+                let shots = media.media.len() - vids;
+                ui.weak(format!("{shots} screenshots · {vids} trailers"));
+                ui.add_space(10.0);
+                // ★ rating row (click a star to set, ✕ to clear) — stored on the stable
+                // `<steam>/game/<appid>` display path via the ratings sidecar.
+                ui.horizontal(|ui| {
+                    ui.weak("Rating");
+                    for s in 1..=5u8 {
+                        let filled = s <= cur_rating;
+                        let star = if filled { "★" } else { "☆" };
+                        if ui.button(star).clicked() {
+                            want_rate = Some(s);
+                        }
+                    }
+                    if cur_rating > 0 && ui.button("✕").on_hover_text("Clear rating").clicked() {
+                        want_rate = Some(0);
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if ui.button("▶ Launch via Steam").clicked() {
+                    want_url = Some(g.run_url());
+                }
+                if ui.button("🎬 Find videos").clicked() {
+                    want_videos = true;
+                }
+                if ui.button("🛒 Store page").clicked() {
+                    want_url = Some(g.store_url());
+                }
+                if ui.button("👥 Community hub").clicked() {
+                    want_url = Some(g.hub_url());
+                }
+                if ui.button("💬 Discussions").clicked() {
+                    want_url = Some(g.discussions_url());
+                }
+            });
+        if let Some(u) = want_url {
+            self.open_url(&u);
+            if u.starts_with("steam://") {
+                self.status = format!("Launching {} via Steam…", media.name);
+            }
+        }
+        if want_videos {
+            self.steam_find_videos(&media.name);
+        }
+        if let Some(r) = want_rate {
+            if let Some(f) = self.folder.clone() {
+                self.set_rating(&f, r);
+            }
+        }
+    }
+
     fn ui_details(&mut self, ui: &mut egui::Ui) {
+        // In a Steam game's detail view the "entries" are screenshots/trailers; the pane should
+        // describe the GAME itself (name/genres/description/links/rating), not a hovered tile.
+        if let Some(appid) = self.folder.as_deref().and_then(crate::steam::detail_appid) {
+            self.ui_steam_detail(ui, appid);
+            return;
+        }
         ui.strong("Details");
         ui.separator();
         let Some(entry) = self.inspected_entry() else {
@@ -14994,10 +15152,40 @@ impl PixelView {
         }
     }
 
+    /// Any async listing/media fetch that should paint a spinner (+ the status line) in an
+    /// otherwise-empty grid/table — 16colo streams, a Steam game's media, a YouTube search, or a
+    /// pending open. Keeps `ui_grid`/`ui_table`'s empty states in sync.
+    fn empty_view_loading(&self) -> bool {
+        self.remote_rx.is_some()
+            || self.colo_rx.is_some()
+            || self.steam_media_rx.is_some()
+            || self.yt_rx.is_some()
+            || self.steam_open_rx.is_some()
+            || self.yt_open_rx.is_some()
+    }
+
+    /// Paint the centered empty-view content: a spinner + the current status while something is
+    /// loading (so entering a Steam game shows "Loading game media…", matching the status bar),
+    /// else the plain "open a folder" hint.
+    fn empty_view_body(&self, ui: &mut egui::Ui, loading: bool) {
+        if loading {
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(40.0));
+                if !self.status.is_empty() {
+                    ui.add_space(10.0);
+                    ui.weak(&self.status);
+                }
+            });
+        } else {
+            ui.label("Nothing here. Open a folder.");
+        }
+    }
+
     fn ui_grid(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            // A 16colo listing / pack download in flight → spinner, else the empty hint.
-            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // A 16colo listing / pack download / Steam-media / YouTube fetch in flight → spinner
+            // + status, else the empty hint.
+            let loading = self.empty_view_loading();
             // Still allow the empty-area menu (paste / new folder) in an empty local folder.
             // The sensor must be registered *after* the centered label — that label is
             // justified to fill the whole rect, so a sensor placed *before* it is fully
@@ -15005,11 +15193,7 @@ impl PixelView {
             // nothing else needs the clicks, so an on-top full-rect sensor is what we want.
             let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
-                if loading {
-                    ui.add(egui::Spinner::new().size(40.0));
-                } else {
-                    ui.label("Nothing here. Open a folder.");
-                }
+                self.empty_view_body(ui, loading);
             });
             let empty_bg = (!loading && self.is_local_dir())
                 .then(|| ui.interact(full, ui.id().with("grid_empty_bg"), egui::Sense::click()));
@@ -15859,17 +16043,13 @@ impl PixelView {
     /// year / group / pack + a per-row download menu); elsewhere, file columns.
     fn ui_table(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            // A 16colo listing in flight (artist/group/search streams in) → spinner.
-            let loading = self.remote_rx.is_some() || self.colo_rx.is_some();
+            // A 16colo listing / Steam-media / YouTube fetch in flight → spinner + status.
+            let loading = self.empty_view_loading();
             // Sensor registered *after* the justified full-rect label so it isn't occluded
             // (see the matching note in `ui_grid`'s empty path).
             let full = ui.available_rect_before_wrap();
             ui.centered_and_justified(|ui| {
-                if loading {
-                    ui.add(egui::Spinner::new().size(40.0));
-                } else {
-                    ui.label("Nothing here. Open a folder.");
-                }
+                self.empty_view_body(ui, loading);
             });
             let empty_bg = (!loading && self.is_local_dir())
                 .then(|| ui.interact(full, ui.id().with("table_empty_bg"), egui::Sense::click()));
@@ -23054,6 +23234,11 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
+        eframe::set_value(
+            storage,
+            Self::YT_OPEN_FOLDER_KEY,
+            &self.yt_open_folder_after,
+        );
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
