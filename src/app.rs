@@ -246,6 +246,14 @@ enum YtOpenMsg {
     Done(Result<(PathBuf, PathBuf), String>), // Ok((virtual path, local file)) | Err(status text)
 }
 
+/// A video's fetched extras (transcript + comments), for the Details pane + the "Copy for LLM"
+/// export. Fetched lazily on demand (both are slow yt-dlp calls).
+#[derive(Clone, Default)]
+struct YtInfo {
+    transcript: Option<String>,
+    comments: Vec<crate::youtube::YtComment>,
+}
+
 /// What a 16colo.rs flat-piece listing is built from (see
 /// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
@@ -1572,6 +1580,10 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     yt_meta_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::youtube::YtMeta)>>,
     yt_meta_pending: Option<PathBuf>,
+    // Transcript (captions) + comments, fetched on demand for the "Copy for LLM" export.
+    yt_info: HashMap<PathBuf, YtInfo>,
+    yt_info_rx: Option<std::sync::mpsc::Receiver<(PathBuf, YtInfo)>>,
+    yt_info_pending: Option<PathBuf>,
     yt_search: String, // the YouTube Places-tab search box text
     // Browser to pull YouTube cookies from (Preferences) — passed to yt-dlp as
     // `--cookies-from-browser` to clear the "confirm you're not a bot" gate + reach age-gated
@@ -2736,6 +2748,9 @@ impl PixelView {
             yt_meta: HashMap::new(),
             yt_meta_rx: None,
             yt_meta_pending: None,
+            yt_info: HashMap::new(),
+            yt_info_rx: None,
+            yt_info_pending: None,
             yt_search: String::new(),
             yt_cookies_browser,
             yt_downloaded_ids: std::collections::HashSet::new(),
@@ -3933,6 +3948,99 @@ impl PixelView {
                 let _ = tx.send((vpath, meta));
             }
         });
+    }
+
+    /// Fetch a video's transcript (captions) + top comments on a worker (both slow yt-dlp calls),
+    /// for the Details pane + "Copy for LLM". No-op if already fetched / in flight / not YouTube.
+    fn start_yt_info(&mut self, vpath: &Path) {
+        if !crate::youtube::is_remote(vpath)
+            || self.yt_info.contains_key(vpath)
+            || self.yt_info_pending.is_some()
+        {
+            return;
+        }
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_info_rx = Some(rx);
+        self.yt_info_pending = Some(vpath.to_path_buf());
+        self.status = "Fetching transcript + comments…".into();
+        let vpath = vpath.to_path_buf();
+        let cookies = self.yt_cookies_browser.clone();
+        std::thread::spawn(move || {
+            let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
+            let info = YtInfo {
+                transcript: crate::youtube::fetch_captions(&id, cookies),
+                comments: crate::youtube::fetch_comments(&id, 50, cookies),
+            };
+            let _ = tx.send((vpath, info));
+        });
+    }
+
+    /// Drain a finished transcript/comments fetch into `yt_info`.
+    fn poll_yt_info(&mut self) {
+        let Some(rx) = &self.yt_info_rx else { return };
+        match rx.try_recv() {
+            Ok((vpath, info)) => {
+                let n = info.comments.len();
+                let has_t = info.transcript.is_some();
+                self.yt_info.insert(vpath, info);
+                self.yt_info_rx = None;
+                self.yt_info_pending = None;
+                self.status = format!(
+                    "Loaded {}{} comments",
+                    if has_t { "transcript · " } else { "no transcript · " },
+                    n
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.yt_info_rx = None;
+                self.yt_info_pending = None;
+            }
+        }
+    }
+
+    /// Assemble a plain-text dump of everything known about a video (title, channel, stats,
+    /// description, transcript, comments) for pasting into an LLM.
+    fn yt_llm_text(&self, path: &Path) -> String {
+        let mut s = String::new();
+        if let Some(m) = self.yt_meta.get(path) {
+            s.push_str(&format!("Title: {}\n", m.title));
+            if !m.channel.is_empty() {
+                s.push_str(&format!("Channel: {}\n", m.channel));
+            }
+            s.push_str(&format!("URL: {}\n", m.watch_url()));
+            if !m.upload_date_fmt().is_empty() {
+                s.push_str(&format!("Published: {}\n", m.upload_date_fmt()));
+            }
+            s.push_str(&format!(
+                "Views: {} · Likes: {} · Comments: {}\n",
+                m.views, m.likes, m.comments
+            ));
+            if !m.description.is_empty() {
+                s.push_str(&format!("\nDescription:\n{}\n", m.description));
+            }
+        } else if let Some(v) = self.yt_videos.get(path) {
+            s.push_str(&format!("Title: {}\nChannel: {}\n", v.title, v.channel));
+        }
+        if let Some(info) = self.yt_info.get(path) {
+            if let Some(t) = &info.transcript {
+                s.push_str(&format!("\nTranscript:\n{t}\n"));
+            }
+            if !info.comments.is_empty() {
+                s.push_str("\nTop comments:\n");
+                for c in &info.comments {
+                    s.push_str(&format!("- {} ({}👍): {}\n", c.author, c.likes, c.text));
+                }
+            }
+        }
+        s
     }
 
     /// Drain a finished metadata fetch (each frame) into `yt_meta`.
@@ -13640,8 +13748,13 @@ impl PixelView {
             .map(|m| m.watch_url())
             .or_else(|| flat.as_ref().map(|f| f.watch_url()))
             .unwrap_or_default();
+        let description = meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+        let info = self.yt_info.get(path).cloned();
+        let info_pending = self.yt_info_pending.as_deref() == Some(path);
         let mut want_url: Option<String> = None;
         let mut want_browser = false;
+        let mut want_fetch_info = false;
+        let mut want_copy_llm = false;
         egui::ScrollArea::vertical()
             .id_salt("yt_detail")
             .auto_shrink([false; 2])
@@ -13723,12 +13836,89 @@ impl PixelView {
                         ui.weak("Loading full details…");
                     });
                 }
+
+                // Description.
+                if !description.is_empty() {
+                    ui.add_space(10.0);
+                    ui.weak("Description");
+                    ui.label(&description);
+                }
+
+                // Transcript + comments — fetched on demand (for feeding an LLM).
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if info.is_none() && !info_pending {
+                        if ui
+                            .button("📝 Get transcript + comments")
+                            .on_hover_text("Fetch the captions transcript + top comments")
+                            .clicked()
+                        {
+                            want_fetch_info = true;
+                        }
+                    }
+                    if ui
+                        .button("📋 Copy for LLM")
+                        .on_hover_text(
+                            "Copy title + description + stats + transcript + comments to the \
+                             clipboard (fetch transcript/comments first for the full dump)",
+                        )
+                        .clicked()
+                    {
+                        want_copy_llm = true;
+                    }
+                });
+                if info_pending {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak("Fetching transcript + comments…");
+                    });
+                }
+                if let Some(info) = &info {
+                    ui.add_space(4.0);
+                    match &info.transcript {
+                        Some(t) => {
+                            egui::CollapsingHeader::new("Transcript")
+                                .id_salt("yt_transcript")
+                                .show(ui, |ui| {
+                                    ui.label(t);
+                                });
+                        }
+                        None => {
+                            ui.weak("No captions available for this video.");
+                        }
+                    }
+                    if !info.comments.is_empty() {
+                        egui::CollapsingHeader::new(format!("Comments ({})", info.comments.len()))
+                            .id_salt("yt_comments")
+                            .show(ui, |ui| {
+                                for c in &info.comments {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(&c.author).strong());
+                                        if c.likes > 0 {
+                                            ui.weak(format!("· {} 👍", c.likes));
+                                        }
+                                    });
+                                    ui.label(&c.text);
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    }
+                }
             });
         if let Some(u) = want_url {
             self.open_url(&u);
         }
         if want_browser {
             self.open_url(&watch_url);
+        }
+        if want_fetch_info {
+            self.start_yt_info(path);
+        }
+        if want_copy_llm {
+            let text = self.yt_llm_text(path);
+            ui.ctx().copy_text(text);
+            self.status = "Copied video info to clipboard".into();
         }
     }
 
@@ -22698,6 +22888,7 @@ impl eframe::App for PixelView {
         self.poll_yt();
         self.poll_yt_open(&ctx);
         self.poll_yt_meta();
+        self.poll_yt_info();
         self.poll_steam_media();
         self.poll_steam_open(&ctx);
         self.poll_colo_save();

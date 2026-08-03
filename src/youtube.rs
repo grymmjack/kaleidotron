@@ -234,6 +234,167 @@ pub fn parse_playlist_entry(line: &str) -> Option<YtPlaylist> {
     })
 }
 
+/// One top-level comment (for the video info / LLM export).
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtComment {
+    pub author: String,
+    pub text: String,
+    pub likes: u64,
+}
+
+/// Fetch up to `n` top-level comments via `yt-dlp --write-comments`. Empty on error/none.
+pub fn fetch_comments(id: &str, n: usize, cookies: Option<&str>) -> Vec<YtComment> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--skip-download",
+        "--write-comments",
+        "--extractor-args",
+        &format!("youtube:max_comments={},all,0", n.max(1)),
+        "--dump-json",
+        "--no-warnings",
+        "--",
+    ])
+    .arg(&watch)
+    .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let Ok(out) = cmd.output() else {
+        return Vec::new();
+    };
+    parse_comments(&out.stdout, n)
+}
+
+/// Parse the `comments` array out of a `yt-dlp --write-comments --dump-json` blob (top-level only).
+pub fn parse_comments(bytes: &[u8], n: usize) -> Vec<YtComment> {
+    let Ok(d) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(arr) = d.get("comments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        // Top-level only (replies have a parent other than "root").
+        .filter(|c| {
+            c.get("parent")
+                .and_then(|v| v.as_str())
+                .map(|p| p == "root")
+                .unwrap_or(true)
+        })
+        .take(n)
+        .map(|c| YtComment {
+            author: c
+                .get("author")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            text: c
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            likes: c.get("like_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Fetch a video's English captions as a plain-text transcript (auto-captions included). Downloads
+/// the VTT to a temp dir, parses it, cleans up. `None` if there are no captions / yt-dlp errors.
+pub fn fetch_captions(id: &str, cookies: Option<&str>) -> Option<String> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let dir = std::env::temp_dir().join(format!("pv_subs_{id}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let out_tmpl = dir.join("%(id)s.%(ext)s");
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--skip-download",
+        "--write-auto-subs",
+        "--write-subs",
+        "--sub-langs",
+        "en.*",
+        "--sub-format",
+        "vtt",
+        "--no-warnings",
+        "-o",
+    ])
+    .arg(&out_tmpl)
+    .arg(&watch)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    push_cookie_args(&mut cmd, cookies);
+    let _ = cmd.status();
+    // Pick the best English VTT: prefer `<id>.en.vtt`, then `en-orig`, then any `.en*.vtt`.
+    let mut best: Option<(u8, std::path::PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.ends_with(".vtt") {
+                continue;
+            }
+            let rank = if name.ends_with(".en.vtt") {
+                0
+            } else if name.contains(".en-orig") {
+                1
+            } else if name.contains(".en") {
+                2
+            } else {
+                3
+            };
+            if best.as_ref().map(|(r, _)| rank < *r).unwrap_or(true) {
+                best = Some((rank, p));
+            }
+        }
+    }
+    let text = best.and_then(|(_, p)| std::fs::read_to_string(p).ok());
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+    let transcript = parse_vtt(&text?);
+    (!transcript.trim().is_empty()).then_some(transcript)
+}
+
+/// Strip a WebVTT file down to a plain-text transcript: drop the header / timestamp cues / inline
+/// `<...>` tags, and collapse the rolling-window duplicate lines auto-captions emit.
+pub fn parse_vtt(vtt: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in vtt.lines() {
+        let l = raw.trim();
+        if l.is_empty()
+            || l == "WEBVTT"
+            || l.starts_with("Kind:")
+            || l.starts_with("Language:")
+            || l.starts_with("NOTE")
+            || l.contains("-->")
+        {
+            continue;
+        }
+        // Strip inline tags: <00:00:00.000>, <c>, </c>, etc.
+        let mut clean = String::with_capacity(l.len());
+        let mut in_tag = false;
+        for ch in l.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => clean.push(ch),
+                _ => {}
+            }
+        }
+        let clean = clean.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        // Auto-captions roll: each cue repeats the previous line then adds one. Drop a line that
+        // just repeats the last kept line (or is contained by it).
+        if lines
+            .last()
+            .map(|prev| prev == clean || prev.ends_with(clean))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        lines.push(clean.to_string());
+    }
+    lines.join("\n")
+}
+
 /// Abbreviate a count the YouTube way: 1_234_567 → "1.2M".
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -636,6 +797,31 @@ mod tests {
         assert_eq!(u.speed, "");
         // Non-progress lines are ignored.
         assert!(parse_progress("[download] Destination: foo.mp4").is_none());
+    }
+
+    #[test]
+    fn vtt_parses_to_plain_transcript() {
+        let vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n\
+                   00:00:01.000 --> 00:00:03.000\n<00:00:01.000><c>Hello</c> world\n\n\
+                   00:00:03.000 --> 00:00:05.000\nHello world\n\n\
+                   00:00:05.000 --> 00:00:07.000\nsecond line\n";
+        let t = parse_vtt(vtt);
+        // Dedupes the rolling repeat; strips tags/timestamps/header.
+        assert_eq!(t, "Hello world\nsecond line");
+    }
+
+    #[test]
+    fn comments_parse_top_level_only() {
+        let json = r#"{"id":"x","comments":[
+            {"author":"A","text":"top","like_count":5,"parent":"root"},
+            {"author":"B","text":"reply","parent":"UgxABC"},
+            {"author":"C","text":"top2","parent":"root"}
+        ]}"#;
+        let cs = parse_comments(json.as_bytes(), 10);
+        assert_eq!(cs.len(), 2); // reply excluded
+        assert_eq!(cs[0].author, "A");
+        assert_eq!(cs[0].likes, 5);
+        assert_eq!(cs[1].text, "top2");
     }
 
     #[test]
