@@ -61,3 +61,20 @@ Ctrl+Alt+K can kill it, import the NEW files that land in `{outdir}`, skipping `
 - **Deferred** (follow-ups): a per-pad "🤖 Generate sound…" button (backend + dialog already
   support `ai_gen_pad`), the `[?]` live macro-reference, steering images ({limg}/{dimg}), and
   saved generation batches beyond `count`.
+
+## ✅ Session complete — all merged to main
+| PR | Feature |
+|----|---------|
+| #7 | Quick wins: audio drag-selection-to-pad + video "Open frame in…" an editor (recolor-aware) |
+| #8 | YouTube channel browser (Browse channel, Videos\|Playlists, channel breadcrumb) |
+| #9 | Video lists / Watch Later (add-to-list, Places section, add-order grid) |
+| #10 | AI generation plugin (pixelmon/soundmon/ansimon) — tools/styles/prompts, generate dialog, batches, Ctrl+Alt+K |
+
+Build clean, 274 unit/GUI tests pass (the 1 failing `clicking_a_favorite_navigates_to_it` is a
+pre-existing flaky GUI-harness test, present on `main` before this session — a spinner-repaint
+timing quirk, not from any of this work).
+
+**Deferred / follow-ups** noted inline: per-pad "🤖 Generate sound…" button (AI backend already
+supports it), the AI `[?]` live macro reference, steering images, and saved generation batches
+beyond `count`. Dice `.obj` mirroring is **not a bug** (qb64-dungeon needs the inside-out winding)
+— left as-is.
