@@ -3837,6 +3837,21 @@ impl PixelView {
         self.open_folder(p);
     }
 
+    /// Play a random result from the current YouTube search (download-in-place → play).
+    fn yt_play_random(&mut self) {
+        let paths: Vec<PathBuf> = self.yt_videos.keys().cloned().collect();
+        if paths.is_empty() {
+            self.status = "No YouTube results — search first".into();
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let p = paths[seed % paths.len()].clone();
+        self.start_yt_open(p);
+    }
+
     /// Open a game's **detail view**: a virtual folder of its Steam-store screenshots + trailers.
     /// Fetches media on a worker (`poll_steam_media` fills the grid when it lands).
     fn open_game_detail(&mut self, appid: u32, dir: PathBuf) {
@@ -15327,25 +15342,43 @@ impl PixelView {
                                 self.want_repaint = true;
                             }
 
-                            // Video tiles show a real frame; mark them with a ▶ pill
-                            // (bottom-right, the one free corner) so they read as video.
+                            // Video tiles: a YouTube result shows its duration (a bottom-right
+                            // pill, YouTube-style); any other video shows a ▶ pill.
                             if !entry.is_dir && is_video_ext(path) {
                                 let p = ui.painter_at(rect);
                                 let r = (tile * 0.10).clamp(9.0, 15.0);
                                 let c = rect.right_bottom() + egui::vec2(-(r + 5.0), -(r + 5.0));
-                                p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
-                                p.text(
-                                    c + egui::vec2(r * 0.12, 0.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    "▶",
-                                    egui::FontId::proportional(r * 1.15),
-                                    egui::Color32::from_white_alpha(235),
-                                );
-                                // A YouTube result that's already downloaded → a green ⬇ badge
-                                // (bottom-left of the ▶) so you can see what's cached locally.
+                                if let Some(v) =
+                                    self.yt_videos.get(path).filter(|v| v.duration > 0.0)
+                                {
+                                    let font =
+                                        egui::FontId::proportional((tile * 0.085).clamp(9.0, 13.0));
+                                    let galley = p.layout_no_wrap(
+                                        v.duration_str(),
+                                        font,
+                                        egui::Color32::WHITE,
+                                    );
+                                    let pad = egui::vec2(5.0, 2.0);
+                                    let sz = galley.size() + pad * 2.0;
+                                    let br = rect.right_bottom() - egui::vec2(5.0, 5.0);
+                                    let pill = egui::Rect::from_min_max(br - sz, br);
+                                    p.rect_filled(pill, 3.0, egui::Color32::from_black_alpha(190));
+                                    p.galley(pill.min + pad, galley, egui::Color32::WHITE);
+                                } else {
+                                    p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+                                    p.text(
+                                        c + egui::vec2(r * 0.12, 0.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        "▶",
+                                        egui::FontId::proportional(r * 1.15),
+                                        egui::Color32::from_white_alpha(235),
+                                    );
+                                }
+                                // A downloaded YouTube result → a green ⬇ badge (top-left, a free
+                                // corner for YouTube tiles) so you can see what's cached locally.
                                 if self.yt_videos.contains_key(path) && self.yt_is_downloaded(path)
                                 {
-                                    let dc = c + egui::vec2(-(2.0 * r + 4.0), 0.0);
+                                    let dc = rect.left_top() + egui::vec2(r + 5.0, r + 5.0);
                                     p.circle_filled(dc, r, egui::Color32::from_rgb(40, 160, 70));
                                     p.text(
                                         dc,
@@ -20552,6 +20585,7 @@ impl PixelView {
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
+        let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
@@ -20683,6 +20717,23 @@ impl PixelView {
                         if !crate::youtube::available() {
                             ui.weak("yt-dlp not found — install it for playback");
                         }
+                        // Random helpers: play a random current result, or roll a new random game.
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("{} Play random", icons::SHUFFLE))
+                                .on_hover_text("Play a random video from the current results")
+                                .clicked()
+                            {
+                                yt_play_random = true;
+                            }
+                            if ui
+                                .button("🎲 Random game")
+                                .on_hover_text("Pick a random Steam game and search for it")
+                                .clicked()
+                            {
+                                steam_random = true;
+                            }
+                        });
                         if let Some(p) = self.favorites_buttons(
                             ui,
                             icons::GLOBE,
@@ -21370,6 +21421,8 @@ impl PixelView {
             self.recall_filter(i);
         } else if steam_random {
             self.steam_random_videos();
+        } else if yt_play_random {
+            self.yt_play_random();
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
