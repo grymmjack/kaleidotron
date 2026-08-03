@@ -1303,6 +1303,7 @@ pub struct PixelView {
     anim: Option<AnimState>,         // Some when viewing an animated GIF
     hover_anim: Option<AnimState>,   // the hovered grid GIF, playing in its tile
     video_hover: Option<VideoStrip>, // the hovered grid video's scrub strip (pointer-x → frame)
+    video_hover_frac: f32, // current scrub position (0..1) — mirrored into the Details preview
     video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
@@ -2457,6 +2458,7 @@ impl PixelView {
             anim: None,
             hover_anim: None,
             video_hover: None,
+            video_hover_frac: 0.5,
             video_player: None,
             video_loading: None,
             video_tex: None,
@@ -12517,7 +12519,21 @@ impl PixelView {
                     // inside a fixed, user-draggable band (see `draw_thumb_area`) rather than
                     // dictating the pane height. The CRT ≈1.2× stretch for text-mode art keeps it
                     // agreeing with the main view + minimap.
-                    if let Some(tex) = self.thumb_tex.get(&entry.path).cloned() {
+                    // While hover-scrubbing this video in the grid, show the SAME scrubbed frame
+                    // here (a bigger view of what you're scrubbing); else the static thumbnail.
+                    let scrub_tex = self
+                        .video_hover
+                        .as_ref()
+                        .filter(|s| s.path == entry.path && !s.frames.is_empty())
+                        .map(|s| {
+                            let n = s.frames.len();
+                            let idx = ((self.video_hover_frac * (n as f32 - 1.0)).round() as usize)
+                                .min(n - 1);
+                            s.frames[idx].clone()
+                        });
+                    let preview_tex =
+                        scrub_tex.or_else(|| self.thumb_tex.get(&entry.path).cloned());
+                    if let Some(tex) = preview_tex {
                         let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                             1.2
                         } else {
@@ -14663,6 +14679,7 @@ impl PixelView {
                                 let idx = ((frac * (n as f32 - 1.0)).round() as usize).min(n - 1);
                                 (s.frames[idx].clone(), s.frames[idx].size_vec2(), frac)
                             };
+                            self.video_hover_frac = frac; // mirror into the Details preview
                             let fit = fit_centered(rect.shrink(8.0), sz);
                             let ppp = ctx.pixels_per_point();
                             let bp = ui.painter_at(rect);
