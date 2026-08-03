@@ -192,17 +192,44 @@ cargo build --release
 ./target/release/pixelview --folder ~/Pictures
 ```
 
-### First-time system dependencies (Debian/Ubuntu/KDE)
+### Dependencies — the easy way
+
+Run the bundled installer (auto-detects apt / dnf / pacman / zypper / Homebrew and installs
+the build deps **and** the runtime tools the plugins need — including a *current* yt-dlp):
 
 ```sh
-sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-                     libxkbcommon-dev libssl-dev libasound2-dev
+./install-deps.sh            # everything
+./install-deps.sh --no-yt    # skip yt-dlp (no YouTube browser)
+```
+
+It's safe to re-run and prints a ✓/– report of what's available at the end.
+
+### First-time system dependencies (manual, Debian/Ubuntu/KDE)
+
+```sh
+sudo apt-get install build-essential pkg-config \
+                     libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+                     libxkbcommon-dev libssl-dev libasound2-dev \
+                     ffmpeg poppler-utils
 ```
 
 `libasound2-dev` (ALSA) is needed **at build time** for the in-app audio player (rodio →
 cpal → ALSA). The audio device itself is opened lazily and fallibly, so a headless box still
-builds and runs fine. For **PDF rendering**, install **poppler** (`poppler-utils` — provides
-`pdftoppm`) at runtime; without it, PDFs still show metadata and a labeled placeholder tile.
+builds and runs fine.
+
+### Runtime tools for plugins (all optional — each degrades gracefully)
+
+| Tool | Needed by | Without it |
+|---|---|---|
+| **ffmpeg / ffprobe** | **Video** plugin — thumbnails, the in-app player, PNG/audio export, lossless trim + join, YouTube playback | a labeled placeholder tile; no playback |
+| **yt-dlp** *(keep it current!)* | **YouTube** browser — search + download-in-place | no results / "update yt-dlp" |
+| **poppler** (`pdftoppm`) | **PDF** plugin — first-page render | metadata + placeholder tile |
+| **blender** | `.blend` tiles — on-demand frame render | branded placeholder |
+
+> **yt-dlp must be recent.** YouTube changes frequently (SABR, rotating signatures) and an
+> old yt-dlp fails with *"Requested format is not available."* Distro packages lag badly —
+> prefer `pipx install yt-dlp` / `pip install -U yt-dlp` (what `install-deps.sh` does), and
+> update it with `pipx upgrade yt-dlp` when YouTube playback stops working.
 
 The build also **compiles the bundled [libxmp](https://github.com/libxmp/libxmp)** (MIT, vendored
 under `vendor/libxmp`) from source for the extra tracker formats — this needs only a **C compiler**

@@ -233,6 +233,13 @@ enum ColoMsg {
     Err(String),
 }
 
+/// A message from the YouTube search worker (`yt_walk`), mirroring [`ColoMsg`]: one `Hit` per
+/// result (its virtual `Entry` + `YtVideo` metadata), then `Done(count)`.
+enum YtMsg {
+    Hit(Entry, Box<crate::youtube::YtVideo>),
+    Done(usize),
+}
+
 /// What a 16colo.rs flat-piece listing is built from (see
 /// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
@@ -1514,6 +1521,21 @@ pub struct PixelView {
     pending_external: Option<(String, String, String)>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
+    // YouTube browsing (mirrors the 16colo source model). `yt_videos` = per-result metadata
+    // keyed by virtual display path (`<youtube>/search/<q>/<title> [id].mp4`); `yt_files` maps
+    // that path to the downloaded local file (so `resolve_local` + the player find it).
+    yt_videos: HashMap<PathBuf, crate::youtube::YtVideo>,
+    yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
+    yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    yt_files: HashMap<PathBuf, PathBuf>,
+    // A video downloading in place so we can open it once ready: (virtual path, local file).
+    yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    yt_search: String, // the YouTube Places-tab search box text
+    yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
+    // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
+    // Preferences-editable so it can live on an external drive; kept separate from the
+    // 16colo/HTTP cache since videos get large.
+    yt_download_dir: Option<PathBuf>,
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
     // cache-first). `None` when idle; a progress window shows while `Some`.
     bulk_dl: Option<BulkDownload>,
@@ -1558,6 +1580,7 @@ impl PixelView {
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
+    const YT_DIR_KEY: &'static str = "yt_download_dir";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1720,6 +1743,10 @@ impl PixelView {
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, false);
         let plugin_3d = load_bool(Self::PLUGIN_3D_KEY, false); // heavy loaders → default OFF
         let plugin_video = load_bool(Self::PLUGIN_VIDEO_KEY, false); // needs ffmpeg → default OFF
+        let yt_download_dir = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::YT_DIR_KEY))
+            .flatten();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -2603,6 +2630,14 @@ impl PixelView {
             colo_open_rx: None,
             pending_external: None,
             colo_save_rx: None,
+            yt_videos: HashMap::new(),
+            yt_rx: None,
+            yt_cancel: None,
+            yt_files: HashMap::new(),
+            yt_open_rx: None,
+            yt_search: String::new(),
+            yt_downloaded_ids: std::collections::HashSet::new(),
+            yt_download_dir,
             bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -2635,6 +2670,11 @@ impl PixelView {
         // The virtual 16colo.rs tree (years → packs → downloaded pack contents).
         if crate::sixteen::is_remote(&dir) {
             self.open_remote(dir);
+            return;
+        }
+        // The virtual YouTube tree (search results → download-in-place → play).
+        if crate::youtube::is_remote(&dir) {
+            self.open_yt(dir);
             return;
         }
         // An archive path is a *virtual* folder: extract it once, then browse the
@@ -3465,12 +3505,208 @@ impl PixelView {
     }
 
     /// Map a display path to a locally-readable file for decoding: a downloaded 16colo
-    /// piece resolves to its cached `raw` file; anything else is already real on disk.
+    /// piece resolves to its cached `raw` file, a downloaded YouTube video to its local
+    /// `.mp4`; anything else is already real on disk.
     fn resolve_local(&self, path: &Path) -> PathBuf {
         self.colo_files
             .get(path)
+            .or_else(|| self.yt_files.get(path))
             .cloned()
             .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Where downloaded YouTube videos live: the user's configured path, else `<data>/youtube`.
+    /// Kept OUT of the size-capped HTTP cache since videos are large + user-managed.
+    fn yt_cache_dir(&self) -> PathBuf {
+        self.yt_download_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("youtube"))
+    }
+
+    /// Refresh the set of already-downloaded video ids (file stems in the download dir), so grid
+    /// tiles can show a "downloaded" badge — even for videos grabbed in a previous session.
+    fn refresh_yt_downloaded(&mut self) {
+        self.yt_downloaded_ids.clear();
+        if let Ok(rd) = std::fs::read_dir(self.yt_cache_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x != "part") {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        self.yt_downloaded_ids.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is this virtual YouTube path's video already downloaded (in the download dir)?
+    fn yt_is_downloaded(&self, path: &Path) -> bool {
+        self.yt_files.contains_key(path)
+            || path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .and_then(parse_yt_id)
+                .is_some_and(|id| self.yt_downloaded_ids.contains(&id))
+    }
+
+    /// Route a `<youtube>` virtual path: root shows the browse hint, `search/<q>` runs a search,
+    /// and a `search/<q>/<Title [id].mp4>` leaf (a pinned/clicked video) downloads + plays it.
+    fn open_yt(&mut self, dir: PathBuf) {
+        let parts = crate::youtube::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "YouTube — search from the Places panel".into();
+            }
+            [s, q] if s == crate::youtube::SEARCH => {
+                let q = q.clone();
+                self.start_yt_search(dir, q);
+            }
+            // A video leaf (e.g. a pinned video): parse its id and download + play.
+            [s, _q, leaf] if s == crate::youtube::SEARCH && parse_yt_id(leaf).is_some() => {
+                self.start_yt_open(dir);
+            }
+            _ => {
+                self.show_folder(dir, Vec::new());
+            }
+        }
+    }
+
+    /// Kick off a YouTube search on a worker thread (mirrors `start_colo_pieces`). Results stream
+    /// into `all_entries` via `poll_yt`; they render as grid tiles with thumbnails.
+    fn start_yt_search(&mut self, dir: PathBuf, query: String) {
+        self.show_folder(dir.clone(), Vec::new());
+        self.yt_videos.clear();
+        self.refresh_yt_downloaded();
+        if let Some(c) = self.yt_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_rx = Some(rx);
+        self.yt_cancel = Some(cancel.clone());
+        self.status = format!("Searching YouTube: {query}");
+        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx));
+    }
+
+    /// Drain the YouTube search worker each frame (mirrors `poll_colo_pieces`): append hits to
+    /// `all_entries`, request their thumbnails, and rebuild the view.
+    fn poll_yt(&mut self) {
+        let Some(rx) = &self.yt_rx else { return };
+        let mut got = false;
+        let mut done = false;
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(YtMsg::Hit(mut entry, v)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.colo_thumbs
+                        .request(&entry.path, &v.thumb_url, THUMB_PX, false);
+                    self.yt_videos.insert(entry.path.clone(), *v);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(YtMsg::Done(n)) => {
+                    self.status = format!("{n} YouTube result(s)");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.yt_rx = None;
+            self.yt_cancel = None;
+        }
+        if got {
+            self.rebuild_view();
+        }
+        self.want_repaint = true;
+    }
+
+    /// Download a YouTube video in place (to `yt_cache_dir`), then open it in the video player.
+    /// Auto-enables the Video plugin (playback needs it). `poll_yt_open` finishes on the UI thread.
+    fn start_yt_open(&mut self, vpath: PathBuf) {
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            self.status = "Not a YouTube video".into();
+            return;
+        };
+        // One download at a time — a double-click must not spawn two racing yt-dlp runs.
+        if self.yt_open_rx.is_some() {
+            self.status = "Already downloading a video…".into();
+            return;
+        }
+        if !self.plugin_video {
+            self.plugin_video = true;
+            self.registry.set_plugin("video", true);
+        }
+        let dir = self.yt_cache_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_open_rx = Some(rx);
+        self.status = "Downloading from YouTube…".into();
+        std::thread::spawn(move || {
+            let res = match crate::youtube::download(&id, &dir) {
+                Some(local) => Ok((vpath, local)),
+                None => Err(
+                    "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
+                        .to_string(),
+                ),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish a YouTube download (each frame): map the virtual path → the local file and open it.
+    fn poll_yt_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.yt_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                if let Some(id) = vpath
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                {
+                    self.yt_downloaded_ids.insert(id);
+                }
+                self.yt_files.insert(vpath.clone(), local);
+                self.yt_open_rx = None;
+                self.load_full(ctx, vpath);
+            }
+            Ok(Err(e)) => {
+                self.status = e;
+                self.yt_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.yt_open_rx = None,
+        }
+    }
+
+    /// Open a YouTube video's watch page in the OS default browser (no download needed) — the
+    /// always-works fallback (and handy even when playback works).
+    fn open_yt_in_browser(&mut self, vpath: &Path) {
+        let watch = self
+            .yt_videos
+            .get(vpath)
+            .map(|v| v.watch_url())
+            .or_else(|| {
+                vpath
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                    .map(|id| format!("https://www.youtube.com/watch?v={id}"))
+            });
+        if let Some(url) = watch {
+            let o = os_file_manager();
+            self.launch_external(&o.exec, &o.args, &o.env, Path::new(&url));
+            self.status = "Opened in browser".into();
+        }
     }
 
     /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
@@ -11001,6 +11237,12 @@ impl PixelView {
             // file, then open it once ready (mode flips in `poll_colo_open`).
             self.selected = idx;
             self.start_piece_open(entry.path);
+        } else if self.yt_videos.contains_key(&entry.path)
+            && !self.yt_files.contains_key(&entry.path)
+        {
+            // A YouTube result not yet downloaded → download in place, then play (poll_yt_open).
+            self.selected = idx;
+            self.start_yt_open(entry.path);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -14484,6 +14726,7 @@ impl PixelView {
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
+        let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -14781,6 +15024,10 @@ impl PixelView {
                                     } else {
                                         self.colo_thumbs.request(path, &p.tn_url, THUMB_PX, false);
                                     }
+                                } else if let Some(v) = self.yt_videos.get(path) {
+                                    // YouTube result → fetch its i.ytimg.com thumbnail over HTTP.
+                                    self.colo_thumbs
+                                        .request(path, &v.thumb_url, THUMB_PX, false);
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -14810,6 +15057,20 @@ impl PixelView {
                                     egui::FontId::proportional(r * 1.15),
                                     egui::Color32::from_white_alpha(235),
                                 );
+                                // A YouTube result that's already downloaded → a green ⬇ badge
+                                // (bottom-left of the ▶) so you can see what's cached locally.
+                                if self.yt_videos.contains_key(path) && self.yt_is_downloaded(path)
+                                {
+                                    let dc = c + egui::vec2(-(2.0 * r + 4.0), 0.0);
+                                    p.circle_filled(dc, r, egui::Color32::from_rgb(40, 160, 70));
+                                    p.text(
+                                        dc,
+                                        egui::Align2::CENTER_CENTER,
+                                        icons::DOWNLOAD.to_string(),
+                                        egui::FontId::proportional(r * 1.1),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
                             }
                         }
 
@@ -14960,6 +15221,7 @@ impl PixelView {
                                     TilePick::RenderBlend => render_blend = Some(idx),
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
                                     TilePick::JoinVideos => join_sel = true,
+                                    TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                 }
                             }
                         });
@@ -15054,6 +15316,11 @@ impl PixelView {
         }
         if join_sel {
             self.join_selected_videos();
+        }
+        if let Some(i) = open_in_browser {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_yt_in_browser(&p);
+            }
         }
         if pin_current {
             self.pin_current_folder();
@@ -15378,6 +15645,7 @@ impl PixelView {
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut join_sel = false; // "Join videos" (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
+        let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -15903,6 +16171,7 @@ impl PixelView {
                                 TilePick::RenderBlend => render_blend = Some(idx),
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
                                 TilePick::JoinVideos => join_sel = true,
+                                TilePick::OpenInBrowser => open_in_browser = Some(idx),
                             }
                         }
                     });
@@ -16045,6 +16314,11 @@ impl PixelView {
         }
         if join_sel {
             self.join_selected_videos();
+        }
+        if let Some(i) = open_in_browser {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_yt_in_browser(&p);
+            }
         }
         if pin_current {
             self.pin_current_folder();
@@ -18970,9 +19244,7 @@ impl PixelView {
     /// listings, mounted archives (a disposable temp dir), and flat-piece listings.
     fn is_local_dir(&self) -> bool {
         match &self.folder {
-            Some(f) => {
-                self.archive_mount.is_none() && !self.colo_flat && !crate::sixteen::is_remote(f)
-            }
+            Some(f) => self.archive_mount.is_none() && !self.colo_flat && !any_remote(f),
             None => false,
         }
     }
@@ -18980,7 +19252,7 @@ impl PixelView {
     /// A path points at a real local folder we can run a folder action on (local pins /
     /// grid folder tiles). Virtual 16colo paths have nothing to reveal in a file manager.
     fn is_local_path(path: &Path) -> bool {
-        !crate::sixteen::is_remote(path)
+        !any_remote(path)
     }
 
     /// The display label for a pin: the user's custom rename if set, else `short_name`.
@@ -20025,6 +20297,7 @@ impl PixelView {
                             (0u8, "Local"),
                             (4, "PixelFX"),
                             (1, "16colo"),
+                            (5, "YouTube"),
                             (2, "Kits"),
                             (3, "Samples"),
                         ] {
@@ -20044,12 +20317,8 @@ impl PixelView {
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
                         }
-                        if let Some(p) = self.favorites_buttons(
-                            ui,
-                            "📁",
-                            |p| !crate::sixteen::is_remote(p),
-                            false,
-                        ) {
+                        if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
+                        {
                             nav = Some(p);
                         }
                         // Smart filters: saved searches. Click recalls + runs; right-click
@@ -20085,6 +20354,39 @@ impl PixelView {
                             ui,
                             icons::GLOBE,
                             crate::sixteen::is_remote,
+                            false,
+                        ) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 5 {
+                        // YouTube: a search box + pinned searches/tags/videos (like 16colo).
+                        // Search + thumbnails need only network; playback needs yt-dlp + the Video plugin.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.yt_search)
+                                    .hint_text("search YouTube…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.yt_search.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(
+                                        Path::new(crate::youtube::ROOT)
+                                            .join(crate::youtube::SEARCH)
+                                            .join(q),
+                                    );
+                                }
+                            }
+                        });
+                        if !crate::youtube::available() {
+                            ui.weak("yt-dlp not found — install it for playback");
+                        }
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            icons::GLOBE,
+                            crate::youtube::is_remote,
                             false,
                         ) {
                             nav = Some(p);
@@ -21046,6 +21348,8 @@ impl eframe::App for PixelView {
         self.poll_random();
         self.poll_colo_pieces();
         self.poll_colo_open(&ctx);
+        self.poll_yt();
+        self.poll_yt_open(&ctx);
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();
@@ -21718,6 +22022,27 @@ impl eframe::App for PixelView {
                                     prefs_refresh = true; // re-scan so the listing adds/drops those types
                                 }
 
+                                // Where downloaded YouTube videos are stored (they get large —
+                                // point this at an external drive if you like). Separate from cache.
+                                if self.plugin_video {
+                                    ui.add_space(8.0);
+                                    ui.label("YouTube downloads");
+                                    let cur = self.yt_cache_dir();
+                                    ui.weak(format!("Saved to: {}", cur.display()));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Change…").clicked() {
+                                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                                self.yt_download_dir = Some(d);
+                                            }
+                                        }
+                                        if self.yt_download_dir.is_some()
+                                            && ui.button("Reset to default").clicked()
+                                        {
+                                            self.yt_download_dir = None;
+                                        }
+                                    });
+                                }
+
                                 // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
                                 if self.plugin_audio {
                                     ui.add_space(8.0);
@@ -22100,6 +22425,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
+        eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -27234,6 +27560,61 @@ fn is_video_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::VIDEO_EXTS.contains(&e.as_str()))
 }
 
+/// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
+/// (favorites split, etc.) on a non-local path.
+fn any_remote(p: &Path) -> bool {
+    crate::sixteen::is_remote(p) || crate::youtube::is_remote(p)
+}
+
+/// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
+fn parse_yt_id(name: &str) -> Option<String> {
+    let stem = name.rsplit_once('.').map(|(a, _)| a).unwrap_or(name);
+    let start = stem.rfind('[')?;
+    let end = stem.rfind(']')?;
+    (end > start + 1).then(|| stem[start + 1..end].to_string())
+}
+
+/// YouTube search worker (mirrors `colo_walk`): run the search, emit one `Hit` per result as a
+/// virtual `Entry` (`<youtube>/search/<q>/<Title [id].mp4>`) + its `YtVideo`, then `Done(n)`.
+fn yt_walk(
+    query: &str,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<YtMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let vids = crate::youtube::search(query, 40);
+    let mut seen = std::collections::HashSet::new();
+    let mut n = 0usize;
+    for v in vids {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let mut base = sanitize_filename(&v.title);
+        if base.is_empty() {
+            base = "video".into();
+        }
+        let path = root.join(format!("{base} [{}].mp4", v.id));
+        if !seen.insert(path.clone()) {
+            continue; // de-dupe identical title+id
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(YtMsg::Hit(entry, Box::new(v))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(YtMsg::Done(n));
+}
+
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
 /// and a leading `[`/`(` are tolerated. `None` if any component isn't a number.
 fn parse_timecode(s: &str) -> Option<f32> {
@@ -28261,6 +28642,7 @@ enum TilePick {
     RenderBlend,           // ".blend" → render frame 1 with headless Blender → becomes its tile
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
+    OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -28864,6 +29246,18 @@ fn entry_context_menu(
                 on(ui, "SAUCE artist", SmartCriterion::Artist);
             }
         });
+        ui.separator();
+    }
+    // YouTube result: open its watch page in the OS default browser (always works, no download).
+    if !entry.is_dir && crate::youtube::is_remote(&entry.path) {
+        if ui
+            .button(format!("{} Open in browser", icons::GLOBE))
+            .on_hover_text("Open this video's YouTube page in your browser")
+            .clicked()
+        {
+            pick = Some(TilePick::OpenInBrowser);
+            ui.close();
+        }
         ui.separator();
     }
     // Compare (files only): mark this file as the "source" (left) or "diff" (right)

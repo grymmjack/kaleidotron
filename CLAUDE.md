@@ -247,7 +247,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 258 tests (248 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
+cargo test               # 262 tests (252 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -1117,6 +1117,47 @@ audio toggle doesn't gate it.
   the **YouTube browser** (Phase 3 — `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` +
   `RemoteThumbs` + this same ffmpeg frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
 
+## YouTube browser (`src/youtube.rs` + `app.rs` — mirrors the 16colo source model)
+
+A **Places → YouTube tab** (search box) that browses YouTube like 16colo.rs: search → a grid of
+result tiles with thumbnails → open a video by **downloading it in place** then playing the local
+file. Backed entirely by the **yt-dlp** binary (shelled out, like ffmpeg/poppler) + the existing
+HTTP cache + `RemoteThumbs` pool.
+
+- **`src/youtube.rs`** (pure, no egui — unit-tested): `ROOT`/`SEARCH`/`is_remote`/`rel_parts`
+  (virtual paths, mirrors `sixteen`), `YtVideo{id,title,channel,duration,views,thumb_url}`,
+  `parse_entry` (one `yt-dlp --dump-json --flat-playlist` line), `search(query,n)`, and
+  **`download(id, dir)`** — grabs a ≤720p file **in place** (cache-first: an existing `<id>.*` is
+  reused with no network) and returns the path. `stream_url` (`-g`) exists but is **unused**:
+  direct-URL streaming is broken by YouTube **SABR**, so playback is download-then-play, not stream.
+- **Source model in `app.rs`** (parallels the colo\_\* machinery): `YtMsg`, `yt_videos`
+  (virtual path → `YtVideo`), `yt_files` (virtual → downloaded local file, folded into
+  `resolve_local`), `yt_rx`/`yt_cancel`, `yt_open_rx`, `yt_downloaded_ids`. `open_folder` routes
+  `youtube::is_remote` → **`open_yt`** (`[]` = hint, `[search,q]` = `start_yt_search`, a
+  `[search,q,leaf]` video-leaf = `start_yt_open` so **pinned videos** re-download+play).
+  `yt_walk` (worker) runs `search` and emits one `Hit(Entry, YtVideo)` per result as a virtual
+  `<youtube>/search/<q>/<Title [id].mp4>` path (the `[id]` is parsed back by `parse_yt_id`);
+  `poll_yt` drains → `all_entries` + requests thumbnails via `colo_thumbs.request(path, thumb_url…)`
+  → `rebuild_view`. Results render as normal **grid tiles** (thumbnail + title caption + ▶ badge),
+  so **recolor / palette / Save all work on a YouTube thumbnail** like any tile.
+- **Opening a video**: `activate` → `start_yt_open` (guarded to one download at a time — a
+  double-click must not race two yt-dlp runs) downloads to `yt_cache_dir()` on a worker;
+  `poll_yt_open` maps the virtual path → local file (`yt_files`) and `load_full`s it. Once
+  downloaded it's **a regular local video** — full player, `.md` markers, trim, join, hover-scrub,
+  PNG export all apply. Auto-enables the Video plugin (playback needs it). A green **⬇ badge** marks
+  already-downloaded tiles (`yt_downloaded_ids`, refreshed from the dir so it persists across runs).
+- **Right-click → Open in browser** (`TilePick::OpenInBrowser` → `open_yt_in_browser`): `xdg-open`
+  the watch URL — always works, no yt-dlp needed. Searches/tags/videos are **pinnable** to Places
+  via the normal favorites (a pinned `<youtube>/search/<q>` re-runs on click).
+- **Download location** is a persisted, Preferences-editable setting (`yt_download_dir` /
+  `YT_DIR_KEY`, default `<data>/youtube`) — **kept OUT of the 2 GiB HTTP cache** since videos are
+  large; point it at an external drive. `any_remote()` = `sixteen::is_remote || youtube::is_remote`
+  is used at the local-vs-remote guard sites (favorites split, `is_local_dir`/`is_local_path`).
+- **yt-dlp must be current** — YouTube's SABR + rotating signatures break old versions (distro
+  packages lag). `install-deps.sh` installs a fresh one via pipx/venv; see the README caveat.
+- **Deferred idea**: "SteamTube" — read the local Steam library (`libraryfolders.vdf` +
+  `appmanifest_*.acf`) → a Places entry of games → each opens a YouTube search for it.
+
 ## Git status in the browser (`git.rs`)
 
 `start_git_status` (on every `show_folder`, off-thread so a big monorepo can't hitch nav) runs
@@ -1911,7 +1952,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 258 tests, all headless (248 unit + 10 GUI; plus 13 `#[ignore]`
+`cargo test` runs 262 tests, all headless (252 unit + 10 GUI; plus 13 `#[ignore]`
 network / real-trash / PSD-dump tests that hit the live 16colo.rs API, the system trash,
 or write a sample `.psd` to `/tmp`):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,

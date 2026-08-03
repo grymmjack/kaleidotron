@@ -12,7 +12,31 @@
 //! session notes), so the public fns are `allow(dead_code)` until then.
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// Virtual root for YouTube browsing (mirrors `sixteen::ROOT`). A path under it is "remote"
+/// (never touched on disk until a video is downloaded in place).
+pub const ROOT: &str = "<youtube>";
+/// Sub-root: search results live at `<youtube>/search/<query>`.
+pub const SEARCH: &str = "search";
+
+/// Is `path` a YouTube virtual path?
+pub fn is_remote(path: &Path) -> bool {
+    path.starts_with(ROOT)
+}
+
+/// The path components below [`ROOT`] (e.g. `["search", "lofi"]`).
+pub fn rel_parts(path: &Path) -> Vec<String> {
+    path.strip_prefix(ROOT)
+        .ok()
+        .map(|rest| {
+            rest.components()
+                .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// One search result (or a video being opened).
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -87,9 +111,17 @@ pub fn parse_entry(line: &str) -> Option<YtVideo> {
     let thumb_url = d
         .get("thumbnails")
         .and_then(|t| t.as_array())
-        .and_then(|a| a.iter().rev().find_map(|t| t.get("url").and_then(|v| v.as_str())))
+        .and_then(|a| {
+            a.iter()
+                .rev()
+                .find_map(|t| t.get("url").and_then(|v| v.as_str()))
+        })
         .map(|s| s.to_string())
-        .or_else(|| d.get("thumbnail").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            d.get("thumbnail")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
     Some(YtVideo {
         id: id.to_string(),
@@ -144,6 +176,51 @@ pub fn stream_url(id: &str) -> Option<String> {
         .map(|l| l.trim())
         .find(|l| !l.is_empty())
         .map(|l| l.to_string())
+}
+
+/// Download a video **in place** to `dir` as `<id>.<ext>` (progressive ≤720p) and return the
+/// produced file path — so it plays via the normal local `VideoPlayer` (streaming via `-g` is
+/// unreliable under YouTube SABR). Cache-first: an existing `<id>.*` is reused with no network.
+/// `None` if yt-dlp can't produce a file (absent / too old / SABR-blocked → caller shows a hint).
+pub fn download(id: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.file_stem().and_then(|s| s.to_str()) == Some(id)
+                && p.extension().is_some_and(|x| x != "part")
+            {
+                return Some(p);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let out_tmpl = dir.join(format!("{id}.%(ext)s"));
+    let ok = Command::new("yt-dlp")
+        .args([
+            "-f",
+            "best[height<=720][ext=mp4]/best[height<=720]/best",
+            "--no-warnings",
+            "-o",
+        ])
+        .arg(&out_tmpl)
+        .arg(&watch)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    // Find the produced `<id>.<ext>`.
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        (p.file_stem().and_then(|s| s.to_str()) == Some(id)
+            && p.extension().is_some_and(|x| x != "part"))
+        .then_some(p)
+    })
 }
 
 /// Is `yt-dlp` on PATH? (Gates the YouTube UI / shows a "install yt-dlp" hint.)
