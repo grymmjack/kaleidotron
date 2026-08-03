@@ -1535,6 +1535,13 @@ pub struct PixelView {
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
+    // A game's detail view = a virtual folder of media tiles (screenshots + trailers), keyed by
+    // virtual path. Screenshots download to `steam_files`; trailers stream from their HLS URL.
+    steam_media: HashMap<PathBuf, crate::steam::MediaItem>,
+    steam_files: HashMap<PathBuf, PathBuf>, // downloaded screenshot vpath → local file
+    #[allow(clippy::type_complexity)]
+    steam_media_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::steam::AppMedia)>>,
+    steam_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
@@ -2641,6 +2648,10 @@ impl PixelView {
             yt_search: String::new(),
             yt_downloaded_ids: std::collections::HashSet::new(),
             steam_games: HashMap::new(),
+            steam_media: HashMap::new(),
+            steam_files: HashMap::new(),
+            steam_media_rx: None,
+            steam_open_rx: None,
             yt_download_dir,
             bulk_dl: None,
             colo_sauce_tx,
@@ -3517,11 +3528,21 @@ impl PixelView {
     /// piece resolves to its cached `raw` file, a downloaded YouTube video to its local
     /// `.mp4`; anything else is already real on disk.
     fn resolve_local(&self, path: &Path) -> PathBuf {
-        self.colo_files
+        if let Some(f) = self
+            .colo_files
             .get(path)
             .or_else(|| self.yt_files.get(path))
-            .cloned()
-            .unwrap_or_else(|| path.to_path_buf())
+            .or_else(|| self.steam_files.get(path))
+        {
+            return f.clone();
+        }
+        // A Steam trailer streams straight from its HLS URL (ffmpeg reads it like a file).
+        if let Some(m) = self.steam_media.get(path) {
+            if m.is_video {
+                return PathBuf::from(&m.open_url);
+            }
+        }
+        path.to_path_buf()
     }
 
     /// Where downloaded YouTube videos live: the user's configured path, else `<data>/youtube`.
@@ -3726,8 +3747,18 @@ impl PixelView {
     /// SteamTube: list installed Steam games as grid tiles (root only; deeper browsing later).
     /// Each game is a virtual `<steam>/<Name>` entry; clicking it finds YouTube videos for it.
     fn open_steam(&mut self, dir: PathBuf) {
-        if !crate::steam::rel_parts(&dir).is_empty() {
-            self.show_folder(dir, Vec::new()); // only the root lists games (for now)
+        let parts = crate::steam::rel_parts(&dir);
+        // A game detail view: `<steam>/game/<appid>` → its screenshots + trailers.
+        if let [g, appid] = parts.as_slice() {
+            if g == "game" {
+                if let Ok(id) = appid.parse::<u32>() {
+                    self.open_game_detail(id, dir);
+                    return;
+                }
+            }
+        }
+        if !parts.is_empty() {
+            self.show_folder(dir, Vec::new());
             return;
         }
         self.steam_games.clear();
@@ -3804,6 +3835,117 @@ impl PixelView {
             .join(crate::youtube::SEARCH)
             .join(&g.name);
         self.open_folder(p);
+    }
+
+    /// Open a game's **detail view**: a virtual folder of its Steam-store screenshots + trailers.
+    /// Fetches media on a worker (`poll_steam_media` fills the grid when it lands).
+    fn open_game_detail(&mut self, appid: u32, dir: PathBuf) {
+        self.steam_media.clear();
+        self.show_folder(dir.clone(), Vec::new());
+        self.status = "Loading game media…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.steam_media_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Some(media) = crate::steam::fetch_app_media(appid) {
+                let _ = tx.send((dir, media));
+            }
+        });
+    }
+
+    /// Drain a finished game-media fetch: build screenshot + trailer tiles (each fetches its
+    /// thumbnail via the HTTP pool; opening a screenshot downloads it, a trailer streams).
+    fn poll_steam_media(&mut self) {
+        let Some(rx) = &self.steam_media_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((dir, media)) => {
+                self.steam_media_rx = None;
+                // Only apply if we're still on that game (a fast click-through discards it).
+                if self.folder.as_deref() != Some(dir.as_path()) {
+                    return;
+                }
+                let mut entries = Vec::new();
+                for (i, m) in media.media.iter().enumerate() {
+                    let fname = if m.is_video {
+                        format!("{:02} {}.m3u8", i, sanitize_filename(&m.name))
+                    } else {
+                        format!("{i:02} screenshot.jpg")
+                    };
+                    let path = dir.join(fname);
+                    entries.push(Entry {
+                        path: path.clone(),
+                        is_dir: false,
+                        is_archive: false,
+                        size: 0,
+                        mtime: None,
+                        ctime: None,
+                        rating: 0,
+                    });
+                    self.steam_media.insert(path, m.clone());
+                }
+                let n = entries.len();
+                self.show_folder(dir, entries);
+                let genres = if media.genres.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ·  {}", media.genres.join(", "))
+                };
+                self.status = if n == 0 {
+                    format!("{} — no store media{genres}", media.name)
+                } else if media.description.is_empty() {
+                    format!("{} · {} media{genres}", media.name, n)
+                } else {
+                    format!("{} — {}{genres}", media.name, media.description)
+                };
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.steam_media_rx = None,
+        }
+    }
+
+    /// Download a screenshot (its full jpg) to the cache, then view it (mirrors `start_yt_open`).
+    fn start_steam_open(&mut self, vpath: PathBuf) {
+        let Some(url) = self.steam_media.get(&vpath).map(|m| m.open_url.clone()) else {
+            return;
+        };
+        if self.steam_open_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.steam_open_rx = Some(rx);
+        self.status = "Loading screenshot…".into();
+        let fname = format!(
+            "steam_{}.jpg",
+            vpath.file_stem().and_then(|s| s.to_str()).unwrap_or("shot")
+        );
+        std::thread::spawn(move || {
+            let res = match crate::cache::get_file(&url, &fname) {
+                Ok(local) => Ok((vpath, local)),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish a screenshot download → map the virtual path to the local file and view it.
+    fn poll_steam_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.steam_open_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                self.steam_files.insert(vpath.clone(), local);
+                self.steam_open_rx = None;
+                self.load_full(ctx, vpath);
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Screenshot failed: {e}");
+                self.steam_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.steam_open_rx = None,
+        }
     }
 
     /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
@@ -11351,10 +11493,27 @@ impl PixelView {
             // A YouTube result not yet downloaded → download in place, then play (poll_yt_open).
             self.selected = idx;
             self.start_yt_open(entry.path);
-        } else if self.steam_games.contains_key(&entry.path) {
-            // A Steam game tile → find YouTube videos for it (SteamTube).
+        } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
+            // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
-            self.steam_action(&entry.path, SteamAct::Videos);
+            let detail = Path::new(crate::steam::ROOT)
+                .join("game")
+                .join(g.appid.to_string());
+            self.open_folder(detail);
+        } else if let Some(m) = self.steam_media.get(&entry.path).cloned() {
+            // A screenshot (download → view) or trailer (stream via the video player).
+            self.selected = idx;
+            if m.is_video {
+                if !self.plugin_video {
+                    self.plugin_video = true;
+                    self.registry.set_plugin("video", true);
+                }
+                self.load_full(ctx, entry.path);
+            } else if self.steam_files.contains_key(&entry.path) {
+                self.load_full(ctx, entry.path);
+            } else {
+                self.start_steam_open(entry.path);
+            }
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -15149,6 +15308,10 @@ impl PixelView {
                                         THUMB_PX,
                                         false,
                                     );
+                                } else if let Some(m) = self.steam_media.get(path) {
+                                    // A game's screenshot / trailer thumbnail.
+                                    self.colo_thumbs
+                                        .request(path, &m.thumb_url, THUMB_PX, false);
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -21513,6 +21676,8 @@ impl eframe::App for PixelView {
         self.poll_colo_open(&ctx);
         self.poll_yt();
         self.poll_yt_open(&ctx);
+        self.poll_steam_media();
+        self.poll_steam_open(&ctx);
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();

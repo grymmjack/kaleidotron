@@ -60,6 +60,110 @@ impl SteamGame {
     }
 }
 
+/// A screenshot or trailer from a game's Steam store page (see [`fetch_app_media`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaItem {
+    pub is_video: bool,    // trailer (streamed) vs screenshot (image)
+    pub name: String,      // trailer name; "" for screenshots
+    pub thumb_url: String, // tile thumbnail
+    pub open_url: String,  // full image (jpg) or trailer stream (HLS .m3u8)
+}
+
+/// Fetched game media: display name, short description, and the screenshot/trailer list.
+#[derive(Clone, Default, Debug)]
+pub struct AppMedia {
+    pub name: String,
+    pub description: String,
+    pub genres: Vec<String>,
+    pub media: Vec<MediaItem>, // trailers first, then screenshots
+}
+
+/// Fetch a game's store media (screenshots + trailers) via the **public** `store/appdetails` API
+/// (no key), through the HTTP cache (1-day TTL). Trailers use the HLS stream URL (ffmpeg reads it).
+/// `None` if the request/parse fails or the app has no store page.
+pub fn fetch_app_media(appid: u32) -> Option<AppMedia> {
+    let url = format!(
+        "https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic,screenshots,movies,genres"
+    );
+    let bytes = crate::cache::get_bytes(&url, Some(86_400)).ok()?;
+    parse_app_media(appid, &bytes)
+}
+
+/// Parse an `appdetails` JSON blob for `appid` into [`AppMedia`]. Split out for unit testing.
+pub fn parse_app_media(appid: u32, bytes: &[u8]) -> Option<AppMedia> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let data = json.get(appid.to_string())?.get("data")?;
+    let mut out = AppMedia {
+        name: data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        description: data
+            .get("short_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        genres: data
+            .get("genres")
+            .and_then(|g| g.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| {
+                        g.get("description")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        media: Vec::new(),
+    };
+    // Trailers first (HLS stream so ffmpeg can play them directly).
+    if let Some(movies) = data.get("movies").and_then(|m| m.as_array()) {
+        for m in movies {
+            let stream = m
+                .get("hls_h264")
+                .and_then(|v| v.as_str())
+                .or_else(|| m.get("dash_h264").and_then(|v| v.as_str()));
+            if let Some(stream) = stream {
+                out.media.push(MediaItem {
+                    is_video: true,
+                    name: m
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Trailer")
+                        .to_string(),
+                    thumb_url: m
+                        .get("thumbnail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    open_url: stream.to_string(),
+                });
+            }
+        }
+    }
+    // Then screenshots.
+    if let Some(shots) = data.get("screenshots").and_then(|s| s.as_array()) {
+        for s in shots {
+            if let Some(full) = s.get("path_full").and_then(|v| v.as_str()) {
+                out.media.push(MediaItem {
+                    is_video: false,
+                    name: String::new(),
+                    thumb_url: s
+                        .get("path_thumbnail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(full)
+                        .to_string(),
+                    open_url: full.to_string(),
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Candidate Steam data roots: native, classic `.steam`, Flatpak, Snap.
 fn steam_roots() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME")
@@ -265,6 +369,27 @@ mod tests {
             }
             None => eprintln!("no Steam install on this machine — skipping"),
         }
+    }
+
+    #[test]
+    fn parses_app_media() {
+        let json = r#"{"620":{"success":true,"data":{
+            "name":"Portal 2","short_description":"co-op puzzler",
+            "genres":[{"description":"Action"},{"description":"Puzzle"}],
+            "movies":[{"id":1,"name":"Trailer","thumbnail":"http://t/mv.jpg",
+                       "hls_h264":"http://v/master.m3u8","dash_h264":"http://v/x.mpd"}],
+            "screenshots":[{"id":0,"path_thumbnail":"http://s/1t.jpg","path_full":"http://s/1.jpg"}]
+        }}}"#;
+        let m = parse_app_media(620, json.as_bytes()).expect("parses");
+        assert_eq!(m.name, "Portal 2");
+        assert_eq!(m.genres, vec!["Action", "Puzzle"]);
+        assert_eq!(m.media.len(), 2);
+        // Trailer first (HLS), streamed.
+        assert!(m.media[0].is_video);
+        assert_eq!(m.media[0].open_url, "http://v/master.m3u8");
+        // Then the screenshot (full jpg).
+        assert!(!m.media[1].is_video);
+        assert_eq!(m.media[1].open_url, "http://s/1.jpg");
     }
 
     #[test]
