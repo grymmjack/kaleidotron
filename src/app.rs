@@ -3951,6 +3951,35 @@ impl PixelView {
         self.start_yt_open(p);
     }
 
+    /// Pick a random game from whatever's currently on screen (any Steam filter — installed, all,
+    /// not-installed, never-played) and open its detail view. Falls back to the installed list.
+    fn steam_random_from_view(&mut self) {
+        let mut appids: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|e| self.steam_games.get(&e.path).map(|g| g.appid))
+            .collect();
+        if appids.is_empty() {
+            appids = crate::steam::installed_games()
+                .iter()
+                .map(|g| g.appid)
+                .collect();
+        }
+        if appids.is_empty() {
+            self.status = "No Steam games to pick from".into();
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let appid = appids[seed % appids.len()];
+        let detail = Path::new(crate::steam::ROOT)
+            .join("game")
+            .join(appid.to_string());
+        self.open_folder(detail);
+    }
+
     /// Open a game's **detail view**: a virtual folder of its Steam-store screenshots + trailers.
     /// Fetches media on a worker (`poll_steam_media` fills the grid when it lands).
     fn open_game_detail(&mut self, appid: u32, dir: PathBuf) {
@@ -20729,6 +20758,7 @@ impl PixelView {
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
+        let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
@@ -20908,6 +20938,13 @@ impl PixelView {
                                 }
                             }
                         });
+                        if ui
+                            .button("🎲 Random (from this list)")
+                            .on_hover_text("Open a random game from whatever's shown above (any filter)")
+                            .clicked()
+                        {
+                            steam_random_view = true;
+                        }
                         if ui
                             .button(format!("{} Random game → videos", icons::SHUFFLE))
                             .on_hover_text("Pick a random installed game and search YouTube for it")
@@ -21580,6 +21617,8 @@ impl PixelView {
             self.recall_filter(i);
         } else if steam_random {
             self.steam_random_videos();
+        } else if steam_random_view {
+            self.steam_random_from_view();
         } else if yt_play_random {
             self.yt_play_random();
         } else if let Some(p) = nav {
