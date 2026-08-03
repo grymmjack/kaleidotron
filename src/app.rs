@@ -19550,7 +19550,10 @@ impl PixelView {
         // Use the *stretched* height (`sh * aspect_y`) so the minimap matches the main
         // view's CRT aspect — otherwise text-mode art looks squished in the strip
         // relative to what it's previewing.
-        let nav = (!self.immersive && (overflow_x || overflow_y)).then(|| {
+        // No navigator/minimap while a video is playing (the user doesn't want it there, and it
+        // avoids any per-frame minimap work over live frames).
+        let nav = (!self.immersive && self.video_player.is_none() && (overflow_x || overflow_y))
+            .then(|| {
             const M: f32 = 8.0;
             const MAX_W: f32 = 120.0;
             let max_h = (resp.rect.height() - 2.0 * M).max(16.0);

@@ -549,13 +549,21 @@ pub fn download(
 
 /// Is `yt-dlp` on PATH? (Gates the YouTube UI / shows a "install yt-dlp" hint.)
 pub fn available() -> bool {
-    Command::new("yt-dlp")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // MEMOIZED: this spawns `yt-dlp --version` — a Python process (~100 ms startup). It used to
+    // be called every UI frame from the Places → YouTube tab, so with a video playing (continuous
+    // repaint) the app spawned yt-dlp 60×/s and dropped to ~9 fps. Check once per process instead.
+    // (Cost: a freshly-installed yt-dlp isn't detected until the next launch — an acceptable trade.)
+    use std::sync::OnceLock;
+    static AVAIL: OnceLock<bool> = OnceLock::new();
+    *AVAIL.get_or_init(|| {
+        Command::new("yt-dlp")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
