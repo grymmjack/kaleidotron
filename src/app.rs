@@ -1339,6 +1339,9 @@ pub struct PixelView {
     fps_video_frames: u32,
     fps_ui_val: f32,
     fps_video_val: f32,
+    fps_upload_ms: f32, // ms spent building+uploading the frame texture (last frame)
+    fps_blit_ms: f32,   // ms spent in draw_image_view (last frame)
+    fps_total_ms: f32,  // ms spent in draw_video_ui total (last frame)
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
     video_md_header: String,         // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
@@ -2578,6 +2581,9 @@ impl PixelView {
             fps_video_frames: 0,
             fps_ui_val: 0.0,
             fps_video_val: 0.0,
+            fps_upload_ms: 0.0,
+            fps_blit_ms: 0.0,
+            fps_total_ms: 0.0,
             video_markers: Vec::new(),
             video_md_header: String::new(),
             video_marker_sel: None,
@@ -5930,6 +5936,7 @@ impl PixelView {
     fn draw_video_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<bool> {
         let dt = ctx.input(|i| i.stable_dt);
         let (vol, muted) = (self.audio_volume, self.audio_muted);
+        let t_total = std::time::Instant::now();
 
         // FPS meter: this call = one UI repaint; a displayed video frame is counted at upload.
         // Recomputed each ~0.5 s window so the numbers are readable.
@@ -5973,6 +5980,7 @@ impl PixelView {
                 None
             }
         };
+        let t_upload = std::time::Instant::now();
         if let Some(mut bytes) = frame {
             if bytes.len() == (dw as usize) * (dh as usize) * 4 {
                 // Recolor the LIVE frame when ANY recolor is active (value pipeline OR palette snap).
@@ -6002,6 +6010,7 @@ impl PixelView {
             // off) re-uploads once instead of every frame.
             self.video_recolor_key = pipe_key;
         }
+        self.fps_upload_ms = t_upload.elapsed().as_secs_f32() * 1000.0;
 
         // Snapshot state for the controls.
         let (pos, dur, playing, speed, frame_idx, frame_cnt, has_audio) = {
@@ -6454,8 +6463,11 @@ impl PixelView {
             .video_tex
             .as_ref()
             .map(|h| TiledTexture::single(h.clone(), [dw as usize, dh as usize]));
+        let t_blit = std::time::Instant::now();
         let forward = if let Some(tex) = tex {
-            self.draw_image_view(ui, &tex)
+            let f = self.draw_image_view(ui, &tex);
+            self.fps_blit_ms = t_blit.elapsed().as_secs_f32() * 1000.0;
+            f
         } else {
             let r = ui.available_rect_before_wrap();
             paint_spinner(
@@ -6471,13 +6483,24 @@ impl PixelView {
             self.want_repaint = true;
         }
         // FPS overlay (top-left of the viewport): UI repaints vs actual displayed video frames,
-        // against the source fps + the display size (so a low number is interpretable).
+        // against the source fps + the display size + a per-frame ms breakdown (so a low number
+        // is interpretable AND we can see WHERE the time goes: upload vs blit vs the rest).
+        self.fps_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
         if self.show_fps {
             let r = ui.min_rect();
             let src_fps = self.video_player.as_ref().map(|v| v.info.fps).unwrap_or(0.0);
+            let other = (self.fps_total_ms - self.fps_upload_ms - self.fps_blit_ms).max(0.0);
             let text = format!(
-                "UI {:.0} · video {:.0}/{:.0} fps · {}×{}",
-                self.fps_ui_val, self.fps_video_val, src_fps, dw, dh
+                "UI {:.0} · video {:.0}/{:.0} fps · {}×{}\nvideo_ui {:.0}ms (upload {:.0} · blit {:.0} · rest {:.0})",
+                self.fps_ui_val,
+                self.fps_video_val,
+                src_fps,
+                dw,
+                dh,
+                self.fps_total_ms,
+                self.fps_upload_ms,
+                self.fps_blit_ms,
+                other,
             );
             let pos = r.left_top() + egui::vec2(8.0, 8.0);
             let painter = ui.painter();
