@@ -75,6 +75,107 @@ impl YtVideo {
     }
 }
 
+/// Rich per-video metadata — a full `yt-dlp --dump-json` of ONE video (slower than the flat
+/// search, so it's fetched lazily when a video's Details pane is shown). Absent JSON fields stay
+/// 0 / "". NB YouTube removed public **dislikes** in 2021, so there's no dislike count to show.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtMeta {
+    pub id: String,
+    pub title: String,
+    pub channel: String,
+    pub channel_url: String,
+    pub upload_date: String, // raw "YYYYMMDD"
+    pub views: u64,
+    pub likes: u64,
+    pub comments: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub ext: String,
+    pub filesize: u64, // bytes (exact or approx)
+    pub description: String,
+}
+
+impl YtMeta {
+    pub fn watch_url(&self) -> String {
+        format!("https://www.youtube.com/watch?v={}", self.id)
+    }
+    pub fn views_short(&self) -> String {
+        human_count(self.views)
+    }
+    pub fn likes_short(&self) -> String {
+        human_count(self.likes)
+    }
+    pub fn comments_short(&self) -> String {
+        human_count(self.comments)
+    }
+    /// "YYYY-MM-DD" from the raw "YYYYMMDD" (else the raw value).
+    pub fn upload_date_fmt(&self) -> String {
+        let d = &self.upload_date;
+        if d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()) {
+            format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
+        } else {
+            d.clone()
+        }
+    }
+}
+
+/// Fetch one video's full metadata via `yt-dlp --dump-json` (no download). `None` if yt-dlp
+/// fails / is absent — the caller degrades to whatever the flat search already had.
+pub fn fetch_video_meta(id: &str) -> Option<YtMeta> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let out = Command::new("yt-dlp")
+        .args(["--dump-json", "--no-warnings", "--skip-download", "--"])
+        .arg(&watch)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_video_meta(&out.stdout)
+}
+
+/// Parse a `yt-dlp --dump-json` blob into [`YtMeta`]. Split out so it's unit-testable offline.
+pub fn parse_video_meta(bytes: &[u8]) -> Option<YtMeta> {
+    let d: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let s = |k: &str| {
+        d.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let u = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let first_nonempty = |a: &str, b: &str| {
+        let x = s(a);
+        if x.is_empty() {
+            s(b)
+        } else {
+            x
+        }
+    };
+    Some(YtMeta {
+        id: s("id"),
+        title: s("title"),
+        channel: first_nonempty("channel", "uploader"),
+        channel_url: first_nonempty("channel_url", "uploader_url"),
+        upload_date: s("upload_date"),
+        views: u("view_count"),
+        likes: u("like_count"),
+        comments: u("comment_count"),
+        width: u("width") as u32,
+        height: u("height") as u32,
+        fps: d.get("fps").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        ext: s("ext"),
+        filesize: d
+            .get("filesize")
+            .and_then(|v| v.as_u64())
+            .or_else(|| d.get("filesize_approx").and_then(|v| v.as_u64()))
+            .unwrap_or(0),
+        description: s("description"),
+    })
+}
+
 /// Abbreviate a count the YouTube way: 1_234_567 → "1.2M".
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -278,5 +379,29 @@ mod tests {
         let v = parse_entry(line).unwrap();
         assert_eq!(v.duration_str(), "1:02:05");
         assert_eq!(v.views_short(), "56.3M");
+    }
+
+    #[test]
+    fn parses_full_video_meta() {
+        let json = r#"{"id":"abc","title":"Cool","channel":"Chan","channel_url":"https://youtube.com/@chan",
+            "upload_date":"20240115","view_count":1234567,"like_count":45000,"comment_count":890,
+            "width":1920,"height":1080,"fps":30.0,"ext":"mp4","filesize_approx":123456789}"#;
+        let m = parse_video_meta(json.as_bytes()).unwrap();
+        assert_eq!(m.channel, "Chan");
+        assert_eq!(m.channel_url, "https://youtube.com/@chan");
+        assert_eq!(m.upload_date_fmt(), "2024-01-15");
+        assert_eq!(m.views_short(), "1.2M");
+        assert_eq!(m.likes_short(), "45.0K");
+        assert_eq!((m.width, m.height), (1920, 1080));
+        assert_eq!(m.filesize, 123456789);
+    }
+
+    #[test]
+    fn video_meta_falls_back_to_uploader() {
+        let json = r#"{"id":"x","title":"t","uploader":"UpChan","uploader_url":"https://u/url"}"#;
+        let m = parse_video_meta(json.as_bytes()).unwrap();
+        assert_eq!(m.channel, "UpChan");
+        assert_eq!(m.channel_url, "https://u/url");
+        assert_eq!(m.upload_date_fmt(), ""); // no date → empty
     }
 }

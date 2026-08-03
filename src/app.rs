@@ -1531,6 +1531,13 @@ pub struct PixelView {
     yt_files: HashMap<PathBuf, PathBuf>,
     // A video downloading in place so we can open it once ready: (virtual path, local file).
     yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    // Rich per-video metadata (channel/likes/comments/date/dims) for the Details pane, fetched
+    // lazily on a worker (`yt-dlp --dump-json`) when a video is opened. `yt_meta_pending` guards
+    // against re-spawning while one fetch is in flight.
+    yt_meta: HashMap<PathBuf, crate::youtube::YtMeta>,
+    #[allow(clippy::type_complexity)]
+    yt_meta_rx: Option<std::sync::mpsc::Receiver<(PathBuf, crate::youtube::YtMeta)>>,
+    yt_meta_pending: Option<PathBuf>,
     yt_search: String, // the YouTube Places-tab search box text
     yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
@@ -2668,6 +2675,9 @@ impl PixelView {
             yt_cancel: None,
             yt_files: HashMap::new(),
             yt_open_rx: None,
+            yt_meta: HashMap::new(),
+            yt_meta_rx: None,
+            yt_meta_pending: None,
             yt_search: String::new(),
             yt_downloaded_ids: std::collections::HashSet::new(),
             steam_games: HashMap::new(),
@@ -3764,6 +3774,7 @@ impl PixelView {
                 if self.yt_open_folder_after {
                     self.reveal_in_file_manager(&local);
                 }
+                self.start_yt_meta(&vpath); // rich Details (channel/likes/comments/date/dims)
                 self.load_full(ctx, vpath);
             }
             Ok(Err(e)) => {
@@ -3772,6 +3783,51 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.yt_open_rx = None,
+        }
+    }
+
+    /// Kick off a lazy full-metadata fetch for a YouTube video (channel/likes/comments/date/dims)
+    /// on a worker thread — drained by `poll_yt_meta`. No-op if already fetched / in flight / not
+    /// a YouTube video. Called when a video opens and from the Details pane.
+    fn start_yt_meta(&mut self, vpath: &Path) {
+        if !crate::youtube::is_remote(vpath)
+            || self.yt_meta.contains_key(vpath)
+            || self.yt_meta_pending.is_some()
+        {
+            return;
+        }
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_meta_rx = Some(rx);
+        self.yt_meta_pending = Some(vpath.to_path_buf());
+        let vpath = vpath.to_path_buf();
+        std::thread::spawn(move || {
+            if let Some(meta) = crate::youtube::fetch_video_meta(&id) {
+                let _ = tx.send((vpath, meta));
+            }
+        });
+    }
+
+    /// Drain a finished metadata fetch (each frame) into `yt_meta`.
+    fn poll_yt_meta(&mut self) {
+        let Some(rx) = &self.yt_meta_rx else { return };
+        match rx.try_recv() {
+            Ok((vpath, meta)) => {
+                self.yt_meta.insert(vpath, meta);
+                self.yt_meta_rx = None;
+                self.yt_meta_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.yt_meta_rx = None;
+                self.yt_meta_pending = None;
+            }
         }
     }
 
@@ -13308,12 +13364,158 @@ impl PixelView {
         }
     }
 
+    /// Details-pane content for an open YouTube video: title, channel + watch links, published
+    /// date, views/likes/comments, and the local file's size/dimensions/format. The rich fields
+    /// come from a lazy `yt-dlp --dump-json` (`start_yt_meta`); until it lands we show the flat
+    /// search data + a spinner. (YouTube removed public dislikes in 2021 — none to show.)
+    fn ui_youtube_detail(&mut self, ui: &mut egui::Ui, path: &Path) {
+        ui.strong("Details");
+        ui.separator();
+        self.start_yt_meta(path); // lazy; no-op if cached / in flight
+        let flat = self.yt_videos.get(path).cloned();
+        let meta = self.yt_meta.get(path).cloned();
+        // Local file (size + a format hint) once downloaded.
+        let local = self.yt_files.get(path).cloned();
+        let size_on_disk = local
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        let local_ext = local
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_uppercase());
+        let title = meta
+            .as_ref()
+            .map(|m| m.title.clone())
+            .or_else(|| flat.as_ref().map(|f| f.title.clone()))
+            .unwrap_or_else(|| "YouTube video".into());
+        let channel = meta
+            .as_ref()
+            .map(|m| m.channel.clone())
+            .or_else(|| flat.as_ref().map(|f| f.channel.clone()))
+            .unwrap_or_default();
+        let watch_url = meta
+            .as_ref()
+            .map(|m| m.watch_url())
+            .or_else(|| flat.as_ref().map(|f| f.watch_url()))
+            .unwrap_or_default();
+        let mut want_url: Option<String> = None;
+        let mut want_browser = false;
+        egui::ScrollArea::vertical()
+            .id_salt("yt_detail")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(&title).heading());
+                if !channel.is_empty() {
+                    ui.add_space(2.0);
+                    let ch_url = meta.as_ref().map(|m| m.channel_url.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.weak("Channel");
+                        if !ch_url.is_empty() {
+                            if ui.link(&channel).clicked() {
+                                want_url = Some(ch_url.clone());
+                            }
+                        } else {
+                            ui.label(&channel);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                if ui
+                    .button(format!("{} Watch on YouTube", icons::GLOBE))
+                    .clicked()
+                {
+                    want_browser = true;
+                }
+                ui.add_space(10.0);
+
+                egui::Grid::new("yt_detail_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            if !v.is_empty() {
+                                ui.weak(k);
+                                ui.label(v);
+                                ui.end_row();
+                            }
+                        };
+                        if let Some(m) = &meta {
+                            row(ui, "Published", m.upload_date_fmt());
+                            row(ui, "Views", format!("{} ({})", m.views, m.views_short()));
+                            if m.likes > 0 {
+                                row(ui, "Likes", format!("{} ({})", m.likes, m.likes_short()));
+                            }
+                            if m.comments > 0 {
+                                row(
+                                    ui,
+                                    "Comments",
+                                    format!("{} ({})", m.comments, m.comments_short()),
+                                );
+                            }
+                            if m.width > 0 && m.height > 0 {
+                                row(ui, "Dimensions", format!("{}×{}", m.width, m.height));
+                            }
+                            if m.fps > 0.0 {
+                                row(ui, "FPS", format!("{:.0}", m.fps));
+                            }
+                        } else if let Some(f) = &flat {
+                            row(ui, "Views", format!("{} ({})", f.views, f.views_short()));
+                            row(ui, "Duration", f.duration_str());
+                        }
+                        // Local file facts (once downloaded).
+                        if let Some(sz) = size_on_disk {
+                            row(ui, "Size on disk", human_size(sz));
+                        }
+                        if let Some(ext) = &local_ext {
+                            row(ui, "Format", ext.clone());
+                        } else if let Some(m) = &meta {
+                            row(ui, "Format", m.ext.to_ascii_uppercase());
+                        }
+                    });
+
+                // Still fetching the rich fields → a small spinner cue.
+                if meta.is_none() && self.yt_meta_pending.as_deref() == Some(path) {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak("Loading full details…");
+                    });
+                }
+            });
+        if let Some(u) = want_url {
+            self.open_url(&u);
+        }
+        if want_browser {
+            self.open_url(&watch_url);
+        }
+    }
+
     fn ui_details(&mut self, ui: &mut egui::Ui) {
         // In a Steam game's detail view the "entries" are screenshots/trailers; the pane should
         // describe the GAME itself (name/genres/description/links/rating), not a hovered tile.
         if let Some(appid) = self.folder.as_deref().and_then(crate::steam::detail_appid) {
             self.ui_steam_detail(ui, appid);
             return;
+        }
+        // An open YouTube video: show its channel/links/stats/size instead of the generic file
+        // details. Only in the single view (the opened video), so a grid hover doesn't spam fetches.
+        if self.mode == Mode::Single {
+            if let Some(entry) = self.inspected_entry() {
+                let is_yt_video = crate::youtube::is_remote(&entry.path)
+                    && (self.yt_videos.contains_key(&entry.path)
+                        || entry
+                            .path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .and_then(parse_yt_id)
+                            .is_some());
+                if is_yt_video {
+                    self.ui_youtube_detail(ui, &entry.path);
+                    return;
+                }
+            }
         }
         ui.strong("Details");
         ui.separator();
@@ -22194,6 +22396,7 @@ impl eframe::App for PixelView {
         self.poll_colo_open(&ctx);
         self.poll_yt();
         self.poll_yt_open(&ctx);
+        self.poll_yt_meta();
         self.poll_steam_media();
         self.poll_steam_open(&ctx);
         self.poll_colo_save();
