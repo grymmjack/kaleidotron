@@ -1128,6 +1128,7 @@ pub struct PixelView {
     plugin_audio: bool,
     plugin_code: bool,
     plugin_3d: bool, // 3D models (.obj/.stl/.ply/.gltf/.glb/.dae) → thumbnail + 3D viewer
+    plugin_video: bool, // video (mp4/mkv/webm/…) → ffmpeg frame thumbnail + in-app player
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
     assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
@@ -1219,7 +1220,15 @@ pub struct PixelView {
 
     anim: Option<AnimState>,       // Some when viewing an animated GIF
     hover_anim: Option<AnimState>, // the hovered grid GIF, playing in its tile
-    player: Option<Player>,        // baud-rate playback for the open text/RIP art (ANSImation)
+    video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
+    video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
+    video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
+    video_markers: Vec<(f32, String)>,      // chapter markers from the `.md` sidecar (secs, label)
+    video_speed: f32,                       // remembered video playback speed (this session)
+    video_scrub: Option<f32>, // seek-bar drag position (Some while dragging the scrubber)
+    video_scrub_t: f64,       // last scrub-preview time (throttles ffmpeg respawns while dragging)
+    video_seek_input: String, // the "go to time" text field (mm:ss / hh:mm:ss)
+    player: Option<Player>,   // baud-rate playback for the open text/RIP art (ANSImation)
     zoom: f32,
     zoom_lock: bool, // viewer: snap zoom to 100% steps (¼ steps below 100%)
     offset: egui::Vec2,
@@ -1459,6 +1468,7 @@ impl PixelView {
     const PLUGIN_AUDIO_KEY: &'static str = "plugin_audio";
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
+    const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1620,6 +1630,7 @@ impl PixelView {
         let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, false);
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, false);
         let plugin_3d = load_bool(Self::PLUGIN_3D_KEY, false); // heavy loaders → default OFF
+        let plugin_video = load_bool(Self::PLUGIN_VIDEO_KEY, false); // needs ffmpeg → default OFF
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -1665,6 +1676,7 @@ impl PixelView {
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
         registry.set_plugin("3d", plugin_3d);
+        registry.set_plugin("video", plugin_video);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -2303,6 +2315,7 @@ impl PixelView {
             plugin_audio,
             plugin_code,
             plugin_3d,
+            plugin_video,
             openers,
             assoc_selected: 0,
             folder_actions,
@@ -2355,6 +2368,14 @@ impl PixelView {
             full_reduced: None,
             anim: None,
             hover_anim: None,
+            video_player: None,
+            video_loading: None,
+            video_tex: None,
+            video_markers: Vec::new(),
+            video_speed: 1.0,
+            video_scrub: None,
+            video_scrub_t: 0.0,
+            video_seek_input: String::new(),
             player: None,
             zoom: img_zoom,
             zoom_lock,
@@ -4906,6 +4927,516 @@ impl PixelView {
             return;
         }
         self.start_audio_load(path, false);
+    }
+
+    /// Kick off the background video open (probe + whole-track audio extract). `src` is the
+    /// resolved local path ffmpeg reads. `poll_video_load` builds the player when it's ready.
+    fn ensure_video_loaded(&mut self, src: PathBuf) {
+        if !self.plugin_video {
+            return;
+        }
+        self.video_loading = Some(crate::video::VideoLoading::start(src));
+    }
+
+    /// Drain the background video open; build the player when ready (each frame, from `ui()`).
+    fn poll_video_load(&mut self, dt: f32) {
+        let (vol, muted, sp) = (self.audio_volume, self.audio_muted, self.video_speed);
+        let Some(loading) = self.video_loading.as_mut() else {
+            return;
+        };
+        loading.t += dt;
+        match loading.try_build(vol, muted, true) {
+            Some(Ok(mut vp)) => {
+                vp.set_speed(sp); // carry the session's chosen playback speed
+                self.video_player = Some(vp);
+                self.video_loading = None;
+                self.want_repaint = true;
+            }
+            Some(Err(e)) => {
+                self.status = format!("Video: {e}");
+                self.video_loading = None;
+            }
+            None => self.want_repaint = true, // keep the spinner animating
+        }
+    }
+
+    /// Dim + spinner while a video is opening (mirrors the audio loading overlay).
+    fn paint_video_loading_overlay(&self, ctx: &egui::Context) {
+        let Some(loading) = &self.video_loading else {
+            return;
+        };
+        if loading.t < 0.2 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let bg = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("video_loading_bg"),
+        ));
+        bg.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+        egui::Area::new(egui::Id::new("video_loading_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(20.0));
+                        ui.add_space(8.0);
+                        ui.label(format!("Loading {}…", short_name(&loading.path)));
+                    });
+                });
+            });
+    }
+
+    /// The video viewer: advance the clock/frames, upload the current frame, draw the transport +
+    /// seek bar + markers, and blit the frame through `draw_image_view` (so zoom/pan/fit work).
+    /// Returns `Some(forward)` when the user asked to step to the prev/next file.
+    fn draw_video_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<bool> {
+        let dt = ctx.input(|i| i.stable_dt);
+        let (vol, muted) = (self.audio_volume, self.audio_muted);
+
+        // Advance the clock/frames and push the master volume.
+        let (dw, dh) = {
+            let vp = self.video_player.as_mut()?;
+            vp.set_volume(vol, muted);
+            vp.tick(dt);
+            (vp.disp_w, vp.disp_h)
+        };
+
+        // Upload the frame texture on the UI thread when it changed.
+        let frame = {
+            let vp = self.video_player.as_mut()?;
+            if vp.tex_dirty {
+                vp.tex_dirty = false;
+                vp.cur.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(bytes) = frame {
+            if bytes.len() == (dw as usize) * (dh as usize) * 4 {
+                let color =
+                    egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &bytes);
+                match &mut self.video_tex {
+                    Some(h) => h.set(color, view_tex_opts()),
+                    None => {
+                        self.video_tex =
+                            Some(ctx.load_texture("video_frame", color, view_tex_opts()))
+                    }
+                }
+            }
+        }
+
+        // Snapshot state for the controls.
+        let (pos, dur, playing, speed, frame_idx, frame_cnt) = {
+            let vp = self.video_player.as_ref()?;
+            (
+                vp.position(),
+                vp.duration(),
+                vp.playing,
+                vp.speed,
+                vp.frame_index(),
+                vp.frame_count(),
+            )
+        };
+        let immersive = self.immersive;
+
+        // Deferred intents.
+        let mut want_toggle = false;
+        let mut want_seek: Option<f32> = None;
+        let mut want_speed: Option<f32> = None;
+        let mut want_export = false;
+        let mut want_extract: Option<bool> = None; // Some(open_after)
+        let mut want_add_marker = false;
+
+        if !immersive {
+            let play_lbl = |p: bool| {
+                format!(
+                    "{} {}",
+                    if p { icons::PAUSE } else { icons::PLAY },
+                    if p { "Pause" } else { "Play" }
+                )
+            };
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(play_lbl(playing))
+                            .min_size(fixed_btn_size(ui, &[&play_lbl(true), &play_lbl(false)])),
+                    )
+                    .clicked()
+                {
+                    want_toggle = true;
+                }
+                ui.label(format!(
+                    "{} / {}",
+                    format_timecode(self.video_scrub.unwrap_or(pos)),
+                    format_timecode(dur)
+                ));
+                ui.separator();
+                ui.label("Speed");
+                egui::ComboBox::from_id_salt("video_speed")
+                    .selected_text(format!("{speed:.2}×"))
+                    .show_ui(ui, |ui| {
+                        for s in [0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0] {
+                            if ui
+                                .selectable_label((speed - s).abs() < 0.01, format!("{s:.2}×"))
+                                .clicked()
+                            {
+                                want_speed = Some(s);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.label(format!("frame {frame_idx}/{frame_cnt}"));
+                ui.separator();
+                ui.label("Go to");
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut self.video_seek_input)
+                        .desired_width(56.0)
+                        .hint_text("m:ss"),
+                );
+                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(t) = parse_timecode(&self.video_seek_input) {
+                        want_seek = Some(t);
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} PNG", icons::DOWNLOAD))
+                    .on_hover_text("Save the current frame as a PNG (native resolution)")
+                    .clicked()
+                {
+                    want_export = true;
+                }
+                ui.menu_button("Audio ▾", |ui| {
+                    if ui
+                        .button("Extract & edit in sampler")
+                        .on_hover_text("Extract the audio and open it in pixelview's built-in sampler/waveform editor")
+                        .clicked()
+                    {
+                        want_extract = Some(true);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Extract audio to file…")
+                        .on_hover_text("Save the audio track to disk (lossless copy, or WAV)")
+                        .clicked()
+                    {
+                        want_extract = Some(false);
+                        ui.close_menu();
+                    }
+                });
+                if ui
+                    .button("＋ Marker")
+                    .on_hover_text("Append a marker at the current time to the .md sidecar")
+                    .clicked()
+                {
+                    want_add_marker = true;
+                }
+            });
+
+            // Seek bar with marker ticks (seeks on release only — each seek respawns ffmpeg).
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 16.0),
+                egui::Sense::click_and_drag(),
+            );
+            let p = ui.painter_at(rect);
+            let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
+            p.rect_filled(bar, 3.0, egui::Color32::from_gray(60));
+            let show_t = self.video_scrub.unwrap_or(pos);
+            let frac = if dur > 0.0 {
+                (show_t / dur).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let played = egui::Rect::from_min_max(
+                bar.min,
+                egui::pos2(bar.min.x + bar.width() * frac, bar.max.y),
+            );
+            p.rect_filled(played, 3.0, egui::Color32::from_rgb(90, 150, 235));
+            for (t, _) in &self.video_markers {
+                if dur > 0.0 {
+                    let x = rect.min.x + rect.width() * (t / dur).clamp(0.0, 1.0);
+                    p.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 60)),
+                    );
+                }
+            }
+            let hx = rect.min.x + rect.width() * frac;
+            p.circle_filled(egui::pos2(hx, rect.center().y), 5.0, egui::Color32::WHITE);
+            let x_to_t = |x: f32| ((x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) * dur;
+            if resp.dragged() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let t = x_to_t(pp.x);
+                    self.video_scrub = Some(t);
+                    // Audio+video scrub preview: hear + see the position while dragging. Throttled
+                    // (each respawns ffmpeg) so a fast drag doesn't spawn dozens of processes.
+                    let now = ctx.input(|i| i.time);
+                    if now - self.video_scrub_t > 0.12 {
+                        self.video_scrub_t = now;
+                        if let Some(vp) = &mut self.video_player {
+                            vp.scrub_to(t);
+                        }
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                want_seek = self.video_scrub.take(); // final precise seek (restores play/pause state)
+            }
+            if resp.clicked() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    want_seek = Some(x_to_t(pp.x));
+                }
+                self.video_scrub = None;
+            }
+
+            // Mousewheel over the seek bar scrubs: coarse (5s) / fine with Shift (1s).
+            if resp.hovered() {
+                let (scroll_y, shift) = ctx.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift));
+                if scroll_y.abs() > 0.5 {
+                    let step = if shift { 1.0 } else { 5.0 };
+                    // Scroll down = forward, up = back (page-scroll intuition).
+                    let base = self.video_scrub.unwrap_or(pos);
+                    want_seek = Some((base - scroll_y.signum() * step).clamp(0.0, dur.max(0.0)));
+                }
+            }
+
+            // Marker jump list (click to seek).
+            if !self.video_markers.is_empty() {
+                egui::ScrollArea::horizontal()
+                    .id_salt("vid_markers")
+                    .max_height(24.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (t, label) in self.video_markers.clone() {
+                                let txt = if label.is_empty() {
+                                    format_timecode(t)
+                                } else {
+                                    format!("{} {}", format_timecode(t), label)
+                                };
+                                if ui.small_button(txt).clicked() {
+                                    want_seek = Some(t);
+                                }
+                            }
+                        });
+                    });
+            }
+        }
+
+        // Apply intents (after all closures dropped → free to borrow self.video_player mutably).
+        if want_toggle {
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.toggle();
+            }
+        }
+        if let Some(s) = want_speed {
+            self.video_speed = s;
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.set_speed(s);
+            }
+        }
+        if let Some(t) = want_seek {
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.seek(t);
+            }
+        }
+        if want_export {
+            self.export_video_frame_png();
+        }
+        match want_extract {
+            Some(true) => {
+                // Extract → open in pixelview's OWN sampler/waveform editor. This leaves the
+                // video (load_full tears the player down) and needs the audio plugin on.
+                if let Some(wav) = self.extract_video_audio_for_edit() {
+                    if !self.plugin_audio {
+                        self.plugin_audio = true;
+                        self.registry.set_plugin("audio", true);
+                    }
+                    self.load_full(ctx, wav);
+                    return None; // switched to the audio editor; nothing more to draw here
+                }
+            }
+            Some(false) => self.extract_video_audio_save(),
+            None => {}
+        }
+        if want_add_marker {
+            self.append_video_marker(pos);
+        }
+
+        // Blit the frame through the image viewer (zoom/pan/fit/transparency for free).
+        let tex = self
+            .video_tex
+            .as_ref()
+            .map(|h| TiledTexture::single(h.clone(), [dw as usize, dh as usize]));
+        let forward = if let Some(tex) = tex {
+            self.draw_image_view(ui, &tex)
+        } else {
+            let r = ui.available_rect_before_wrap();
+            paint_spinner(
+                &ui.painter_at(r),
+                r.center(),
+                16.0,
+                ctx.input(|i| i.time),
+                egui::Color32::from_gray(140),
+            );
+            None
+        };
+        if playing || self.video_loading.is_some() {
+            self.want_repaint = true;
+        }
+        forward
+    }
+
+    /// Save the current video frame as a PNG at **native** resolution (re-grabbed at the current
+    /// timestamp, so it's full quality, not the downscaled display frame). Auto-named beside the video.
+    fn export_video_frame_png(&mut self) {
+        let Some((src, pts)) = self
+            .video_player
+            .as_ref()
+            .map(|vp| (vp.path.clone(), vp.cur_pts))
+        else {
+            return;
+        };
+        let Some(img) = crate::decode::grab_video_frame(&src, pts, None) else {
+            self.status = "PNG export failed (is ffmpeg installed?)".into();
+            return;
+        };
+        let dir = src.parent().unwrap_or_else(|| Path::new("."));
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+        let tc = format_timecode(pts).replace(':', "-");
+        let mut out = dir.join(format!("{stem}_{tc}.png"));
+        let mut n = 1;
+        while out.exists() {
+            out = dir.join(format!("{stem}_{tc}_{n}.png"));
+            n += 1;
+        }
+        match image::save_buffer(
+            &out,
+            &img.rgba_bytes(),
+            img.width,
+            img.height,
+            image::ColorType::Rgba8,
+        ) {
+            Ok(()) => self.status = format!("Saved {}", short_name(&out)),
+            Err(e) => self.status = format!("PNG failed: {e}"),
+        }
+    }
+
+    /// Run `ffmpeg -vn` to write the current video's audio track to `dest`. At `speed == 1.0`:
+    /// `.wav` → PCM, any other container → **lossless stream copy** (`-c:a copy`) with a re-encode
+    /// fallback. At any other speed it **re-encodes with a speed filter** matching what the player
+    /// sounds like — a resample (`asetrate`), so pitch tracks speed exactly like live playback
+    /// (not the pitch-preserving `atempo`). Returns whether it succeeded.
+    fn extract_video_audio_to(&self, src: &Path, dest: &Path, speed: f32) -> bool {
+        let is_wav = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+        let speed_changed = (speed - 1.0).abs() > 0.001;
+        // Normalize to 44.1 kHz, reinterpret at rate·speed (= faster + higher pitch, like the
+        // player's rodio `.speed()`), then resample back to a standard rate.
+        let af = format!(
+            "aresample=44100,asetrate={},aresample=44100",
+            (44100.0 * speed).round().max(1.0) as i64
+        );
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-v", "quiet", "-nostdin", "-y"])
+                .arg("-i")
+                .arg(src)
+                .arg("-vn");
+            if speed_changed {
+                cmd.arg("-af").arg(&af);
+            }
+            if is_wav {
+                cmd.args(["-c:a", "pcm_s16le"]);
+            } else if copy && !speed_changed {
+                cmd.args(["-c:a", "copy"]); // lossless: keep the original encoded audio
+            }
+            // else (speed changed, non-wav): re-encode to the container default (a filter needs it)
+            cmd.arg(dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if speed_changed {
+            run(false) // a filtered stream can't be copied — must re-encode
+        } else {
+            // Try lossless copy first; if the codec ↮ container, re-encode (ffmpeg picks the encoder).
+            run(true) || (!is_wav && run(false))
+        }
+    }
+
+    /// "Extract audio to file…" — a save dialog (lossless copy by default, or WAV/anything).
+    fn extract_video_audio_save(&mut self) {
+        let Some(src) = self.video_player.as_ref().map(|vp| vp.path.clone()) else {
+            return;
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.m4a"))
+            .add_filter(
+                "Audio",
+                &["m4a", "wav", "mp3", "aac", "flac", "ogg", "opus"],
+            )
+            .save_file()
+        else {
+            return;
+        };
+        let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
+        self.status = if self.extract_video_audio_to(&src, &dest, speed) {
+            let at = if (speed - 1.0).abs() > 0.001 {
+                format!(" at {speed:.2}×")
+            } else {
+                String::new()
+            };
+            format!("Extracted audio{at} → {}", short_name(&dest))
+        } else {
+            "Audio extract failed (is ffmpeg installed?)".into()
+        };
+    }
+
+    /// "Extract & edit in sampler" — decode the audio to a temp WAV (frictionless, no dialog) so
+    /// the caller can open it in pixelview's built-in sampler/waveform editor via `load_full`.
+    /// Returns the temp WAV path, or `None` on failure (status set).
+    fn extract_video_audio_for_edit(&mut self) -> Option<PathBuf> {
+        let src = self.video_player.as_ref().map(|vp| vp.path.clone())?;
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+        let dest = std::env::temp_dir().join(format!("pixelview_{}.wav", sanitize_filename(stem)));
+        let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
+        if self.extract_video_audio_to(&src, &dest, speed) {
+            self.status = format!("Editing audio from {}", short_name(&src));
+            Some(dest)
+        } else {
+            self.status = "Audio extract failed (is ffmpeg installed?)".into();
+            None
+        }
+    }
+
+    /// Append a marker at `secs` to the video's `.md` sidecar (YouTube-chapter format), then reload.
+    /// The label is left blank for you to fill in — the whole point of "log the footage" quickly.
+    fn append_video_marker(&mut self, secs: f32) {
+        let Some(src) = self.video_player.as_ref().map(|vp| vp.path.clone()) else {
+            return;
+        };
+        let md = video_markers_path(&src);
+        let line = format!("{} \n", format_timecode(secs));
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&md)
+        {
+            Ok(mut f) => {
+                let _ = f.write_all(line.as_bytes());
+                self.video_markers = load_video_markers(&src);
+                self.status = format!("Marker at {} → {}", format_timecode(secs), short_name(&md));
+            }
+            Err(e) => self.status = format!("Marker write failed: {e}"),
+        }
     }
 
     /// Enter the standalone **Sample-Pads** editor (item 15): the pad grid + keyboard + a silent
@@ -9745,6 +10276,11 @@ impl PixelView {
         }
         self.anim = None;
         self.player = None;
+        // Tear down any previous video (kills its ffmpeg + soundtrack) when opening a new file.
+        self.video_player = None;
+        self.video_loading = None;
+        self.video_tex = None;
+        self.video_markers.clear();
         self.pdf_view = None;
         self.xmind_view = None;
         self.three_d = None;
@@ -9828,6 +10364,15 @@ impl PixelView {
                 self.mode = Mode::ThreeD;
                 return;
             }
+        }
+
+        // Video → the in-app player (frame stream + soundtrack). The heavy open (probe +
+        // whole-track audio extract) runs on a background thread; `poll_video_load` builds
+        // the player when ready. Independent of the audio plugin — video always has sound.
+        if self.plugin_video && is_video_ext(&path) {
+            self.video_markers = load_video_markers(&src);
+            self.ensure_video_loaded(src.clone());
+            return;
         }
 
         // Audio → load the interactive player now so the big transport + waveform + keyboard
@@ -13669,6 +14214,12 @@ impl PixelView {
                             }
                             if let Some(tex) = tex {
                                 let fit = fit_centered(rect.shrink(8.0), tex.size_vec2());
+                                // Show the transparency backdrop (checkerboard / solid colour)
+                                // through any alpha, exactly like the viewer. Opaque thumbnails
+                                // cover it entirely, so photos look unchanged.
+                                let ppp = ctx.pixels_per_point();
+                                let bp = ui.painter_at(rect);
+                                self.paint_transparency_backdrop(&bp, fit, ppp);
                                 ui.painter().image(
                                     tex.id(),
                                     fit,
@@ -13723,6 +14274,22 @@ impl PixelView {
                                     egui::Color32::from_gray(130),
                                 );
                                 self.want_repaint = true;
+                            }
+
+                            // Video tiles show a real frame; mark them with a ▶ pill
+                            // (bottom-right, the one free corner) so they read as video.
+                            if !entry.is_dir && is_video_ext(path) {
+                                let p = ui.painter_at(rect);
+                                let r = (tile * 0.10).clamp(9.0, 15.0);
+                                let c = rect.right_bottom() + egui::vec2(-(r + 5.0), -(r + 5.0));
+                                p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+                                p.text(
+                                    c + egui::vec2(r * 0.12, 0.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "▶",
+                                    egui::FontId::proportional(r * 1.15),
+                                    egui::Color32::from_white_alpha(235),
+                                );
                             }
                         }
 
@@ -15144,6 +15711,14 @@ impl PixelView {
 
         // In immersive (F11) mode the controls row is hidden too, for a fully black screen.
         let immersive = self.immersive;
+
+        // Video: transport (play/pause, seek, speed, PNG/audio/markers) + the frame.
+        if self.video_player.is_some() {
+            if let Some(forward) = self.draw_video_ui(ctx, ui) {
+                self.step_image(ctx, forward);
+            }
+            return;
+        }
 
         // Animated GIF: a controls row (play/pause, seek, frame info) + the frame.
         if self.anim.is_some() {
@@ -19800,6 +20375,60 @@ impl eframe::App for PixelView {
             }
             self.want_repaint = true;
         }
+        // Video transport hotkeys (only when a video is open + not typing).
+        if !typing && self.video_player.is_some() {
+            // Space = play/pause; Shift+Space = restart from the beginning.
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                let shift = ctx.input(|i| i.modifiers.shift);
+                if let Some(vp) = &mut self.video_player {
+                    if shift {
+                        vp.seek(0.0);
+                        vp.set_playing(true);
+                    } else {
+                        vp.toggle();
+                    }
+                }
+                self.want_repaint = true;
+            }
+            // Scrub jumps: Home/1 = start, 2 = 25%, 3 = 50%, 4 = end. Consumed (input_mut) so 1-4
+            // don't ALSO set a star rating and Home doesn't scroll the frame.
+            let dur = self
+                .video_player
+                .as_ref()
+                .map(|vp| vp.duration())
+                .unwrap_or(0.0);
+            let target = ctx.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                let n = Modifiers::NONE;
+                if i.consume_key(n, Key::Home) || i.consume_key(n, Key::Num1) {
+                    Some(0.0)
+                } else if i.consume_key(n, Key::Num2) {
+                    Some(dur * 0.25)
+                } else if i.consume_key(n, Key::Num3) {
+                    Some(dur * 0.5)
+                } else if i.consume_key(n, Key::Num4) {
+                    Some((dur - 0.1).max(0.0)) // just shy of the end so a frame still shows
+                } else {
+                    None
+                }
+            });
+            if let Some(t) = target {
+                if let Some(vp) = &mut self.video_player {
+                    vp.seek(t);
+                }
+                self.want_repaint = true;
+            }
+            // m = place a marker at the current position (logs to the .md sidecar).
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M)) {
+                let pos = self
+                    .video_player
+                    .as_ref()
+                    .map(|vp| vp.position())
+                    .unwrap_or(0.0);
+                self.append_video_marker(pos);
+                self.want_repaint = true;
+            }
+        }
         // Shift+Esc — PANIC: stop all audio + every pad voice (kills a runaway looping pad / all
         // MIDI notes). Works globally when a player exists; plain Esc still goes Back to grid.
         if !typing
@@ -19864,6 +20493,7 @@ impl eframe::App for PixelView {
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
+        self.poll_video_load(ctx.input(|i| i.stable_dt)); // background video open → build player
         self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
                                                                // Screensaver: once a (random) pack has finished downloading + mounting, open its
                                                                // first art file. Both async ops idle ⇒ the listing has settled.
@@ -20272,6 +20902,7 @@ impl eframe::App for PixelView {
         });
 
         self.paint_audio_loading_overlay(&ctx);
+        self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
 
         if self.show_hotkeys {
@@ -20512,11 +21143,20 @@ impl eframe::App for PixelView {
                                          + an interactive 3D viewer (rotate / zoom / pan / WASD)",
                                     )
                                     .changed();
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_video, "Video")
+                                    .on_hover_text(
+                                        "MP4 / MKV / WEBM / MOV / … — a frame thumbnail + an \
+                                         in-app player (play / seek / speed / volume / PNG export). \
+                                         Needs ffmpeg on PATH.",
+                                    )
+                                    .changed();
                                 if plug_changed {
                                     self.registry.set_plugin("code", self.plugin_code);
                                     self.registry.set_plugin("pdf", self.plugin_pdf);
                                     self.registry.set_plugin("audio", self.plugin_audio);
                                     self.registry.set_plugin("3d", self.plugin_3d);
+                                    self.registry.set_plugin("video", self.plugin_video);
                                     prefs_refresh = true; // re-scan so the listing adds/drops those types
                                 }
 
@@ -20901,6 +21541,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
+        eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -26027,6 +26668,66 @@ fn is_mesh_path(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::mesh3d::MESH_EXTS.contains(&e.as_str()))
 }
 
+/// Is `p` a video container the video plugin handles (mp4/mkv/webm/mov/…)?
+fn is_video_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::VIDEO_EXTS.contains(&e.as_str()))
+}
+
+/// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
+/// and a leading `[`/`(` are tolerated. `None` if any component isn't a number.
+fn parse_timecode(s: &str) -> Option<f32> {
+    let s = s
+        .trim()
+        .trim_start_matches(['[', '('])
+        .trim_end_matches([']', ')']);
+    let nums: Option<Vec<f32>> = s.split(':').map(|p| p.trim().parse::<f32>().ok()).collect();
+    match nums?.as_slice() {
+        [s] => Some(*s),
+        [m, s] => Some(m * 60.0 + s),
+        [h, m, s] => Some(h * 3600.0 + m * 60.0 + s),
+        _ => None,
+    }
+}
+
+/// Format seconds → `h:mm:ss` (or `m:ss` under an hour) — YouTube-chapter style, so the `.md`
+/// sidecar pastes straight into a video description.
+fn format_timecode(secs: f32) -> String {
+    let t = secs.max(0.0).round() as u64;
+    let (h, m, s) = (t / 3600, (t % 3600) / 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The `.md` marker sidecar for a video (`clip.mp4` → `clip.md`).
+fn video_markers_path(video: &Path) -> PathBuf {
+    video.with_extension("md")
+}
+
+/// Load YouTube-style chapter markers from the video's `.md` sidecar: each line starting with a
+/// timecode (after optional `-`/`*`/`#` list bullets) followed by text → a `(seconds, label)`.
+/// Missing/unreadable sidecar → no markers.
+fn load_video_markers(video: &Path) -> Vec<(f32, String)> {
+    let Ok(text) = std::fs::read_to_string(video_markers_path(video)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', '#', ' ']).trim();
+        let mut it = line.splitn(2, char::is_whitespace);
+        if let Some(secs) = it.next().and_then(parse_timecode) {
+            out.push((secs, it.next().unwrap_or("").trim().to_string()));
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.
 fn is_kit_ext(p: &Path) -> bool {
     p.extension()
@@ -28210,6 +28911,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::AUDIO_EXTS.contains(&x.as_str())
                 || crate::decode::mesh3d::MESH_EXTS.contains(&x.as_str())
                 || crate::decode::mesh3d::AUX_EXTS.contains(&x.as_str())
+                || crate::decode::VIDEO_EXTS.contains(&x.as_str())
         }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.

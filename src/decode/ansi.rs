@@ -479,13 +479,12 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
                         }
                     }
                     // Clear screen (ESC[2J) — restart the grid at the origin.
-                    b'J'
-                        if nums.first().copied() == Some(2) => {
-                            grid.clear();
-                            x = 0;
-                            y = 0;
-                            max_y = 0; // a clear restarts the screen extent
-                        }
+                    b'J' if nums.first().copied() == Some(2) => {
+                        grid.clear();
+                        x = 0;
+                        y = 0;
+                        max_y = 0; // a clear restarts the screen extent
+                    }
                     _ => {}
                 }
                 i = j + 1;
@@ -602,8 +601,16 @@ mod tests {
         // renders a blank row between every content row — venetian-blind black stripes.
         // Matches ansilove (wrap lives in the printable-char branch). wrap=4.
         let (g, _) = parse(b"AAAA\r\nB", 4, true);
-        assert_eq!(g.len(), 2, "4 chars + CRLF + B = rows 0,1 with no blank between");
-        assert_eq!(g[0].iter().filter(|c| c.ch != 0).count(), 4, "row 0 stayed full");
+        assert_eq!(
+            g.len(),
+            2,
+            "4 chars + CRLF + B = rows 0,1 with no blank between"
+        );
+        assert_eq!(
+            g[0].iter().filter(|c| c.ch != 0).count(),
+            4,
+            "row 0 stayed full"
+        );
         assert_eq!(g[1][0].ch, b'B', "B on row 1, directly under the full row");
     }
 

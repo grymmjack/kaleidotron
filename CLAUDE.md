@@ -53,11 +53,13 @@ COLLADA, resolving an OBJ's `.mtl`), a hand-rolled PLY loader, + the `gltf` crat
 embedded/external `.bin`),
 flattened to one triangle mesh + bounding sphere, then **CPU-rasterized** (z-buffered flat-shaded
 orthographic — no GPU context on the thumbnailer thread) to a tile; opening one enters an
-**interactive `Mode::ThreeD` viewer** — see "3D model viewer" below). These **four** are
+**interactive `Mode::ThreeD` viewer** — see "3D model viewer" below), and **video**
+(`decode/video.rs` + `src/video.rs`: mp4/mkv/webm/mov/… — the tile is a real frame grabbed by
+**ffmpeg**, opening one enters an in-app **player** — see "Video playback" below). These **five** are
 **toggleable plugins** (Preferences → "Format plugins" checkboxes; a runtime atomic flag on the
-`Registry` — off drops the type from the listing + skips decoding). **All four default OFF** (a
-fresh install: `load_bool(PLUGIN_*_KEY, false)` in `new()` — they're the heaviest decode paths; an
-existing user keeps whatever they persisted); enable them in Preferences. **Any** file also gets "Open in default
+`Registry` — off drops the type from the listing + skips decoding). **All five default OFF** (a
+fresh install: `load_bool(PLUGIN_*_KEY, false)` in `new()` — they're the heaviest decode paths / need
+an external tool; an existing user keeps whatever they persisted); enable them in Preferences. **Any** file also gets "Open in default
 app" (xdg-open/open/explorer) in the right-click "Open in…" menu, the Details pane, and via
 **Enter** in the viewer — so a source file drops into its associated editor.
 **Animated GIFs** play (autoplay + seek in the viewer,
@@ -90,6 +92,11 @@ src/
                      via a global Mutex<Connection>. `init`/`get_bytes`/`get_file`/
                      `stats`/`clear`. Used by sixteen.rs (get_json/download) + colo_thumb.
   thumb.rs           worker pool: thumbnails + image metadata (dims, color count)
+  video.rs           interactive video player: an ffmpeg raw-RGBA frame pipe (reader thread +
+                     bounded sync_channel = backpressure) + a self-contained rodio soundtrack
+                     engine (whole audio track extracted upfront by ffmpeg) + an A/V sync clock
+                     (frames chase audio pos, else wall-clock). Seek = kill+respawn ffmpeg at
+                     `-ss t`. VideoPlayer / VideoLoading (async open); see "Video playback".
   colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
                      (mirrors ThumbBuilder; results uploaded to thumb_tex + thumb_rgba
                      by path, so 16colo tiles recolor). Holds an Arc<Registry>: a PDF
@@ -190,6 +197,14 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
                      DECODE path is device-free so `cargo test` stays headless. `AUDIO_EXTS`
                      re-exported; registry routes audio exts to `decode_ext` (needs the ext hint).
                      In-app PLAYBACK is separate (`AudioPlayer` in app.rs, rodio) — see below.
+    video.rs         video containers (mp4/m4v/mkv/webm/mov/avi/…) — path-routed like mesh3d
+                     (ffmpeg needs the file). `decode_thumb` grabs a representative frame via
+                     `ffmpeg -ss <t> -frames:v 1` (10% in, avoids black intros); `probe` reads
+                     duration/fps/dims/codec/has_audio via `ffprobe -print_format json`; `grab_frame`
+                     is the shared single-frame grabber (also used for native-res PNG export).
+                     `VIDEO_EXTS`/`VideoInfo`/`grab_video_frame`/`probe_video` re-exported. Falls
+                     back to a labeled placeholder tile when ffmpeg is absent. Interactive PLAYBACK
+                     is `src/video.rs` (see "Video playback").
     tundra.rs        .tnd — TundraDraw 24-bit truecolor command stream
     idf.rs           .idf — iCE Draw: bounds + RLE + end-of-file font/palette
     adf.rs           .adf — Artworx: version + 64-color palette + font + pairs
@@ -232,7 +247,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 252 tests (242 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
+cargo test               # 258 tests (248 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -848,7 +863,10 @@ rematch**, and the *order* of all of it is user-controlled.
   a **2×2 `TextureWrapMode::Repeat` texture** (`checker_tex`, rebuilt only when the colours
   change) tiled via one UV-> N `painter.image` — O(1) regardless of image size; the UV origin
   is anchored to the image rect so the checker pans WITH the art. Cell size is device-px (a
-  screen-space backdrop, constant across zoom).
+  screen-space backdrop, constant across zoom). **The grid uses the same backdrop**: `ui_grid`
+  calls `paint_transparency_backdrop` into each thumbnail's `fit` rect before blitting the tile,
+  so transparent thumbnails (PNG/GIF/webp/…) show the checkerboard/solid instead of the tile
+  tint — opaque thumbnails cover it, so photos look unchanged.
 - **Pixel-perfect blit (accuracy — read before touching `draw_image_view`).**
   Nearest-neighbor only stays undistorted when one source pixel maps to a **whole
   number of *device* pixels** — and integer `zoom` is not enough, because what counts
@@ -1000,6 +1018,83 @@ The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF
   thumbnail**, cached across restarts. The `.blend` still opens externally / rates / etc.
 - Adding a scene-format extension: `MESH_EXTS`/`AUX_EXTS` + `is_image_ext` + `is_mesh_path`
   are the parallel lists (like `CODE_EXTS`/`AUDIO_EXTS`).
+
+## Video playback (`decode/video.rs` + `src/video.rs` + `Mode::Single`)
+
+The **"video" format plugin** (Preferences → Format plugins, default OFF like PDF/audio/3D; a
+`plugin_video` bool synced to the registry via `set_plugin("video", …)`). Handles `.mp4 .m4v .mkv
+.webm .mov .avi .wmv .flv .mpg .mpeg .mts .m2ts .ts .ogv .3gp` (`VIDEO_EXTS`). **Requires
+`ffmpeg`/`ffprobe` on PATH** — everything shells out (no libav FFI / no build dep), the same ethos
+as poppler/blender; absent ⇒ a labeled placeholder tile + a "not installed" status, never a crash.
+It is **decoupled from the audio plugin**: video always has sound (its own rodio device), so the
+audio toggle doesn't gate it.
+
+- **Thumbnails + metadata (`decode/video.rs`).** Path-routed in `decode_bytes` **before** the sniff
+  loop (ffmpeg needs the file path, not bytes) → `video::decode_thumb(path, 512)`, which grabs a
+  representative frame (`grab_frame` = `ffmpeg -ss <t> -frames:v 1 … -f image2pipe png`, `t` = 10%
+  in to skip black intros, falling back to frame 0 on a short clip). Flows through the **existing**
+  thumbnailer/`make_thumb` (box-downscaled) → LINEAR upload → `thumb_tex` unchanged. The grid paints
+  a ▶ pill (bottom-right, the free corner) on video tiles. `probe` (`ffprobe -print_format json`)
+  → `VideoInfo { width, height, duration, fps, vcodec, has_audio }`.
+- **The player (`src/video.rs`, `VideoPlayer`).** A fusion of three existing subsystems — the audio
+  transport, the GIF frame-clock, and the image blit. Opening a video (`load_full`'s `is_video_ext`
+  branch) kicks a **background open** (`VideoLoading::start` → a worker probes + extracts the WHOLE
+  audio track to PCM via `ffmpeg -f f32le`), drained by **`poll_video_load`** (in the poll battery
+  next to `poll_audio_load`; `paint_video_loading_overlay` = the same dim+spinner). The built
+  `VideoPlayer` holds:
+  - a **`FrameStream`**: an ffmpeg process (`-f rawvideo -pix_fmt rgba -s WxH`, scaled to `DISPLAY_CAP`
+    = 1600px longest side so raw frames stay ~10 MB) + a reader thread pushing `VideoFrame{pts,data}`
+    over a **bounded `sync_channel(FRAME_BUF=8)`** — the backpressure keeps memory flat for any clip
+    length (a full buffer blocks the reader → blocks ffmpeg). `Drop` sets a cancel flag + `child.kill()`.
+  - a self-contained **`Sound`** (rodio; whole track held once, a fresh `SamplesBuffer` per (re)start —
+    the same idiom as `AudioPlayer::play_source`). `Sound::pos()` = base + `player.get_pos()·speed`.
+  - the **A/V sync clock** (`clock()`): the audio position when there's a soundtrack, else a
+    wall-clock accumulator. `tick(dt)` advances the clock (when playing) and pulls the newest frame
+    whose `pts <= clock`, holding the next in `pending` — a "present-on-time, drop-if-behind" policy
+    that stays in audio sync on a slow machine. It pulls up to the clock even while **paused**, so a
+    seek cues the correct frame.
+  - **Seek = kill + respawn**: `seek(t)` drops the `FrameStream` (kills ffmpeg) and spawns a new one
+    at `-ss t` + re-cues `Sound::play_from(t)`. Far simpler than in-process libav seeking.
+- **Viewer + transport (`draw_video_ui`, called from `ui_single` before the GIF branch).** Each
+  displayed frame is uploaded into `video_tex` and wrapped as `TiledTexture::single`, then blitted
+  through **`draw_image_view`** — so zoom/pan/fit/transparency come for free. The transport uses the
+  **`want_*` deferred-intent idiom** (egui can't borrow `self` twice): play/pause (Space too), a
+  **custom seek bar** with marker ticks. **Dragging the playhead scrub-previews** (audio+video):
+  each drag frame throttles (`video_scrub_t`, ~120 ms) a `VideoPlayer::scrub_to(t)` that respawns
+  the frame at `t` AND plays the soundtrack from `t` even when paused (DAW-style audio scrubbing);
+  the **final precise seek fires on release** (restoring the play/pause state). **Mousewheel over the
+  bar** scrubs (coarse 5 s / Shift = fine 1 s). Also: a **Speed** combo (0.25×–4× — re-cues the
+  soundtrack, the clock scales, frames unchanged), a **frame N/M** readout + a **"Go to" `m:ss` field**
+  (Enter → `parse_timecode` → seek), **⬇ PNG** export (auto-named beside the video, re-grabbed at
+  **native** resolution via `grab_video_frame(path, cur_pts, None)`, not the capped display frame),
+  an **Audio ▾** menu, and **＋ Marker**.
+- **Transport hotkeys** (in `ui()`, gated `!typing && video_player.is_some()`): **Space** play/pause,
+  **Shift+Space** restart from 0, **Home/1** = start, **2** = 25%, **3** = 50%, **4** = end,
+  **m** = drop a marker. The digit + Home keys are **`consume_key`'d** so they don't also set a star
+  rating / scroll the frame (the rating handler reads `key_pressed` *after*, so a consumed key is gone).
+- **Audio extract (`extract_video_audio_to`, shared).** **"Extract & edit in sampler"** →
+  `extract_video_audio_for_edit` decodes to a temp WAV and `load_full`s it into pixelview's **own**
+  built-in sampler/waveform editor (enabling the audio plugin first if off — that editor *is* the
+  audio plugin). **"Extract audio to file…"** → a save dialog (`.wav`→PCM, else lossless `-c:a copy`
+  with a re-encode fallback). **Both honor the current playback speed**: at any speed ≠ 1× it
+  re-encodes with an `asetrate` resample filter matching what the player *sounds* like (pitch tracks
+  speed, like the live rodio `.speed()` — not the pitch-preserving `atempo`).
+- **Chapter markers via a `.md` sidecar** (the user's "log the footage" workflow). `clip.mp4` →
+  `clip.md`, YouTube-chapter format (`0:00 Intro` / `00:01:23 Title`), parsed by `load_video_markers`
+  (`parse_timecode` handles `ss`/`mm:ss`/`hh:mm:ss`, tolerates `-`/`*`/`#` bullets) into
+  `video_markers: Vec<(secs, label)>` → seek-bar ticks + a clickable jump list. `append_video_marker`
+  writes a blank-label line at the current time (`format_timecode`). Because the `.md` *is* the
+  YouTube chapter format, logging footage and building the description chapters are one action.
+- **Player state fields** (`PixelView`): `video_player` / `video_loading` / `video_tex` /
+  `video_markers` / `video_speed` / `video_scrub` / `video_scrub_t` / `video_seek_input`, reset in
+  `load_full`'s teardown block. Master volume/mute pushed each frame via `set_volume`.
+- **Still TODO** (follow-ups, deferred): **hover-scrub thumbnails** (grid tile + Details preview —
+  needs an async frame-strip generator, since one-off `ffmpeg -ss` per hover-x is too slow; precompute
+  N frames on hover-start + map pointer-x → nearest, like a YouTube storyboard), lossless
+  **trim/export** (mark in/out → `ffmpeg -ss/-to -c copy`, keyframe-snapped unless re-encoded),
+  lossless **join/concat** (`-f concat -c copy`), and the **YouTube browser** (Phase 3 — `yt-dlp` as
+  the "API" mirroring `sixteen.rs`, reusing `cache.rs` + `RemoteThumbs` + this same ffmpeg frame pipe,
+  since `ffmpeg -i <stream-url>` reads URLs like files).
 
 ## Git status in the browser (`git.rs`)
 
@@ -1795,7 +1890,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 252 tests, all headless (242 unit + 10 GUI; plus 13 `#[ignore]`
+`cargo test` runs 258 tests, all headless (248 unit + 10 GUI; plus 13 `#[ignore]`
 network / real-trash / PSD-dump tests that hit the live 16colo.rs API, the system trash,
 or write a sample `.psd` to `/tmp`):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
