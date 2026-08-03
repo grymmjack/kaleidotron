@@ -5694,6 +5694,70 @@ impl PixelView {
         };
     }
 
+    /// Join the selected videos (in on-screen order) into one clip via ffmpeg's **concat
+    /// demuxer** — `-c copy` = **lossless**, no re-encode (with a re-encode fallback). Works
+    /// cleanly when the clips share codec/size/params (e.g. splits of one source, same-camera
+    /// takes); wildly different clips would need the concat *filter* (scaling) — out of scope here.
+    fn join_selected_videos(&mut self) {
+        // Selected videos in the current view order.
+        let display: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir && is_video_ext(&e.path) && self.selection.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        if display.len() < 2 {
+            self.status = "Select 2 or more videos to join".into();
+            return;
+        }
+        let paths: Vec<PathBuf> = display.iter().map(|p| self.resolve_local(p)).collect();
+        let ext = paths[0]
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_string();
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("joined.{ext}"))
+            .save_file()
+        else {
+            return;
+        };
+        // The concat demuxer reads a list file of `file '<path>'` lines (single quotes escaped).
+        let list_path = std::env::temp_dir().join("pixelview_concat.txt");
+        let mut list = String::new();
+        for p in &paths {
+            let esc = p.to_string_lossy().replace('\'', "'\\''");
+            list.push_str(&format!("file '{esc}'\n"));
+        }
+        if std::fs::write(&list_path, &list).is_err() {
+            self.status = "Join failed (could not write the concat list)".into();
+            return;
+        }
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args([
+                "-v", "quiet", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i",
+            ])
+            .arg(&list_path);
+            if copy {
+                cmd.args(["-c", "copy"]);
+            }
+            cmd.arg(&dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let ok = run(true) || run(false);
+        let _ = std::fs::remove_file(&list_path);
+        self.status = if ok {
+            format!("Joined {} videos → {}", paths.len(), short_name(&dest))
+        } else {
+            "Join failed (clips must share codec/size for a lossless join)".into()
+        };
+    }
+
     /// Enter the standalone **Sample-Pads** editor (item 15): the pad grid + keyboard + a silent
     /// waveform, no audio file required. Used when the Kits tab is opened or a kit is loaded so the
     /// pads are visible immediately. Switches to the single view and stays there.
@@ -14273,6 +14337,8 @@ impl PixelView {
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
+        let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
+        let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -14671,8 +14737,18 @@ impl PixelView {
                             let local_dir = Self::is_local_path(&entry.path);
                             let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                             if let Some(pick) = entry_context_menu(
-                                ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
-                                &openers, &facts, local_dir, bulk_dir,
+                                ui,
+                                &entry,
+                                can_paste,
+                                pinned,
+                                viewed,
+                                colo_pin,
+                                colo_piece,
+                                &openers,
+                                &facts,
+                                local_dir,
+                                bulk_dir,
+                                selected_videos,
                             ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
@@ -14691,6 +14767,7 @@ impl PixelView {
                                     TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                     TilePick::RenderBlend => render_blend = Some(idx),
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
+                                    TilePick::JoinVideos => join_sel = true,
                                 }
                             }
                         });
@@ -14782,6 +14859,9 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.export_blend_render(&p);
             }
+        }
+        if join_sel {
+            self.join_selected_videos();
         }
         if pin_current {
             self.pin_current_folder();
@@ -15104,6 +15184,8 @@ impl PixelView {
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
+        let mut join_sel = false; // "Join videos" (uses the current selection)
+        let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -15598,8 +15680,18 @@ impl PixelView {
                         let local_dir = Self::is_local_path(&entry.path);
                         let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                         if let Some(pick) = entry_context_menu(
-                            ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece, &openers,
-                            &facts, local_dir, bulk_dir,
+                            ui,
+                            &entry,
+                            can_paste,
+                            pinned,
+                            viewed,
+                            colo_pin,
+                            colo_piece,
+                            &openers,
+                            &facts,
+                            local_dir,
+                            bulk_dir,
+                            selected_videos,
                         ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
@@ -15618,6 +15710,7 @@ impl PixelView {
                                 TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                 TilePick::RenderBlend => render_blend = Some(idx),
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
+                                TilePick::JoinVideos => join_sel = true,
                             }
                         }
                     });
@@ -15757,6 +15850,9 @@ impl PixelView {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.export_blend_render(&p);
             }
+        }
+        if join_sel {
+            self.join_selected_videos();
         }
         if pin_current {
             self.pin_current_folder();
@@ -27972,6 +28068,7 @@ enum TilePick {
     CompareDiff,           // "Compare ▸ Set as diff" — this file becomes the right pane
     RenderBlend,           // ".blend" → render frame 1 with headless Blender → becomes its tile
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
+    JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -28403,6 +28500,7 @@ fn entry_context_menu(
     folder_actions: &[OpenerItem],  // "Open folder in…" actions (shown for local dirs)
     local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
     bulk_dir: bool, // a 16colo artist/group/pack folder → offer "Download all pieces…"
+    selected_videos: usize, // count of currently-selected local video files (≥2 → offer Join)
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -28589,6 +28687,21 @@ fn entry_context_menu(
                 ui.close();
             }
         });
+        ui.separator();
+    }
+    // Join (lossless): when ≥2 videos are selected, offer to concat them into one clip.
+    if !entry.is_dir && selected_videos >= 2 && is_video_ext(&entry.path) {
+        if ui
+            .button(format!("Join {selected_videos} videos (lossless)…"))
+            .on_hover_text(
+                "Concatenate the selected videos into one clip in view order \
+                 (ffmpeg -f concat -c copy; best when they share codec/size)",
+            )
+            .clicked()
+        {
+            pick = Some(TilePick::JoinVideos);
+            ui.close();
+        }
         ui.separator();
     }
     // Star rating (files only) — same effect as the 0-5 hotkeys, shown alongside each

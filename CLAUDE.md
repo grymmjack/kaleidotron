@@ -1100,12 +1100,18 @@ audio toggle doesn't gate it.
   `video_markers` / `video_md_header` / `video_marker_sel` / `video_marker_focus` / `video_speed` /
   `video_scrub` / `video_scrub_t` / `video_seek_input` / `video_trim_in` / `video_trim_out`, all reset
   in `load_full`'s teardown. Master volume/mute pushed each frame via `set_volume`.
+- **Lossless join/concat.** Select ≥2 videos in the grid/table → right-click → **"Join N videos
+  (lossless)…"** (`TilePick::JoinVideos`, gated by a `selected_videos` count passed to
+  `entry_context_menu`). `join_selected_videos` gathers the selection in view order, writes an ffmpeg
+  **concat-demuxer** list file (`file '<path>'`, single-quotes escaped), and runs `ffmpeg -f concat
+  -safe 0 -i list -c copy` = lossless (re-encode fallback). Works when the clips share codec/size
+  (splits of one source, same-camera takes); differing clips would need the concat *filter* (scaling),
+  out of scope. rfd dialog, default `joined.<ext>`.
 - **Still TODO** (follow-ups, deferred): **hover-scrub thumbnails** (grid tile + Details preview —
   needs an async frame-strip generator, since one-off `ffmpeg -ss` per hover-x is too slow; precompute
-  N frames on hover-start + map pointer-x → nearest, like a YouTube storyboard), lossless
-  **join/concat** (`-f concat -c copy` over a multi-selection), and the **YouTube browser** (Phase 3 —
-  `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` + `RemoteThumbs` + this same ffmpeg
-  frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
+  N frames on hover-start + map pointer-x → nearest, like a YouTube storyboard), and the **YouTube
+  browser** (Phase 3 — `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` +
+  `RemoteThumbs` + this same ffmpeg frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
 
 ## Git status in the browser (`git.rs`)
 
