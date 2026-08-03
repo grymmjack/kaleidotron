@@ -1532,6 +1532,9 @@ pub struct PixelView {
     yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     yt_search: String, // the YouTube Places-tab search box text
     yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
+    // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
+    // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
+    steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
     // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
@@ -2637,6 +2640,7 @@ impl PixelView {
             yt_open_rx: None,
             yt_search: String::new(),
             yt_downloaded_ids: std::collections::HashSet::new(),
+            steam_games: HashMap::new(),
             yt_download_dir,
             bulk_dl: None,
             colo_sauce_tx,
@@ -2675,6 +2679,11 @@ impl PixelView {
         // The virtual YouTube tree (search results → download-in-place → play).
         if crate::youtube::is_remote(&dir) {
             self.open_yt(dir);
+            return;
+        }
+        // The virtual Steam library (installed games → find YouTube videos).
+        if crate::steam::is_remote(&dir) {
+            self.open_steam(dir);
             return;
         }
         // An archive path is a *virtual* folder: extract it once, then browse the
@@ -3703,10 +3712,98 @@ impl PixelView {
                     .map(|id| format!("https://www.youtube.com/watch?v={id}"))
             });
         if let Some(url) = watch {
-            let o = os_file_manager();
-            self.launch_external(&o.exec, &o.args, &o.env, Path::new(&url));
+            self.open_url(&url);
             self.status = "Opened in browser".into();
         }
+    }
+
+    /// Hand a URL (http(s):// or steam://) to the OS default handler (xdg-open / open / explorer).
+    fn open_url(&mut self, url: &str) {
+        let o = os_file_manager();
+        self.launch_external(&o.exec, &o.args, &o.env, Path::new(url));
+    }
+
+    /// SteamTube: list installed Steam games as grid tiles (root only; deeper browsing later).
+    /// Each game is a virtual `<steam>/<Name>` entry; clicking it finds YouTube videos for it.
+    fn open_steam(&mut self, dir: PathBuf) {
+        if !crate::steam::rel_parts(&dir).is_empty() {
+            self.show_folder(dir, Vec::new()); // only the root lists games (for now)
+            return;
+        }
+        self.steam_games.clear();
+        let games = crate::steam::installed_games();
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for g in games {
+            let mut name = sanitize_filename(&g.name);
+            if name.is_empty() {
+                name = format!("app {}", g.appid);
+            }
+            let mut path = Path::new(crate::steam::ROOT).join(&name);
+            if !seen.insert(path.clone()) {
+                path = Path::new(crate::steam::ROOT).join(format!("{name} ({})", g.appid));
+                seen.insert(path.clone());
+            }
+            let rating = self.read_rating(&path);
+            entries.push(Entry {
+                path: path.clone(),
+                is_dir: false,
+                is_archive: false,
+                size: g.size,
+                mtime: None,
+                ctime: None,
+                rating,
+            });
+            self.steam_games.insert(path, g);
+        }
+        let n = entries.len();
+        self.show_folder(dir, entries);
+        self.status = if n == 0 {
+            "No Steam library found (is Steam installed?)".into()
+        } else {
+            format!("{n} Steam games — click one to find videos")
+        };
+    }
+
+    /// Run a right-click Steam action on a game tile.
+    fn steam_action(&mut self, path: &Path, act: SteamAct) {
+        let Some(g) = self.steam_games.get(path).cloned() else {
+            return;
+        };
+        match act {
+            SteamAct::Videos => {
+                let p = Path::new(crate::youtube::ROOT)
+                    .join(crate::youtube::SEARCH)
+                    .join(&g.name);
+                self.open_folder(p);
+            }
+            SteamAct::Launch => {
+                self.open_url(&g.run_url());
+                self.status = format!("Launching {} via Steam…", g.name);
+            }
+            SteamAct::Store => self.open_url(&g.store_url()),
+            SteamAct::Hub => self.open_url(&g.hub_url()),
+            SteamAct::Discussions => self.open_url(&g.discussions_url()),
+        }
+    }
+
+    /// Pick a random installed Steam game and find YouTube videos for it (works from anywhere).
+    fn steam_random_videos(&mut self) {
+        let games = crate::steam::installed_games();
+        if games.is_empty() {
+            self.status = "No Steam games found (is Steam installed?)".into();
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        let g = games[seed % games.len()].clone();
+        self.status = format!("🎲 {} → videos", g.name);
+        let p = Path::new(crate::youtube::ROOT)
+            .join(crate::youtube::SEARCH)
+            .join(&g.name);
+        self.open_folder(p);
     }
 
     /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
@@ -11243,6 +11340,10 @@ impl PixelView {
             // A YouTube result not yet downloaded → download in place, then play (poll_yt_open).
             self.selected = idx;
             self.start_yt_open(entry.path);
+        } else if self.steam_games.contains_key(&entry.path) {
+            // A Steam game tile → find YouTube videos for it (SteamTube).
+            self.selected = idx;
+            self.steam_action(&entry.path, SteamAct::Videos);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -14727,6 +14828,7 @@ impl PixelView {
         let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
+        let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -15028,6 +15130,14 @@ impl PixelView {
                                     // YouTube result → fetch its i.ytimg.com thumbnail over HTTP.
                                     self.colo_thumbs
                                         .request(path, &v.thumb_url, THUMB_PX, false);
+                                } else if let Some(g) = self.steam_games.get(path) {
+                                    // Steam game → fetch its CDN header image over HTTP.
+                                    self.colo_thumbs.request(
+                                        path,
+                                        &g.header_url(),
+                                        THUMB_PX,
+                                        false,
+                                    );
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -15222,6 +15332,7 @@ impl PixelView {
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
                                     TilePick::JoinVideos => join_sel = true,
                                     TilePick::OpenInBrowser => open_in_browser = Some(idx),
+                                    TilePick::Steam(a) => steam_act = Some((idx, a)),
                                 }
                             }
                         });
@@ -15320,6 +15431,11 @@ impl PixelView {
         if let Some(i) = open_in_browser {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.open_yt_in_browser(&p);
+            }
+        }
+        if let Some((i, a)) = steam_act {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.steam_action(&p, a);
             }
         }
         if pin_current {
@@ -15646,6 +15762,7 @@ impl PixelView {
         let mut join_sel = false; // "Join videos" (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
+        let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -16172,6 +16289,7 @@ impl PixelView {
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
                                 TilePick::JoinVideos => join_sel = true,
                                 TilePick::OpenInBrowser => open_in_browser = Some(idx),
+                                TilePick::Steam(a) => steam_act = Some((idx, a)),
                             }
                         }
                     });
@@ -16318,6 +16436,11 @@ impl PixelView {
         if let Some(i) = open_in_browser {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.open_yt_in_browser(&p);
+            }
+        }
+        if let Some((i, a)) = steam_act {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.steam_action(&p, a);
             }
         }
         if pin_current {
@@ -20253,6 +20376,7 @@ impl PixelView {
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
+        let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
@@ -20298,6 +20422,7 @@ impl PixelView {
                             (4, "PixelFX"),
                             (1, "16colo"),
                             (5, "YouTube"),
+                            (6, "Steam"),
                             (2, "Kits"),
                             (3, "Samples"),
                         ] {
@@ -20389,6 +20514,30 @@ impl PixelView {
                             crate::youtube::is_remote,
                             false,
                         ) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 6 {
+                        // SteamTube: browse installed games → find YouTube videos for them.
+                        if ui
+                            .button("🎮 My Steam games")
+                            .on_hover_text("List installed Steam games — click one to find videos")
+                            .clicked()
+                        {
+                            nav = Some(PathBuf::from(crate::steam::ROOT));
+                        }
+                        if ui
+                            .button(format!("{} Random game → videos", icons::SHUFFLE))
+                            .on_hover_text("Pick a random installed game and search YouTube for it")
+                            .clicked()
+                        {
+                            steam_random = true;
+                        }
+                        if crate::steam::steam_root().is_none() {
+                            ui.weak("No Steam library found");
+                        }
+                        if let Some(p) =
+                            self.favorites_buttons(ui, "🎮", crate::steam::is_remote, false)
+                        {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 2 {
@@ -21044,6 +21193,8 @@ impl PixelView {
             self.enter_kit_editor();
         } else if let Some(i) = recall {
             self.recall_filter(i);
+        } else if steam_random {
+            self.steam_random_videos();
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
@@ -27563,7 +27714,7 @@ fn is_video_ext(p: &Path) -> bool {
 /// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
 /// (favorites split, etc.) on a non-local path.
 fn any_remote(p: &Path) -> bool {
-    crate::sixteen::is_remote(p) || crate::youtube::is_remote(p)
+    crate::sixteen::is_remote(p) || crate::youtube::is_remote(p) || crate::steam::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -28643,6 +28794,17 @@ enum TilePick {
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
+    Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
+}
+
+/// A right-click action on a Steam game tile.
+#[derive(Clone, Copy)]
+enum SteamAct {
+    Launch,      // steam://rungameid/<appid> (via xdg-open → the Steam client)
+    Videos,      // route to a YouTube search for the game
+    Store,       // store page (browser)
+    Hub,         // community hub (browser)
+    Discussions, // community discussions (browser)
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -29245,6 +29407,24 @@ fn entry_context_menu(
                 on(ui, "SAUCE group", SmartCriterion::Group);
                 on(ui, "SAUCE artist", SmartCriterion::Artist);
             }
+        });
+        ui.separator();
+    }
+    // Steam game (SteamTube): find videos / launch / open Steam pages.
+    if !entry.is_dir && crate::steam::is_remote(&entry.path) {
+        ui.menu_button("🎮 Steam", |ui| {
+            let mut item = |ui: &mut egui::Ui, label: &str, act: SteamAct| {
+                if ui.button(label).clicked() {
+                    pick = Some(TilePick::Steam(act));
+                    ui.close();
+                }
+            };
+            item(ui, "Find videos", SteamAct::Videos);
+            item(ui, "Launch game", SteamAct::Launch);
+            ui.separator();
+            item(ui, "Store page", SteamAct::Store);
+            item(ui, "Community hub", SteamAct::Hub);
+            item(ui, "Discussions", SteamAct::Discussions);
         });
         ui.separator();
     }

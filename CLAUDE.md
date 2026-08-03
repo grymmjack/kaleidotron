@@ -247,7 +247,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 262 tests (252 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
+cargo test               # 266 tests (256 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -1158,6 +1158,33 @@ HTTP cache + `RemoteThumbs` pool.
 - **Deferred idea**: "SteamTube" — read the local Steam library (`libraryfolders.vdf` +
   `appmanifest_*.acf`) → a Places entry of games → each opens a YouTube search for it.
 
+## SteamTube (`src/steam.rs` + `app.rs` — a Steam library → YouTube bridge)
+
+A **Places → Steam tab** that lists installed Steam games as grid tiles (Steam CDN header images
+via `RemoteThumbs`); **clicking a game routes to a YouTube search for it** (`<youtube>/search/<name>`),
+reusing the whole YouTube source. Reads the local Steam config directly — no Steam API, no login.
+
+- **`src/steam.rs`** (pure, unit-tested): detects the Steam root across **native / `.steam` /
+  Flatpak / Snap** (`steam_root`), follows `libraryfolders.vdf` to every library, and parses each
+  `appmanifest_*.acf` (a tiny VDF field reader: `vdf_value`/`vdf_values`/`quoted`) into
+  `SteamGame{appid,name,last_played,size}` (`installed_games`, sorted, de-duped, runtimes filtered by
+  `is_nongame`). URL helpers: `header_url` (CDN thumbnail), `store_url`, `run_url`
+  (`steam://rungameid/<appid>`), `hub_url`, `discussions_url`. `ROOT = "<steam>"` + `is_remote` +
+  `rel_parts` mirror the youtube/16colo virtual-path scheme. A `#[ignore]` `lists_real_library` test
+  dumps the machine's actual games.
+- **`app.rs`**: `steam_games` (virtual path → `SteamGame`); `open_folder` routes `steam::is_remote`
+  → **`open_steam`** (scans `installed_games`, builds `<steam>/<Name>` entries with a rating read
+  from the sidecar, `show_folder`s them). Grid tiles fetch `header_url` via `colo_thumbs`.
+  **`activate`** on a game → `steam_action(SteamAct::Videos)` → YouTube search. Right-click **🎮 Steam**
+  submenu (`TilePick::Steam(SteamAct)`): Find videos / **Launch game** (`open_url(run_url)` → xdg-open
+  → the Steam client) / Store page / Community hub / Discussions. The Places tab also has **🔀 Random
+  game → videos** (`steam_random_videos`, wall-clock pick). Games are **ratable** (virtual entries →
+  the `ratings.json` sidecar, like 16colo/YouTube) and **pinnable** (favorites). `any_remote` now =
+  `sixteen || youtube || steam`.
+- **Deferred**: deeper in-app game browsing (news/achievements/screens), and the broader idea of an
+  **HTTP/FTP "virtual filesystem" browser** (pass a URL → introspect + crawl it, Total-Commander
+  style) — both natural extensions of the virtual-source pattern.
+
 ## Git status in the browser (`git.rs`)
 
 `start_git_status` (on every `show_folder`, off-thread so a big monorepo can't hitch nav) runs
@@ -1952,7 +1979,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 
 ## Testing
 
-`cargo test` runs 262 tests, all headless (252 unit + 10 GUI; plus 13 `#[ignore]`
+`cargo test` runs 266 tests, all headless (256 unit + 10 GUI; plus 13 `#[ignore]`
 network / real-trash / PSD-dump tests that hit the live 16colo.rs API, the system trash,
 or write a sample `.psd` to `/tmp`):
 - **Unit tests** (`#[cfg(test)] mod tests` per module): PCX decode + sniff,
