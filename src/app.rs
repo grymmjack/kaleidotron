@@ -1332,6 +1332,13 @@ pub struct PixelView {
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
     video_recolor_key: Option<String>, // recolor pipeline key last applied → re-colorize a PAUSED frame when it changes
     recolor_playback: bool, // apply the recolor pipeline to live video frames? off = raw = faster fps (persisted)
+    show_fps: bool,         // overlay a UI-fps / video-fps meter on the video (persisted)
+    // FPS meter accumulators (not persisted): UI repaints + displayed video frames per window.
+    fps_accum_t: f32,
+    fps_ui_frames: u32,
+    fps_video_frames: u32,
+    fps_ui_val: f32,
+    fps_video_val: f32,
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
     video_md_header: String,         // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
@@ -1640,6 +1647,7 @@ impl PixelView {
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
     const RECOLOR_PLAYBACK_KEY: &'static str = "recolor_playback";
+    const SHOW_FPS_KEY: &'static str = "show_fps";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
@@ -2564,6 +2572,12 @@ impl PixelView {
             video_tex: None,
             video_recolor_key: None,
             recolor_playback: load_bool(Self::RECOLOR_PLAYBACK_KEY, true),
+            show_fps: load_bool(Self::SHOW_FPS_KEY, false),
+            fps_accum_t: 0.0,
+            fps_ui_frames: 0,
+            fps_video_frames: 0,
+            fps_ui_val: 0.0,
+            fps_video_val: 0.0,
             video_markers: Vec::new(),
             video_md_header: String::new(),
             video_marker_sel: None,
@@ -5917,6 +5931,18 @@ impl PixelView {
         let dt = ctx.input(|i| i.stable_dt);
         let (vol, muted) = (self.audio_volume, self.audio_muted);
 
+        // FPS meter: this call = one UI repaint; a displayed video frame is counted at upload.
+        // Recomputed each ~0.5 s window so the numbers are readable.
+        self.fps_ui_frames += 1;
+        self.fps_accum_t += dt;
+        if self.fps_accum_t >= 0.5 {
+            self.fps_ui_val = self.fps_ui_frames as f32 / self.fps_accum_t;
+            self.fps_video_val = self.fps_video_frames as f32 / self.fps_accum_t;
+            self.fps_accum_t = 0.0;
+            self.fps_ui_frames = 0;
+            self.fps_video_frames = 0;
+        }
+
         // Advance the clock/frames and push the master volume.
         let (dw, dh) = {
             let vp = self.video_player.as_mut()?;
@@ -5970,6 +5996,7 @@ impl PixelView {
                             Some(ctx.load_texture("video_frame", color, view_tex_opts()))
                     }
                 }
+                self.fps_video_frames += 1; // a real new displayed frame
             }
             // Remember which pipeline we just baked in, so a paused re-tweak (or turning recolor
             // off) re-uploads once instead of every frame.
@@ -6159,6 +6186,8 @@ impl PixelView {
                         "Apply the Recolor pane to live playback. Turn OFF for faster fps — the \
                          preview + PNG export still recolor. Persisted.",
                     );
+                ui.checkbox(&mut self.show_fps, "FPS")
+                    .on_hover_text("Overlay a UI-fps + video-fps meter on the video");
                 ui.separator();
                 ui.checkbox(&mut self.yt_open_folder_after, "Open folder after download")
                     .on_hover_text(
@@ -6440,6 +6469,27 @@ impl PixelView {
         };
         if playing || self.video_loading.is_some() {
             self.want_repaint = true;
+        }
+        // FPS overlay (top-left of the viewport): UI repaints vs actual displayed video frames,
+        // against the source fps + the display size (so a low number is interpretable).
+        if self.show_fps {
+            let r = ui.min_rect();
+            let src_fps = self.video_player.as_ref().map(|v| v.info.fps).unwrap_or(0.0);
+            let text = format!(
+                "UI {:.0} · video {:.0}/{:.0} fps · {}×{}",
+                self.fps_ui_val, self.fps_video_val, src_fps, dw, dh
+            );
+            let pos = r.left_top() + egui::vec2(8.0, 8.0);
+            let painter = ui.painter();
+            let galley = painter.layout_no_wrap(
+                text,
+                egui::FontId::monospace(13.0),
+                egui::Color32::from_rgb(120, 255, 140),
+            );
+            let bg = egui::Rect::from_min_size(pos, galley.size())
+                .expand2(egui::vec2(6.0, 4.0));
+            painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(190));
+            painter.galley(pos, galley, egui::Color32::WHITE);
         }
         forward
     }
@@ -23790,6 +23840,7 @@ impl eframe::App for PixelView {
         );
         eframe::set_value(storage, Self::YT_COOKIES_KEY, &self.yt_cookies_browser);
         eframe::set_value(storage, Self::RECOLOR_PLAYBACK_KEY, &self.recolor_playback);
+        eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);

@@ -20,6 +20,28 @@ use std::process::{Command, Stdio};
 pub const ROOT: &str = "<youtube>";
 /// Sub-root: search results live at `<youtube>/search/<query>`.
 pub const SEARCH: &str = "search";
+/// Sub-root: a channel's videos at `<youtube>/channel/<id>`, its playlists at
+/// `<youtube>/channel/<id>/playlists`.
+pub const CHANNEL: &str = "channel";
+/// Sub-leaf under a channel path: the channel's playlists listing.
+pub const PLAYLISTS: &str = "playlists";
+/// Sub-root: a playlist's videos at `<youtube>/playlist/<id>`.
+pub const PLAYLIST: &str = "playlist";
+
+/// The UC… channel id from a channel URL (`…/channel/UC…`) or a bare id. `""` if not found.
+pub fn channel_id_from_url(url: &str) -> String {
+    if let Some(i) = url.find("/channel/") {
+        url[i + 9..]
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else if url.starts_with("UC") {
+        url.to_string()
+    } else {
+        String::new()
+    }
+}
 
 /// Is `path` a YouTube virtual path?
 pub fn is_remote(path: &Path) -> bool {
@@ -44,7 +66,8 @@ pub struct YtVideo {
     pub id: String,
     pub title: String,
     pub channel: String,
-    pub duration: f32, // seconds; 0 = unknown (e.g. a live stream)
+    pub channel_id: String, // the UC… id (for "Go to channel"); "" when yt-dlp omits it
+    pub duration: f32,      // seconds; 0 = unknown (e.g. a live stream)
     pub views: u64,
     pub thumb_url: String,
 }
@@ -176,6 +199,41 @@ pub fn parse_video_meta(bytes: &[u8]) -> Option<YtMeta> {
     })
 }
 
+/// One playlist from a channel's Playlists tab.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct YtPlaylist {
+    pub id: String,
+    pub title: String,
+    pub count: u64, // video count (0 = unknown in flat mode)
+    pub thumb_url: String,
+}
+
+/// Parse one `--flat-playlist --dump-json` line from a channel's *playlists* listing into a
+/// [`YtPlaylist`]. `None` for non-playlist lines.
+pub fn parse_playlist_entry(line: &str) -> Option<YtPlaylist> {
+    let d: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = d.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+    let thumb_url = d
+        .get("thumbnails")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.iter().rev().find_map(|t| t.get("url").and_then(|v| v.as_str())))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    Some(YtPlaylist {
+        id: id.to_string(),
+        title: d
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(playlist)")
+            .to_string(),
+        count: d
+            .get("playlist_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        thumb_url,
+    })
+}
+
 /// Abbreviate a count the YouTube way: 1_234_567 → "1.2M".
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -227,21 +285,29 @@ pub fn parse_entry(line: &str) -> Option<YtVideo> {
     Some(YtVideo {
         id: id.to_string(),
         title: str_of(&["title"]),
-        channel: str_of(&["channel", "uploader", "channel_id"]),
+        channel: str_of(&["channel", "uploader"]),
+        channel_id: str_of(&["channel_id", "uploader_id"]),
         duration: d.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
         views: d.get("view_count").and_then(|v| v.as_u64()).unwrap_or(0),
         thumb_url,
     })
 }
 
-/// Run a YouTube search (`ytsearch<n>:<query>`) via yt-dlp's flat/fast mode. Empty vec if yt-dlp
-/// is absent or errors — the caller shows a "not installed / no results" status.
-pub fn search(query: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
-    let spec = format!("ytsearch{}:{}", n.max(1), query);
+/// Run `yt-dlp --flat-playlist --dump-json` over a `target` (a `ytsearchN:q` spec OR a channel/
+/// playlist URL), capped to `n` entries, and map each JSON line with `f`. The shared engine behind
+/// search / channel-videos / playlist-videos / channel-playlists. Empty vec on absence/error.
+fn flat_list<T>(target: &str, n: usize, cookies: Option<&str>, f: impl Fn(&str) -> Option<T>) -> Vec<T> {
     let mut cmd = Command::new("yt-dlp");
-    cmd.args(["--dump-json", "--flat-playlist", "--no-warnings", &spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    cmd.args([
+        "--flat-playlist",
+        "--dump-json",
+        "--no-warnings",
+        "-I",
+        &format!("1:{}", n.max(1)),
+        target,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     push_cookie_args(&mut cmd, cookies);
     let Ok(out) = cmd.output() else {
         return Vec::new();
@@ -249,10 +315,30 @@ pub fn search(query: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_entry)
-        .collect()
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(f).collect()
+}
+
+/// Run a YouTube search (`ytsearch<n>:<query>`). Empty vec if yt-dlp is absent or errors.
+pub fn search(query: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    flat_list(&format!("ytsearch{}:{}", n.max(1), query), n, cookies, parse_entry)
+}
+
+/// A channel's uploaded videos (newest first), by UC… id.
+pub fn channel_videos(channel_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    let url = format!("https://www.youtube.com/channel/{channel_id}/videos");
+    flat_list(&url, n, cookies, parse_entry)
+}
+
+/// A playlist's videos (in order), by playlist id.
+pub fn playlist_videos(playlist_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtVideo> {
+    let url = format!("https://www.youtube.com/playlist?list={playlist_id}");
+    flat_list(&url, n, cookies, parse_entry)
+}
+
+/// A channel's playlists, by UC… id.
+pub fn channel_playlists(channel_id: &str, n: usize, cookies: Option<&str>) -> Vec<YtPlaylist> {
+    let url = format!("https://www.youtube.com/channel/{channel_id}/playlists");
+    flat_list(&url, n, cookies, parse_playlist_entry)
 }
 
 /// Append `--cookies-from-browser <b>` when a browser is configured (Preferences → YouTube
