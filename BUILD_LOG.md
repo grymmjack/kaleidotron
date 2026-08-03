@@ -23,3 +23,15 @@ merge each so the next builds on clean main. Order: quick-ish → medium → lar
   temp PNG (recolored if the Recolor pane is active, else source — the user's rule) and open it in
   a registered image editor (DRAW/Aseprite/GIMP, filtered to png handlers) or the OS default app.
   Shared `grab_video_frame_now` with the PNG export.
+
+### Medium: YouTube channel browser (branch `yt-channels`, backend was already in main)
+- ✅ `YtSource` enum + `YtMsg::PlaylistHit`; `yt_walk` refactored to list search / channel videos /
+  playlist videos / a channel's playlists. `start_yt_list` generalizes `start_yt_search`.
+- ✅ `open_yt` routes `<youtube>/channel/<id>` (videos), `.../channel/<id>/playlists`,
+  `<youtube>/playlist/<Title [plid]>` (folder-like tile → its videos), + pinned-video leaves.
+- ✅ Details pane: **▸ Browse channel** (opens the channel in pixelview) next to Web + the channel
+  name; `go_to_channel`. Pin a channel via the ★ toolbar once there.
+- ✅ Breadcrumb shows the channel NAME (yt_channel_names, learned from results) + friendly
+  Channel/Playlists/Playlist segment labels.
+- ✅ **Videos | Playlists** switcher on the breadcrumb row while in a channel.
+- ✅ Playlist tiles fetch their cover thumbnail (poll_yt + grid request).
