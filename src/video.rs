@@ -24,10 +24,12 @@ use std::sync::Arc;
 
 use crate::decode::VideoInfo;
 
-/// Longest side (px) of decoded display frames. Streaming *raw* RGBA is bandwidth-heavy, so we
-/// let ffmpeg downscale before the pipe — a 1600px frame is ~10 MB, ×`FRAME_BUF` ≈ 60 MB max.
-/// PNG *export* re-grabs at native resolution, so this only bounds the on-screen preview.
-const DISPLAY_CAP: u32 = 1600;
+/// Longest side (px) of decoded display frames. Streaming *raw* RGBA is bandwidth-heavy (a
+/// 1280×720 frame is ~3.7 MB; every displayed frame is both piped AND uploaded to a GPU texture),
+/// so we let ffmpeg downscale before the pipe to keep playback smooth — dropping from 1600→1280
+/// cuts ~36% of per-frame bandwidth. PNG/clip *export* re-grabs at native resolution, so this
+/// only bounds the on-screen preview.
+const DISPLAY_CAP: u32 = 1280;
 /// Frames buffered ahead of the playhead (the backpressure window).
 const FRAME_BUF: usize = 8;
 
@@ -567,10 +569,10 @@ mod tests {
 
     #[test]
     fn display_dims_caps_and_evens() {
-        // 4K → capped to 1600 longest side, even dims, aspect preserved.
+        // 4K → capped to DISPLAY_CAP (1280) longest side, even dims, aspect preserved.
         let (w, h) = display_dims(&info(3840, 2160));
-        assert_eq!(w, 1600);
-        assert_eq!(h, 900);
+        assert_eq!(w, DISPLAY_CAP);
+        assert_eq!(h, 720);
         assert_eq!(w % 2, 0);
         assert_eq!(h % 2, 0);
         // Small video is not upscaled.

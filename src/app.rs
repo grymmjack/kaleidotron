@@ -5893,7 +5893,8 @@ impl PixelView {
         // Upload the frame texture on the UI thread when it changed — OR when the Recolor
         // pipeline changed while PAUSED (no new frames arrive, but `vp.cur` persists, so we can
         // re-colorize what's on screen live). Turning recolor off re-uploads the raw frame.
-        let pipe_key = self.pipeline_active().then(|| self.pipeline_key());
+        // `recolor_key_all` (not `pipeline_active`) so a **palette-only** recolor applies too.
+        let pipe_key = self.recolor_key_all();
         let recolor_changed = pipe_key != self.video_recolor_key;
         let frame = {
             let vp = self.video_player.as_mut()?;
@@ -5907,8 +5908,8 @@ impl PixelView {
         };
         if let Some(mut bytes) = frame {
             if bytes.len() == (dw as usize) * (dh as usize) * 4 {
-                // Recolor the LIVE frame when the Recolor pane is active (same pipeline as images).
-                if self.pipeline_active() {
+                // Recolor the LIVE frame when ANY recolor is active (value pipeline OR palette snap).
+                if pipe_key.is_some() {
                     if let Some(vpath) = self.video_player.as_ref().map(|vp| vp.path.clone()) {
                         let (w, h) = (dw as usize, dh as usize);
                         let palette = self.tile_palette(&vpath);
@@ -6016,7 +6017,7 @@ impl PixelView {
                 ui.separator();
                 // With the Recolor pane active, offer the frame recolored-as-shown OR original;
                 // otherwise a plain one-click PNG.
-                if self.pipeline_active() {
+                if self.any_recolor_active() {
                     ui.menu_button(format!("{} PNG ▾", icons::DOWNLOAD), |ui| {
                         if ui
                             .button("Recolored (as shown)")
@@ -6414,7 +6415,7 @@ impl PixelView {
         let mut rgba = img.rgba_bytes();
         // Bake the Recolor pipeline into the full-res grab so the saved frame matches what's on
         // screen. Uses the same palette/aux as the live view (`tile_palette` on the source).
-        let recolored = recolor && self.pipeline_active();
+        let recolored = recolor && self.any_recolor_active();
         if recolored {
             let palette = self.tile_palette(&src);
             let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
@@ -12840,6 +12841,36 @@ impl PixelView {
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
             || self.scale_algo != crate::scale::Scaler::None
+    }
+
+    /// Is ANY recolor active — the value pipeline (`pipeline_active`) OR a **palette snap**
+    /// (custom/selected/reduce)? `pipeline_active` alone misses palette-only recolors (CGA /
+    /// Gameboy / most PixelFX presets), so the *video* view must gate on this broader check or a
+    /// palette-only recolor silently affects the little preview but not the actual playback.
+    fn any_recolor_active(&self) -> bool {
+        self.pipeline_active()
+            || self.custom_palette.is_some()
+            || self.selected_palette.is_some()
+            || self.quantize_on
+    }
+
+    /// A cache key for the currently-active recolor (value pipeline + palette snap), or `None`
+    /// when nothing is active. Used by the video view to re-bake a paused frame only when the
+    /// recolor changes (mirrors `grid_recolor_key` without the "Apply to grid" gate).
+    fn recolor_key_all(&self) -> Option<String> {
+        if !self.any_recolor_active() {
+            return None;
+        }
+        let rkey = if let Some(cp) = &self.custom_palette {
+            format!("custom:{}", palette_hash(cp))
+        } else if let Some(pp) = &self.selected_palette {
+            format!("pal:{}", pp.display())
+        } else if self.quantize_on {
+            format!("reduce:{}", self.quantize_n)
+        } else {
+            "none".to_string()
+        };
+        Some(format!("{}|{rkey}", self.pipeline_key()))
     }
 
     /// True when the Resize/resample actually downsamples (on + a factor below 1).
