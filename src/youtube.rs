@@ -178,11 +178,12 @@ pub fn stream_url(id: &str) -> Option<String> {
         .map(|l| l.to_string())
 }
 
-/// Download a video **in place** to `dir` as `<id>.<ext>` (progressive ≤720p) and return the
-/// produced file path — so it plays via the normal local `VideoPlayer` (streaming via `-g` is
-/// unreliable under YouTube SABR). Cache-first: an existing `<id>.*` is reused with no network.
-/// `None` if yt-dlp can't produce a file (absent / too old / SABR-blocked → caller shows a hint).
-pub fn download(id: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Download a video **in place** to `dir` as `<id>.<ext>` and return the produced file path — so
+/// it plays via the normal local `VideoPlayer` (streaming via `-g` is unreliable under YouTube
+/// SABR). `max_height` caps the resolution (0 = best available; video+audio are merged via ffmpeg
+/// so 1080p+ works). Cache-first: an existing `<id>.*` is reused with no network. `None` if yt-dlp
+/// can't produce a file (absent / too old / SABR-blocked → caller shows a hint).
+pub fn download(id: &str, dir: &std::path::Path, max_height: u32) -> Option<std::path::PathBuf> {
     // Cache hit: any already-downloaded `<id>.<ext>` in `dir`.
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -197,13 +198,17 @@ pub fn download(id: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let _ = std::fs::create_dir_all(dir);
     let watch = format!("https://www.youtube.com/watch?v={id}");
     let out_tmpl = dir.join(format!("{id}.%(ext)s"));
+    // Merge the best video+audio at/under the cap (falls back to a progressive stream, then best).
+    let fmt = if max_height == 0 {
+        "bestvideo+bestaudio/best".to_string()
+    } else {
+        format!(
+            "bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
+            h = max_height
+        )
+    };
     let ok = Command::new("yt-dlp")
-        .args([
-            "-f",
-            "best[height<=720][ext=mp4]/best[height<=720]/best",
-            "--no-warnings",
-            "-o",
-        ])
+        .args(["-f", &fmt, "--no-warnings", "-o"])
         .arg(&out_tmpl)
         .arg(&watch)
         .stdout(Stdio::null())

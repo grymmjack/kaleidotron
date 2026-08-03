@@ -1546,6 +1546,7 @@ pub struct PixelView {
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
     yt_download_dir: Option<PathBuf>,
+    yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
     // cache-first). `None` when idle; a progress window shows while `Some`.
     bulk_dl: Option<BulkDownload>,
@@ -1591,6 +1592,7 @@ impl PixelView {
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
+    const YT_QUALITY_KEY: &'static str = "yt_max_height";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1757,6 +1759,10 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::YT_DIR_KEY))
             .flatten();
+        let yt_max_height = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::YT_QUALITY_KEY))
+            .unwrap_or(1080);
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -2653,6 +2659,7 @@ impl PixelView {
             steam_media_rx: None,
             steam_open_rx: None,
             yt_download_dir,
+            yt_max_height,
             bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -3657,6 +3664,28 @@ impl PixelView {
         self.want_repaint = true;
     }
 
+    /// Right-click "Download quality" → set the resolution cap, drop any cached copy so the chosen
+    /// resolution actually (re)downloads, then open. `height` 0 = best available.
+    fn start_yt_open_quality(&mut self, vpath: PathBuf, height: u32) {
+        self.yt_max_height = height;
+        if let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        {
+            if let Ok(rd) = std::fs::read_dir(self.yt_cache_dir()) {
+                for e in rd.flatten() {
+                    if e.path().file_stem().and_then(|s| s.to_str()) == Some(id.as_str()) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            self.yt_files.remove(&vpath);
+            self.yt_downloaded_ids.remove(&id);
+        }
+        self.start_yt_open(vpath);
+    }
+
     /// Download a YouTube video in place (to `yt_cache_dir`), then open it in the video player.
     /// Auto-enables the Video plugin (playback needs it). `poll_yt_open` finishes on the UI thread.
     fn start_yt_open(&mut self, vpath: PathBuf) {
@@ -3678,11 +3707,12 @@ impl PixelView {
             self.registry.set_plugin("video", true);
         }
         let dir = self.yt_cache_dir();
+        let height = self.yt_max_height;
         let (tx, rx) = std::sync::mpsc::channel();
         self.yt_open_rx = Some(rx);
         self.status = "Downloading from YouTube…".into();
         std::thread::spawn(move || {
-            let res = match crate::youtube::download(&id, &dir) {
+            let res = match crate::youtube::download(&id, &dir, height) {
                 Some(local) => Ok((vpath, local)),
                 None => Err(
                     "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
@@ -5610,8 +5640,20 @@ impl PixelView {
                 None
             }
         };
-        if let Some(bytes) = frame {
+        if let Some(mut bytes) = frame {
             if bytes.len() == (dw as usize) * (dh as usize) * 4 {
+                // Recolor the LIVE frame when the Recolor pane is active (same pipeline as images).
+                if self.pipeline_active() {
+                    if let Some(vpath) = self.video_player.as_ref().map(|vp| vp.path.clone()) {
+                        let (w, h) = (dw as usize, dh as usize);
+                        let palette = self.tile_palette(&vpath);
+                        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+                        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+                        let (tw, th) = self.resize_target(w, h);
+                        let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+                        apply_pipeline_resized(&mut bytes, w, h, tw, th, &self.adjust, &aux);
+                    }
+                }
                 let color =
                     egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &bytes);
                 match &mut self.video_tex {
@@ -15014,6 +15056,7 @@ impl PixelView {
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
+        let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -15540,6 +15583,7 @@ impl PixelView {
                                     TilePick::JoinVideos => join_sel = true,
                                     TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                     TilePick::Steam(a) => steam_act = Some((idx, a)),
+                                    TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                                 }
                             }
                         });
@@ -15643,6 +15687,11 @@ impl PixelView {
         if let Some((i, a)) = steam_act {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.steam_action(&p, a);
+            }
+        }
+        if let Some((i, h)) = yt_quality {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.start_yt_open_quality(p, h);
             }
         }
         if pin_current {
@@ -15970,6 +16019,7 @@ impl PixelView {
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
+        let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -16497,6 +16547,7 @@ impl PixelView {
                                 TilePick::JoinVideos => join_sel = true,
                                 TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                 TilePick::Steam(a) => steam_act = Some((idx, a)),
+                                TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                             }
                         }
                     });
@@ -16648,6 +16699,11 @@ impl PixelView {
         if let Some((i, a)) = steam_act {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.steam_action(&p, a);
+            }
+        }
+        if let Some((i, h)) = yt_quality {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.start_yt_open_quality(p, h);
             }
         }
         if pin_current {
@@ -22808,6 +22864,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
+        eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -29026,6 +29083,7 @@ enum TilePick {
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
+    YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
 }
 
 /// A right-click action on a Steam game tile.
@@ -29669,6 +29727,21 @@ fn entry_context_menu(
             pick = Some(TilePick::OpenInBrowser);
             ui.close();
         }
+        ui.menu_button(format!("{} Download quality", icons::DOWNLOAD), |ui| {
+            for (label, h) in [
+                ("480p", 480u32),
+                ("720p", 720),
+                ("1080p", 1080),
+                ("1440p", 1440),
+                ("4K", 2160),
+                ("Best", 0),
+            ] {
+                if ui.button(label).clicked() {
+                    pick = Some(TilePick::YtQuality(h));
+                    ui.close();
+                }
+            }
+        });
         ui.separator();
     }
     // Compare (files only): mark this file as the "source" (left) or "diff" (right)
