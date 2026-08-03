@@ -7629,6 +7629,23 @@ impl PixelView {
             }
             let mm = |s: f32| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60);
             ui.weak(format!("{} / {}", mm(pos), mm(dur)));
+            // Drag-to-pad handle (big view): drag it onto a sample pad to load the current
+            // waveform SELECTION (trimmed at the selection), else the whole sample. Reuses the
+            // per-pad "⟲ load" path (load_pad → current_region_buf).
+            if big {
+                ui.separator();
+                let sel = format!("{} → {}", mm(sel_lo), mm(sel_hi));
+                let r = ui
+                    .add(egui::Button::new("⠿ → pad").sense(egui::Sense::click_and_drag()))
+                    .on_hover_text(format!(
+                        "Drag onto a sample pad to load the selection ({sel}).\n\
+                         (No selection = the whole sample.)"
+                    ));
+                if r.dragged() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Selection);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
         });
         // Two CONDITIONAL control rows live between the transport and the waveform: an "Editing:
         // <source>" row (when editing a sample/pad that has an external file) and the per-pad
@@ -10571,10 +10588,13 @@ impl PixelView {
         }
         if let Some((i, drop)) = want_drop {
             // A sample load drills into the pad afterwards (below); a pad move/swap/clone doesn't.
-            let sample_load = matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_));
+            let sample_load =
+                matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection);
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
+                // The current waveform selection (trimmed) — reuses the "⟲ load" path.
+                PadDrop::Selection => self.load_pad(i),
                 // Alt = clone the whole pad; plain = move/swap.
                 PadDrop::Pad(src) if alt_down => self.clone_pad(src, i),
                 PadDrop::Pad(src) => self.move_pad(src, i),
@@ -27487,6 +27507,7 @@ enum PadDrop {
     File(PathBuf),  // a sample file (Samples explorer)
     Tracker(usize), // a tracker/bank sample index in the current player
     Pad(usize),     // another pad (drag one pad onto another to move/swap them)
+    Selection,      // the current waveform-editor selection (drag the ⠿ handle onto a pad)
 }
 
 /// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
