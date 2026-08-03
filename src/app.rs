@@ -237,7 +237,17 @@ enum ColoMsg {
 /// result (its virtual `Entry` + `YtVideo` metadata), then `Done(count)`.
 enum YtMsg {
     Hit(Entry, Box<crate::youtube::YtVideo>),
+    PlaylistHit(Entry, Box<crate::youtube::YtPlaylist>),
     Done(usize),
+}
+
+/// What a `yt_walk` worker should list (search / a channel's videos / a playlist's videos / a
+/// channel's playlists). The video sources emit `YtMsg::Hit`; `Playlists` emits `PlaylistHit`.
+enum YtSource {
+    Search(String),
+    ChannelVideos(String),  // by UC… id
+    PlaylistVideos(String), // by playlist id
+    ChannelPlaylists(String),
 }
 
 /// Messages from a YouTube **download** worker (`start_yt_open`): live progress, then the result.
@@ -1561,6 +1571,10 @@ pub struct PixelView {
     // keyed by virtual display path (`<youtube>/search/<q>/<title> [id].mp4`); `yt_files` maps
     // that path to the downloaded local file (so `resolve_local` + the player find it).
     yt_videos: HashMap<PathBuf, crate::youtube::YtVideo>,
+    // A channel's Playlists listing: virtual path → playlist metadata (tile title/thumb/count).
+    yt_playlists: HashMap<PathBuf, crate::youtube::YtPlaylist>,
+    // Channel id → display name (for the breadcrumb + "Go to channel"), learned from results.
+    yt_channel_names: HashMap<String, String>,
     // Last completed YouTube search (path → its result entries + video metadata), so navigating
     // BACK to a search (breadcrumb / back button) restores the results instead of re-running the
     // search. Cleared by F5 so an explicit refresh still re-fetches.
@@ -2738,6 +2752,8 @@ impl PixelView {
             pending_external: None,
             colo_save_rx: None,
             yt_videos: HashMap::new(),
+            yt_playlists: HashMap::new(),
+            yt_channel_names: HashMap::new(),
             yt_search_cache: None,
             yt_rx: None,
             yt_cancel: None,
@@ -3720,6 +3736,36 @@ impl PixelView {
             [s, _q, leaf] if s == crate::youtube::SEARCH && parse_yt_id(leaf).is_some() => {
                 self.start_yt_open(dir);
             }
+            // A channel's Playlists tab: `<youtube>/channel/<id>/playlists`.
+            [c, id, sub]
+                if c == crate::youtube::CHANNEL && sub == crate::youtube::PLAYLISTS =>
+            {
+                self.start_yt_list(dir, YtSource::ChannelPlaylists(id.clone()));
+            }
+            // A channel video leaf (a pinned video under a channel).
+            [c, _id, leaf]
+                if c == crate::youtube::CHANNEL && parse_yt_id(leaf).is_some() =>
+            {
+                self.start_yt_open(dir);
+            }
+            // A channel's videos: `<youtube>/channel/<id>`.
+            [c, id] if c == crate::youtube::CHANNEL => {
+                self.start_yt_list(dir, YtSource::ChannelVideos(id.clone()));
+            }
+            // A playlist video leaf (a pinned video under a playlist).
+            [p, _leaf, vleaf]
+                if p == crate::youtube::PLAYLIST && parse_yt_id(vleaf).is_some() =>
+            {
+                self.start_yt_open(dir);
+            }
+            // A playlist's videos: `<youtube>/playlist/<Title [plid]>` (the leaf carries the id).
+            [p, leaf] if p == crate::youtube::PLAYLIST => {
+                if let Some(plid) = parse_yt_id(leaf) {
+                    self.start_yt_list(dir, YtSource::PlaylistVideos(plid));
+                } else {
+                    self.show_folder(dir, Vec::new());
+                }
+            }
             _ => {
                 self.show_folder(dir, Vec::new());
             }
@@ -3729,8 +3775,15 @@ impl PixelView {
     /// Kick off a YouTube search on a worker thread (mirrors `start_colo_pieces`). Results stream
     /// into `all_entries` via `poll_yt`; they render as grid tiles with thumbnails.
     fn start_yt_search(&mut self, dir: PathBuf, query: String) {
+        self.start_yt_list(dir, YtSource::Search(query));
+    }
+
+    /// Kick off ANY YouTube listing worker (search / channel videos / playlist videos / channel
+    /// playlists) — mirrors `start_yt_search`. Results stream in via `poll_yt`.
+    fn start_yt_list(&mut self, dir: PathBuf, source: YtSource) {
         self.show_folder(dir.clone(), Vec::new());
         self.yt_videos.clear();
+        self.yt_playlists.clear();
         self.refresh_yt_downloaded();
         if let Some(c) = self.yt_cancel.take() {
             c.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3739,9 +3792,14 @@ impl PixelView {
         let (tx, rx) = std::sync::mpsc::channel();
         self.yt_rx = Some(rx);
         self.yt_cancel = Some(cancel.clone());
-        self.status = format!("Searching YouTube: {query}");
+        self.status = match &source {
+            YtSource::Search(q) => format!("Searching YouTube: {q}"),
+            YtSource::ChannelVideos(_) => "Loading channel videos…".into(),
+            YtSource::PlaylistVideos(_) => "Loading playlist…".into(),
+            YtSource::ChannelPlaylists(_) => "Loading playlists…".into(),
+        };
         let cookies = self.yt_cookies_browser.clone();
-        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx, cookies));
+        std::thread::spawn(move || yt_walk(source, &dir, cancel, tx, cookies));
     }
 
     /// Drain the YouTube search worker each frame (mirrors `poll_colo_pieces`): append hits to
@@ -3756,7 +3814,20 @@ impl PixelView {
                     entry.rating = self.read_rating(&entry.path);
                     self.colo_thumbs
                         .request(&entry.path, &v.thumb_url, THUMB_PX, false);
+                    // Learn channel id → name so "Go to channel" + the breadcrumb read nicely.
+                    if !v.channel_id.is_empty() && !v.channel.is_empty() {
+                        self.yt_channel_names
+                            .insert(v.channel_id.clone(), v.channel.clone());
+                    }
                     self.yt_videos.insert(entry.path.clone(), *v);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(YtMsg::PlaylistHit(entry, p)) => {
+                    if !p.thumb_url.is_empty() {
+                        self.colo_thumbs.request(&entry.path, &p.thumb_url, THUMB_PX, false);
+                    }
+                    self.yt_playlists.insert(entry.path.clone(), *p);
                     self.all_entries.push(entry);
                     got = true;
                 }
@@ -12323,8 +12394,31 @@ impl PixelView {
                             "Steam".to_string()
                         } else if label == crate::youtube::ROOT {
                             "YouTube".to_string()
+                        } else if label == crate::youtube::CHANNEL {
+                            "Channel".to_string()
+                        } else if label == crate::youtube::PLAYLISTS {
+                            "Playlists".to_string()
+                        } else if label == crate::youtube::PLAYLIST {
+                            "Playlist".to_string()
                         } else if let Some(name) = crate::steam::detail_appid(a)
                             .and_then(|id| self.steam_names.get(&id).cloned())
+                        {
+                            name
+                        } else if let Some(name) = (
+                            // A `<youtube>/channel/<id>` crumb → the channel's name.
+                            crate::youtube::is_remote(a)
+                                && matches!(
+                                    crate::youtube::rel_parts(a).as_slice(),
+                                    [c, _] if c == crate::youtube::CHANNEL
+                                )
+                        )
+                        .then(|| {
+                            crate::youtube::rel_parts(a)
+                                .get(1)
+                                .and_then(|id| self.yt_channel_names.get(id))
+                                .cloned()
+                        })
+                        .flatten()
                         {
                             name
                         } else {
@@ -12333,6 +12427,33 @@ impl PixelView {
                         if ui.button(label).clicked() {
                             let real = self.real_path(a);
                             self.open_folder(real);
+                        }
+                    }
+                    // YouTube channel: a Videos | Playlists switcher on the breadcrumb row.
+                    if let Some(f) = self.folder.clone() {
+                        let parts = crate::youtube::rel_parts(&f);
+                        let ch_id = match parts.as_slice() {
+                            [c, id] if c == crate::youtube::CHANNEL => Some(id.clone()),
+                            [c, id, sub]
+                                if c == crate::youtube::CHANNEL
+                                    && sub == crate::youtube::PLAYLISTS =>
+                            {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(id) = ch_id {
+                            ui.separator();
+                            let on_playlists = parts.len() == 3;
+                            let ch = Path::new(crate::youtube::ROOT)
+                                .join(crate::youtube::CHANNEL)
+                                .join(&id);
+                            if ui.selectable_label(!on_playlists, "Videos").clicked() {
+                                self.open_folder(ch.clone());
+                            }
+                            if ui.selectable_label(on_playlists, "Playlists").clicked() {
+                                self.open_folder(ch.join(crate::youtube::PLAYLISTS));
+                            }
                         }
                     }
                 }
@@ -13848,10 +13969,22 @@ impl PixelView {
         let description = meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
         let info = self.yt_info.get(path).cloned();
         let info_pending = self.yt_info_pending.as_deref() == Some(path);
+        // The channel id (for "Go to channel" — browse the channel inside pixelview).
+        let channel_id = meta
+            .as_ref()
+            .map(|m| crate::youtube::channel_id_from_url(&m.channel_url))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                flat.as_ref()
+                    .map(|f| f.channel_id.clone())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
         let mut want_url: Option<String> = None;
         let mut want_browser = false;
         let mut want_fetch_info = false;
         let mut want_copy_llm = false;
+        let mut want_channel: Option<String> = None;
         egui::ScrollArea::vertical()
             .id_salt("yt_detail")
             .auto_shrink([false; 2])
@@ -13860,14 +13993,24 @@ impl PixelView {
                 if !channel.is_empty() {
                     ui.add_space(2.0);
                     let ch_url = meta.as_ref().map(|m| m.channel_url.clone()).unwrap_or_default();
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.weak("Channel");
-                        if !ch_url.is_empty() {
-                            if ui.link(&channel).clicked() {
-                                want_url = Some(ch_url.clone());
-                            }
-                        } else {
-                            ui.label(&channel);
+                        ui.label(&channel);
+                        if !channel_id.is_empty()
+                            && ui
+                                .button("▸ Browse channel")
+                                .on_hover_text("Browse this channel's videos + playlists in pixelview")
+                                .clicked()
+                        {
+                            want_channel = Some(channel_id.clone());
+                        }
+                        if !ch_url.is_empty()
+                            && ui
+                                .button(format!("{} Web", icons::GLOBE))
+                                .on_hover_text("Open the channel page in your browser")
+                                .clicked()
+                        {
+                            want_url = Some(ch_url.clone());
                         }
                     });
                 }
@@ -14017,6 +14160,22 @@ impl PixelView {
             ui.ctx().copy_text(text);
             self.status = "Copied video info to clipboard".into();
         }
+        if let Some(id) = want_channel {
+            // Remember the name so the breadcrumb reads nicely once we're there.
+            if !channel.is_empty() {
+                self.yt_channel_names.insert(id.clone(), channel.clone());
+            }
+            self.go_to_channel(&id);
+        }
+    }
+
+    /// Navigate to a YouTube channel's videos listing (`<youtube>/channel/<id>`). Pin it from the
+    /// ★ toolbar to save the channel to Places.
+    fn go_to_channel(&mut self, channel_id: &str) {
+        let dir = Path::new(crate::youtube::ROOT)
+            .join(crate::youtube::CHANNEL)
+            .join(channel_id);
+        self.open_folder(dir);
     }
 
     fn ui_details(&mut self, ui: &mut egui::Ui) {
@@ -16456,6 +16615,12 @@ impl PixelView {
                                     // YouTube result → fetch its i.ytimg.com thumbnail over HTTP.
                                     self.colo_thumbs
                                         .request(path, &v.thumb_url, THUMB_PX, false);
+                                } else if let Some(pl) = self.yt_playlists.get(path) {
+                                    // A channel playlist tile → its cover thumbnail.
+                                    if !pl.thumb_url.is_empty() {
+                                        self.colo_thumbs
+                                            .request(path, &pl.thumb_url, THUMB_PX, false);
+                                    }
                                 } else if let Some(g) = self.steam_games.get(path) {
                                     // Steam game → fetch its CDN header image over HTTP.
                                     self.colo_thumbs.request(
@@ -29340,10 +29505,12 @@ fn parse_yt_id(name: &str) -> Option<String> {
     (end > start + 1).then(|| stem[start + 1..end].to_string())
 }
 
-/// YouTube search worker (mirrors `colo_walk`): run the search, emit one `Hit` per result as a
-/// virtual `Entry` (`<youtube>/search/<q>/<Title [id].mp4>`) + its `YtVideo`, then `Done(n)`.
+/// YouTube listing worker (mirrors `colo_walk`): fetch the requested source's items and emit one
+/// message per item (a video `Hit`, or a `PlaylistHit` for a channel's Playlists tab) as a virtual
+/// `Entry`, then `Done(n)`. Video paths are `<root>/<Title [id].mp4>`; playlist tiles are folder-
+/// like `<youtube>/playlist/<Title [plid]>` so a click navigates into the playlist's videos.
 fn yt_walk(
-    query: &str,
+    source: YtSource,
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<YtMsg>,
@@ -29351,9 +29518,50 @@ fn yt_walk(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
-    let vids = crate::youtube::search(query, 40, cookies);
     let mut seen = std::collections::HashSet::new();
     let mut n = 0usize;
+
+    // A channel's Playlists tab → folder-like playlist tiles.
+    if let YtSource::ChannelPlaylists(id) = &source {
+        for p in crate::youtube::channel_playlists(id, 60, cookies) {
+            if cancel.load(Relaxed) {
+                return;
+            }
+            let mut base = sanitize_filename(&p.title);
+            if base.is_empty() {
+                base = "playlist".into();
+            }
+            let path = Path::new(crate::youtube::ROOT)
+                .join(crate::youtube::PLAYLIST)
+                .join(format!("{base} [{}]", p.id));
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let entry = Entry {
+                path,
+                is_dir: true, // navigate into it → the playlist's videos
+                is_archive: false,
+                size: 0,
+                mtime: None,
+                ctime: None,
+                rating: 0,
+            };
+            n += 1;
+            if tx.send(YtMsg::PlaylistHit(entry, Box::new(p))).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(YtMsg::Done(n));
+        return;
+    }
+
+    // Otherwise a list of videos.
+    let vids = match &source {
+        YtSource::Search(q) => crate::youtube::search(q, 40, cookies),
+        YtSource::ChannelVideos(id) => crate::youtube::channel_videos(id, 60, cookies),
+        YtSource::PlaylistVideos(id) => crate::youtube::playlist_videos(id, 200, cookies),
+        YtSource::ChannelPlaylists(_) => unreachable!(),
+    };
     for v in vids {
         if cancel.load(Relaxed) {
             return;
