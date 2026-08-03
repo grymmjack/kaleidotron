@@ -1331,6 +1331,7 @@ pub struct PixelView {
     video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
     video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
     video_recolor_key: Option<String>, // recolor pipeline key last applied → re-colorize a PAUSED frame when it changes
+    recolor_playback: bool, // apply the recolor pipeline to live video frames? off = raw = faster fps (persisted)
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
     video_md_header: String,         // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
@@ -1638,6 +1639,7 @@ impl PixelView {
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
+    const RECOLOR_PLAYBACK_KEY: &'static str = "recolor_playback";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
@@ -2561,6 +2563,7 @@ impl PixelView {
             video_loading: None,
             video_tex: None,
             video_recolor_key: None,
+            recolor_playback: load_bool(Self::RECOLOR_PLAYBACK_KEY, true),
             video_markers: Vec::new(),
             video_md_header: String::new(),
             video_marker_sel: None,
@@ -5926,7 +5929,13 @@ impl PixelView {
         // pipeline changed while PAUSED (no new frames arrive, but `vp.cur` persists, so we can
         // re-colorize what's on screen live). Turning recolor off re-uploads the raw frame.
         // `recolor_key_all` (not `pipeline_active`) so a **palette-only** recolor applies too.
-        let pipe_key = self.recolor_key_all();
+        // The "Recolor" toggle skips it entirely for full-fps playback (settings kept for the
+        // preview / PNG export). When recolor is neutral this is already None (no per-frame cost).
+        let pipe_key = if self.recolor_playback {
+            self.recolor_key_all()
+        } else {
+            None
+        };
         let recolor_changed = pipe_key != self.video_recolor_key;
         let frame = {
             let vp = self.video_player.as_mut()?;
@@ -6144,6 +6153,12 @@ impl PixelView {
                 {
                     want_trim_clear = true;
                 }
+                ui.separator();
+                ui.checkbox(&mut self.recolor_playback, "Recolor")
+                    .on_hover_text(
+                        "Apply the Recolor pane to live playback. Turn OFF for faster fps — the \
+                         preview + PNG export still recolor. Persisted.",
+                    );
                 ui.separator();
                 ui.checkbox(&mut self.yt_open_folder_after, "Open folder after download")
                     .on_hover_text(
@@ -21401,6 +21416,7 @@ impl PixelView {
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
         let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
+        let mut save_yt_search = false; // "Save this search" clicked in the YouTube tab
         let mut browse_sample: Option<PathBuf> = None; // open a Samples location in the inline explorer
         let mut select_sample: Option<PathBuf> = None; // a file clicked in the sample explorer (select + audition)
         let mut add_sample = false;
@@ -21531,6 +21547,36 @@ impl PixelView {
                         });
                         if !crate::youtube::available() {
                             ui.weak("yt-dlp not found — install it for playback");
+                        }
+                        // Save the current search to Places (a pinned search re-runs on click).
+                        let cur_search = self.folder.as_ref().filter(|f| {
+                            crate::youtube::is_remote(f)
+                                && matches!(
+                                    crate::youtube::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::youtube::SEARCH
+                                )
+                        });
+                        let saved = cur_search.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur_search {
+                            let label = crate::youtube::rel_parts(f)
+                                .get(1)
+                                .cloned()
+                                .unwrap_or_default();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                let btn = ui.button(if saved {
+                                    "★ Saved".to_string()
+                                } else {
+                                    format!("★ Save “{label}”")
+                                });
+                                if btn
+                                    .on_hover_text(
+                                        "Pin this search to Places — click the pin later to re-run it",
+                                    )
+                                    .clicked()
+                                {
+                                    save_yt_search = true;
+                                }
+                            });
                         }
                         // Random helpers: play a random current result, or roll a new random game.
                         ui.horizontal(|ui| {
@@ -22262,6 +22308,13 @@ impl PixelView {
             self.steam_random_from_view();
         } else if yt_play_random {
             self.yt_play_random();
+        } else if save_yt_search {
+            if let Some(f) = self.folder.clone() {
+                if !self.favorites.contains(&f) {
+                    self.favorites.push(f);
+                    self.status = "Saved search to Places (click it to re-run)".into();
+                }
+            }
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
@@ -23736,6 +23789,7 @@ impl eframe::App for PixelView {
             &self.yt_open_folder_after,
         );
         eframe::set_value(storage, Self::YT_COOKIES_KEY, &self.yt_cookies_browser);
+        eframe::set_value(storage, Self::RECOLOR_PLAYBACK_KEY, &self.recolor_playback);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
