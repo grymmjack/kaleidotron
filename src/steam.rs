@@ -164,6 +164,112 @@ pub fn parse_app_media(appid: u32, bytes: &[u8]) -> Option<AppMedia> {
     Some(out)
 }
 
+/// One game from the Steam Web API's owned-games list (installed OR not).
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct OwnedGame {
+    pub appid: u32,
+    pub name: String,
+    pub playtime_min: u64, // total minutes played (0 = never played)
+    pub last_played: u64,  // unix seconds (0 = never)
+}
+
+/// The signed-in account's SteamID64 — read from `loginusers.vdf` (the first `7656…` key), else
+/// computed from the `userdata/<accountid>` dir (`accountid + 76561197960265728`). `None` if absent.
+pub fn steam_id64() -> Option<u64> {
+    let root = steam_root()?;
+    // 1) loginusers.vdf holds the full SteamID64 as a section key.
+    if let Ok(text) = std::fs::read_to_string(root.join("config/loginusers.vdf")) {
+        for line in text.lines() {
+            if let Some(id) = line
+                .trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+            {
+                if id.len() == 17 && id.starts_with("7656") {
+                    if let Ok(n) = id.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    // 2) Fallback: the userdata dir name is the 32-bit accountid.
+    std::fs::read_dir(root.join("userdata"))
+        .ok()?
+        .flatten()
+        .find_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|acc| acc + 76_561_197_960_265_728)
+        })
+}
+
+/// Fetch the account's **full owned-games list** (installed + not) via the Steam Web API
+/// `GetOwnedGames` — needs a free API key (steamcommunity.com/dev/apikey) + the SteamID64. Cached
+/// (1-hour TTL). Empty on any failure (no key / private profile / network).
+pub fn owned_games(api_key: &str, steamid: u64) -> Vec<OwnedGame> {
+    if api_key.trim().is_empty() {
+        return Vec::new();
+    }
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key={}&steamid={}&include_appinfo=1&include_played_free_games=1&format=json",
+        api_key.trim(),
+        steamid
+    );
+    let Ok(bytes) = crate::cache::get_bytes(&url, Some(3600)) else {
+        return Vec::new();
+    };
+    parse_owned_games(&bytes)
+}
+
+/// Parse a `GetOwnedGames` JSON response. Split out for unit testing (no network).
+pub fn parse_owned_games(bytes: &[u8]) -> Vec<OwnedGame> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(games) = json
+        .get("response")
+        .and_then(|r| r.get("games"))
+        .and_then(|g| g.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<OwnedGame> = games
+        .iter()
+        .filter_map(|g| {
+            let appid = g.get("appid").and_then(|v| v.as_u64())? as u32;
+            let name = g
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() || is_nongame(&name) {
+                return None;
+            }
+            Some(OwnedGame {
+                appid,
+                name,
+                playtime_min: g
+                    .get("playtime_forever")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                last_played: g
+                    .get("rtime_last_played")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+/// The set of installed appids (from appmanifests) — to flag owned games as installed-or-not.
+pub fn installed_appids() -> std::collections::HashSet<u32> {
+    installed_games().into_iter().map(|g| g.appid).collect()
+}
+
 /// Candidate Steam data roots: native, classic `.steam`, Flatpak, Snap.
 fn steam_roots() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME")
@@ -369,6 +475,22 @@ mod tests {
             }
             None => eprintln!("no Steam install on this machine — skipping"),
         }
+    }
+
+    #[test]
+    fn parses_owned_games() {
+        let json = r#"{"response":{"game_count":3,"games":[
+            {"appid":1245620,"name":"ELDEN RING","playtime_forever":8520,"rtime_last_played":1700000000},
+            {"appid":367520,"name":"Hollow Knight","playtime_forever":0,"rtime_last_played":0},
+            {"appid":228980,"name":"Steamworks Common Redistributables","playtime_forever":0}
+        ]}}"#;
+        let g = parse_owned_games(json.as_bytes());
+        assert_eq!(g.len(), 2); // redistributables filtered out
+                                // sorted by name: ELDEN RING, Hollow Knight
+        assert_eq!(g[0].name, "ELDEN RING");
+        assert_eq!(g[0].playtime_min, 8520);
+        assert_eq!(g[1].name, "Hollow Knight");
+        assert_eq!(g[1].playtime_min, 0); // never played
     }
 
     #[test]

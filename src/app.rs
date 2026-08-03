@@ -1535,6 +1535,8 @@ pub struct PixelView {
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
+    steam_uninstalled: std::collections::HashSet<PathBuf>, // owned-but-not-installed tiles (→ badge)
+    steam_api_key: String, // Steam Web API key (Preferences) for the full owned-games list
     // A game's detail view = a virtual folder of media tiles (screenshots + trailers), keyed by
     // virtual path. Screenshots download to `steam_files`; trailers stream from their HLS URL.
     steam_media: HashMap<PathBuf, crate::steam::MediaItem>,
@@ -1593,6 +1595,7 @@ impl PixelView {
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
+    const STEAM_KEY_KEY: &'static str = "steam_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1763,6 +1766,10 @@ impl PixelView {
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::YT_QUALITY_KEY))
             .unwrap_or(1080);
+        let steam_api_key = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::STEAM_KEY_KEY))
+            .unwrap_or_default();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -2654,6 +2661,8 @@ impl PixelView {
             yt_search: String::new(),
             yt_downloaded_ids: std::collections::HashSet::new(),
             steam_games: HashMap::new(),
+            steam_uninstalled: std::collections::HashSet::new(),
+            steam_api_key,
             steam_media: HashMap::new(),
             steam_files: HashMap::new(),
             steam_media_rx: None,
@@ -3787,15 +3796,69 @@ impl PixelView {
                 }
             }
         }
-        if !parts.is_empty() {
-            self.show_folder(dir, Vec::new());
-            return;
-        }
+        let filter = match parts.as_slice() {
+            [] => SteamFilter::Installed, // default root = installed (fast, no key needed)
+            [f] if f == "all" => SteamFilter::All,
+            [f] if f == "notinstalled" => SteamFilter::NotInstalled,
+            [f] if f == "neverplayed" => SteamFilter::NeverPlayed,
+            _ => {
+                self.show_folder(dir, Vec::new());
+                return;
+            }
+        };
+        self.list_steam_games(dir, filter);
+    }
+
+    /// Build the Steam game grid for a filter. `Installed` uses the fast local appmanifest scan;
+    /// the others need the Web API key (full owned library + playtime). Each game → a virtual
+    /// `<steam>/<Name>` tile; `steam_uninstalled` marks the not-installed ones for a badge.
+    fn list_steam_games(&mut self, dir: PathBuf, filter: SteamFilter) {
         self.steam_games.clear();
-        let games = crate::steam::installed_games();
+        self.steam_uninstalled.clear();
+        // (game, installed, playtime_min) rows.
+        let rows: Vec<(crate::steam::SteamGame, bool, u64)> = if filter == SteamFilter::Installed {
+            crate::steam::installed_games()
+                .into_iter()
+                .map(|g| (g, true, 0))
+                .collect()
+        } else {
+            let key = self.steam_api_key.clone();
+            match crate::steam::steam_id64() {
+                Some(id) if !key.trim().is_empty() => {
+                    let installed = crate::steam::installed_appids();
+                    crate::steam::owned_games(&key, id)
+                        .into_iter()
+                        .map(|o| {
+                            let inst = installed.contains(&o.appid);
+                            let g = crate::steam::SteamGame {
+                                appid: o.appid,
+                                name: o.name,
+                                last_played: o.last_played,
+                                size: 0,
+                            };
+                            (g, inst, o.playtime_min)
+                        })
+                        .collect()
+                }
+                _ => {
+                    self.show_folder(dir, Vec::new());
+                    self.status =
+                        "Add a Steam Web API key in Preferences to see your full library".into();
+                    return;
+                }
+            }
+        };
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for g in games {
+        for (g, installed, playtime) in rows {
+            let keep = match filter {
+                SteamFilter::All | SteamFilter::Installed => true,
+                SteamFilter::NotInstalled => !installed,
+                SteamFilter::NeverPlayed => playtime == 0,
+            };
+            if !keep {
+                continue;
+            }
             let mut name = sanitize_filename(&g.name);
             if name.is_empty() {
                 name = format!("app {}", g.appid);
@@ -3804,6 +3867,9 @@ impl PixelView {
             if !seen.insert(path.clone()) {
                 path = Path::new(crate::steam::ROOT).join(format!("{name} ({})", g.appid));
                 seen.insert(path.clone());
+            }
+            if !installed {
+                self.steam_uninstalled.insert(path.clone());
             }
             let rating = self.read_rating(&path);
             entries.push(Entry {
@@ -3820,9 +3886,12 @@ impl PixelView {
         let n = entries.len();
         self.show_folder(dir, entries);
         self.status = if n == 0 {
-            "No Steam library found (is Steam installed?)".into()
+            match filter {
+                SteamFilter::Installed => "No Steam library found (is Steam installed?)".into(),
+                _ => "No games (add a Steam Web API key in Preferences?)".into(),
+            }
         } else {
-            format!("{n} Steam games — click one to find videos")
+            format!("{n} {} Steam games — click one for details", filter.label())
         };
     }
 
@@ -15434,6 +15503,25 @@ impl PixelView {
                             }
                         }
 
+                        // "Not installed" badge for owned-but-not-installed Steam games (top-right).
+                        if self.steam_uninstalled.contains(path) {
+                            let p = ui.painter_at(rect);
+                            let font = egui::FontId::proportional((tile * 0.075).clamp(8.0, 12.0));
+                            let g = p.layout_no_wrap(
+                                "not installed".into(),
+                                font,
+                                egui::Color32::from_gray(220),
+                            );
+                            let pad = egui::vec2(5.0, 2.0);
+                            let tr = rect.right_top() + egui::vec2(-5.0, 5.0);
+                            let pill = egui::Rect::from_min_max(
+                                egui::pos2(tr.x - g.size().x - pad.x * 2.0, tr.y),
+                                egui::pos2(tr.x, tr.y + g.size().y + pad.y * 2.0),
+                            );
+                            p.rect_filled(pill, 3.0, egui::Color32::from_black_alpha(190));
+                            p.galley(pill.min + pad, g, egui::Color32::from_gray(220));
+                        }
+
                         // Star-rating overlay (bottom-left of the tile).
                         if !entry.is_dir && entry.rating > 0 {
                             ui.painter_at(rect).text(
@@ -20799,14 +20887,27 @@ impl PixelView {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
-                        // SteamTube: browse installed games → find YouTube videos for them.
+                        // SteamTube: browse games → detail view / find videos.
                         if ui
-                            .button("🎮 My Steam games")
-                            .on_hover_text("List installed Steam games — click one to find videos")
+                            .button("🎮 Installed games")
+                            .on_hover_text("Installed Steam games (fast — no API key needed)")
                             .clicked()
                         {
                             nav = Some(PathBuf::from(crate::steam::ROOT));
                         }
+                        // Full-library filters (need the Web API key in Preferences).
+                        let have_key = !self.steam_api_key.trim().is_empty();
+                        ui.add_enabled_ui(have_key, |ui| {
+                            for (label, sub, hover) in [
+                                ("📚 All owned", "all", "Your entire owned library"),
+                                ("⬇ Not installed", "notinstalled", "Owned but not installed"),
+                                ("💤 Never played", "neverplayed", "Owned with zero playtime"),
+                            ] {
+                                if ui.button(label).on_hover_text(hover).clicked() {
+                                    nav = Some(Path::new(crate::steam::ROOT).join(sub));
+                                }
+                            }
+                        });
                         if ui
                             .button(format!("{} Random game → videos", icons::SHUFFLE))
                             .on_hover_text("Pick a random installed game and search YouTube for it")
@@ -20816,6 +20917,8 @@ impl PixelView {
                         }
                         if crate::steam::steam_root().is_none() {
                             ui.weak("No Steam library found");
+                        } else if !have_key {
+                            ui.weak("Add a Steam Web API key in Preferences for your full library");
                         }
                         if let Some(p) =
                             self.favorites_buttons(ui, "🎮", crate::steam::is_remote, false)
@@ -22479,6 +22582,53 @@ impl eframe::App for PixelView {
                                             self.yt_download_dir = None;
                                         }
                                     });
+                                    // YouTube download quality (also on a per-video right-click).
+                                    ui.horizontal(|ui| {
+                                        ui.label("Quality");
+                                        let cur = match self.yt_max_height {
+                                            0 => "Best".to_string(),
+                                            h => format!("{h}p"),
+                                        };
+                                        egui::ComboBox::from_id_salt("yt_quality")
+                                            .selected_text(cur)
+                                            .show_ui(ui, |ui| {
+                                                for (lbl, h) in [
+                                                    ("480p", 480u32),
+                                                    ("720p", 720),
+                                                    ("1080p", 1080),
+                                                    ("1440p", 1440),
+                                                    ("4K", 2160),
+                                                    ("Best", 0),
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut self.yt_max_height,
+                                                        h,
+                                                        lbl,
+                                                    );
+                                                }
+                                            });
+                                    });
+                                }
+
+                                // Steam Web API key → your full owned library (Installed / Not
+                                // installed / Never played). Free from steamcommunity.com/dev/apikey.
+                                if crate::steam::steam_root().is_some() {
+                                    ui.add_space(8.0);
+                                    ui.label("Steam Web API key");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.steam_api_key)
+                                                .password(true)
+                                                .hint_text("32-hex key")
+                                                .desired_width(220.0),
+                                        );
+                                        if ui.button("Get key…").clicked() {
+                                            self.open_url("https://steamcommunity.com/dev/apikey");
+                                        }
+                                    });
+                                    ui.weak(
+                                        "Stored locally only. Enables the full owned-games library.",
+                                    );
                                 }
 
                                 // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
@@ -22865,6 +23015,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
+        eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -29084,6 +29235,25 @@ enum TilePick {
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
     YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
+}
+
+/// Which slice of the Steam library to list.
+#[derive(Clone, Copy, PartialEq)]
+enum SteamFilter {
+    Installed,    // fast local scan (no key)
+    All,          // full owned library (Web API key)
+    NotInstalled, // owned but not installed
+    NeverPlayed,  // owned with 0 playtime
+}
+impl SteamFilter {
+    fn label(self) -> &'static str {
+        match self {
+            SteamFilter::Installed => "installed",
+            SteamFilter::All => "owned",
+            SteamFilter::NotInstalled => "not-installed",
+            SteamFilter::NeverPlayed => "never-played",
+        }
+    }
 }
 
 /// A right-click action on a Steam game tile.
