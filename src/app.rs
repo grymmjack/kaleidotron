@@ -233,6 +233,13 @@ enum ColoMsg {
     Err(String),
 }
 
+/// A message from the YouTube search worker (`yt_walk`), mirroring [`ColoMsg`]: one `Hit` per
+/// result (its virtual `Entry` + `YtVideo` metadata), then `Done(count)`.
+enum YtMsg {
+    Hit(Entry, Box<crate::youtube::YtVideo>),
+    Done(usize),
+}
+
 /// What a 16colo.rs flat-piece listing is built from (see
 /// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
@@ -362,6 +369,88 @@ struct AnimState {
     current: usize,
     playing: bool,
     acc_ms: f32, // elapsed time accumulated toward the current frame's delay
+}
+
+/// A hovered video's **scrub strip**: N evenly-spaced frames extracted by one background ffmpeg
+/// call, so moving the pointer horizontally across the tile previews the clip over time (like a
+/// file manager / YouTube storyboard). `rx` delivers the raw frames; once uploaded to `frames`
+/// (textures) the strip is ready. `path` is the tile's (display) identity.
+struct VideoStrip {
+    path: PathBuf,
+    frames: Vec<egui::TextureHandle>,
+    rx: Option<std::sync::mpsc::Receiver<Vec<(u32, u32, Vec<u8>)>>>,
+}
+
+/// Extract a hover-scrub strip of `~12` frames for `real` (the resolved local file) on a worker
+/// thread, in ONE ffmpeg pass (`-vf fps=N/duration` → numbered PNGs in a temp dir). `id` is the
+/// display path kept for identity. Empty result if ffmpeg/probe fail — the tile keeps its thumb.
+fn start_video_strip(real: &Path, id: PathBuf) -> VideoStrip {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let real = real.to_path_buf();
+    std::thread::spawn(move || {
+        let out = extract_video_strip(&real).unwrap_or_default();
+        let _ = tx.send(out);
+    });
+    VideoStrip {
+        path: id,
+        frames: Vec::new(),
+        rx: Some(rx),
+    }
+}
+
+/// The worker body: probe duration, then one ffmpeg pass emitting `N` evenly-spaced PNGs into a
+/// temp dir, read back as `(w, h, rgba)`. Cleans up the temp dir. `None`/empty on any failure.
+fn extract_video_strip(real: &Path) -> Option<Vec<(u32, u32, Vec<u8>)>> {
+    const N: usize = 12;
+    let dur = crate::decode::probe_video(real)
+        .map(|i| i.duration)
+        .unwrap_or(0.0);
+    if dur <= 0.1 {
+        // Unknown length — just grab the first frame so hover still shows something.
+        let img = crate::decode::grab_video_frame(real, 0.0, Some(256))?;
+        return Some(vec![(img.width, img.height, img.rgba_bytes())]);
+    }
+    // A unique temp dir (no Math.random / time in-process here — key off the path bytes).
+    let mut h: u64 = 1469598103934665603;
+    for b in real.to_string_lossy().bytes() {
+        h = (h ^ b as u64).wrapping_mul(1099511628211);
+    }
+    let dir = std::env::temp_dir().join(format!("pv_strip_{h:016x}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let pattern = dir.join("f_%03d.png");
+    let fps = format!("{:.6}", N as f32 / dur);
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "quiet", "-nostdin", "-y", "-i"])
+        .arg(real)
+        .args([
+            "-vf",
+            &format!("fps={fps},scale=256:-1:flags=bilinear"),
+            "-frames:v",
+            &N.to_string(),
+        ])
+        .arg(&pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    let mut out = Vec::new();
+    if status.success() {
+        for i in 1..=N {
+            let f = dir.join(format!("f_{i:03}.png"));
+            let Ok(bytes) = std::fs::read(&f) else { break };
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let img = img.to_rgba8();
+                let (w, hh) = img.dimensions();
+                out.push((w, hh, img.into_raw()));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Simulated modem baud rate for "type-out" / "watch-it-draw" playback of text-mode
@@ -1128,6 +1217,7 @@ pub struct PixelView {
     plugin_audio: bool,
     plugin_code: bool,
     plugin_3d: bool, // 3D models (.obj/.stl/.ply/.gltf/.glb/.dae) → thumbnail + 3D viewer
+    plugin_video: bool, // video (mp4/mkv/webm/…) → ffmpeg frame thumbnail + in-app player
     // User-defined external "Open in…" programs by file type (persisted).
     openers: Vec<Opener>,
     assoc_selected: usize, // selected opener row in the Associations editor (Files tab)
@@ -1217,9 +1307,24 @@ pub struct PixelView {
     compare: Compare,                  // transient runtime (textures, per-pane view, overlay)
     saved_compares: Vec<SavedCompare>, // saved, recallable comparisons (persisted)
 
-    anim: Option<AnimState>,       // Some when viewing an animated GIF
-    hover_anim: Option<AnimState>, // the hovered grid GIF, playing in its tile
-    player: Option<Player>,        // baud-rate playback for the open text/RIP art (ANSImation)
+    anim: Option<AnimState>,         // Some when viewing an animated GIF
+    hover_anim: Option<AnimState>,   // the hovered grid GIF, playing in its tile
+    video_hover: Option<VideoStrip>, // the hovered grid video's scrub strip (pointer-x → frame)
+    video_hover_frac: f32, // current scrub position (0..1) — mirrored into the Details preview
+    video_player: Option<crate::video::VideoPlayer>, // Some when viewing a video (frame stream + soundtrack)
+    video_loading: Option<crate::video::VideoLoading>, // a background video open in flight (spinner)
+    video_tex: Option<egui::TextureHandle>, // the current video frame, uploaded on the UI thread
+    video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
+    video_md_header: String,         // any `.md` text before the first marker (preserved on save)
+    video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
+    video_marker_focus: bool,        // request focus on a freshly-added marker's title field
+    video_speed: f32,                // remembered video playback speed (this session)
+    video_scrub: Option<f32>,        // seek-bar drag position (Some while dragging the scrubber)
+    video_scrub_t: f64, // last scrub-preview time (throttles ffmpeg respawns while dragging)
+    video_seek_input: String, // the "go to time" text field (mm:ss / hh:mm:ss)
+    video_trim_in: Option<f32>, // trim/export In point (seconds); i-key or ⟦In
+    video_trim_out: Option<f32>, // trim/export Out point (seconds); o-key or Out⟧
+    player: Option<Player>, // baud-rate playback for the open text/RIP art (ANSImation)
     zoom: f32,
     zoom_lock: bool, // viewer: snap zoom to 100% steps (¼ steps below 100%)
     offset: egui::Vec2,
@@ -1416,6 +1521,21 @@ pub struct PixelView {
     pending_external: Option<(String, String, String)>,
     // Status messages from "Download file/pack" save threads (drained into `status`).
     colo_save_rx: Option<std::sync::mpsc::Receiver<String>>,
+    // YouTube browsing (mirrors the 16colo source model). `yt_videos` = per-result metadata
+    // keyed by virtual display path (`<youtube>/search/<q>/<title> [id].mp4`); `yt_files` maps
+    // that path to the downloaded local file (so `resolve_local` + the player find it).
+    yt_videos: HashMap<PathBuf, crate::youtube::YtVideo>,
+    yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
+    yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    yt_files: HashMap<PathBuf, PathBuf>,
+    // A video downloading in place so we can open it once ready: (virtual path, local file).
+    yt_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    yt_search: String, // the YouTube Places-tab search box text
+    yt_downloaded_ids: std::collections::HashSet<String>, // video ids present in the download dir (→ badge)
+    // Where downloaded YouTube videos are stored (default `<data>/youtube`). Persisted +
+    // Preferences-editable so it can live on an external drive; kept separate from the
+    // 16colo/HTTP cache since videos get large.
+    yt_download_dir: Option<PathBuf>,
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
     // cache-first). `None` when idle; a progress window shows while `Some`.
     bulk_dl: Option<BulkDownload>,
@@ -1459,6 +1579,8 @@ impl PixelView {
     const PLUGIN_AUDIO_KEY: &'static str = "plugin_audio";
     const PLUGIN_CODE_KEY: &'static str = "plugin_code";
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
+    const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
+    const YT_DIR_KEY: &'static str = "yt_download_dir";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -1620,6 +1742,11 @@ impl PixelView {
         let plugin_audio = load_bool(Self::PLUGIN_AUDIO_KEY, false);
         let plugin_code = load_bool(Self::PLUGIN_CODE_KEY, false);
         let plugin_3d = load_bool(Self::PLUGIN_3D_KEY, false); // heavy loaders → default OFF
+        let plugin_video = load_bool(Self::PLUGIN_VIDEO_KEY, false); // needs ffmpeg → default OFF
+        let yt_download_dir = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::YT_DIR_KEY))
+            .flatten();
         let audio_autoplay = load_bool(Self::AUDIO_AUTOPLAY_KEY, false);
         let audio_volume = cc
             .storage
@@ -1665,6 +1792,7 @@ impl PixelView {
         registry.set_plugin("audio", plugin_audio);
         registry.set_plugin("code", plugin_code);
         registry.set_plugin("3d", plugin_3d);
+        registry.set_plugin("video", plugin_video);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -2303,6 +2431,7 @@ impl PixelView {
             plugin_audio,
             plugin_code,
             plugin_3d,
+            plugin_video,
             openers,
             assoc_selected: 0,
             folder_actions,
@@ -2355,6 +2484,21 @@ impl PixelView {
             full_reduced: None,
             anim: None,
             hover_anim: None,
+            video_hover: None,
+            video_hover_frac: 0.5,
+            video_player: None,
+            video_loading: None,
+            video_tex: None,
+            video_markers: Vec::new(),
+            video_md_header: String::new(),
+            video_marker_sel: None,
+            video_marker_focus: false,
+            video_speed: 1.0,
+            video_scrub: None,
+            video_scrub_t: 0.0,
+            video_seek_input: String::new(),
+            video_trim_in: None,
+            video_trim_out: None,
             player: None,
             zoom: img_zoom,
             zoom_lock,
@@ -2486,6 +2630,14 @@ impl PixelView {
             colo_open_rx: None,
             pending_external: None,
             colo_save_rx: None,
+            yt_videos: HashMap::new(),
+            yt_rx: None,
+            yt_cancel: None,
+            yt_files: HashMap::new(),
+            yt_open_rx: None,
+            yt_search: String::new(),
+            yt_downloaded_ids: std::collections::HashSet::new(),
+            yt_download_dir,
             bulk_dl: None,
             colo_sauce_tx,
             colo_sauce_rx,
@@ -2518,6 +2670,11 @@ impl PixelView {
         // The virtual 16colo.rs tree (years → packs → downloaded pack contents).
         if crate::sixteen::is_remote(&dir) {
             self.open_remote(dir);
+            return;
+        }
+        // The virtual YouTube tree (search results → download-in-place → play).
+        if crate::youtube::is_remote(&dir) {
+            self.open_yt(dir);
             return;
         }
         // An archive path is a *virtual* folder: extract it once, then browse the
@@ -3348,12 +3505,208 @@ impl PixelView {
     }
 
     /// Map a display path to a locally-readable file for decoding: a downloaded 16colo
-    /// piece resolves to its cached `raw` file; anything else is already real on disk.
+    /// piece resolves to its cached `raw` file, a downloaded YouTube video to its local
+    /// `.mp4`; anything else is already real on disk.
     fn resolve_local(&self, path: &Path) -> PathBuf {
         self.colo_files
             .get(path)
+            .or_else(|| self.yt_files.get(path))
             .cloned()
             .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Where downloaded YouTube videos live: the user's configured path, else `<data>/youtube`.
+    /// Kept OUT of the size-capped HTTP cache since videos are large + user-managed.
+    fn yt_cache_dir(&self) -> PathBuf {
+        self.yt_download_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("youtube"))
+    }
+
+    /// Refresh the set of already-downloaded video ids (file stems in the download dir), so grid
+    /// tiles can show a "downloaded" badge — even for videos grabbed in a previous session.
+    fn refresh_yt_downloaded(&mut self) {
+        self.yt_downloaded_ids.clear();
+        if let Ok(rd) = std::fs::read_dir(self.yt_cache_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x != "part") {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        self.yt_downloaded_ids.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is this virtual YouTube path's video already downloaded (in the download dir)?
+    fn yt_is_downloaded(&self, path: &Path) -> bool {
+        self.yt_files.contains_key(path)
+            || path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .and_then(parse_yt_id)
+                .is_some_and(|id| self.yt_downloaded_ids.contains(&id))
+    }
+
+    /// Route a `<youtube>` virtual path: root shows the browse hint, `search/<q>` runs a search,
+    /// and a `search/<q>/<Title [id].mp4>` leaf (a pinned/clicked video) downloads + plays it.
+    fn open_yt(&mut self, dir: PathBuf) {
+        let parts = crate::youtube::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "YouTube — search from the Places panel".into();
+            }
+            [s, q] if s == crate::youtube::SEARCH => {
+                let q = q.clone();
+                self.start_yt_search(dir, q);
+            }
+            // A video leaf (e.g. a pinned video): parse its id and download + play.
+            [s, _q, leaf] if s == crate::youtube::SEARCH && parse_yt_id(leaf).is_some() => {
+                self.start_yt_open(dir);
+            }
+            _ => {
+                self.show_folder(dir, Vec::new());
+            }
+        }
+    }
+
+    /// Kick off a YouTube search on a worker thread (mirrors `start_colo_pieces`). Results stream
+    /// into `all_entries` via `poll_yt`; they render as grid tiles with thumbnails.
+    fn start_yt_search(&mut self, dir: PathBuf, query: String) {
+        self.show_folder(dir.clone(), Vec::new());
+        self.yt_videos.clear();
+        self.refresh_yt_downloaded();
+        if let Some(c) = self.yt_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_rx = Some(rx);
+        self.yt_cancel = Some(cancel.clone());
+        self.status = format!("Searching YouTube: {query}");
+        std::thread::spawn(move || yt_walk(&query, &dir, cancel, tx));
+    }
+
+    /// Drain the YouTube search worker each frame (mirrors `poll_colo_pieces`): append hits to
+    /// `all_entries`, request their thumbnails, and rebuild the view.
+    fn poll_yt(&mut self) {
+        let Some(rx) = &self.yt_rx else { return };
+        let mut got = false;
+        let mut done = false;
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(YtMsg::Hit(mut entry, v)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.colo_thumbs
+                        .request(&entry.path, &v.thumb_url, THUMB_PX, false);
+                    self.yt_videos.insert(entry.path.clone(), *v);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(YtMsg::Done(n)) => {
+                    self.status = format!("{n} YouTube result(s)");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.yt_rx = None;
+            self.yt_cancel = None;
+        }
+        if got {
+            self.rebuild_view();
+        }
+        self.want_repaint = true;
+    }
+
+    /// Download a YouTube video in place (to `yt_cache_dir`), then open it in the video player.
+    /// Auto-enables the Video plugin (playback needs it). `poll_yt_open` finishes on the UI thread.
+    fn start_yt_open(&mut self, vpath: PathBuf) {
+        let Some(id) = vpath
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(parse_yt_id)
+        else {
+            self.status = "Not a YouTube video".into();
+            return;
+        };
+        // One download at a time — a double-click must not spawn two racing yt-dlp runs.
+        if self.yt_open_rx.is_some() {
+            self.status = "Already downloading a video…".into();
+            return;
+        }
+        if !self.plugin_video {
+            self.plugin_video = true;
+            self.registry.set_plugin("video", true);
+        }
+        let dir = self.yt_cache_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.yt_open_rx = Some(rx);
+        self.status = "Downloading from YouTube…".into();
+        std::thread::spawn(move || {
+            let res = match crate::youtube::download(&id, &dir) {
+                Some(local) => Ok((vpath, local)),
+                None => Err(
+                    "YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp)"
+                        .to_string(),
+                ),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish a YouTube download (each frame): map the virtual path → the local file and open it.
+    fn poll_yt_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.yt_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                if let Some(id) = vpath
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                {
+                    self.yt_downloaded_ids.insert(id);
+                }
+                self.yt_files.insert(vpath.clone(), local);
+                self.yt_open_rx = None;
+                self.load_full(ctx, vpath);
+            }
+            Ok(Err(e)) => {
+                self.status = e;
+                self.yt_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.yt_open_rx = None,
+        }
+    }
+
+    /// Open a YouTube video's watch page in the OS default browser (no download needed) — the
+    /// always-works fallback (and handy even when playback works).
+    fn open_yt_in_browser(&mut self, vpath: &Path) {
+        let watch = self
+            .yt_videos
+            .get(vpath)
+            .map(|v| v.watch_url())
+            .or_else(|| {
+                vpath
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(parse_yt_id)
+                    .map(|id| format!("https://www.youtube.com/watch?v={id}"))
+            });
+        if let Some(url) = watch {
+            let o = os_file_manager();
+            self.launch_external(&o.exec, &o.args, &o.env, Path::new(&url));
+            self.status = "Opened in browser".into();
+        }
     }
 
     /// Lazily parse + cache a PDF's metadata (page count / size / title / author) for the
@@ -4906,6 +5259,825 @@ impl PixelView {
             return;
         }
         self.start_audio_load(path, false);
+    }
+
+    /// Kick off the background video open (probe + whole-track audio extract). `src` is the
+    /// resolved local path ffmpeg reads. `poll_video_load` builds the player when it's ready.
+    fn ensure_video_loaded(&mut self, src: PathBuf) {
+        if !self.plugin_video {
+            return;
+        }
+        self.video_loading = Some(crate::video::VideoLoading::start(src));
+    }
+
+    /// Drain the background video open; build the player when ready (each frame, from `ui()`).
+    fn poll_video_load(&mut self, dt: f32) {
+        let (vol, muted, sp) = (self.audio_volume, self.audio_muted, self.video_speed);
+        let Some(loading) = self.video_loading.as_mut() else {
+            return;
+        };
+        loading.t += dt;
+        match loading.try_build(vol, muted, true) {
+            Some(Ok(mut vp)) => {
+                vp.set_speed(sp); // carry the session's chosen playback speed
+                self.video_player = Some(vp);
+                self.video_loading = None;
+                self.want_repaint = true;
+            }
+            Some(Err(e)) => {
+                self.status = format!("Video: {e}");
+                self.video_loading = None;
+            }
+            None => self.want_repaint = true, // keep the spinner animating
+        }
+    }
+
+    /// Dim + spinner while a video is opening (mirrors the audio loading overlay).
+    fn paint_video_loading_overlay(&self, ctx: &egui::Context) {
+        let Some(loading) = &self.video_loading else {
+            return;
+        };
+        if loading.t < 0.2 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let bg = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("video_loading_bg"),
+        ));
+        bg.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+        egui::Area::new(egui::Id::new("video_loading_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(20.0));
+                        ui.add_space(8.0);
+                        ui.label(format!("Loading {}…", short_name(&loading.path)));
+                    });
+                });
+            });
+    }
+
+    /// The video viewer: advance the clock/frames, upload the current frame, draw the transport +
+    /// seek bar + markers, and blit the frame through `draw_image_view` (so zoom/pan/fit work).
+    /// Returns `Some(forward)` when the user asked to step to the prev/next file.
+    fn draw_video_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<bool> {
+        let dt = ctx.input(|i| i.stable_dt);
+        let (vol, muted) = (self.audio_volume, self.audio_muted);
+
+        // Advance the clock/frames and push the master volume.
+        let (dw, dh) = {
+            let vp = self.video_player.as_mut()?;
+            vp.set_volume(vol, muted);
+            vp.tick(dt);
+            (vp.disp_w, vp.disp_h)
+        };
+
+        // Upload the frame texture on the UI thread when it changed.
+        let frame = {
+            let vp = self.video_player.as_mut()?;
+            if vp.tex_dirty {
+                vp.tex_dirty = false;
+                vp.cur.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(bytes) = frame {
+            if bytes.len() == (dw as usize) * (dh as usize) * 4 {
+                let color =
+                    egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &bytes);
+                match &mut self.video_tex {
+                    Some(h) => h.set(color, view_tex_opts()),
+                    None => {
+                        self.video_tex =
+                            Some(ctx.load_texture("video_frame", color, view_tex_opts()))
+                    }
+                }
+            }
+        }
+
+        // Snapshot state for the controls.
+        let (pos, dur, playing, speed, frame_idx, frame_cnt, has_audio) = {
+            let vp = self.video_player.as_ref()?;
+            (
+                vp.position(),
+                vp.duration(),
+                vp.playing,
+                vp.speed,
+                vp.frame_index(),
+                vp.frame_count(),
+                vp.has_audio(),
+            )
+        };
+        let immersive = self.immersive;
+
+        // Deferred intents.
+        let mut want_toggle = false;
+        let mut want_seek: Option<f32> = None;
+        let mut want_speed: Option<f32> = None;
+        let mut want_export = false;
+        let mut want_extract: Option<bool> = None; // Some(open_after)
+        let mut want_add_marker = false;
+        let mut want_marker_click: Option<usize> = None; // a marker chip was clicked (seek + toggle notes)
+        let mut want_set_in = false;
+        let mut want_set_out = false;
+        let mut want_trim_clear = false;
+        let mut want_trim_export = false;
+
+        if !immersive {
+            let play_lbl = |p: bool| {
+                format!(
+                    "{} {}",
+                    if p { icons::PAUSE } else { icons::PLAY },
+                    if p { "Pause" } else { "Play" }
+                )
+            };
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(play_lbl(playing))
+                            .min_size(fixed_btn_size(ui, &[&play_lbl(true), &play_lbl(false)])),
+                    )
+                    .clicked()
+                {
+                    want_toggle = true;
+                }
+                ui.label(format!(
+                    "{} / {}",
+                    format_timecode(self.video_scrub.unwrap_or(pos)),
+                    format_timecode(dur)
+                ));
+                ui.separator();
+                ui.label("Speed");
+                egui::ComboBox::from_id_salt("video_speed")
+                    .selected_text(format!("{speed:.2}×"))
+                    .show_ui(ui, |ui| {
+                        for s in [0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0] {
+                            if ui
+                                .selectable_label((speed - s).abs() < 0.01, format!("{s:.2}×"))
+                                .clicked()
+                            {
+                                want_speed = Some(s);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.label(format!("frame {frame_idx}/{frame_cnt}"));
+                ui.separator();
+                ui.label("Go to");
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut self.video_seek_input)
+                        .desired_width(56.0)
+                        .hint_text("m:ss"),
+                );
+                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(t) = parse_timecode(&self.video_seek_input) {
+                        want_seek = Some(t);
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} PNG", icons::DOWNLOAD))
+                    .on_hover_text("Save the current frame as a PNG (native resolution)")
+                    .clicked()
+                {
+                    want_export = true;
+                }
+                ui.add_enabled_ui(has_audio, |ui| {
+                    ui.menu_button("Audio ▾", |ui| {
+                        if ui
+                            .button("Extract & edit in sampler")
+                            .on_hover_text("Extract the audio and open it in pixelview's built-in sampler/waveform editor")
+                            .clicked()
+                        {
+                            want_extract = Some(true);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Extract audio to file…")
+                            .on_hover_text("Save the audio track to disk (lossless copy, or WAV)")
+                            .clicked()
+                        {
+                            want_extract = Some(false);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text("This video has no audio track");
+                });
+                if ui
+                    .button("+ Marker")
+                    .on_hover_text("Add a marker at the current time to the .md sidecar (m)")
+                    .clicked()
+                {
+                    want_add_marker = true;
+                }
+                // Trim / lossless clip export.
+                ui.separator();
+                if ui
+                    .button("Set In")
+                    .on_hover_text("Set trim In at the current time (i)")
+                    .clicked()
+                {
+                    want_set_in = true;
+                }
+                if ui
+                    .button("Set Out")
+                    .on_hover_text("Set trim Out at the current time (o)")
+                    .clicked()
+                {
+                    want_set_out = true;
+                }
+                let tc = |o: Option<f32>| o.map(format_timecode).unwrap_or_else(|| "—".into());
+                ui.label(format!(
+                    "{}–{}",
+                    tc(self.video_trim_in),
+                    tc(self.video_trim_out)
+                ));
+                let can_export = matches!(
+                    (self.video_trim_in, self.video_trim_out),
+                    (Some(a), Some(b)) if b > a
+                );
+                if ui
+                    .add_enabled(can_export, egui::Button::new("Export clip…"))
+                    .on_hover_text("Lossless trim (ffmpeg -c copy; snaps to a keyframe)")
+                    .clicked()
+                {
+                    want_trim_export = true;
+                }
+                if (self.video_trim_in.is_some() || self.video_trim_out.is_some())
+                    && ui.button("Clear").on_hover_text("Clear In/Out").clicked()
+                {
+                    want_trim_clear = true;
+                }
+            });
+
+            // Seek bar with marker ticks (seeks on release only — each seek respawns ffmpeg).
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 16.0),
+                egui::Sense::click_and_drag(),
+            );
+            let p = ui.painter_at(rect);
+            let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
+            p.rect_filled(bar, 3.0, egui::Color32::from_gray(60));
+            let show_t = self.video_scrub.unwrap_or(pos);
+            let frac = if dur > 0.0 {
+                (show_t / dur).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let played = egui::Rect::from_min_max(
+                bar.min,
+                egui::pos2(bar.min.x + bar.width() * frac, bar.max.y),
+            );
+            p.rect_filled(played, 3.0, egui::Color32::from_rgb(90, 150, 235));
+            // Trim region shading + green In/Out ticks.
+            if dur > 0.0 {
+                let x_at = |t: f32| rect.min.x + rect.width() * (t / dur).clamp(0.0, 1.0);
+                if let (Some(a), Some(b)) = (self.video_trim_in, self.video_trim_out) {
+                    if b > a {
+                        p.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x_at(a), rect.top()),
+                                egui::pos2(x_at(b), rect.bottom()),
+                            ),
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(90, 235, 150, 60),
+                        );
+                    }
+                }
+                for t in [self.video_trim_in, self.video_trim_out]
+                    .into_iter()
+                    .flatten()
+                {
+                    let x = x_at(t);
+                    p.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 235, 150)),
+                    );
+                }
+            }
+            for (i, m) in self.video_markers.iter().enumerate() {
+                if dur > 0.0 {
+                    let x = rect.min.x + rect.width() * (m.secs / dur).clamp(0.0, 1.0);
+                    // The selected marker's tick is brighter/thicker.
+                    let (w, c) = if self.video_marker_sel == Some(i) {
+                        (2.5, egui::Color32::from_rgb(255, 235, 120))
+                    } else {
+                        (1.5, egui::Color32::from_rgb(255, 200, 60))
+                    };
+                    p.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(w, c),
+                    );
+                }
+            }
+            let hx = rect.min.x + rect.width() * frac;
+            p.circle_filled(egui::pos2(hx, rect.center().y), 5.0, egui::Color32::WHITE);
+            let x_to_t = |x: f32| ((x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) * dur;
+            if resp.dragged() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    let t = x_to_t(pp.x);
+                    self.video_scrub = Some(t);
+                    // Audio+video scrub preview: hear + see the position while dragging. Throttled
+                    // (each respawns ffmpeg) so a fast drag doesn't spawn dozens of processes.
+                    let now = ctx.input(|i| i.time);
+                    if now - self.video_scrub_t > 0.12 {
+                        self.video_scrub_t = now;
+                        if let Some(vp) = &mut self.video_player {
+                            vp.scrub_to(t);
+                        }
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                want_seek = self.video_scrub.take(); // final precise seek (restores play/pause state)
+            }
+            if resp.clicked() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    want_seek = Some(x_to_t(pp.x));
+                }
+                self.video_scrub = None;
+            }
+
+            // Mousewheel over the seek bar scrubs: coarse (5s) / fine with Shift (1s).
+            if resp.hovered() {
+                let (scroll_y, shift) = ctx.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift));
+                if scroll_y.abs() > 0.5 {
+                    let step = if shift { 1.0 } else { 5.0 };
+                    // Scroll down = forward, up = back (page-scroll intuition).
+                    let base = self.video_scrub.unwrap_or(pos);
+                    want_seek = Some((base - scroll_y.signum() * step).clamp(0.0, dur.max(0.0)));
+                }
+            }
+
+            // Marker jump list: click a chip to seek + toggle its notes editor.
+            if !self.video_markers.is_empty() {
+                let sel = self.video_marker_sel;
+                let chips: Vec<(usize, f32, String)> = self
+                    .video_markers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let txt = if m.title.trim().is_empty() {
+                            format_timecode(m.secs)
+                        } else {
+                            format!("{} {}", format_timecode(m.secs), m.title.trim())
+                        };
+                        (i, m.secs, txt)
+                    })
+                    .collect();
+                egui::ScrollArea::horizontal()
+                    .id_salt("vid_markers")
+                    .max_height(24.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, t, txt) in &chips {
+                                if ui.selectable_label(sel == Some(*i), txt).clicked() {
+                                    want_seek = Some(*t);
+                                    want_marker_click = Some(*i);
+                                }
+                            }
+                        });
+                    });
+            }
+
+            // Apply the marker click now (before the notes editor) so selection is current: a
+            // click seeks AND toggles that marker's notes open/closed.
+            if let Some(i) = want_marker_click {
+                self.video_marker_sel = if self.video_marker_sel == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+            }
+
+            // Notes editor for the selected marker: an editable title + a multiline notes field,
+            // saved to the `.md` on every change (so you can type while logging footage).
+            if let Some(sel) = self.video_marker_sel {
+                if sel < self.video_markers.len() {
+                    let take_focus = std::mem::take(&mut self.video_marker_focus);
+                    let mut md_dirty = false;
+                    let mut want_delete = false;
+                    let mut want_close = false;
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format_timecode(self.video_markers[sel].secs))
+                                    .monospace()
+                                    .strong(),
+                            );
+                            let tr = ui.add(
+                                egui::TextEdit::singleline(&mut self.video_markers[sel].title)
+                                    .hint_text("marker title")
+                                    .desired_width(220.0),
+                            );
+                            if take_focus {
+                                tr.request_focus();
+                            }
+                            if tr.changed() {
+                                md_dirty = true;
+                            }
+                            if ui.button("🗑").on_hover_text("Delete this marker").clicked() {
+                                want_delete = true;
+                            }
+                            if ui.button("×").on_hover_text("Close notes").clicked() {
+                                want_close = true;
+                            }
+                        });
+                        let nr = ui.add(
+                            egui::TextEdit::multiline(&mut self.video_markers[sel].notes)
+                                .hint_text("notes… (logged to the .md sidecar)")
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if nr.changed() {
+                            md_dirty = true;
+                        }
+                    });
+                    if md_dirty {
+                        self.save_markers();
+                    }
+                    if want_delete {
+                        self.video_markers.remove(sel);
+                        self.video_marker_sel = None;
+                        self.save_markers();
+                    }
+                    if want_close {
+                        self.video_marker_sel = None;
+                    }
+                } else {
+                    self.video_marker_sel = None;
+                }
+            }
+        }
+
+        // Apply intents (after all closures dropped → free to borrow self.video_player mutably).
+        if want_toggle {
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.toggle();
+            }
+        }
+        if let Some(s) = want_speed {
+            self.video_speed = s;
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.set_speed(s);
+            }
+        }
+        if let Some(t) = want_seek {
+            if let Some(vp) = self.video_player.as_mut() {
+                vp.seek(t);
+            }
+        }
+        if want_export {
+            self.export_video_frame_png();
+        }
+        match want_extract {
+            Some(true) => {
+                // Extract → open in pixelview's OWN sampler/waveform editor. This leaves the
+                // video (load_full tears the player down) and needs the audio plugin on.
+                if let Some(wav) = self.extract_video_audio_for_edit() {
+                    if !self.plugin_audio {
+                        self.plugin_audio = true;
+                        self.registry.set_plugin("audio", true);
+                    }
+                    self.load_full(ctx, wav);
+                    return None; // switched to the audio editor; nothing more to draw here
+                }
+            }
+            Some(false) => self.extract_video_audio_save(),
+            None => {}
+        }
+        if want_add_marker {
+            self.append_video_marker(pos);
+        }
+        if want_set_in {
+            self.set_trim_in(pos);
+        }
+        if want_set_out {
+            self.set_trim_out(pos);
+        }
+        if want_trim_clear {
+            self.video_trim_in = None;
+            self.video_trim_out = None;
+        }
+        if want_trim_export {
+            self.export_video_clip();
+        }
+
+        // Blit the frame through the image viewer (zoom/pan/fit/transparency for free).
+        let tex = self
+            .video_tex
+            .as_ref()
+            .map(|h| TiledTexture::single(h.clone(), [dw as usize, dh as usize]));
+        let forward = if let Some(tex) = tex {
+            self.draw_image_view(ui, &tex)
+        } else {
+            let r = ui.available_rect_before_wrap();
+            paint_spinner(
+                &ui.painter_at(r),
+                r.center(),
+                16.0,
+                ctx.input(|i| i.time),
+                egui::Color32::from_gray(140),
+            );
+            None
+        };
+        if playing || self.video_loading.is_some() {
+            self.want_repaint = true;
+        }
+        forward
+    }
+
+    /// Save the current video frame as a PNG at **native** resolution (re-grabbed at the current
+    /// timestamp, so it's full quality, not the downscaled display frame). Auto-named beside the video.
+    fn export_video_frame_png(&mut self) {
+        let Some((src, pts)) = self
+            .video_player
+            .as_ref()
+            .map(|vp| (vp.path.clone(), vp.cur_pts))
+        else {
+            return;
+        };
+        let Some(img) = crate::decode::grab_video_frame(&src, pts, None) else {
+            self.status = "PNG export failed (is ffmpeg installed?)".into();
+            return;
+        };
+        let dir = src.parent().unwrap_or_else(|| Path::new("."));
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+        let tc = format_timecode(pts).replace(':', "-");
+        let mut out = dir.join(format!("{stem}_{tc}.png"));
+        let mut n = 1;
+        while out.exists() {
+            out = dir.join(format!("{stem}_{tc}_{n}.png"));
+            n += 1;
+        }
+        match image::save_buffer(
+            &out,
+            &img.rgba_bytes(),
+            img.width,
+            img.height,
+            image::ColorType::Rgba8,
+        ) {
+            Ok(()) => self.status = format!("Saved {}", short_name(&out)),
+            Err(e) => self.status = format!("PNG failed: {e}"),
+        }
+    }
+
+    /// Run `ffmpeg -vn` to write the current video's audio track to `dest`. At `speed == 1.0`:
+    /// `.wav` → PCM, any other container → **lossless stream copy** (`-c:a copy`) with a re-encode
+    /// fallback. At any other speed it **re-encodes with a speed filter** matching what the player
+    /// sounds like — a resample (`asetrate`), so pitch tracks speed exactly like live playback
+    /// (not the pitch-preserving `atempo`). Returns whether it succeeded.
+    fn extract_video_audio_to(&self, src: &Path, dest: &Path, speed: f32) -> bool {
+        let is_wav = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+        let speed_changed = (speed - 1.0).abs() > 0.001;
+        // Normalize to 44.1 kHz, reinterpret at rate·speed (= faster + higher pitch, like the
+        // player's rodio `.speed()`), then resample back to a standard rate.
+        let af = format!(
+            "aresample=44100,asetrate={},aresample=44100",
+            (44100.0 * speed).round().max(1.0) as i64
+        );
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-v", "quiet", "-nostdin", "-y"])
+                .arg("-i")
+                .arg(src)
+                .arg("-vn");
+            if speed_changed {
+                cmd.arg("-af").arg(&af);
+            }
+            if is_wav {
+                cmd.args(["-c:a", "pcm_s16le"]);
+            } else if copy && !speed_changed {
+                cmd.args(["-c:a", "copy"]); // lossless: keep the original encoded audio
+            }
+            // else (speed changed, non-wav): re-encode to the container default (a filter needs it)
+            cmd.arg(dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if speed_changed {
+            run(false) // a filtered stream can't be copied — must re-encode
+        } else {
+            // Try lossless copy first; if the codec ↮ container, re-encode (ffmpeg picks the encoder).
+            run(true) || (!is_wav && run(false))
+        }
+    }
+
+    /// "Extract audio to file…" — a save dialog (lossless copy by default, or WAV/anything).
+    fn extract_video_audio_save(&mut self) {
+        let Some(src) = self.video_player.as_ref().map(|vp| vp.path.clone()) else {
+            return;
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.m4a"))
+            .add_filter(
+                "Audio",
+                &["m4a", "wav", "mp3", "aac", "flac", "ogg", "opus"],
+            )
+            .save_file()
+        else {
+            return;
+        };
+        let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
+        self.status = if self.extract_video_audio_to(&src, &dest, speed) {
+            let at = if (speed - 1.0).abs() > 0.001 {
+                format!(" at {speed:.2}×")
+            } else {
+                String::new()
+            };
+            format!("Extracted audio{at} → {}", short_name(&dest))
+        } else {
+            "Audio extract failed (is ffmpeg installed?)".into()
+        };
+    }
+
+    /// "Extract & edit in sampler" — decode the audio to a temp WAV (frictionless, no dialog) so
+    /// the caller can open it in pixelview's built-in sampler/waveform editor via `load_full`.
+    /// Returns the temp WAV path, or `None` on failure (status set).
+    fn extract_video_audio_for_edit(&mut self) -> Option<PathBuf> {
+        let src = self.video_player.as_ref().map(|vp| vp.path.clone())?;
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+        let dest = std::env::temp_dir().join(format!("pixelview_{}.wav", sanitize_filename(stem)));
+        let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
+        if self.extract_video_audio_to(&src, &dest, speed) {
+            self.status = format!("Editing audio from {}", short_name(&src));
+            Some(dest)
+        } else {
+            self.status = "Audio extract failed (is ffmpeg installed?)".into();
+            None
+        }
+    }
+
+    /// Write the current markers (+ header) back to the video's `.md` sidecar. No-op if no video.
+    fn save_markers(&self) {
+        if let Some(vp) = self.video_player.as_ref() {
+            let _ = save_video_markers(&vp.path, &self.video_md_header, &self.video_markers);
+        }
+    }
+
+    /// Add a blank marker at `secs` (kept time-sorted), select it, and focus its title field so
+    /// you can type immediately — the "log the footage" quick-capture. Persists to the `.md`.
+    fn append_video_marker(&mut self, secs: f32) {
+        if self.video_player.is_none() {
+            return;
+        }
+        let idx = self.video_markers.partition_point(|m| m.secs <= secs);
+        self.video_markers.insert(
+            idx,
+            VideoMarker {
+                secs,
+                title: String::new(),
+                notes: String::new(),
+            },
+        );
+        self.video_marker_sel = Some(idx);
+        self.video_marker_focus = true; // request focus on the new marker's title next frame
+        self.save_markers();
+        self.status = format!("Marker at {}", format_timecode(secs));
+    }
+
+    /// Set the trim In point (drops a stale Out that's now ≤ In).
+    fn set_trim_in(&mut self, secs: f32) {
+        self.video_trim_in = Some(secs);
+        if self.video_trim_out.is_some_and(|o| o <= secs) {
+            self.video_trim_out = None;
+        }
+        self.status = format!("Trim In {}", format_timecode(secs));
+    }
+
+    /// Set the trim Out point (drops a stale In that's now ≥ Out).
+    fn set_trim_out(&mut self, secs: f32) {
+        self.video_trim_out = Some(secs);
+        if self.video_trim_in.is_some_and(|i| i >= secs) {
+            self.video_trim_in = None;
+        }
+        self.status = format!("Trim Out {}", format_timecode(secs));
+    }
+
+    /// Export the In→Out range as a **lossless** clip via ffmpeg stream-copy (`-c copy`, so no
+    /// re-encode — the cut snaps to the nearest keyframe at/before In). Falls back to a re-encode
+    /// if copy fails (e.g. the chosen container can't hold the source codecs).
+    fn export_video_clip(&mut self) {
+        let (src, a, b) = match (
+            self.video_player.as_ref().map(|v| v.path.clone()),
+            self.video_trim_in,
+            self.video_trim_out,
+        ) {
+            (Some(s), Some(a), Some(b)) if b > a => (s, a, b),
+            _ => {
+                self.status = "Set trim In and Out first".into();
+                return;
+            }
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_clip.{ext}"))
+            .save_file()
+        else {
+            return;
+        };
+        let ss = format!("{a:.3}");
+        let t = format!("{:.3}", b - a);
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-v", "quiet", "-nostdin", "-y", "-ss", &ss])
+                .arg("-i")
+                .arg(&src)
+                .args(["-t", &t]);
+            if copy {
+                cmd.args(["-c", "copy", "-avoid_negative_ts", "make_zero"]);
+            }
+            // else: re-encode with the container defaults (a frame-accurate cut).
+            cmd.arg(&dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let ok = run(true) || run(false);
+        self.status = if ok {
+            format!("Exported clip {}–{} → {}", ss, t, short_name(&dest))
+        } else {
+            "Clip export failed (is ffmpeg installed?)".into()
+        };
+    }
+
+    /// Join the selected videos (in on-screen order) into one clip via ffmpeg's **concat
+    /// demuxer** — `-c copy` = **lossless**, no re-encode (with a re-encode fallback). Works
+    /// cleanly when the clips share codec/size/params (e.g. splits of one source, same-camera
+    /// takes); wildly different clips would need the concat *filter* (scaling) — out of scope here.
+    fn join_selected_videos(&mut self) {
+        // Selected videos in the current view order.
+        let display: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir && is_video_ext(&e.path) && self.selection.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        if display.len() < 2 {
+            self.status = "Select 2 or more videos to join".into();
+            return;
+        }
+        let paths: Vec<PathBuf> = display.iter().map(|p| self.resolve_local(p)).collect();
+        let ext = paths[0]
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_string();
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("joined.{ext}"))
+            .save_file()
+        else {
+            return;
+        };
+        // The concat demuxer reads a list file of `file '<path>'` lines (single quotes escaped).
+        let list_path = std::env::temp_dir().join("pixelview_concat.txt");
+        let mut list = String::new();
+        for p in &paths {
+            let esc = p.to_string_lossy().replace('\'', "'\\''");
+            list.push_str(&format!("file '{esc}'\n"));
+        }
+        if std::fs::write(&list_path, &list).is_err() {
+            self.status = "Join failed (could not write the concat list)".into();
+            return;
+        }
+        let run = |copy: bool| -> bool {
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args([
+                "-v", "quiet", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i",
+            ])
+            .arg(&list_path);
+            if copy {
+                cmd.args(["-c", "copy"]);
+            }
+            cmd.arg(&dest)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let ok = run(true) || run(false);
+        let _ = std::fs::remove_file(&list_path);
+        self.status = if ok {
+            format!("Joined {} videos → {}", paths.len(), short_name(&dest))
+        } else {
+            "Join failed (clips must share codec/size for a lossless join)".into()
+        };
     }
 
     /// Enter the standalone **Sample-Pads** editor (item 15): the pad grid + keyboard + a silent
@@ -9745,6 +10917,15 @@ impl PixelView {
         }
         self.anim = None;
         self.player = None;
+        // Tear down any previous video (kills its ffmpeg + soundtrack) when opening a new file.
+        self.video_player = None;
+        self.video_loading = None;
+        self.video_tex = None;
+        self.video_markers.clear();
+        self.video_md_header.clear();
+        self.video_marker_sel = None;
+        self.video_trim_in = None;
+        self.video_trim_out = None;
         self.pdf_view = None;
         self.xmind_view = None;
         self.three_d = None;
@@ -9828,6 +11009,18 @@ impl PixelView {
                 self.mode = Mode::ThreeD;
                 return;
             }
+        }
+
+        // Video → the in-app player (frame stream + soundtrack). The heavy open (probe +
+        // whole-track audio extract) runs on a background thread; `poll_video_load` builds
+        // the player when ready. Independent of the audio plugin — video always has sound.
+        if self.plugin_video && is_video_ext(&path) {
+            let (header, markers) = load_video_markers(&src);
+            self.video_md_header = header;
+            self.video_markers = markers;
+            self.video_marker_sel = None;
+            self.ensure_video_loaded(src.clone());
+            return;
         }
 
         // Audio → load the interactive player now so the big transport + waveform + keyboard
@@ -10044,6 +11237,12 @@ impl PixelView {
             // file, then open it once ready (mode flips in `poll_colo_open`).
             self.selected = idx;
             self.start_piece_open(entry.path);
+        } else if self.yt_videos.contains_key(&entry.path)
+            && !self.yt_files.contains_key(&entry.path)
+        {
+            // A YouTube result not yet downloaded → download in place, then play (poll_yt_open).
+            self.selected = idx;
+            self.start_yt_open(entry.path);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -11562,7 +12761,21 @@ impl PixelView {
                     // inside a fixed, user-draggable band (see `draw_thumb_area`) rather than
                     // dictating the pane height. The CRT ≈1.2× stretch for text-mode art keeps it
                     // agreeing with the main view + minimap.
-                    if let Some(tex) = self.thumb_tex.get(&entry.path).cloned() {
+                    // While hover-scrubbing this video in the grid, show the SAME scrubbed frame
+                    // here (a bigger view of what you're scrubbing); else the static thumbnail.
+                    let scrub_tex = self
+                        .video_hover
+                        .as_ref()
+                        .filter(|s| s.path == entry.path && !s.frames.is_empty())
+                        .map(|s| {
+                            let n = s.frames.len();
+                            let idx = ((self.video_hover_frac * (n as f32 - 1.0)).round() as usize)
+                                .min(n - 1);
+                            s.frames[idx].clone()
+                        });
+                    let preview_tex =
+                        scrub_tex.or_else(|| self.thumb_tex.get(&entry.path).cloned());
+                    if let Some(tex) = preview_tex {
                         let ar_y = if self.crt_aspect && is_textmode_ext(&entry.path) {
                             1.2
                         } else {
@@ -13449,6 +14662,51 @@ impl PixelView {
             self.want_repaint = true;
         }
 
+        // Hover-scrub: for a hovered video tile, extract a frame strip (once) so moving the
+        // pointer across the tile previews the clip over time.
+        let vhov = self
+            .hovered
+            .and_then(|i| self.entries.get(i))
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+            .filter(|p| self.plugin_video && is_video_ext(p));
+        match vhov {
+            Some(p)
+                if self
+                    .video_hover
+                    .as_ref()
+                    .map(|s| s.path != p)
+                    .unwrap_or(true) =>
+            {
+                let real = self.resolve_local(&p);
+                self.video_hover = Some(start_video_strip(&real, p));
+            }
+            None => self.video_hover = None,
+            _ => {}
+        }
+        // Upload the strip's frames once the worker delivers them.
+        if let Some(s) = self.video_hover.as_mut() {
+            if let Some(rx) = &s.rx {
+                match rx.try_recv() {
+                    Ok(frames) => {
+                        s.frames = frames
+                            .iter()
+                            .map(|(w, h, px)| {
+                                let img = egui::ColorImage::from_rgba_unmultiplied(
+                                    [*w as usize, *h as usize],
+                                    px,
+                                );
+                                ctx.load_texture("vstrip", img, egui::TextureOptions::LINEAR)
+                            })
+                            .collect();
+                        s.rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => s.rx = None,
+                }
+            }
+        }
+
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut hovered: Option<usize> = None;
         // Right-click file ops are deferred out of the row closure (which holds
@@ -13466,6 +14724,9 @@ impl PixelView {
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
+        let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
+        let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
+        let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -13642,6 +14903,53 @@ impl PixelView {
                                     crate::format_color::color32(ext),
                                 );
                             }
+                        } else if self
+                            .video_hover
+                            .as_ref()
+                            .is_some_and(|s| &s.path == path && !s.frames.is_empty())
+                        {
+                            // Hover-scrub: pointer x across the tile → a frame in the strip.
+                            let (tex, sz, frac) = {
+                                let s = self.video_hover.as_ref().unwrap();
+                                let n = s.frames.len();
+                                let frac = ui
+                                    .input(|i| i.pointer.hover_pos())
+                                    .map(|p| {
+                                        ((p.x - rect.left()) / rect.width().max(1.0))
+                                            .clamp(0.0, 1.0)
+                                    })
+                                    .unwrap_or(0.5);
+                                let idx = ((frac * (n as f32 - 1.0)).round() as usize).min(n - 1);
+                                (s.frames[idx].clone(), s.frames[idx].size_vec2(), frac)
+                            };
+                            self.video_hover_frac = frac; // mirror into the Details preview
+                            let fit = fit_centered(rect.shrink(8.0), sz);
+                            let ppp = ctx.pixels_per_point();
+                            let bp = ui.painter_at(rect);
+                            self.paint_transparency_backdrop(&bp, fit, ppp);
+                            ui.painter().image(
+                                tex.id(),
+                                fit,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                            // A thin scrub-position bar along the tile bottom.
+                            let pr = ui.painter_at(rect);
+                            let y = rect.bottom() - 6.0;
+                            let (lx, rx2) = (rect.left() + 8.0, rect.right() - 8.0);
+                            pr.line_segment(
+                                [egui::pos2(lx, y), egui::pos2(rx2, y)],
+                                egui::Stroke::new(2.0, egui::Color32::from_gray(70)),
+                            );
+                            let px = lx + (rx2 - lx) * frac;
+                            pr.line_segment(
+                                [egui::pos2(px, y - 3.0), egui::pos2(px, y + 3.0)],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 235)),
+                            );
+                            self.want_repaint = true;
                         } else if self.hover_anim.as_ref().is_some_and(|a| &a.path == path) {
                             // Play the hovered GIF in its own tile.
                             let a = self.hover_anim.as_ref().unwrap();
@@ -13669,6 +14977,12 @@ impl PixelView {
                             }
                             if let Some(tex) = tex {
                                 let fit = fit_centered(rect.shrink(8.0), tex.size_vec2());
+                                // Show the transparency backdrop (checkerboard / solid colour)
+                                // through any alpha, exactly like the viewer. Opaque thumbnails
+                                // cover it entirely, so photos look unchanged.
+                                let ppp = ctx.pixels_per_point();
+                                let bp = ui.painter_at(rect);
+                                self.paint_transparency_backdrop(&bp, fit, ppp);
                                 ui.painter().image(
                                     tex.id(),
                                     fit,
@@ -13710,6 +15024,10 @@ impl PixelView {
                                     } else {
                                         self.colo_thumbs.request(path, &p.tn_url, THUMB_PX, false);
                                     }
+                                } else if let Some(v) = self.yt_videos.get(path) {
+                                    // YouTube result → fetch its i.ytimg.com thumbnail over HTTP.
+                                    self.colo_thumbs
+                                        .request(path, &v.thumb_url, THUMB_PX, false);
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -13723,6 +15041,36 @@ impl PixelView {
                                     egui::Color32::from_gray(130),
                                 );
                                 self.want_repaint = true;
+                            }
+
+                            // Video tiles show a real frame; mark them with a ▶ pill
+                            // (bottom-right, the one free corner) so they read as video.
+                            if !entry.is_dir && is_video_ext(path) {
+                                let p = ui.painter_at(rect);
+                                let r = (tile * 0.10).clamp(9.0, 15.0);
+                                let c = rect.right_bottom() + egui::vec2(-(r + 5.0), -(r + 5.0));
+                                p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+                                p.text(
+                                    c + egui::vec2(r * 0.12, 0.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "▶",
+                                    egui::FontId::proportional(r * 1.15),
+                                    egui::Color32::from_white_alpha(235),
+                                );
+                                // A YouTube result that's already downloaded → a green ⬇ badge
+                                // (bottom-left of the ▶) so you can see what's cached locally.
+                                if self.yt_videos.contains_key(path) && self.yt_is_downloaded(path)
+                                {
+                                    let dc = c + egui::vec2(-(2.0 * r + 4.0), 0.0);
+                                    p.circle_filled(dc, r, egui::Color32::from_rgb(40, 160, 70));
+                                    p.text(
+                                        dc,
+                                        egui::Align2::CENTER_CENTER,
+                                        icons::DOWNLOAD.to_string(),
+                                        egui::FontId::proportional(r * 1.1),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
                             }
                         }
 
@@ -13842,8 +15190,18 @@ impl PixelView {
                             let local_dir = Self::is_local_path(&entry.path);
                             let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                             if let Some(pick) = entry_context_menu(
-                                ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece,
-                                &openers, &facts, local_dir, bulk_dir,
+                                ui,
+                                &entry,
+                                can_paste,
+                                pinned,
+                                viewed,
+                                colo_pin,
+                                colo_piece,
+                                &openers,
+                                &facts,
+                                local_dir,
+                                bulk_dir,
+                                selected_videos,
                             ) {
                                 match pick {
                                     TilePick::Pin => pin_dir = Some(idx),
@@ -13862,6 +15220,8 @@ impl PixelView {
                                     TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                     TilePick::RenderBlend => render_blend = Some(idx),
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
+                                    TilePick::JoinVideos => join_sel = true,
+                                    TilePick::OpenInBrowser => open_in_browser = Some(idx),
                                 }
                             }
                         });
@@ -13952,6 +15312,14 @@ impl PixelView {
         if let Some(idx) = export_blend {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.export_blend_render(&p);
+            }
+        }
+        if join_sel {
+            self.join_selected_videos();
+        }
+        if let Some(i) = open_in_browser {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_yt_in_browser(&p);
             }
         }
         if pin_current {
@@ -14275,6 +15643,9 @@ impl PixelView {
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
+        let mut join_sel = false; // "Join videos" (uses the current selection)
+        let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
+        let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -14769,8 +16140,18 @@ impl PixelView {
                         let local_dir = Self::is_local_path(&entry.path);
                         let bulk_dir = self.bulk_job_for_path(&entry.path).is_some();
                         if let Some(pick) = entry_context_menu(
-                            ui, &entry, can_paste, pinned, viewed, colo_pin, colo_piece, &openers,
-                            &facts, local_dir, bulk_dir,
+                            ui,
+                            &entry,
+                            can_paste,
+                            pinned,
+                            viewed,
+                            colo_pin,
+                            colo_piece,
+                            &openers,
+                            &facts,
+                            local_dir,
+                            bulk_dir,
+                            selected_videos,
                         ) {
                             match pick {
                                 TilePick::Pin => pin_dir = Some(idx),
@@ -14789,6 +16170,8 @@ impl PixelView {
                                 TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                 TilePick::RenderBlend => render_blend = Some(idx),
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
+                                TilePick::JoinVideos => join_sel = true,
+                                TilePick::OpenInBrowser => open_in_browser = Some(idx),
                             }
                         }
                     });
@@ -14927,6 +16310,14 @@ impl PixelView {
         if let Some(idx) = export_blend {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.export_blend_render(&p);
+            }
+        }
+        if join_sel {
+            self.join_selected_videos();
+        }
+        if let Some(i) = open_in_browser {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_yt_in_browser(&p);
             }
         }
         if pin_current {
@@ -15144,6 +16535,14 @@ impl PixelView {
 
         // In immersive (F11) mode the controls row is hidden too, for a fully black screen.
         let immersive = self.immersive;
+
+        // Video: transport (play/pause, seek, speed, PNG/audio/markers) + the frame.
+        if self.video_player.is_some() {
+            if let Some(forward) = self.draw_video_ui(ctx, ui) {
+                self.step_image(ctx, forward);
+            }
+            return;
+        }
 
         // Animated GIF: a controls row (play/pause, seek, frame info) + the frame.
         if self.anim.is_some() {
@@ -17845,9 +19244,7 @@ impl PixelView {
     /// listings, mounted archives (a disposable temp dir), and flat-piece listings.
     fn is_local_dir(&self) -> bool {
         match &self.folder {
-            Some(f) => {
-                self.archive_mount.is_none() && !self.colo_flat && !crate::sixteen::is_remote(f)
-            }
+            Some(f) => self.archive_mount.is_none() && !self.colo_flat && !any_remote(f),
             None => false,
         }
     }
@@ -17855,7 +19252,7 @@ impl PixelView {
     /// A path points at a real local folder we can run a folder action on (local pins /
     /// grid folder tiles). Virtual 16colo paths have nothing to reveal in a file manager.
     fn is_local_path(path: &Path) -> bool {
-        !crate::sixteen::is_remote(path)
+        !any_remote(path)
     }
 
     /// The display label for a pin: the user's custom rename if set, else `short_name`.
@@ -18900,6 +20297,7 @@ impl PixelView {
                             (0u8, "Local"),
                             (4, "PixelFX"),
                             (1, "16colo"),
+                            (5, "YouTube"),
                             (2, "Kits"),
                             (3, "Samples"),
                         ] {
@@ -18919,12 +20317,8 @@ impl PixelView {
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
                         }
-                        if let Some(p) = self.favorites_buttons(
-                            ui,
-                            "📁",
-                            |p| !crate::sixteen::is_remote(p),
-                            false,
-                        ) {
+                        if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
+                        {
                             nav = Some(p);
                         }
                         // Smart filters: saved searches. Click recalls + runs; right-click
@@ -18960,6 +20354,39 @@ impl PixelView {
                             ui,
                             icons::GLOBE,
                             crate::sixteen::is_remote,
+                            false,
+                        ) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 5 {
+                        // YouTube: a search box + pinned searches/tags/videos (like 16colo).
+                        // Search + thumbnails need only network; playback needs yt-dlp + the Video plugin.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.yt_search)
+                                    .hint_text("search YouTube…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.yt_search.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(
+                                        Path::new(crate::youtube::ROOT)
+                                            .join(crate::youtube::SEARCH)
+                                            .join(q),
+                                    );
+                                }
+                            }
+                        });
+                        if !crate::youtube::available() {
+                            ui.weak("yt-dlp not found — install it for playback");
+                        }
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            icons::GLOBE,
+                            crate::youtube::is_remote,
                             false,
                         ) {
                             nav = Some(p);
@@ -19800,6 +21227,68 @@ impl eframe::App for PixelView {
             }
             self.want_repaint = true;
         }
+        // Video transport hotkeys (only when a video is open + not typing).
+        if !typing && self.video_player.is_some() {
+            // Space = play/pause; Shift+Space = restart from the beginning.
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                let shift = ctx.input(|i| i.modifiers.shift);
+                if let Some(vp) = &mut self.video_player {
+                    if shift {
+                        vp.seek(0.0);
+                        vp.set_playing(true);
+                    } else {
+                        vp.toggle();
+                    }
+                }
+                self.want_repaint = true;
+            }
+            // Scrub jumps: Home/1 = start, 2 = 25%, 3 = 50%, 4 = end. Consumed (input_mut) so 1-4
+            // don't ALSO set a star rating and Home doesn't scroll the frame.
+            let dur = self
+                .video_player
+                .as_ref()
+                .map(|vp| vp.duration())
+                .unwrap_or(0.0);
+            let target = ctx.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                let n = Modifiers::NONE;
+                if i.consume_key(n, Key::Home) || i.consume_key(n, Key::Num1) {
+                    Some(0.0)
+                } else if i.consume_key(n, Key::Num2) {
+                    Some(dur * 0.25)
+                } else if i.consume_key(n, Key::Num3) {
+                    Some(dur * 0.5)
+                } else if i.consume_key(n, Key::Num4) {
+                    Some((dur - 0.1).max(0.0)) // just shy of the end so a frame still shows
+                } else {
+                    None
+                }
+            });
+            if let Some(t) = target {
+                if let Some(vp) = &mut self.video_player {
+                    vp.seek(t);
+                }
+                self.want_repaint = true;
+            }
+            // m = place a marker; i / o = set trim In / Out — all at the current position.
+            let pos_now = self
+                .video_player
+                .as_ref()
+                .map(|vp| vp.position())
+                .unwrap_or(0.0);
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M)) {
+                self.append_video_marker(pos_now);
+                self.want_repaint = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
+                self.set_trim_in(pos_now);
+                self.want_repaint = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O)) {
+                self.set_trim_out(pos_now);
+                self.want_repaint = true;
+            }
+        }
         // Shift+Esc — PANIC: stop all audio + every pad voice (kills a runaway looping pad / all
         // MIDI notes). Works globally when a player exists; plain Esc still goes Back to grid.
         if !typing
@@ -19859,11 +21348,14 @@ impl eframe::App for PixelView {
         self.poll_random();
         self.poll_colo_pieces();
         self.poll_colo_open(&ctx);
+        self.poll_yt();
+        self.poll_yt_open(&ctx);
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
+        self.poll_video_load(ctx.input(|i| i.stable_dt)); // background video open → build player
         self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
                                                                // Screensaver: once a (random) pack has finished downloading + mounting, open its
                                                                // first art file. Both async ops idle ⇒ the listing has settled.
@@ -20272,6 +21764,7 @@ impl eframe::App for PixelView {
         });
 
         self.paint_audio_loading_overlay(&ctx);
+        self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
 
         if self.show_hotkeys {
@@ -20512,12 +22005,42 @@ impl eframe::App for PixelView {
                                          + an interactive 3D viewer (rotate / zoom / pan / WASD)",
                                     )
                                     .changed();
+                                plug_changed |= ui
+                                    .checkbox(&mut self.plugin_video, "Video")
+                                    .on_hover_text(
+                                        "MP4 / MKV / WEBM / MOV / … — a frame thumbnail + an \
+                                         in-app player (play / seek / speed / volume / PNG export). \
+                                         Needs ffmpeg on PATH.",
+                                    )
+                                    .changed();
                                 if plug_changed {
                                     self.registry.set_plugin("code", self.plugin_code);
                                     self.registry.set_plugin("pdf", self.plugin_pdf);
                                     self.registry.set_plugin("audio", self.plugin_audio);
                                     self.registry.set_plugin("3d", self.plugin_3d);
+                                    self.registry.set_plugin("video", self.plugin_video);
                                     prefs_refresh = true; // re-scan so the listing adds/drops those types
+                                }
+
+                                // Where downloaded YouTube videos are stored (they get large —
+                                // point this at an external drive if you like). Separate from cache.
+                                if self.plugin_video {
+                                    ui.add_space(8.0);
+                                    ui.label("YouTube downloads");
+                                    let cur = self.yt_cache_dir();
+                                    ui.weak(format!("Saved to: {}", cur.display()));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Change…").clicked() {
+                                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                                self.yt_download_dir = Some(d);
+                                            }
+                                        }
+                                        if self.yt_download_dir.is_some()
+                                            && ui.button("Reset to default").clicked()
+                                        {
+                                            self.yt_download_dir = None;
+                                        }
+                                    });
                                 }
 
                                 // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
@@ -20901,6 +22424,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_AUDIO_KEY, &self.plugin_audio);
         eframe::set_value(storage, Self::PLUGIN_CODE_KEY, &self.plugin_code);
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
+        eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
+        eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -26027,6 +27552,202 @@ fn is_mesh_path(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::mesh3d::MESH_EXTS.contains(&e.as_str()))
 }
 
+/// Is `p` a video container the video plugin handles (mp4/mkv/webm/mov/…)?
+fn is_video_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::VIDEO_EXTS.contains(&e.as_str()))
+}
+
+/// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
+/// (favorites split, etc.) on a non-local path.
+fn any_remote(p: &Path) -> bool {
+    crate::sixteen::is_remote(p) || crate::youtube::is_remote(p)
+}
+
+/// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
+fn parse_yt_id(name: &str) -> Option<String> {
+    let stem = name.rsplit_once('.').map(|(a, _)| a).unwrap_or(name);
+    let start = stem.rfind('[')?;
+    let end = stem.rfind(']')?;
+    (end > start + 1).then(|| stem[start + 1..end].to_string())
+}
+
+/// YouTube search worker (mirrors `colo_walk`): run the search, emit one `Hit` per result as a
+/// virtual `Entry` (`<youtube>/search/<q>/<Title [id].mp4>`) + its `YtVideo`, then `Done(n)`.
+fn yt_walk(
+    query: &str,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<YtMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let vids = crate::youtube::search(query, 40);
+    let mut seen = std::collections::HashSet::new();
+    let mut n = 0usize;
+    for v in vids {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let mut base = sanitize_filename(&v.title);
+        if base.is_empty() {
+            base = "video".into();
+        }
+        let path = root.join(format!("{base} [{}].mp4", v.id));
+        if !seen.insert(path.clone()) {
+            continue; // de-dupe identical title+id
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(YtMsg::Hit(entry, Box::new(v))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(YtMsg::Done(n));
+}
+
+/// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
+/// and a leading `[`/`(` are tolerated. `None` if any component isn't a number.
+fn parse_timecode(s: &str) -> Option<f32> {
+    let s = s
+        .trim()
+        .trim_start_matches(['[', '('])
+        .trim_end_matches([']', ')']);
+    let nums: Option<Vec<f32>> = s.split(':').map(|p| p.trim().parse::<f32>().ok()).collect();
+    match nums?.as_slice() {
+        [s] => Some(*s),
+        [m, s] => Some(m * 60.0 + s),
+        [h, m, s] => Some(h * 3600.0 + m * 60.0 + s),
+        _ => None,
+    }
+}
+
+/// Format seconds → `h:mm:ss` (or `m:ss` under an hour) — YouTube-chapter style, so the `.md`
+/// sidecar pastes straight into a video description.
+fn format_timecode(secs: f32) -> String {
+    let t = secs.max(0.0).round() as u64;
+    let (h, m, s) = (t / 3600, (t % 3600) / 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The `.md` marker sidecar for a video (`clip.mp4` → `clip.md`).
+fn video_markers_path(video: &Path) -> PathBuf {
+    video.with_extension("md")
+}
+
+/// One chapter marker: a timecode + a title (the YouTube-chapter line) plus free-form **notes**
+/// (the lines beneath it in the `.md`, for logging footage). See `load_video_markers`.
+#[derive(Clone, Default)]
+struct VideoMarker {
+    secs: f32,
+    title: String,
+    notes: String,
+}
+
+/// A line counts as a marker (not a note) when it has **no leading whitespace** and its first
+/// token (after optional `-`/`*`/`#` bullets) parses as a timecode. Returns `(secs, title)`.
+fn parse_marker_line(line: &str) -> Option<(f32, String)> {
+    if line.starts_with([' ', '\t']) {
+        return None; // indented → a note, not a marker
+    }
+    let stripped = line.trim_start_matches(['-', '*', '#', ' ']);
+    let mut it = stripped.splitn(2, char::is_whitespace);
+    let secs = it.next().and_then(parse_timecode)?;
+    Some((secs, it.next().unwrap_or("").trim().to_string()))
+}
+
+/// Load markers from the video's `.md` sidecar. A timecode line starts a marker (its title = the
+/// rest); the lines beneath it (until the next timecode line) are that marker's **notes**. Any
+/// text before the first marker is returned as the `header` (preserved on save). YouTube-chapter
+/// compatible: the timecode lines paste straight into a video description.
+fn load_video_markers(video: &Path) -> (String, Vec<VideoMarker>) {
+    let Ok(text) = std::fs::read_to_string(video_markers_path(video)) else {
+        return (String::new(), Vec::new());
+    };
+    let mut header: Vec<&str> = Vec::new();
+    let mut markers: Vec<VideoMarker> = Vec::new();
+    let mut notes: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if let Some((secs, title)) = parse_marker_line(line) {
+            // Flush the previous marker's notes (trimmed of surrounding blanks).
+            if let Some(m) = markers.last_mut() {
+                while notes.first().is_some_and(|l| l.trim().is_empty()) {
+                    notes.remove(0);
+                }
+                while notes.last().is_some_and(|l| l.trim().is_empty()) {
+                    notes.pop();
+                }
+                m.notes = notes.join("\n");
+            }
+            notes.clear();
+            markers.push(VideoMarker {
+                secs,
+                title,
+                notes: String::new(),
+            });
+        } else if markers.is_empty() {
+            header.push(line);
+        } else {
+            notes.push(line);
+        }
+    }
+    if let Some(m) = markers.last_mut() {
+        while notes.first().is_some_and(|l| l.trim().is_empty()) {
+            notes.remove(0);
+        }
+        while notes.last().is_some_and(|l| l.trim().is_empty()) {
+            notes.pop();
+        }
+        m.notes = notes.join("\n");
+    }
+    markers.sort_by(|a, b| {
+        a.secs
+            .partial_cmp(&b.secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (header.join("\n").trim().to_string(), markers)
+}
+
+/// Write markers back to the `.md` sidecar (YouTube-chapter format + notes beneath each). The
+/// preserved `header` (if any) leads. Called on every marker edit so the log stays on disk.
+fn save_video_markers(video: &Path, header: &str, markers: &[VideoMarker]) -> std::io::Result<()> {
+    let mut s = String::new();
+    let h = header.trim_end();
+    if !h.is_empty() {
+        s.push_str(h);
+        s.push_str("\n\n");
+    }
+    for m in markers {
+        s.push_str(&format_timecode(m.secs));
+        let title = m.title.trim();
+        if !title.is_empty() {
+            s.push(' ');
+            s.push_str(title);
+        }
+        s.push('\n');
+        let notes = m.notes.trim_end();
+        if !notes.is_empty() {
+            s.push_str(notes);
+            s.push('\n');
+        }
+        s.push('\n'); // blank line between markers
+    }
+    std::fs::write(video_markers_path(video), s)
+}
+
 /// Is `p` a saved sample-pad kit (`.pvkit`)? Clicking one loads it into the pad grid.
 fn is_kit_ext(p: &Path) -> bool {
     p.extension()
@@ -26920,6 +28641,8 @@ enum TilePick {
     CompareDiff,           // "Compare ▸ Set as diff" — this file becomes the right pane
     RenderBlend,           // ".blend" → render frame 1 with headless Blender → becomes its tile
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
+    JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
+    OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
 }
 
 /// A user-defined external program registered to open files of certain types ("open in
@@ -27351,6 +29074,7 @@ fn entry_context_menu(
     folder_actions: &[OpenerItem],  // "Open folder in…" actions (shown for local dirs)
     local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
     bulk_dir: bool, // a 16colo artist/group/pack folder → offer "Download all pieces…"
+    selected_videos: usize, // count of currently-selected local video files (≥2 → offer Join)
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -27524,6 +29248,18 @@ fn entry_context_menu(
         });
         ui.separator();
     }
+    // YouTube result: open its watch page in the OS default browser (always works, no download).
+    if !entry.is_dir && crate::youtube::is_remote(&entry.path) {
+        if ui
+            .button(format!("{} Open in browser", icons::GLOBE))
+            .on_hover_text("Open this video's YouTube page in your browser")
+            .clicked()
+        {
+            pick = Some(TilePick::OpenInBrowser);
+            ui.close();
+        }
+        ui.separator();
+    }
     // Compare (files only): mark this file as the "source" (left) or "diff" (right)
     // pane of the side-by-side compare view. Setting both opens the comparison.
     if !entry.is_dir {
@@ -27537,6 +29273,21 @@ fn entry_context_menu(
                 ui.close();
             }
         });
+        ui.separator();
+    }
+    // Join (lossless): when ≥2 videos are selected, offer to concat them into one clip.
+    if !entry.is_dir && selected_videos >= 2 && is_video_ext(&entry.path) {
+        if ui
+            .button(format!("Join {selected_videos} videos (lossless)…"))
+            .on_hover_text(
+                "Concatenate the selected videos into one clip in view order \
+                 (ffmpeg -f concat -c copy; best when they share codec/size)",
+            )
+            .clicked()
+        {
+            pick = Some(TilePick::JoinVideos);
+            ui.close();
+        }
         ui.separator();
     }
     // Star rating (files only) — same effect as the 0-5 hotkeys, shown alongside each
@@ -28210,6 +29961,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::AUDIO_EXTS.contains(&x.as_str())
                 || crate::decode::mesh3d::MESH_EXTS.contains(&x.as_str())
                 || crate::decode::mesh3d::AUX_EXTS.contains(&x.as_str())
+                || crate::decode::VIDEO_EXTS.contains(&x.as_str())
         }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.

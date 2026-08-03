@@ -27,6 +27,7 @@ mod rip;
 mod rip_chr;
 mod svg;
 mod tundra;
+pub mod video; // video containers (mp4/mkv/webm/…) → ffmpeg frame grab + ffprobe metadata
 mod xbin;
 mod xcf;
 mod xmind;
@@ -53,6 +54,10 @@ pub use pdf::{pdf_meta, render_page as render_pdf_page, PdfMeta};
 /// Audio metadata (duration / sample rate / channels / codec) + the extension list, for
 /// the Details pane and `is_image_ext`.
 pub use audio::{audio_info, AudioInfo, AUDIO_EXTS};
+
+/// Video metadata (duration / fps / dimensions / codec) + the extension list + a single-frame
+/// grabber, for the Details pane, `is_image_ext`, and the interactive player's PNG export.
+pub use video::{grab_frame as grab_video_frame, probe as probe_video, VideoInfo, VIDEO_EXTS};
 
 /// XMind mind-map sheet titles + a per-sheet renderer (with a resolution knob for the
 /// pseudo-vector zoom re-render), for the in-app multi-sheet viewer.
@@ -95,6 +100,7 @@ pub struct Registry {
     audio_on: std::sync::atomic::AtomicBool,
     code_on: std::sync::atomic::AtomicBool,
     mesh_on: std::sync::atomic::AtomicBool,
+    video_on: std::sync::atomic::AtomicBool,
 }
 
 impl Registry {
@@ -105,6 +111,7 @@ impl Registry {
             audio_on: std::sync::atomic::AtomicBool::new(true),
             code_on: std::sync::atomic::AtomicBool::new(true),
             mesh_on: std::sync::atomic::AtomicBool::new(true),
+            video_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
@@ -127,6 +134,7 @@ impl Registry {
                 Box::new(mesh3d::MeshDecoder), // .obj/.stl/.ply/.gltf/.glb/.dae → CPU-shaded tile
                 Box::new(mesh3d::MtlDecoder),  // .mtl → material colour swatches
                 Box::new(mesh3d::BlendDecoder), // .blend/.blend1 → placeholder (open in Blender)
+                Box::new(video::VideoDecoder), // mp4/mkv/webm/… → ffmpeg frame grab (path-routed)
                 Box::new(builtin::ImageCrateDecoder), // png/gif/bmp/jpeg/webp/tga/tiff/pnm/qoi
             ],
         }
@@ -141,6 +149,7 @@ impl Registry {
             "audio" => self.audio_on.store(on, Relaxed),
             "code" => self.code_on.store(on, Relaxed),
             "3d" => self.mesh_on.store(on, Relaxed),
+            "video" => self.video_on.store(on, Relaxed),
             _ => {}
         }
     }
@@ -153,6 +162,7 @@ impl Registry {
             || (!self.code_on.load(Relaxed) && code::CODE_EXTS.contains(&ext))
             || (!self.mesh_on.load(Relaxed)
                 && (mesh3d::MESH_EXTS.contains(&ext) || mesh3d::AUX_EXTS.contains(&ext)))
+            || (!self.video_on.load(Relaxed) && video::VIDEO_EXTS.contains(&ext))
     }
 
     /// Does any decoder claim this extension? Used to filter a folder listing. A disabled
@@ -196,6 +206,11 @@ impl Registry {
             }
             if ext == "mtl" {
                 return caught(|| mesh3d::decode_mtl_path(path));
+            }
+            // Video is path-routed too: ffmpeg opens the file itself (no byte slice), and the
+            // tile is a real grabbed frame. `decode(bytes)` is never used for video.
+            if video::VIDEO_EXTS.contains(&ext.as_str()) {
+                return caught(|| video::decode_thumb(path, 512));
             }
         }
 

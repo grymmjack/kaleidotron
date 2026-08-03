@@ -18,8 +18,10 @@ mod sfz;
 mod sixteen;
 mod soundfont;
 mod thumb;
+mod video;
 mod viewdb;
 mod xi;
+mod youtube;
 
 use eframe::egui;
 

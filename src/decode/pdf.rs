@@ -491,7 +491,10 @@ mod tests {
         }
         let img = render_via_pdfium(&mini_pdf(), 1, 400).expect("pdfium should render page 1");
         // US Letter portrait → taller than wide; longest side ≈ the 400px request.
-        assert!(img.height > img.width, "portrait page renders taller than wide");
+        assert!(
+            img.height > img.width,
+            "portrait page renders taller than wide"
+        );
         assert!(
             img.width > 50 && img.height > 50 && img.height <= 420,
             "sane raster dimensions ({}x{})",
