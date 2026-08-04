@@ -11,8 +11,30 @@ use ab_glyph::{point, Font, FontRef, Glyph, GlyphId, ScaleFont};
 /// a fallback.
 pub const FONT_EXTS: &[&str] = &["ttf", "otf", "ttc", "otc"];
 
-/// The sample shown on the grid thumbnail (compact, recognizable across a folder of fonts).
-const THUMB_SAMPLE: &str = "AaBbCcDdEe\n0123456789\nGrymm!";
+/// The default sample shown on a font grid thumbnail (compact, recognizable across a folder of
+/// fonts). User-overridable via [`set_thumb_sample`] (Preferences → "Font preview sample").
+pub const DEFAULT_THUMB_SAMPLE: &str = "AaBbCcDdEe\n0123456789";
+
+/// The active thumbnail sample text — a process-wide rendering preference (set from the UI, primed
+/// from storage on launch), read at decode time. Same pattern as `ansi::set_font_9px`, since a
+/// `Decoder` only receives bytes, not app state. Newlines split lines on the tile.
+static THUMB_SAMPLE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Override the font-thumbnail sample text (empty ⇒ falls back to the default).
+pub fn set_thumb_sample(text: &str) {
+    let t = text.trim_end_matches(['\n', '\r']);
+    *THUMB_SAMPLE.write().unwrap() = (!t.is_empty()).then(|| t.to_string());
+}
+
+/// The current thumbnail sample (the user's override, else the default). Shared with the `.fon`
+/// bitmap-font decoder so both tile types honour the same Preferences setting.
+pub fn thumb_sample() -> String {
+    THUMB_SAMPLE
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| DEFAULT_THUMB_SAMPLE.to_string())
+}
 
 /// Parsed font metadata for the Details / viewer header.
 #[derive(Clone, Debug, Default)]
@@ -209,7 +231,7 @@ impl Decoder for FontDecoder {
         is_font(bytes)
     }
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
-        render_text(bytes, THUMB_SAMPLE, 44.0, [235, 235, 235])
+        render_text(bytes, &thumb_sample(), 44.0, [235, 235, 235])
             .ok_or(DecodeError::Unsupported)
     }
 }

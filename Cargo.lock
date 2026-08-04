@@ -3664,6 +3664,7 @@ name = "pixelview"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "arboard",
  "asefile",
  "cc",
  "eframe",
