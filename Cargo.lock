@@ -3663,6 +3663,7 @@ checksum = "ad78bf43dcf80e8f950c92b84f938a0fc7590b7f6866fbcbeca781609c115590"
 name = "pixelview"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "asefile",
  "cc",
  "eframe",
@@ -3686,6 +3687,7 @@ dependencies = [
  "serde_json",
  "symphonia 0.6.0",
  "trash",
+ "ttf-parser",
  "unarc-rs",
  "ureq",
  "xattr",
