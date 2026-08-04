@@ -3092,14 +3092,14 @@ impl PixelView {
 
     /// Scan `dir` into folder + image entries (directories first, then images,
     /// each name-sorted — the default order; Phase 5 makes this configurable).
-    /// Write the embedded TheDraw font library to a stable cache file (once) and open it as a
-    /// virtual folder — the existing archive machinery browses the 1240 bundled `.tdf` fonts, each
-    /// tile rendering the font's name, click to open in the TDF viewer.
-    fn open_bundled_tdf(&mut self) {
+    /// Open the embedded TheDraw font library (1238 `.tdf` fonts, grouped into `Outline` / `Single
+    /// Color` / `Multi-color` subfolders). `category` deep-links into one of those (None = the root,
+    /// showing all three). The zip is written to a stable cache file once, then mounted + browsed by
+    /// the existing archive machinery — each tile renders the font's name; click to open the viewer.
+    fn open_bundled_tdf(&mut self, category: Option<&str>) {
         const ZIP: &[u8] = include_bytes!("../assets/tdf/thedraw_fonts.zip");
         let dir = self.data_dir.join("bundled");
         let path = dir.join("TheDraw Fonts.zip");
-        // Extract once; re-extract if missing or a different size (e.g. after an app update).
         let need = std::fs::metadata(&path).map(|m| m.len() != ZIP.len() as u64).unwrap_or(true);
         if need {
             let _ = std::fs::create_dir_all(&dir);
@@ -3108,7 +3108,22 @@ impl PixelView {
                 return;
             }
         }
-        self.open_folder(path);
+        match category {
+            None => self.open_folder(path),
+            Some(cat) => {
+                // Extract synchronously, then browse straight into the category subfolder (so the
+                // breadcrumb still shows the archive as the mount root).
+                match crate::archive::extract_to_cache(&path) {
+                    Ok(temp_root) => {
+                        self.archive_mount =
+                            Some(ArchiveMount { archive: path.clone(), temp_root: temp_root.clone() });
+                        let sub = temp_root.join(cat);
+                        self.open_folder(if sub.is_dir() { sub } else { temp_root });
+                    }
+                    Err(e) => self.status = format!("Couldn't open the bundled fonts: {e}"),
+                }
+            }
+        }
     }
 
     fn open_folder(&mut self, dir: PathBuf) {
@@ -7031,9 +7046,12 @@ impl PixelView {
             ui.label("Preset");
             let names: Vec<String> = self.tdf_presets.iter().map(|p| p.name.clone()).collect();
             let sel = if self.tdf_preset_name.is_empty() { "— pick —".to_string() } else { self.tdf_preset_name.clone() };
+            // Let the popup grow to (almost) the full screen height when there are many presets;
+            // egui shrinks it to the content when there are few.
+            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
             egui::ComboBox::from_id_salt("tdf_preset_pick")
                 .width(220.0)
-                .height(420.0)
+                .height(max_h)
                 .selected_text(sel)
                 .show_ui(ui, |ui| {
                     for p in &self.tdf_presets {
@@ -24854,7 +24872,8 @@ impl PixelView {
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
-        let mut open_bundled_tdf = false; // "🎨 TheDraw Fonts" → mount the bundled font library
+        // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
+        let mut open_bundled_tdf: Option<Option<&'static str>> = None;
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
         let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
@@ -24934,15 +24953,26 @@ impl PixelView {
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
                         }
-                        // The bundled TheDraw font library (1240 public-domain .tdf fonts) — opens
-                        // as a virtual folder you can browse + open in the TDF viewer.
+                        // The bundled TheDraw font library (public-domain .tdf fonts) — a virtual
+                        // folder you can browse + open in the TDF viewer, plus by-type shortcuts.
                         if ui
                             .button("🎨 TheDraw Fonts")
-                            .on_hover_text("Browse the bundled library of 1240 TheDraw (.tdf) fonts")
+                            .on_hover_text("Browse the bundled library of TheDraw (.tdf) fonts — all types")
                             .clicked()
                         {
-                            open_bundled_tdf = true;
+                            open_bundled_tdf = Some(None);
                         }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.small_button("Outline").on_hover_text("Outline TheDraw fonts").clicked() {
+                                open_bundled_tdf = Some(Some("Outline"));
+                            }
+                            if ui.small_button("Single Color").on_hover_text("Single-colour (block) TheDraw fonts").clicked() {
+                                open_bundled_tdf = Some(Some("Single Color"));
+                            }
+                            if ui.small_button("Multi-color").on_hover_text("Multi-colour TheDraw fonts").clicked() {
+                                open_bundled_tdf = Some(Some("Multi-color"));
+                            }
+                        });
                         if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
                         {
                             nav = Some(p);
@@ -25916,8 +25946,8 @@ impl PixelView {
                     self.status = "Saved search to Places (click it to re-run)".into();
                 }
             }
-        } else if open_bundled_tdf {
-            self.open_bundled_tdf();
+        } else if let Some(cat) = open_bundled_tdf {
+            self.open_bundled_tdf(cat);
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
