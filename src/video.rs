@@ -211,9 +211,6 @@ impl Sound {
     fn pause(&self) {
         self.player.pause();
     }
-    fn resume(&self) {
-        self.player.play();
-    }
     fn apply_volume(&self) {
         self.player.set_volume(self.effective_volume());
     }

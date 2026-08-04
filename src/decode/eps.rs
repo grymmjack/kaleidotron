@@ -54,7 +54,9 @@ pub fn render_eps(bytes: &[u8], dpi: u32) -> Option<PixImage> {
     img
 }
 
-/// Is `gs` on PATH? (Gates whether EPS renders vs shows a placeholder.)
+/// Is `gs` on PATH? (Gates whether EPS renders vs shows a placeholder.) Used by the tests + a
+/// future "install ghostscript" hint.
+#[allow(dead_code)]
 pub fn gs_available() -> bool {
     Command::new("gs")
         .arg("--version")

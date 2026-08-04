@@ -44,9 +44,6 @@ pub struct FontInfo {
     pub glyphs: u16,
     pub monospace: bool,
     pub units_per_em: u16,
-    pub regular: bool,
-    pub bold: bool,
-    pub italic: bool,
 }
 
 /// True if `bytes` looks like a TrueType/OpenType font (magic in the first 4 bytes).
@@ -82,9 +79,6 @@ pub fn font_info(bytes: &[u8]) -> Option<FontInfo> {
         glyphs: face.number_of_glyphs(),
         monospace: face.is_monospaced(),
         units_per_em: face.units_per_em(),
-        regular: face.is_regular(),
-        bold: face.is_bold(),
-        italic: face.is_italic(),
     })
 }
 

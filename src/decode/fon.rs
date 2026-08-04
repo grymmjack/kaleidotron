@@ -35,7 +35,6 @@ pub struct FonFace {
     pub name: String,
     pub points: u16,
     pub height: usize, // pixel cell height
-    pub ascent: usize,
     pub glyphs: Vec<FonGlyph>, // dfFirstChar..=dfLastChar (CP437/ANSI byte → char)
 }
 
@@ -80,7 +79,6 @@ fn parse_fnt(b: &[u8], base: usize) -> Option<FonFace> {
         return None; // bit 0 set = vector font (stroke glyphs, not bitmaps) — unsupported
     }
     let points = le16(b, base + 0x44);
-    let ascent = le16(b, base + 0x4A) as usize;
     let pix_height = le16(b, base + 0x58) as usize;
     let first = b[base + 0x5F];
     let last = b[base + 0x60];
@@ -133,7 +131,7 @@ fn parse_fnt(b: &[u8], base: usize) -> Option<FonFace> {
             String::new()
         }
     };
-    Some(FonFace { name, points, height: pix_height, ascent, glyphs })
+    Some(FonFace { name, points, height: pix_height, glyphs })
 }
 
 /// Decode a fixed-width row-major bitmap font into a face: `count` glyphs, each `bpg` bytes tall
@@ -165,7 +163,7 @@ fn face_from_rows(
         }
         glyphs.push(FonGlyph { ch: byte_to_char(i as u8), w: width, bits });
     }
-    (!glyphs.is_empty()).then(|| FonFace { name: name.into(), points, height, ascent: height, glyphs })
+    (!glyphs.is_empty()).then(|| FonFace { name: name.into(), points, height, glyphs })
 }
 
 /// PC Screen Font (PSF1 magic `36 04`, or PSF2 magic `72 b5 4a 86`) — Linux console bitmap fonts.
@@ -195,7 +193,7 @@ fn parse_psf(b: &[u8]) -> Option<FonFace> {
 
 /// A raw fixed-width dump (`.f16`/`.f08`): `256 × bytes-per-glyph`, 8px wide, row-major.
 fn parse_raw(b: &[u8]) -> Option<FonFace> {
-    if b.len() < 256 || b.len() % 256 != 0 {
+    if b.len() < 256 || !b.len().is_multiple_of(256) {
         return None;
     }
     let bpg = b.len() / 256;
