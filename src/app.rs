@@ -23027,6 +23027,81 @@ impl PixelView {
         }
     }
 
+    /// The file currently open in a single-file viewer (image / font / PDF / GIF / audio / video /
+    /// 3D / compare), for the universal status-bar "Open in…" menu. `None` in the grid + kit editor.
+    fn current_open_file(&self) -> Option<PathBuf> {
+        if self.kit_editor {
+            return None;
+        }
+        match self.mode {
+            Mode::Single => self
+                .full_tex
+                .as_ref()
+                .map(|(p, _)| p.clone())
+                .or_else(|| self.anim.as_ref().map(|a| a.path.clone()))
+                .or_else(|| self.video_player.as_ref().map(|v| v.path.clone()))
+                .or_else(|| self.audio_player.as_ref().map(|a| a.path.clone())),
+            Mode::ThreeD => self.three_d.as_ref().map(|v| v.path.clone()),
+            Mode::Compare => self.compare_diff.clone().or_else(|| self.compare_source.clone()),
+            Mode::Grid => None,
+        }
+    }
+
+    /// A reusable "📂 Open in…" menu for `path` — the configured associations for its extension,
+    /// plus the OS default app + a one-off "Other program…". Drop into any viewer toolbar / the
+    /// status bar. Applies the pick itself (it's `&mut self`, not an egui closure).
+    fn open_in_button(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        // Snapshot the matching openers up front so the menu closure needn't borrow `self`.
+        let openers: Vec<OpenerItem> = self
+            .opener_items()
+            .into_iter()
+            .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == &ext))
+            .collect();
+        let mut pick: Option<usize> = None;
+        let mut other = false;
+        let mut default = false;
+        ui.menu_button("📂 Open in…", |ui| {
+            for o in &openers {
+                if ui.button(&o.name).clicked() {
+                    pick = Some(o.idx);
+                    ui.close();
+                }
+            }
+            if !openers.is_empty() {
+                ui.separator();
+            }
+            if ui.button("➡ Default app").clicked() {
+                default = true;
+                ui.close();
+            }
+            if ui.button("Other program…").clicked() {
+                other = true;
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Open this file in a configured program (set up in View → Associations…)");
+        if let Some(oi) = pick {
+            if let Some(o) = self.openers.get(oi).cloned() {
+                self.open_external_for(path.to_path_buf(), o.exec, o.args, o.env);
+            }
+        }
+        if default {
+            self.open_in_default_app(path);
+        }
+        if other {
+            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+                let exec = exec.to_string_lossy().to_string();
+                self.open_external_for(path.to_path_buf(), exec, String::new(), String::new());
+            }
+        }
+    }
+
     /// Decode any not-yet-cached opener icons into small textures (cheap: cached by path,
     /// `None` on failure so we don't re-decode every frame). Drives the menu + editor icons.
     /// Covers both file "Open in…" openers and folder actions (they share `opener_icons`).
@@ -23266,10 +23341,19 @@ impl PixelView {
     /// Right (flush): the zoom readout + hint that used to live in the top toolbar.
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            // The file open in the current viewer (any single-file mode) → the universal
+            // "Open in…" menu below. Computed before the closure (which borrows self mutably).
+            let open_file = self.current_open_file();
             // Reserve the flush-right group FIRST (right-to-left), then fill the
             // remaining space with the left group — so a long left line truncates
             // instead of colliding with the zoom readout (the old overlap bug).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Universal "Open in…" (configured associations) for whatever's open — works in the
+                // image / font / TDF / FON / PDF / audio / video / 3D viewers alike.
+                if let Some(p) = open_file.clone() {
+                    self.open_in_button(ui, &p);
+                    ui.separator();
+                }
                 match self.mode {
                     Mode::Single => {
                         // The full zoom/pan hint used to sit here permanently, eating
