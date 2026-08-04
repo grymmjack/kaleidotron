@@ -82,21 +82,29 @@ fn type_label(t: TdfFontType) -> &'static str {
     }
 }
 
-/// Rasterise `text` in font `index` of the file → a `PixImage` (black background, VGA colours).
-/// `extra_spacing` adjusts the inter-glyph gap in cells (negative overlaps letters). `font_9px`
-/// renders the authentic 9-dot VGA cell (like the ANSI viewer). `None` if nothing drawable.
-pub fn render_tdf(
-    bytes: &[u8],
-    index: usize,
-    text: &str,
-    extra_spacing: i32,
-    line_gap: i32,
-    font_9px: bool,
-) -> Option<PixImage> {
+/// Rendering options for the TDF viewer (grouped so callers don't juggle a long arg list).
+#[derive(Clone, Copy)]
+pub struct TdfOpts {
+    pub spacing: i32,   // inter-glyph gap delta (negative overlaps)
+    pub line_gap: i32,  // vertical gap between multi-line rows
+    pub font_9px: bool, // render the 9-dot VGA cell
+    pub fg: u8,         // single-colour (outline/block) foreground palette index 0-15
+    pub bg: u8,         // single-colour background palette index 0-15 (colour fonts ignore both)
+    pub top_down: bool, // multi-line overlap order: true = earlier (upper) lines draw on top
+}
+
+impl Default for TdfOpts {
+    fn default() -> Self {
+        Self { spacing: 0, line_gap: 0, font_9px: false, fg: 15, bg: 0, top_down: true }
+    }
+}
+
+/// Rasterise `text` in font `index` of the file → a `PixImage`. `None` if nothing drawable.
+pub fn render_tdf(bytes: &[u8], index: usize, text: &str, opts: &TdfOpts) -> Option<PixImage> {
     let fonts = TdfFont::load(bytes).ok()?;
     let font = fonts.get(index)?;
-    let (grid, w, h) = build_grid_lh(font, text, extra_spacing, line_gap)?;
-    Some(rasterize(&grid, w, h, font_9px))
+    let (grid, w, h) = build_grid_lh(font, text, opts)?;
+    Some(rasterize(&grid, w, h, opts.font_9px))
 }
 
 /// SAUCE metadata for the ANSI export (so editors like Moebius/PabloDraw open the canvas at the
@@ -117,12 +125,11 @@ pub fn tdf_to_ansi(
     bytes: &[u8],
     index: usize,
     text: &str,
-    extra_spacing: i32,
-    line_gap: i32,
+    opts: &TdfOpts,
     sauce: &AnsiSauce,
 ) -> Option<Vec<u8>> {
     let fonts = TdfFont::load(bytes).ok()?;
-    let (grid, w, h) = build_grid_lh(fonts.get(index)?, text, extra_spacing, line_gap)?;
+    let (grid, w, h) = build_grid_lh(fonts.get(index)?, text, opts)?;
     let mut out = grid_to_ansi(&grid, w, h);
     append_ansi_sauce(&mut out, w, h, sauce);
     Some(out)
@@ -200,7 +207,7 @@ pub fn render_glyph_grid(
     chars: &[char],
     cols: usize,
     cell: usize,
-    font_9px: bool,
+    opts: &TdfOpts,
 ) -> Option<(PixImage, usize)> {
     let fonts = TdfFont::load(bytes).ok()?;
     let font = fonts.get(index)?;
@@ -211,10 +218,13 @@ pub fn render_glyph_grid(
     let (gw, gh) = (cols * cell, rows * cell);
     let mut px = vec![[0u8, 0, 0, 255]; gw * gh];
     let pad = 4usize; // breathing room + implicit cell separation
+    // Force a black background here (bg=0) so the near-black skip below leaves gaps transparent;
+    // keep the picked fg + 9px so each glyph matches the preview's ink colour.
+    let gopts = TdfOpts { bg: 0, spacing: 0, line_gap: 0, ..*opts };
     for (i, &ch) in chars.iter().enumerate() {
         let (cx, cy) = ((i % cols) * cell, (i / cols) * cell);
-        let Some((grid, w, h)) = build_grid(font, &ch.to_string(), 0) else { continue };
-        let img = rasterize(&grid, w, h, font_9px);
+        let Some((grid, w, h)) = build_grid(font, &ch.to_string(), &gopts) else { continue };
+        let img = rasterize(&grid, w, h, gopts.font_9px);
         let (iw, ih) = (img.width as usize, img.height as usize);
         if iw == 0 || ih == 0 {
             continue;
@@ -276,19 +286,24 @@ struct Block {
 /// Lay out `text` glyph-by-glyph into a CP437 cell grid. Glyphs are top-aligned; the inter-glyph
 /// gap is the font's own `spacing` plus `extra_spacing` (may be **negative** → letters overlap;
 /// later ink draws over earlier, transparent cells don't erase). Returns `(grid, cols, rows)`.
-fn build_grid(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cell>, usize, usize)> {
-    build_grid_lh(font, text, extra_spacing, 0)
+fn build_grid(font: &TdfFont, text: &str, opts: &TdfOpts) -> Option<(Vec<Cell>, usize, usize)> {
+    build_grid_lh(font, text, opts)
+}
+
+/// The background cell for a render — a colour font stays on black; a single-colour (outline/block)
+/// font fills with the picked `bg` so an fg/bg pick tints the whole canvas.
+fn bg_cell(font: &TdfFont, opts: &TdfOpts) -> Cell {
+    if font.font_type == TdfFontType::Color {
+        Cell::BLANK
+    } else {
+        Cell { ch: b' ', fg: opts.fg & 0x0f, bg: opts.bg & 0x0f, ink: false }
+    }
 }
 
 /// Multi-line layout: each `\n`-separated line is rendered as its own row of TheDraw letters and
 /// stacked vertically, with `line_gap` extra blank cell-rows between lines (may be **negative** to
-/// tighten). Empty lines add a blank line-height of vertical space.
-fn build_grid_lh(
-    font: &TdfFont,
-    text: &str,
-    extra_spacing: i32,
-    line_gap: i32,
-) -> Option<(Vec<Cell>, usize, usize)> {
+/// tighten). `top_down` chooses which line wins where they overlap.
+fn build_grid_lh(font: &TdfFont, text: &str, opts: &TdfOpts) -> Option<(Vec<Cell>, usize, usize)> {
     let lines: Vec<&str> = text.split('\n').collect();
     // The natural line height = the tallest glyph the font defines (so blank lines match).
     let line_h = (33u8..=126)
@@ -299,18 +314,23 @@ fn build_grid_lh(
         .max(1);
     // Build each line's own grid.
     let built: Vec<(Vec<Cell>, usize, usize)> =
-        lines.iter().map(|l| build_line(font, l, extra_spacing).unwrap_or((Vec::new(), 1, line_h))).collect();
+        lines.iter().map(|l| build_line(font, l, opts).unwrap_or((Vec::new(), 1, line_h))).collect();
     if built.iter().all(|(_, _, h)| *h == 0) {
         return None;
     }
     let total_w = built.iter().map(|(_, w, _)| *w).max().unwrap_or(1).max(1);
     // Uniform line pitch = the font's line height + line_gap (clamped so it stays ≥ 1 row).
     let n = built.len();
-    let pitch = (line_h as i32 + line_gap).max(1);
+    let pitch = (line_h as i32 + opts.line_gap).max(1);
     let total_h = (line_h as i32 + pitch * (n.saturating_sub(1)) as i32).max(1) as usize;
 
-    let mut grid = vec![Cell::BLANK; total_w * total_h];
-    for (i, (cells, w, h)) in built.iter().enumerate() {
+    let blank = bg_cell(font, opts);
+    let mut grid = vec![blank; total_w * total_h];
+    // Draw order: `top_down` draws the LAST line first so line 0 (top) overwrites in an overlap;
+    // otherwise the last line lands on top.
+    let order: Vec<usize> = if opts.top_down { (0..n).rev().collect() } else { (0..n).collect() };
+    for &i in &order {
+        let (cells, w, h) = &built[i];
         let y0 = i as i32 * pitch;
         for ry in 0..*h {
             let gy = y0 + ry as i32;
@@ -318,7 +338,7 @@ fn build_grid_lh(
                 continue;
             }
             for cx in 0..*w {
-                let cell = cells.get(ry * w + cx).copied().unwrap_or(Cell::BLANK);
+                let cell = cells.get(ry * w + cx).copied().unwrap_or(blank);
                 if cell.ink || cell.bg != 0 {
                     grid[gy as usize * total_w + cx] = cell;
                 }
@@ -329,8 +349,12 @@ fn build_grid_lh(
 }
 
 /// Lay out a SINGLE line of TheDraw letters → `(cells, cols, rows)`.
-fn build_line(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cell>, usize, usize)> {
-    let gap = (font.spacing.clamp(0, 40) + extra_spacing).max(-64); // allow overlap, bound it
+fn build_line(font: &TdfFont, text: &str, opts: &TdfOpts) -> Option<(Vec<Cell>, usize, usize)> {
+    let gap = (font.spacing.clamp(0, 40) + opts.spacing).max(-64); // allow overlap, bound it
+    // Single-colour (outline/block) glyphs use the picked fg/bg; colour fonts keep per-cell colour.
+    let color_font = font.font_type == TdfFontType::Color;
+    let (gfg, gbg) = if color_font { (15u8, 0u8) } else { (opts.fg & 0x0f, opts.bg & 0x0f) };
+    let blank = bg_cell(font, opts);
 
     let mut blocks: Vec<Block> = Vec::new();
     for ch in text.chars() {
@@ -342,23 +366,22 @@ fn build_line(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cel
             blocks.push(Block { rows: Vec::new(), width: 3 });
             continue;
         };
-        let color = font.font_type == TdfFontType::Color;
         let mut rows: Vec<Vec<Cell>> = vec![Vec::new()];
         let push = |rows: &mut Vec<Vec<Cell>>, cell: Cell| rows.last_mut().unwrap().push(cell);
         for part in &glyph.parts {
             match part {
                 GlyphPart::NewLine => rows.push(Vec::new()),
                 GlyphPart::EndMarker => {}
-                GlyphPart::Skip => push(&mut rows, Cell::BLANK),
+                GlyphPart::Skip => push(&mut rows, blank),
                 GlyphPart::HardBlank | GlyphPart::FillMarker | GlyphPart::OutlineHole => {
-                    push(&mut rows, Cell { ch: b' ', ink: false, ..Cell::BLANK })
+                    push(&mut rows, Cell { ink: false, ..blank })
                 }
                 GlyphPart::OutlinePlaceholder(b) => {
                     let uc = transform_outline(OUTLINE_STYLE, *b);
-                    push(&mut rows, Cell { ch: unicode_to_cp437(uc), fg: 15, bg: 0, ink: true })
+                    push(&mut rows, Cell { ch: unicode_to_cp437(uc), fg: gfg, bg: gbg, ink: true })
                 }
                 GlyphPart::Char(c) => {
-                    push(&mut rows, Cell { ch: unicode_to_cp437(*c), fg: 15, bg: 0, ink: true })
+                    push(&mut rows, Cell { ch: unicode_to_cp437(*c), fg: gfg, bg: gbg, ink: true })
                 }
                 GlyphPart::AnsiChar { ch, fg, bg, .. } => push(
                     &mut rows,
@@ -376,7 +399,6 @@ fn build_line(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cel
             rows.pop();
         }
         let width = glyph.width.max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-        let _ = color; // color already applied per-cell above
         blocks.push(Block { rows, width });
     }
     if blocks.is_empty() {
@@ -399,7 +421,7 @@ fn build_line(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cel
     let total_w = (right + 1).max(1) as usize;
     let total_h = blocks.iter().map(|b| b.rows.len()).max().unwrap_or(1).max(1);
 
-    let mut grid = vec![Cell::BLANK; total_w * total_h];
+    let mut grid = vec![blank; total_w * total_h];
     for (b, &p) in blocks.iter().zip(&positions) {
         for (ry, row) in b.rows.iter().enumerate() {
             for (cx, cell) in row.iter().enumerate() {
@@ -502,7 +524,7 @@ impl Decoder for TdfDecoder {
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
         let fonts = TdfFont::load(bytes).map_err(|e| DecodeError::Malformed(e.to_string()))?;
         let font = fonts.first().ok_or(DecodeError::Unsupported)?;
-        let (grid, w, h) = build_grid(font, &sample_text(font), 0).ok_or(DecodeError::Unsupported)?;
+        let (grid, w, h) = build_grid(font, &sample_text(font), &TdfOpts::default()).ok_or(DecodeError::Unsupported)?;
         Ok(rasterize(&grid, w, h, false))
     }
 }
@@ -547,7 +569,7 @@ mod dump {
             for (i, (fname, ty, gc)) in fonts.iter().enumerate() {
                 eprintln!("  [{i}] {fname:?} ({ty}, {gc} glyphs)");
             }
-            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", 0, 0, false) {
+            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", &TdfOpts { spacing: 0, line_gap: 0, font_9px: false, ..Default::default() }) {
                 let out = format!("/tmp/tdf_{}.png", name.replace('.', "_"));
                 let buf: Vec<u8> = img.rgba_bytes().to_vec();
                 image::save_buffer(&out, &buf, img.width, img.height, image::ColorType::Rgba8).unwrap();
@@ -566,12 +588,12 @@ mod export_tests {
         let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
         let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
         // .ans export non-empty + starts with an SGR escape
-        let ans = tdf_to_ansi(&bytes, 0, "AB", 0, 0, &AnsiSauce::default()).unwrap();
+        let ans = tdf_to_ansi(&bytes, 0, "AB", &TdfOpts { spacing: 0, line_gap: 0, ..Default::default() }, &AnsiSauce::default()).unwrap();
         eprintln!("ans {} bytes, head: {:?}", ans.len(), &ans[..ans.len().min(12)]);
         assert!(ans.windows(2).any(|w| w == b"\x1b["));
         // overlap spacing shrinks the render width
-        let w0 = render_tdf(&bytes, 0, "AB", 0, 0, false).unwrap().width;
-        let wn = render_tdf(&bytes, 0, "AB", -4, 0, false).unwrap().width;
+        let w0 = render_tdf(&bytes, 0, "AB", &TdfOpts { spacing: 0, line_gap: 0, font_9px: false, ..Default::default() }).unwrap().width;
+        let wn = render_tdf(&bytes, 0, "AB", &TdfOpts { spacing: -4, line_gap: 0, font_9px: false, ..Default::default() }).unwrap().width;
         eprintln!("width normal={w0} overlap={wn}");
         assert!(wn < w0);
         // .tdf export re-loads as a font
@@ -593,8 +615,8 @@ mod grid_test {
         let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
         let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
         // 8px vs 9px width delta
-        let w8 = render_tdf(&bytes, 0, "WWW", 0, 0, false).unwrap().width;
-        let w9 = render_tdf(&bytes, 0, "WWW", 0, 0, true).unwrap().width;
+        let w8 = render_tdf(&bytes, 0, "WWW", &TdfOpts { spacing: 0, line_gap: 0, font_9px: false, ..Default::default() }).unwrap().width;
+        let w9 = render_tdf(&bytes, 0, "WWW", &TdfOpts { spacing: 0, line_gap: 0, font_9px: true, ..Default::default() }).unwrap().width;
         eprintln!("width 8px={w8} 9px={w9}");
         assert!(w9 > w8);
         // coverage + grid
@@ -602,7 +624,7 @@ mod grid_test {
         let defined = cov.iter().filter(|(_,d)| *d).count();
         eprintln!("coverage {defined}/{}", cov.len());
         let chars: Vec<char> = cov.iter().map(|(c,_)| *c).collect();
-        if let Some((img,rows)) = render_glyph_grid(&bytes, 0, &chars, 16, 48, false) {
+        if let Some((img,rows)) = render_glyph_grid(&bytes, 0, &chars, 16, 48, &TdfOpts::default()) {
             image::save_buffer("/tmp/tdf_grid.png", &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8).unwrap();
             eprintln!("grid {rows} rows → /tmp/tdf_grid.png {}x{}", img.width, img.height);
         }
@@ -618,14 +640,14 @@ mod sauce_multiline {
         let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
         let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
         // multi-line: 2 lines should be taller than 1 line
-        let h1 = render_tdf(&bytes, 0, "AB", 0, 0, false).unwrap().height;
-        let h2 = render_tdf(&bytes, 0, "AB\nCD", 0, 2, false).unwrap().height;
+        let h1 = render_tdf(&bytes, 0, "AB", &TdfOpts { spacing: 0, line_gap: 0, font_9px: false, ..Default::default() }).unwrap().height;
+        let h2 = render_tdf(&bytes, 0, "AB\nCD", &TdfOpts { spacing: 0, line_gap: 2, font_9px: false, ..Default::default() }).unwrap().height;
         eprintln!("height 1-line={h1} 2-line={h2}");
         assert!(h2 > h1 + 5);
         // SAUCE on the ANS
         let sauce = AnsiSauce { title: "bbs main menu", author: "", group: "pixel-viewer",
             comment: "Created by pixel-viewer https://github.com/grymmjack/pixel-viewer", date: "20260804" };
-        let ans = tdf_to_ansi(&bytes, 0, "WW", 0, 0, &sauce).unwrap();
+        let ans = tdf_to_ansi(&bytes, 0, "WW", &TdfOpts { spacing: 0, line_gap: 0, ..Default::default() }, &sauce).unwrap();
         // last 128 bytes = SAUCE record
         let rec = &ans[ans.len()-128..];
         assert_eq!(&rec[0..7], b"SAUCE00");
@@ -641,3 +663,30 @@ mod sauce_multiline {
     }
 }
 
+
+#[cfg(test)]
+mod color_test {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn single_color_fg_bg() {
+        let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
+        // find a block/outline (single-color) font
+        for name in ["ALPHAX.TDF","CALVIN_S.TDF"] {
+            let Ok(bytes) = std::fs::read(format!("{dir}/{name}")) else { continue };
+            let fonts = TdfFont::load(&bytes).unwrap();
+            let idx = fonts.iter().position(|f| f.font_type != TdfFontType::Color);
+            let Some(i) = idx else { continue };
+            let green = TdfOpts { fg: 2, bg: 1, ..Default::default() }; // green on blue
+            let img = render_tdf(&bytes, i, "A", &green).unwrap();
+            let px = img.rgba_bytes();
+            let has_green = px.chunks_exact(4).any(|p| p[1] > 120 && p[0] < 80 && p[2] < 80);
+            let has_blue = px.chunks_exact(4).any(|p| p[2] > 120 && p[0] < 80 && p[1] < 80);
+            eprintln!("{name} font {i} ({:?}): green_ink={has_green} blue_bg={has_blue}", fonts[i].font_type);
+            assert!(has_green, "expected green ink");
+            assert!(has_blue, "expected blue bg");
+            image::save_buffer("/tmp/tdf_color.png", &px, img.width, img.height, image::ColorType::Rgba8).unwrap();
+            return;
+        }
+    }
+}
