@@ -190,3 +190,19 @@ Continuing the font work from user feedback:
   VGA→SGR colour fix; round-trips through our own ANSI decoder), **💾 TDF** (the selected font as a
   standalone `.tdf` via retrofont's serializer). All persisted (`tdf_spacing`/`tdf_zoom`).
 - 286 tests pass; export round-trips unit-verified (`ans_and_tdf_export_roundtrip`).
+
+### Fixes + "Open in…" for any file (branch `font-and-search-fixes`)
+Three from user testing:
+- **Recolor didn't auto-apply to fonts/TDF** (had to navigate away+back). Cause: the sample cache
+  key used `pipeline_key()`, which covers adjustments/dither/post-FX but NOT the *palette* selection
+  (that lives in `active_recolor`). Added a cheap `&self` `recolor_ident()` (custom / selected .gpl /
+  reduce) to all three font-viewer sample keys → picking a palette now invalidates + re-renders live.
+- **Free image search returned nothing.** The backend was fine (verified 10 live "skull" results
+  through ureq); `poll_img` broke on `Err(Empty)` WITHOUT setting `want_repaint`, so once the initial
+  input frames settled the repaint loop died and the async results never drained (they'd only appear
+  on the next mouse move). Fixed: `want_repaint = true` while pending (matches the other pollers) +
+  `img_rx`/`img_open_rx` folded into `net_busy` (busy spinner) + kick at search start.
+- **"Open in…" association button in the Details pane** — a `📂 Open in…` menu listing the configured
+  programs for the file's extension (+ "Other program…"), so a `.ans` opens straight into PabloDraw /
+  Moebius / etc. without the right-click. Set up in View → Associations…
+- 286 tests pass.

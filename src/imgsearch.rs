@@ -207,3 +207,21 @@ mod tests {
         assert_eq!(enc("blue sky!"), "blue%20sky%21");
     }
 }
+
+#[cfg(test)]
+mod live {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn live_search_skull() {
+        match search("skull", 10) {
+            Ok(v) => {
+                eprintln!("got {} results", v.len());
+                for r in v.iter().take(3) {
+                    eprintln!("  {} | {} | {}", r.title, r.thumb_url, r.img_url);
+                }
+            }
+            Err(e) => eprintln!("ERROR: {e}"),
+        }
+    }
+}
