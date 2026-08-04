@@ -6894,8 +6894,9 @@ impl PixelView {
             fg: self.tdf_fg,
             bg: self.tdf_bg,
             top_down: self.tdf_top_down,
-            // The recolor pane's selected palette (so a colour choice on a colour font is recalled).
-            palette: self.selected_palette.as_ref().map(|p| self.to_display(p).display().to_string()),
+            // Full recolor snapshot (palette / adjustments / dither / post-FX) so recolouring a
+            // colour font — e.g. cyan → green — is saved and restored on recall.
+            fx: Some(self.capture_fx_preset(String::new())),
         };
         if let Some(slot) = self.tdf_presets.iter_mut().find(|p| p.name == name) {
             *slot = preset;
@@ -6926,8 +6927,11 @@ impl PixelView {
         self.tdf_fg = preset.fg & 0x0f;
         self.tdf_bg = preset.bg & 0x0f;
         self.tdf_top_down = preset.top_down;
-        // Restore the Recolor pane's palette choice (single-choice: a .gpl, else clear to no remap).
-        self.selected_palette = preset.palette.as_ref().map(PathBuf::from);
+        // Restore the whole Recolor pane (so a recoloured colour font comes back as saved).
+        if let Some(fx) = &preset.fx {
+            let fx = fx.clone();
+            self.apply_fx_preset(&fx);
+        }
         self.tdf_preset_name = preset.name.clone();
         self.tdf_sample_tex = None;
         self.tdf_grid_tex = None;
@@ -28688,7 +28692,8 @@ struct TdfPreset {
     #[serde(default = "default_true")]
     top_down: bool, // multi-line overlap order
     #[serde(default)]
-    palette: Option<String>, // the Recolor pane's selected .gpl (so a colour choice is recalled)
+    fx: Option<FxPreset>, // a full snapshot of the Recolor pane (palette/adjust/dither/…) — so a
+                          // colour font recoloured green (or any recolour) is restored on recall
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
