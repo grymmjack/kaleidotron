@@ -1414,6 +1414,7 @@ pub struct PixelView {
     tdf_index: usize,                              // selected font
     tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample|recolor"
     tdf_spacing: i32,   // TDF letter-spacing delta (negative overlaps), persisted
+    tdf_line_gap: i32,  // TDF line-height delta between multi-line rows (negative tightens), persisted
     tdf_zoom: f32,      // TDF preview zoom multiplier, persisted
     tdf_font_9px: bool, // TDF: render the 9-dot VGA cell (like the ANSI viewer), persisted
     tdf_crt: bool,      // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
@@ -1913,6 +1914,7 @@ impl PixelView {
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
+    const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
     const TDF_9PX_KEY: &'static str = "tdf_font_9px";
     const TDF_CRT_KEY: &'static str = "tdf_crt";
@@ -2793,6 +2795,11 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<i32>(s, Self::TDF_SPACING_KEY))
                 .unwrap_or(0)
+                .clamp(-40, 40),
+            tdf_line_gap: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::TDF_LINE_GAP_KEY))
+                .unwrap_or(1)
                 .clamp(-40, 40),
             tdf_zoom: cc
                 .storage
@@ -6933,18 +6940,24 @@ impl PixelView {
                 want_tdf = true;
             }
         });
+        // Multi-line: each line of the sample becomes its own row of TheDraw letters.
         let changed = ui
             .add(
                 egui::TextEdit::multiline(&mut self.font_sample)
-                    .desired_rows(1)
-                    .desired_width(f32::INFINITY),
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("type here — press Enter for a new TDF line"),
             )
             .changed();
-        // Letter-spacing (negative = overlap) + preview zoom + VGA rendering toggles.
+        // Letter-spacing + line-height + preview zoom + VGA rendering toggles.
         ui.horizontal_wrapped(|ui| {
             ui.label("Spacing");
             ui.add(egui::Slider::new(&mut self.tdf_spacing, -20..=20).show_value(true))
                 .on_hover_text("Adjust inter-letter gap; negative overlaps letters");
+            ui.separator();
+            ui.label("Line height");
+            ui.add(egui::Slider::new(&mut self.tdf_line_gap, -20..=40).show_value(true))
+                .on_hover_text("Vertical gap between multi-line rows; negative tightens / overlaps");
             ui.separator();
             ui.label("Zoom");
             ui.add(egui::Slider::new(&mut self.tdf_zoom, 0.25..=8.0).show_value(true).suffix("×"));
@@ -6955,6 +6968,7 @@ impl PixelView {
                 .on_hover_text("Stretch ~1.2× vertically for the 4:3 CRT look (display only)");
             if ui.small_button("Reset").clicked() {
                 self.tdf_spacing = 0;
+                self.tdf_line_gap = 1;
                 self.tdf_zoom = 1.0;
             }
         });
@@ -6966,7 +6980,7 @@ impl PixelView {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_font_9px) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
@@ -6989,9 +7003,9 @@ impl PixelView {
         if want_tdf {
             self.export_tdf_file();
         }
-        let key = format!("{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_font_9px, self.pipeline_key(), self.recolor_ident());
+        let key = format!("{}|{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px, self.pipeline_key(), self.recolor_ident());
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_font_9px) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -7137,7 +7151,7 @@ impl PixelView {
 
     /// Save the current TDF sample render as a PNG beside the font file and report the path.
     fn export_tdf_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing, self.tdf_font_9px)
+        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px)
             .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
@@ -7179,10 +7193,41 @@ impl PixelView {
     }
 
     /// Export the rendered TDF text as ANSI art (`.ans`) via a save dialog.
+    /// SAUCE metadata for an ANSI export: `(title, comment, date CCYYMMDD)`. Credits pixel-viewer +
+    /// names the source TheDraw font.
+    fn tdf_ansi_sauce(&self, sample: &str) -> (String, String, String) {
+        let title: String = sample.lines().next().unwrap_or("").chars().take(35).collect();
+        let font = self.tdf_fonts.get(self.tdf_index).map(|(n, _, _)| n.clone()).unwrap_or_default();
+        let fname = self
+            .tdf_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let comment = format!(
+            "Created by pixel-viewer https://github.com/grymmjack/pixel-viewer — TheDraw font '{font}' ({fname})"
+        );
+        let date = date_ymd_unix(unix_now()).replace('-', ""); // YYYY-MM-DD → CCYYMMDD
+        (title, comment, date)
+    }
+
     fn export_tdf_ans(&mut self, sample: &str) {
-        let Some(bytes) =
-            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
-        else {
+        let (title, comment, date) = self.tdf_ansi_sauce(sample);
+        let sauce = crate::decode::tdf::AnsiSauce {
+            title: &title,
+            author: "",
+            group: "pixel-viewer",
+            comment: &comment,
+            date: &date,
+        };
+        let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
+            &self.tdf_bytes,
+            self.tdf_index,
+            sample,
+            self.tdf_spacing,
+            self.tdf_line_gap,
+            &sauce,
+        ) else {
             self.status = "Nothing to export.".into();
             return;
         };
@@ -7200,9 +7245,22 @@ impl PixelView {
     /// (`exec`/`args`/`env` from a configured `.ans` association, or a one-off pick). Lets you
     /// send TheDraw art straight into PabloDraw / Moebius / an ANSI editor.
     fn open_tdf_ans_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
-        let Some(bytes) =
-            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
-        else {
+        let (title, comment, date) = self.tdf_ansi_sauce(sample);
+        let sauce = crate::decode::tdf::AnsiSauce {
+            title: &title,
+            author: "",
+            group: "pixel-viewer",
+            comment: &comment,
+            date: &date,
+        };
+        let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
+            &self.tdf_bytes,
+            self.tdf_index,
+            sample,
+            self.tdf_spacing,
+            self.tdf_line_gap,
+            &sauce,
+        ) else {
             self.status = "Nothing to render.".into();
             return;
         };
@@ -27078,6 +27136,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
+        eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
         eframe::set_value(storage, Self::TDF_9PX_KEY, &self.tdf_font_9px);
         eframe::set_value(storage, Self::TDF_CRT_KEY, &self.tdf_crt);
