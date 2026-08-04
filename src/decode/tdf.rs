@@ -90,20 +90,90 @@ pub fn render_tdf(
     index: usize,
     text: &str,
     extra_spacing: i32,
+    line_gap: i32,
     font_9px: bool,
 ) -> Option<PixImage> {
     let fonts = TdfFont::load(bytes).ok()?;
     let font = fonts.get(index)?;
-    let (grid, w, h) = build_grid(font, text, extra_spacing)?;
+    let (grid, w, h) = build_grid_lh(font, text, extra_spacing, line_gap)?;
     Some(rasterize(&grid, w, h, font_9px))
 }
 
-/// Encode `text` in font `index` as **ANSI art** (CP437 bytes + SGR colour codes) — a `.ans` file.
-/// Converts the cells' VGA-attribute colours to SGR order (the red↔blue / cyan↔brown swap).
-pub fn tdf_to_ansi(bytes: &[u8], index: usize, text: &str, extra_spacing: i32) -> Option<Vec<u8>> {
+/// SAUCE metadata for the ANSI export (so editors like Moebius/PabloDraw open the canvas at the
+/// right width instead of wrapping at 80, and the piece is credited to pixelview).
+#[derive(Default)]
+pub struct AnsiSauce<'a> {
+    pub title: &'a str,
+    pub author: &'a str,
+    pub group: &'a str,
+    pub comment: &'a str,
+    pub date: &'a str, // CCYYMMDD (8 chars); spaces if unknown
+}
+
+/// Encode `text` in font `index` as **ANSI art** (CP437 bytes + SGR colour codes) with a **SAUCE
+/// record** carrying the true width/height — a `.ans` file. Converts the cells' VGA-attribute
+/// colours to SGR order (the red↔blue / cyan↔brown swap).
+pub fn tdf_to_ansi(
+    bytes: &[u8],
+    index: usize,
+    text: &str,
+    extra_spacing: i32,
+    line_gap: i32,
+    sauce: &AnsiSauce,
+) -> Option<Vec<u8>> {
     let fonts = TdfFont::load(bytes).ok()?;
-    let (grid, w, h) = build_grid(fonts.get(index)?, text, extra_spacing)?;
-    Some(grid_to_ansi(&grid, w, h))
+    let (grid, w, h) = build_grid_lh(fonts.get(index)?, text, extra_spacing, line_gap)?;
+    let mut out = grid_to_ansi(&grid, w, h);
+    append_ansi_sauce(&mut out, w, h, sauce);
+    Some(out)
+}
+
+/// Append an EOF marker + optional COMNT block + a 128-byte SAUCE record describing an ANSI file
+/// of `cols`×`rows` characters (DataType 1 / FileType 1). Width in TInfo1 is what makes an editor
+/// open the canvas wide enough (the wrap fix).
+fn append_ansi_sauce(out: &mut Vec<u8>, cols: usize, rows: usize, s: &AnsiSauce) {
+    fn pad_spaces(out: &mut Vec<u8>, text: &str, n: usize) {
+        let b = text.as_bytes();
+        let take = b.len().min(n);
+        out.extend_from_slice(&b[..take]);
+        out.extend(std::iter::repeat_n(b' ', n - take));
+    }
+    let data_len = out.len() as u32; // file size of the character data (before EOF + SAUCE)
+
+    // Comment → COMNT block: up to 255 lines of exactly 64 chars.
+    let comment: Vec<&str> = if s.comment.is_empty() { Vec::new() } else { vec![s.comment] };
+    let clines: Vec<String> = comment
+        .iter()
+        .flat_map(|c| c.as_bytes().chunks(64).map(|ch| String::from_utf8_lossy(ch).into_owned()))
+        .take(255)
+        .collect();
+
+    out.push(0x1A); // Ctrl-Z EOF (SAUCE follows)
+    if !clines.is_empty() {
+        out.extend_from_slice(b"COMNT");
+        for line in &clines {
+            pad_spaces(out, line, 64);
+        }
+    }
+    out.extend_from_slice(b"SAUCE00");
+    pad_spaces(out, s.title, 35);
+    pad_spaces(out, s.author, 20);
+    pad_spaces(out, s.group, 20);
+    let date = if s.date.len() == 8 { s.date } else { "        " };
+    pad_spaces(out, date, 8);
+    out.extend_from_slice(&data_len.to_le_bytes()); // FileSize
+    out.push(1); // DataType = Character
+    out.push(1); // FileType = ANSi
+    out.extend_from_slice(&(cols.min(u16::MAX as usize) as u16).to_le_bytes()); // TInfo1 = width
+    out.extend_from_slice(&(rows.min(u16::MAX as usize) as u16).to_le_bytes()); // TInfo2 = height
+    out.extend_from_slice(&0u16.to_le_bytes()); // TInfo3
+    out.extend_from_slice(&0u16.to_le_bytes()); // TInfo4
+    out.push(clines.len() as u8); // Comments
+    out.push(0x01); // TFlags: bit0 = iCE colours (non-blink)
+    // TInfoS (22): font name, null-terminated + null-padded.
+    let font = b"IBM VGA";
+    out.extend_from_slice(font);
+    out.extend(std::iter::repeat_n(0u8, 22 - font.len()));
 }
 
 /// Export font `index` as a standalone `.tdf` file (via retrofont's serializer).
@@ -203,6 +273,59 @@ struct Block {
 /// gap is the font's own `spacing` plus `extra_spacing` (may be **negative** → letters overlap;
 /// later ink draws over earlier, transparent cells don't erase). Returns `(grid, cols, rows)`.
 fn build_grid(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cell>, usize, usize)> {
+    build_grid_lh(font, text, extra_spacing, 0)
+}
+
+/// Multi-line layout: each `\n`-separated line is rendered as its own row of TheDraw letters and
+/// stacked vertically, with `line_gap` extra blank cell-rows between lines (may be **negative** to
+/// tighten). Empty lines add a blank line-height of vertical space.
+fn build_grid_lh(
+    font: &TdfFont,
+    text: &str,
+    extra_spacing: i32,
+    line_gap: i32,
+) -> Option<(Vec<Cell>, usize, usize)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    // The natural line height = the tallest glyph the font defines (so blank lines match).
+    let line_h = (33u8..=126)
+        .filter_map(|b| font.glyph(b as char))
+        .map(|g| g.height)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    // Build each line's own grid.
+    let built: Vec<(Vec<Cell>, usize, usize)> =
+        lines.iter().map(|l| build_line(font, l, extra_spacing).unwrap_or((Vec::new(), 1, line_h))).collect();
+    if built.iter().all(|(_, _, h)| *h == 0) {
+        return None;
+    }
+    let total_w = built.iter().map(|(_, w, _)| *w).max().unwrap_or(1).max(1);
+    // Uniform line pitch = the font's line height + line_gap (clamped so it stays ≥ 1 row).
+    let n = built.len();
+    let pitch = (line_h as i32 + line_gap).max(1);
+    let total_h = (line_h as i32 + pitch * (n.saturating_sub(1)) as i32).max(1) as usize;
+
+    let mut grid = vec![Cell::BLANK; total_w * total_h];
+    for (i, (cells, w, h)) in built.iter().enumerate() {
+        let y0 = i as i32 * pitch;
+        for ry in 0..*h {
+            let gy = y0 + ry as i32;
+            if gy < 0 || gy as usize >= total_h {
+                continue;
+            }
+            for cx in 0..*w {
+                let cell = cells.get(ry * w + cx).copied().unwrap_or(Cell::BLANK);
+                if cell.ink || cell.bg != 0 {
+                    grid[gy as usize * total_w + cx] = cell;
+                }
+            }
+        }
+    }
+    Some((grid, total_w, total_h))
+}
+
+/// Lay out a SINGLE line of TheDraw letters → `(cells, cols, rows)`.
+fn build_line(font: &TdfFont, text: &str, extra_spacing: i32) -> Option<(Vec<Cell>, usize, usize)> {
     let gap = (font.spacing.clamp(0, 40) + extra_spacing).max(-64); // allow overlap, bound it
 
     let mut blocks: Vec<Block> = Vec::new();
@@ -420,7 +543,7 @@ mod dump {
             for (i, (fname, ty, gc)) in fonts.iter().enumerate() {
                 eprintln!("  [{i}] {fname:?} ({ty}, {gc} glyphs)");
             }
-            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", 0, false) {
+            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", 0, 0, false) {
                 let out = format!("/tmp/tdf_{}.png", name.replace('.', "_"));
                 let buf: Vec<u8> = img.rgba_bytes().to_vec();
                 image::save_buffer(&out, &buf, img.width, img.height, image::ColorType::Rgba8).unwrap();
@@ -439,12 +562,12 @@ mod export_tests {
         let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
         let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
         // .ans export non-empty + starts with an SGR escape
-        let ans = tdf_to_ansi(&bytes, 0, "AB", 0).unwrap();
+        let ans = tdf_to_ansi(&bytes, 0, "AB", 0, 0, &AnsiSauce::default()).unwrap();
         eprintln!("ans {} bytes, head: {:?}", ans.len(), &ans[..ans.len().min(12)]);
         assert!(ans.windows(2).any(|w| w == b"\x1b["));
         // overlap spacing shrinks the render width
-        let w0 = render_tdf(&bytes, 0, "AB", 0, false).unwrap().width;
-        let wn = render_tdf(&bytes, 0, "AB", -4, false).unwrap().width;
+        let w0 = render_tdf(&bytes, 0, "AB", 0, 0, false).unwrap().width;
+        let wn = render_tdf(&bytes, 0, "AB", -4, 0, false).unwrap().width;
         eprintln!("width normal={w0} overlap={wn}");
         assert!(wn < w0);
         // .tdf export re-loads as a font
@@ -466,8 +589,8 @@ mod grid_test {
         let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
         let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
         // 8px vs 9px width delta
-        let w8 = render_tdf(&bytes, 0, "WWW", 0, false).unwrap().width;
-        let w9 = render_tdf(&bytes, 0, "WWW", 0, true).unwrap().width;
+        let w8 = render_tdf(&bytes, 0, "WWW", 0, 0, false).unwrap().width;
+        let w9 = render_tdf(&bytes, 0, "WWW", 0, 0, true).unwrap().width;
         eprintln!("width 8px={w8} 9px={w9}");
         assert!(w9 > w8);
         // coverage + grid
@@ -479,5 +602,37 @@ mod grid_test {
             image::save_buffer("/tmp/tdf_grid.png", &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8).unwrap();
             eprintln!("grid {rows} rows → /tmp/tdf_grid.png {}x{}", img.width, img.height);
         }
+    }
+}
+
+#[cfg(test)]
+mod sauce_multiline {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn multiline_and_sauce() {
+        let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
+        let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
+        // multi-line: 2 lines should be taller than 1 line
+        let h1 = render_tdf(&bytes, 0, "AB", 0, 0, false).unwrap().height;
+        let h2 = render_tdf(&bytes, 0, "AB\nCD", 0, 2, false).unwrap().height;
+        eprintln!("height 1-line={h1} 2-line={h2}");
+        assert!(h2 > h1 + 5);
+        // SAUCE on the ANS
+        let sauce = AnsiSauce { title: "bbs main menu", author: "", group: "pixel-viewer",
+            comment: "Created by pixel-viewer https://github.com/grymmjack/pixel-viewer", date: "20260804" };
+        let ans = tdf_to_ansi(&bytes, 0, "WW", 0, 0, &sauce).unwrap();
+        // last 128 bytes = SAUCE record
+        let rec = &ans[ans.len()-128..];
+        assert_eq!(&rec[0..7], b"SAUCE00");
+        let tinfo1 = u16::from_le_bytes([rec[96], rec[97]]);
+        let tinfo2 = u16::from_le_bytes([rec[98], rec[99]]);
+        eprintln!("SAUCE width={tinfo1} height={tinfo2} datatype={} filetype={}", rec[94], rec[95]);
+        assert_eq!(rec[94], 1); assert_eq!(rec[95], 1);
+        assert!(tinfo1 > 0 && tinfo2 > 0);
+        let title = String::from_utf8_lossy(&rec[7..42]);
+        eprintln!("title={:?}", title.trim());
+        assert!(title.starts_with("bbs main menu"));
+        assert!(ans.windows(5).any(|w| w == b"COMNT"));
     }
 }
