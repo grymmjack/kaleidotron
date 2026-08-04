@@ -83,13 +83,19 @@ fn type_label(t: TdfFontType) -> &'static str {
 }
 
 /// Rasterise `text` in font `index` of the file → a `PixImage` (black background, VGA colours).
-/// `extra_spacing` adjusts the inter-glyph gap in cells (negative overlaps letters). `None` if the
-/// file/font/text yields nothing drawable.
-pub fn render_tdf(bytes: &[u8], index: usize, text: &str, extra_spacing: i32) -> Option<PixImage> {
+/// `extra_spacing` adjusts the inter-glyph gap in cells (negative overlaps letters). `font_9px`
+/// renders the authentic 9-dot VGA cell (like the ANSI viewer). `None` if nothing drawable.
+pub fn render_tdf(
+    bytes: &[u8],
+    index: usize,
+    text: &str,
+    extra_spacing: i32,
+    font_9px: bool,
+) -> Option<PixImage> {
     let fonts = TdfFont::load(bytes).ok()?;
     let font = fonts.get(index)?;
     let (grid, w, h) = build_grid(font, text, extra_spacing)?;
-    Some(rasterize(&grid, w, h))
+    Some(rasterize(&grid, w, h, font_9px))
 }
 
 /// Encode `text` in font `index` as **ANSI art** (CP437 bytes + SGR colour codes) — a `.ans` file.
@@ -104,6 +110,66 @@ pub fn tdf_to_ansi(bytes: &[u8], index: usize, text: &str, extra_spacing: i32) -
 pub fn export_font(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
     let fonts = TdfFont::load(bytes).ok()?;
     fonts.get(index)?.to_bytes().ok()
+}
+
+/// The TheDraw character slots `'!'..='~'` (33..=126) with whether font `index` defines each —
+/// for the viewer's glyph grid ("find gaps"). `(char, is_defined, defined_count)` via the returned
+/// list + a caller `.filter(|(_,d)| *d).count()`.
+pub fn glyph_coverage(bytes: &[u8], index: usize) -> Vec<(char, bool)> {
+    let Ok(fonts) = TdfFont::load(bytes) else { return Vec::new() };
+    let Some(font) = fonts.get(index) else { return Vec::new() };
+    (33u8..=126).map(|b| (b as char, font.glyph(b as char).is_some())).collect()
+}
+
+/// Render font `index`'s glyphs for `chars` into a paged grid — each defined glyph scaled to fit a
+/// `cell`-px square (aspect-preserved, centred); undefined slots stay blank so gaps are obvious.
+/// Returns `(image, rows)`. Mirrors `font::render_glyph_grid` / `fon::render_glyph_grid`.
+pub fn render_glyph_grid(
+    bytes: &[u8],
+    index: usize,
+    chars: &[char],
+    cols: usize,
+    cell: usize,
+    font_9px: bool,
+) -> Option<(PixImage, usize)> {
+    let fonts = TdfFont::load(bytes).ok()?;
+    let font = fonts.get(index)?;
+    if chars.is_empty() || cols == 0 || cell == 0 {
+        return None;
+    }
+    let rows = chars.len().div_ceil(cols);
+    let (gw, gh) = (cols * cell, rows * cell);
+    let mut px = vec![[0u8, 0, 0, 255]; gw * gh];
+    let pad = 4usize; // breathing room + implicit cell separation
+    for (i, &ch) in chars.iter().enumerate() {
+        let (cx, cy) = ((i % cols) * cell, (i / cols) * cell);
+        let Some((grid, w, h)) = build_grid(font, &ch.to_string(), 0) else { continue };
+        let img = rasterize(&grid, w, h, font_9px);
+        let (iw, ih) = (img.width as usize, img.height as usize);
+        if iw == 0 || ih == 0 {
+            continue;
+        }
+        let avail = cell.saturating_sub(pad).max(1) as f32;
+        let scale = (avail / iw as f32).min(avail / ih as f32).clamp(0.01, 1.0);
+        let (dw, dh) = ((iw as f32 * scale) as usize, (ih as f32 * scale) as usize);
+        let (ox, oy) = (cx + (cell.saturating_sub(dw)) / 2, cy + (cell.saturating_sub(dh)) / 2);
+        let src = img.rgba_bytes();
+        for dy in 0..dh {
+            let sy = ((dy as f32 / scale) as usize).min(ih - 1);
+            for dx in 0..dw {
+                let sx = ((dx as f32 / scale) as usize).min(iw - 1);
+                let s = (sy * iw + sx) * 4;
+                // Skip near-black (the glyph background) so cells don't paint solid boxes.
+                if src[s] as u16 + src[s + 1] as u16 + src[s + 2] as u16 > 24 {
+                    let (x, y) = (ox + dx, oy + dy);
+                    if x < gw && y < gh {
+                        px[y * gw + x] = [src[s], src[s + 1], src[s + 2], 255];
+                    }
+                }
+            }
+        }
+    }
+    Some((PixImage::from_rgba(gw as u32, gh as u32, px), rows))
 }
 
 /// A representative sample string for a grid tile: the font's own name (uppercased — many TDF
@@ -261,10 +327,13 @@ fn grid_to_ansi(grid: &[Cell], cols: usize, rows: usize) -> Vec<u8> {
 }
 
 /// Blit a CP437 `(ch, fg, bg)` grid to RGBA using the embedded 8×16 VGA font + VGA palette.
-fn rasterize(grid: &[Cell], cols: usize, rows: usize) -> PixImage {
+fn rasterize(grid: &[Cell], cols: usize, rows: usize, font_9px: bool) -> PixImage {
     use super::ansi::VGA_PALETTE;
     use super::cp437_font::CP437_8X16;
-    let w = cols * FONT_W;
+    // 9-dot VGA cell: the 9th column is background for every glyph except the line-draw range
+    // 0xC0..=0xDF, where it repeats column 8 so box rules connect (mirrors `ansi::dot_on`).
+    let cell_w = if font_9px { FONT_W + 1 } else { FONT_W };
+    let w = cols * cell_w;
     let h = rows * FONT_H;
     let mut pixels = vec![[0u8, 0, 0, 255]; w * h];
     for cy in 0..rows {
@@ -275,10 +344,14 @@ fn rasterize(grid: &[Cell], cols: usize, rows: usize) -> PixImage {
             let glyph = &CP437_8X16[cell.ch as usize];
             for ry in 0..FONT_H {
                 let bits = glyph[ry];
-                for rx in 0..FONT_W {
-                    let on = (bits >> (7 - rx)) & 1 == 1;
+                for rx in 0..cell_w {
+                    let on = if rx < FONT_W {
+                        (bits >> (7 - rx)) & 1 == 1
+                    } else {
+                        (0xC0u8..=0xDFu8).contains(&cell.ch) && (bits & 1 == 1)
+                    };
                     let c = if on { fg } else { bg };
-                    pixels[(cy * FONT_H + ry) * w + (cx * FONT_W + rx)] = [c[0], c[1], c[2], 255];
+                    pixels[(cy * FONT_H + ry) * w + (cx * cell_w + rx)] = [c[0], c[1], c[2], 255];
                 }
             }
         }
@@ -303,7 +376,7 @@ impl Decoder for TdfDecoder {
         let fonts = TdfFont::load(bytes).map_err(|e| DecodeError::Malformed(e.to_string()))?;
         let font = fonts.first().ok_or(DecodeError::Unsupported)?;
         let (grid, w, h) = build_grid(font, &sample_text(font), 0).ok_or(DecodeError::Unsupported)?;
-        Ok(rasterize(&grid, w, h))
+        Ok(rasterize(&grid, w, h, false))
     }
 }
 
@@ -347,7 +420,7 @@ mod dump {
             for (i, (fname, ty, gc)) in fonts.iter().enumerate() {
                 eprintln!("  [{i}] {fname:?} ({ty}, {gc} glyphs)");
             }
-            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", 0) {
+            if let Some(img) = render_tdf(&bytes, 0, "HELLO World 123", 0, false) {
                 let out = format!("/tmp/tdf_{}.png", name.replace('.', "_"));
                 let buf: Vec<u8> = img.rgba_bytes().to_vec();
                 image::save_buffer(&out, &buf, img.width, img.height, image::ColorType::Rgba8).unwrap();
@@ -370,8 +443,8 @@ mod export_tests {
         eprintln!("ans {} bytes, head: {:?}", ans.len(), &ans[..ans.len().min(12)]);
         assert!(ans.windows(2).any(|w| w == b"\x1b["));
         // overlap spacing shrinks the render width
-        let w0 = render_tdf(&bytes, 0, "AB", 0).unwrap().width;
-        let wn = render_tdf(&bytes, 0, "AB", -4).unwrap().width;
+        let w0 = render_tdf(&bytes, 0, "AB", 0, false).unwrap().width;
+        let wn = render_tdf(&bytes, 0, "AB", -4, false).unwrap().width;
         eprintln!("width normal={w0} overlap={wn}");
         assert!(wn < w0);
         // .tdf export re-loads as a font
@@ -383,3 +456,28 @@ mod export_tests {
     }
 }
 
+
+#[cfg(test)]
+mod grid_test {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dump_9px_and_grid() {
+        let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
+        let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
+        // 8px vs 9px width delta
+        let w8 = render_tdf(&bytes, 0, "WWW", 0, false).unwrap().width;
+        let w9 = render_tdf(&bytes, 0, "WWW", 0, true).unwrap().width;
+        eprintln!("width 8px={w8} 9px={w9}");
+        assert!(w9 > w8);
+        // coverage + grid
+        let cov = glyph_coverage(&bytes, 0);
+        let defined = cov.iter().filter(|(_,d)| *d).count();
+        eprintln!("coverage {defined}/{}", cov.len());
+        let chars: Vec<char> = cov.iter().map(|(c,_)| *c).collect();
+        if let Some((img,rows)) = render_glyph_grid(&bytes, 0, &chars, 16, 48, false) {
+            image::save_buffer("/tmp/tdf_grid.png", &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8).unwrap();
+            eprintln!("grid {rows} rows → /tmp/tdf_grid.png {}x{}", img.width, img.height);
+        }
+    }
+}

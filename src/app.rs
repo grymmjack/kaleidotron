@@ -1413,8 +1413,13 @@ pub struct PixelView {
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
     tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample|recolor"
-    tdf_spacing: i32, // TDF letter-spacing delta (negative overlaps), persisted
-    tdf_zoom: f32,    // TDF preview zoom multiplier, persisted
+    tdf_spacing: i32,   // TDF letter-spacing delta (negative overlaps), persisted
+    tdf_zoom: f32,      // TDF preview zoom multiplier, persisted
+    tdf_font_9px: bool, // TDF: render the 9-dot VGA cell (like the ANSI viewer), persisted
+    tdf_crt: bool,      // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
+    tdf_page: usize,    // TDF glyph-grid page
+    #[allow(clippy::type_complexity)]
+    tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
     // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
     fon_path: Option<PathBuf>,
     fon_bytes: Vec<u8>,
@@ -1909,6 +1914,8 @@ impl PixelView {
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
+    const TDF_9PX_KEY: &'static str = "tdf_font_9px";
+    const TDF_CRT_KEY: &'static str = "tdf_crt";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2792,6 +2799,16 @@ impl PixelView {
                 .and_then(|s| eframe::get_value::<f32>(s, Self::TDF_ZOOM_KEY))
                 .unwrap_or(1.0)
                 .clamp(0.25, 8.0),
+            tdf_font_9px: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_9PX_KEY))
+                .unwrap_or(false),
+            tdf_crt: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_CRT_KEY))
+                .unwrap_or(false),
+            tdf_page: 0,
+            tdf_grid_tex: None,
             fon_path: None,
             fon_bytes: Vec::new(),
             fon_faces: Vec::new(),
@@ -6792,6 +6809,8 @@ impl PixelView {
         self.tdf_path = Some(path.to_path_buf());
         self.tdf_index = 0;
         self.tdf_sample_tex = None;
+        self.tdf_grid_tex = None;
+        self.tdf_page = 0;
         match std::fs::read(self.resolve_local(path)) {
             Ok(bytes) => {
                 self.tdf_fonts = crate::decode::tdf::font_list(&bytes);
@@ -6840,6 +6859,8 @@ impl PixelView {
                             {
                                 self.tdf_index = i;
                                 self.tdf_sample_tex = None;
+                                self.tdf_grid_tex = None;
+                                self.tdf_page = 0;
                             }
                         }
                     });
@@ -6919,14 +6940,19 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Letter-spacing (negative = overlap) + preview zoom.
-        ui.horizontal(|ui| {
+        // Letter-spacing (negative = overlap) + preview zoom + VGA rendering toggles.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Spacing");
             ui.add(egui::Slider::new(&mut self.tdf_spacing, -20..=20).show_value(true))
                 .on_hover_text("Adjust inter-letter gap; negative overlaps letters");
             ui.separator();
             ui.label("Zoom");
             ui.add(egui::Slider::new(&mut self.tdf_zoom, 0.25..=8.0).show_value(true).suffix("×"));
+            ui.separator();
+            ui.checkbox(&mut self.tdf_font_9px, "9px")
+                .on_hover_text("Render the authentic 9-dot VGA cell (box rules join), like the ANSI viewer");
+            ui.checkbox(&mut self.tdf_crt, "CRT")
+                .on_hover_text("Stretch ~1.2× vertically for the 4:3 CRT look (display only)");
             if ui.small_button("Reset").clicked() {
                 self.tdf_spacing = 0;
                 self.tdf_zoom = 1.0;
@@ -6940,7 +6966,7 @@ impl PixelView {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_font_9px) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
@@ -6963,9 +6989,9 @@ impl PixelView {
         if want_tdf {
             self.export_tdf_file();
         }
-        let key = format!("{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.pipeline_key(), self.recolor_ident());
+        let key = format!("{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_font_9px, self.pipeline_key(), self.recolor_ident());
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_font_9px) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -6978,19 +7004,129 @@ impl PixelView {
                 self.tdf_sample_tex = None;
             }
         }
+        let crt_y = if self.tdf_crt { 1.2 } else { 1.0 };
         egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
             if let Some((_, tex)) = &self.tdf_sample_tex {
-                // Explicit zoom (user slider), integer-snapped so nearest sampling stays crisp.
+                // Explicit zoom (user slider); CRT stretches Y ~1.2× (display only, texture unchanged).
                 let native = tex.size_vec2();
                 let scale = self.tdf_zoom.max(0.25);
-                ui.add(egui::Image::new((tex.id(), native * scale)));
+                let size = egui::vec2(native.x * scale, native.y * scale * crt_y);
+                ui.add(egui::Image::new((tex.id(), size)));
             } else {
                 ui.weak("(nothing to render — the font may lack these characters)");
             }
         });
+        ui.separator();
+
+        // Character grid — every TheDraw slot ('!'..='~'); defined glyphs render, gaps stay blank
+        // (a faint grey char marks each gap) so you can spot what the font is missing.
+        let cov = crate::decode::tdf::glyph_coverage(&self.tdf_bytes, self.tdf_index);
+        if !cov.is_empty() {
+            let defined = cov.iter().filter(|(_, d)| *d).count();
+            let all_chars: Vec<char> = cov.iter().map(|(c, _)| *c).collect();
+            let cols = 16usize;
+            let cell = self.font_grid_cell.round() as usize;
+            let per_page = cols * 8;
+            let pages = all_chars.len().div_ceil(per_page).max(1);
+            self.tdf_page = self.tdf_page.min(pages - 1);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Glyphs ({defined}/{} defined)", cov.len()));
+                if pages > 1 {
+                    if ui.add_enabled(self.tdf_page > 0, egui::Button::new("◀").small()).clicked() {
+                        self.tdf_page -= 1;
+                        self.tdf_grid_tex = None;
+                    }
+                    ui.weak(format!("page {}/{}", self.tdf_page + 1, pages));
+                    if ui
+                        .add_enabled(self.tdf_page + 1 < pages, egui::Button::new("▶").small())
+                        .clicked()
+                    {
+                        self.tdf_page += 1;
+                        self.tdf_grid_tex = None;
+                    }
+                }
+                ui.separator();
+                ui.label("Cell");
+                if ui
+                    .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                    .changed()
+                {
+                    self.tdf_grid_tex = None;
+                }
+            });
+            let start = self.tdf_page * per_page;
+            let end = (start + per_page).min(all_chars.len());
+            let page_chars: Vec<char> = all_chars[start..end].to_vec();
+            let gkey = format!("{}|{}|{}|{}", self.tdf_index, self.tdf_page, cell, self.tdf_font_9px);
+            if self.tdf_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+                if let Some((img, _rows)) = crate::decode::tdf::render_glyph_grid(
+                    &self.tdf_bytes,
+                    self.tdf_index,
+                    &page_chars,
+                    cols,
+                    cell,
+                    self.tdf_font_9px,
+                ) {
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [img.width as usize, img.height as usize],
+                        &img.rgba_bytes(),
+                    );
+                    let tex = ctx.load_texture("tdf_grid", color, egui::TextureOptions::NEAREST);
+                    self.tdf_grid_tex = Some((gkey, tex, cols, page_chars.clone()));
+                }
+            }
+            if let Some((_, tex, cols, chars)) = self.tdf_grid_tex.clone() {
+                let defined_set: std::collections::HashSet<char> =
+                    cov.iter().filter(|(_, d)| *d).map(|(c, _)| *c).collect();
+                egui::ScrollArea::vertical().id_salt("tdf_grid_scroll").show(ui, |ui| {
+                    let size = tex.size_vec2();
+                    let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+                    // Paint a faint char label in each *undefined* (gap) cell so it stands out.
+                    let painter = ui.painter_at(resp.rect);
+                    for (i, ch) in chars.iter().enumerate() {
+                        if defined_set.contains(ch) {
+                            continue;
+                        }
+                        let (c, r) = (i % cols, i / cols);
+                        let center = resp.rect.min
+                            + egui::vec2((c * cell) as f32 + cell as f32 / 2.0, (r * cell) as f32 + cell as f32 / 2.0);
+                        painter.text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            ch.to_string(),
+                            egui::FontId::monospace((cell as f32 * 0.4).clamp(9.0, 22.0)),
+                            egui::Color32::from_gray(70),
+                        );
+                    }
+                    if let Some(pos) = resp.hover_pos() {
+                        let local = pos - resp.rect.min;
+                        let (c, r) = ((local.x / cell as f32) as usize, (local.y / cell as f32) as usize);
+                        if c < cols {
+                            if let Some(&ch) = chars.get(r * cols + c) {
+                                let cr = egui::Rect::from_min_size(
+                                    resp.rect.min + egui::vec2((c * cell) as f32, (r * cell) as f32),
+                                    egui::vec2(cell as f32, cell as f32),
+                                );
+                                ui.painter().rect_stroke(
+                                    cr,
+                                    2.0,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let tag = if defined_set.contains(&ch) { "defined" } else { "— gap (undefined)" };
+                                resp.clone().on_hover_text(format!("{ch}   U+{:04X}   {tag}", ch as u32));
+                                if resp.clicked() {
+                                    want_copy = Some(ch.to_string());
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         if want_copy.is_some() {
-            let s = self.font_sample.clone();
+            let s = want_copy.clone().unwrap_or_default();
             ctx.copy_text(s.clone());
             self.status = format!("Copied “{}”", elide(&s, 40));
         }
@@ -7001,7 +7137,7 @@ impl PixelView {
 
     /// Save the current TDF sample render as a PNG beside the font file and report the path.
     fn export_tdf_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
+        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing, self.tdf_font_9px)
             .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
@@ -26943,6 +27079,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
+        eframe::set_value(storage, Self::TDF_9PX_KEY, &self.tdf_font_9px);
+        eframe::set_value(storage, Self::TDF_CRT_KEY, &self.tdf_crt);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
