@@ -108,3 +108,22 @@ SVG source** at a higher resolution instead of upscaling a fixed raster → cris
   (`gs`)** (EPSCrop → PNG), the poppler/ffmpeg ethos; absent `gs` → placeholder. Sniffs `%!PS`.
 - Both gated under the **PDF plugin** (document formats needing an external renderer; default off).
   Unit-tested; verified end-to-end via `--render`.
+
+### TheDraw fonts .tdf (branch `tdf-fonts`)
+The user's "and other fonts … .tdf" ask + "Add TDF next". `.tdf` = classic DOS ANSI-art figlet
+fonts; one file holds several named fonts (outline / block / colour sub-types). Rather than
+hand-parse the fiddly binary (my prototype kept misaligning the header), I depend on Mike Krüger's
+**`retrofont`** crate (same icy ecosystem as `icy_parser_core`, MIT/Apache) which fully resolves
+every glyph into a uniform `Vec<GlyphPart>` cell stream; `decode/tdf.rs` rasterises those with
+pixelview's own CP437 8×16 font + VGA palette (crisp pixel-perfect zoom, matches the other
+text-mode decoders).
+- `decode/tdf.rs`: `TdfDecoder` (sniff `0x13`+"TheDraw FONTS file"), `font_list`/`render_tdf`;
+  `render_string` walks GlyphPart (NewLine/Skip/HardBlank/FillMarker/OutlinePlaceholder→
+  `transform_outline`/Char/AnsiChar) into a `(ch,fg,bg)` grid → CP437 blit. Unicode→CP437 via a
+  reversed `CP437_TO_UNICODE`. Grid tile spells the font's own name.
+- Viewer (`draw_tdf_ui`, mirrors the TTF viewer): file-name header + **font picker** (a .tdf holds
+  N fonts) + a **type-to-sample** box (shares the persisted `font_sample`) + a big NEAREST render,
+  plus **📋 art** = export the sample as a PNG beside the file. `is_tdf_ext`, added to `is_image_ext`.
+- Verified against the user's real corpus (~1200 .tdf): ARCHANA (dripping magenta colour font),
+  4Max Colour, Thin Cyan (outline), multi-font files (ASSYLUM/THINX = 4 fonts each) all render
+  correctly. Unit-tested (sniff + Unicode round-trip) + an `#[ignore]` corpus dump. 283 tests pass.

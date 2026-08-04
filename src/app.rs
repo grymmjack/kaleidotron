@@ -1399,6 +1399,12 @@ pub struct PixelView {
     font_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "sample|size"
     #[allow(clippy::type_complexity)]
     font_grid_tex: Option<(usize, egui::TextureHandle, usize, [usize; 2])>, // (page, tex, rows, [cols,cell])
+    // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
+    tdf_path: Option<PathBuf>,
+    tdf_bytes: Vec<u8>,
+    tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
+    tdf_index: usize,                              // selected font
+    tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample"
     recolor_playback: bool, // apply the recolor pipeline to live video frames? off = raw = faster fps (persisted)
     show_fps: bool,         // overlay a UI-fps / video-fps meter on the video (persisted)
     // FPS meter accumulators (not persisted): UI repaints + displayed video frames per window.
@@ -2731,6 +2737,11 @@ impl PixelView {
             font_page: 0,
             font_sample_tex: None,
             font_grid_tex: None,
+            tdf_path: None,
+            tdf_bytes: Vec::new(),
+            tdf_fonts: Vec::new(),
+            tdf_index: 0,
+            tdf_sample_tex: None,
             recolor_playback: load_bool(Self::RECOLOR_PLAYBACK_KEY, true),
             show_fps: load_bool(Self::SHOW_FPS_KEY, false),
             fps_accum_t: 0.0,
@@ -6471,6 +6482,174 @@ impl PixelView {
         if let Some(s) = want_copy {
             ctx.copy_text(s.clone());
             self.status = format!("Copied “{}”", elide(&s, 40));
+        }
+    }
+
+    fn ensure_tdf_loaded(&mut self, path: &Path) {
+        if self.tdf_path.as_deref() == Some(path) {
+            return;
+        }
+        self.tdf_path = Some(path.to_path_buf());
+        self.tdf_index = 0;
+        self.tdf_sample_tex = None;
+        match std::fs::read(self.resolve_local(path)) {
+            Ok(bytes) => {
+                self.tdf_fonts = crate::decode::tdf::font_list(&bytes);
+                self.tdf_bytes = bytes;
+            }
+            Err(_) => {
+                self.tdf_bytes.clear();
+                self.tdf_fonts.clear();
+            }
+        }
+    }
+
+    /// TheDraw font viewer: a font picker (one .tdf holds several), a type-to-sample box (shares
+    /// the same persisted sample text as the TTF viewer), and the big rendered preview.
+    fn draw_tdf_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
+        self.ensure_tdf_loaded(path);
+        if self.tdf_bytes.is_empty() || self.tdf_fonts.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No TheDraw fonts found in this file.");
+            });
+            return;
+        }
+        self.tdf_index = self.tdf_index.min(self.tdf_fonts.len() - 1);
+        let mut want_copy: Option<String> = None;
+        let mut want_export: Option<()> = None;
+
+        // Header: file name + font picker + selected font's type/glyph-count.
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(
+                egui::RichText::new(
+                    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
+                .heading(),
+            );
+            ui.separator();
+            let n = self.tdf_fonts.len();
+            if n > 1 {
+                let cur = self.tdf_fonts[self.tdf_index].0.clone();
+                egui::ComboBox::from_id_salt("tdf_font_pick")
+                    .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
+                    .show_ui(ui, |ui| {
+                        for (i, (name, ty, gc)) in self.tdf_fonts.iter().enumerate() {
+                            if ui
+                                .selectable_label(i == self.tdf_index, format!("{name}  ({ty}, {gc})"))
+                                .clicked()
+                            {
+                                self.tdf_index = i;
+                                self.tdf_sample_tex = None;
+                            }
+                        }
+                    });
+            } else {
+                ui.strong(&self.tdf_fonts[0].0);
+            }
+            let (_, ty, gc) = &self.tdf_fonts[self.tdf_index];
+            ui.weak(format!("· {ty} · {gc} glyphs"));
+        });
+        ui.separator();
+
+        // Sample text (reuses the persisted font_sample) + actions.
+        ui.horizontal(|ui| {
+            ui.label("Sample");
+            if ui.small_button("📋 art").on_hover_text("Copy the rendered sample as a PNG path").clicked() {
+                want_export = Some(());
+            }
+            if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
+                want_copy = Some(self.font_sample.clone());
+            }
+        });
+        let changed = ui
+            .add(
+                egui::TextEdit::multiline(&mut self.font_sample)
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+
+        // Rendered preview (cached by "index|sample"). Empty sample → the font's own sample text.
+        let sample = if self.font_sample.trim().is_empty() {
+            "ABCDEFG abcdefg 0123".to_string()
+        } else {
+            self.font_sample.clone()
+        };
+        let key = format!("{}|{}", self.tdf_index, sample);
+        if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample) {
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba_bytes(),
+                );
+                // NEAREST: TDF art is CP437 pixel art — keep it crisp when the preview upscales.
+                let tex = ctx.load_texture("tdf_sample", color, egui::TextureOptions::NEAREST);
+                self.tdf_sample_tex = Some((key, tex));
+            } else {
+                self.tdf_sample_tex = None;
+            }
+        }
+        egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
+            if let Some((_, tex)) = &self.tdf_sample_tex {
+                // Fit-to-width but never below native (nearest stays integer-ish).
+                let native = tex.size_vec2();
+                let avail = ui.available_width().max(64.0);
+                let scale = (avail / native.x).clamp(1.0, 4.0);
+                ui.add(egui::Image::new((tex.id(), native * scale)));
+            } else {
+                ui.weak("(nothing to render — the font may lack these characters)");
+            }
+        });
+
+        if want_copy.is_some() {
+            let s = self.font_sample.clone();
+            ctx.copy_text(s.clone());
+            self.status = format!("Copied “{}”", elide(&s, 40));
+        }
+        if want_export.is_some() {
+            self.export_tdf_png(&sample);
+        }
+    }
+
+    /// Save the current TDF sample render as a PNG beside the font file and report the path.
+    fn export_tdf_png(&mut self, sample: &str) {
+        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample)
+        else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let base = self
+            .tdf_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "tdf".into());
+        let slug: String = sample
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(24)
+            .collect();
+        let dir = self
+            .tdf_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let mut out = dir.join(format!("{base}_{}_{slug}.png", self.tdf_index));
+        let mut n = 1;
+        while out.exists() {
+            out = dir.join(format!("{base}_{}_{slug}_{n}.png", self.tdf_index));
+            n += 1;
+        }
+        match image::save_buffer(
+            &out,
+            &img.rgba_bytes(),
+            img.width,
+            img.height,
+            image::ColorType::Rgba8,
+        ) {
+            Ok(()) => self.status = format!("Saved {}", out.display()),
+            Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
 
@@ -19463,6 +19642,11 @@ impl PixelView {
                 self.draw_font_ui(ctx, ui, &p);
                 return;
             }
+            // TheDraw font viewer (.tdf): font picker + type-to-sample + big render.
+            if is_tdf_ext(&p) {
+                self.draw_tdf_ui(ctx, ui, &p);
+                return;
+            }
         }
 
         // Video: transport (play/pause, seek, speed, PNG/audio/markers) + the frame.
@@ -30920,6 +31104,14 @@ fn is_font_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::font::FONT_EXTS.contains(&e.as_str()))
 }
 
+/// A TheDraw font file (.tdf) → the interactive TDF font viewer (picker + type-to-sample).
+fn is_tdf_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::tdf::TDF_EXTS.contains(&e.as_str()))
+}
+
 /// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
 /// (favorites split, etc.) on a non-local path.
 fn any_remote(p: &Path) -> bool {
@@ -33462,6 +33654,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::mesh3d::AUX_EXTS.contains(&x.as_str())
                 || crate::decode::VIDEO_EXTS.contains(&x.as_str())
                 || crate::decode::font::FONT_EXTS.contains(&x.as_str())
+                || crate::decode::tdf::TDF_EXTS.contains(&x.as_str())
                 || crate::decode::EPS_EXTS.contains(&x.as_str())
                 || x == "ai"
         }

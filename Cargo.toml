@@ -39,6 +39,11 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # crate only — no tokio/egui — driven into our own renderer via its CommandSink.
 # Pinned to a rev so upstream master can't break our build.
 icy_parser_core = { git = "https://github.com/mkrueger/icy_tools", rev = "68d4b4866c6b67bce0ad99d30f449bc8a8c30515" }
+# TheDraw font (.tdf) parsing — Mike Krüger's font toolkit (same icy ecosystem, MIT/Apache).
+# It fully resolves outline/block/color glyphs to a Unicode-cell model (`GlyphPart`), which
+# we rasterize with our own CP437 font + VGA palette. Default features include `tdf`; pinned
+# by rev so upstream can't break the build. See decode/tdf.rs.
+retrofont = { git = "https://github.com/mkrueger/retrofont", rev = "a7731d9", default-features = false, features = ["tdf"] }
 # Browse 16colo.rs as a virtual disk: HTTPS for the JSON API + pack-zip downloads.
 ureq = "2"
 serde_json = "1"
