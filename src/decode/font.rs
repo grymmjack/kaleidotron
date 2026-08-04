@@ -113,6 +113,52 @@ pub fn glyph_chars(bytes: &[u8]) -> Vec<char> {
     chars
 }
 
+/// Extract glyph `ch`'s outline from the font as a standalone **SVG** string (fill=`hex`, e.g.
+/// "#000000"). Font Y (up) is flipped to SVG Y (down); the viewBox spans the advance width × the
+/// em height. `None` if the font/glyph has no outline (e.g. a bitmap-only or missing glyph).
+pub fn glyph_svg(bytes: &[u8], ch: char, fill: &str) -> Option<String> {
+    let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    let gid = face.glyph_index(ch)?;
+
+    struct PathBuilder {
+        d: String,
+    }
+    impl ttf_parser::OutlineBuilder for PathBuilder {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.d.push_str(&format!("M{x} {y} "));
+        }
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.d.push_str(&format!("L{x} {y} "));
+        }
+        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+            self.d.push_str(&format!("Q{x1} {y1} {x} {y} "));
+        }
+        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+            self.d.push_str(&format!("C{x1} {y1} {x2} {y2} {x} {y} "));
+        }
+        fn close(&mut self) {
+            self.d.push_str("Z ");
+        }
+    }
+
+    let mut b = PathBuilder { d: String::new() };
+    face.outline_glyph(gid, &mut b)?; // None for glyphs with no contours (e.g. space)
+    if b.d.trim().is_empty() {
+        return None;
+    }
+    let asc = face.ascender() as f32;
+    let desc = face.descender() as f32;
+    let height = (asc - desc).max(1.0);
+    let upem = face.units_per_em() as f32;
+    let adv = face.glyph_hor_advance(gid).unwrap_or(upem as u16).max(1) as f32;
+    // `scale(1,-1)` flips font-Y (up) to SVG-Y (down); the viewBox then spans [−asc, −desc].
+    Some(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 {:.0} {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">\
+         <g transform=\"scale(1,-1)\"><path d=\"{}\" fill=\"{fill}\"/></g></svg>",
+        -asc, adv, height, adv, height, b.d.trim()
+    ))
+}
+
 /// Rasterize `text` in the font at `px` em-height into an RGBA `PixImage` (glyphs in `color` over
 /// transparent). Honors `\n`, advance widths + kerning. `None` if the font can't be parsed. The
 /// output is bounded to a sane max so a giant paste can't allocate wildly.
@@ -284,3 +330,23 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod svg_test {
+    use super::*;
+    #[test]
+    fn glyph_svg_is_valid() {
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans.ttf"] {
+            let Ok(bytes) = std::fs::read(p) else { continue };
+            let svg = glyph_svg(&bytes, 'g', "#000000").expect("g has an outline");
+            eprintln!("svg head: {}", &svg[..svg.len().min(120)]);
+            assert!(svg.contains("<path d=\"M"));
+            // re-parse via usvg to confirm it's valid SVG
+            let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default());
+            assert!(tree.is_ok(), "svg should parse");
+            // a space typically has no outline → None
+            assert!(glyph_svg(&bytes, ' ', "#000").is_none());
+            return;
+        }
+    }
+}

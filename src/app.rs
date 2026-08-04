@@ -6912,38 +6912,96 @@ impl PixelView {
                 self.font_grid_key = gkey;
             }
         }
+        let mut svg_copy: Option<char> = None;
+        let mut svg_export: Option<char> = None;
         if let Some((_, tex, rows, [cols, cell])) = self.font_grid_tex.clone() {
             egui::ScrollArea::vertical()
                 .id_salt("font_grid_scroll")
                 .show(ui, |ui| {
                     let size = egui::vec2((cols * cell) as f32, (rows * cell) as f32);
                     let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+                    // The glyph under the pointer (hover for highlight, or the interact pos so the
+                    // right-click menu targets the correct cell).
+                    let ptr = resp.hover_pos().or_else(|| ui.ctx().pointer_interact_pos());
+                    let hovered = ptr.and_then(|pos| {
+                        let local = pos - resp.rect.min;
+                        let (col, row) = ((local.x / cell as f32) as usize, (local.y / cell as f32) as usize);
+                        (col < cols).then(|| page_chars.get(row * cols + col).copied()).flatten()
+                    });
                     if let Some(pos) = resp.hover_pos() {
                         let local = pos - resp.rect.min;
-                        let col = (local.x / cell as f32) as usize;
-                        let row = (local.y / cell as f32) as usize;
-                        let idx = row * cols + col;
-                        if col < cols {
-                            if let Some(&c) = page_chars.get(idx) {
-                                let cr = egui::Rect::from_min_size(
-                                    resp.rect.min
-                                        + egui::vec2((col * cell) as f32, (row * cell) as f32),
-                                    egui::vec2(cell as f32, cell as f32),
-                                );
-                                ui.painter().rect_stroke(
-                                    cr,
-                                    2.0,
-                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
-                                    egui::StrokeKind::Inside,
-                                );
-                                resp.clone().on_hover_text(format!("{c}   U+{:04X}", c as u32));
-                                if resp.clicked() {
-                                    want_copy = Some(c.to_string());
-                                }
-                            }
+                        let (col, row) = ((local.x / cell as f32) as usize, (local.y / cell as f32) as usize);
+                        if col < cols && row * cols + col < page_chars.len() {
+                            let cr = egui::Rect::from_min_size(
+                                resp.rect.min + egui::vec2((col * cell) as f32, (row * cell) as f32),
+                                egui::vec2(cell as f32, cell as f32),
+                            );
+                            ui.painter().rect_stroke(
+                                cr,
+                                2.0,
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
+                                egui::StrokeKind::Inside,
+                            );
                         }
                     }
+                    if let Some(c) = hovered {
+                        resp.clone().on_hover_text(format!(
+                            "{c}   U+{:04X}\nclick: copy char · double-click: copy SVG · right-click: more",
+                            c as u32
+                        ));
+                        if resp.double_clicked() {
+                            svg_copy = Some(c);
+                        } else if resp.clicked() {
+                            want_copy = Some(c.to_string());
+                        }
+                    }
+                    resp.context_menu(|ui| {
+                        if let Some(c) = hovered {
+                            ui.label(format!("{c}   U+{:04X}", c as u32));
+                            ui.separator();
+                            if ui.button("Copy character").clicked() {
+                                want_copy = Some(c.to_string());
+                                ui.close();
+                            }
+                            if ui.button("Copy SVG").clicked() {
+                                svg_copy = Some(c);
+                                ui.close();
+                            }
+                            if ui.button("Export SVG…").clicked() {
+                                svg_export = Some(c);
+                                ui.close();
+                            }
+                        } else {
+                            ui.label("Hover a glyph first");
+                        }
+                    });
                 });
+        }
+
+        let hex = format!("#{:02X}{:02X}{:02X}", self.font_ink[0], self.font_ink[1], self.font_ink[2]);
+        if let Some(c) = svg_copy {
+            match crate::decode::font::glyph_svg(&self.font_bytes, c, &hex) {
+                Some(svg) => {
+                    ctx.copy_text(svg);
+                    self.status = format!("Copied SVG for “{c}”");
+                }
+                None => self.status = format!("“{c}” has no outline to copy"),
+            }
+        }
+        if let Some(c) = svg_export {
+            if let Some(svg) = crate::decode::font::glyph_svg(&self.font_bytes, c, &hex) {
+                let base = self.font_info.as_ref().map(|i| i.family.clone()).unwrap_or_default();
+                let clean: String = base.chars().map(|x| if x.is_ascii_alphanumeric() { x } else { '_' }).take(20).collect();
+                let default = format!("{clean}_U{:04X}.svg", c as u32);
+                if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+                    match std::fs::write(&p, svg) {
+                        Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                        Err(e) => self.status = format!("Export failed: {e}"),
+                    }
+                }
+            } else {
+                self.status = format!("“{c}” has no outline to export");
+            }
         }
 
         if let Some(s) = want_copy {
