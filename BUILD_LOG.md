@@ -206,3 +206,10 @@ Three from user testing:
   programs for the file's extension (+ "Other program…"), so a `.ans` opens straight into PabloDraw /
   Moebius / etc. without the right-click. Set up in View → Associations…
 - 286 tests pass.
+
+### Universal "Open in…" across all viewers (branch `universal-open-in`)
+Follow-up to the Details "Open in…": a reusable `open_in_button(ui, path)` (configured associations
+for the file's ext + Default app + Other program…) is now in the **status bar for every single-file
+viewer** — image / font / TDF / FON / PDF / GIF / audio / video / 3D / compare (`current_open_file`
+resolves the open file per `Mode`). So you can bounce whatever you're viewing into PabloDraw / an
+editor / etc. from anywhere, not just the grid right-click. 286 tests pass.
