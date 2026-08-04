@@ -107,8 +107,22 @@ impl AiCtx {
     }
 }
 
+/// A safe-for-shell filename base from a prompt: slug, truncated to `max` chars, + `_<seed>`.
+/// e.g. "a fierce dragon" seed 42 → "a-fierce-dragon_42".
+pub fn filename_base(prompt: &str, seed: i64, max: usize) -> String {
+    let mut s = slug(prompt);
+    if s.chars().count() > max {
+        s = s.chars().take(max).collect::<String>();
+        s = s.trim_end_matches('-').to_string();
+    }
+    if s.is_empty() {
+        s = "ai".into();
+    }
+    format!("{s}_{seed}")
+}
+
 /// Lower-case, non-alphanumeric → `-`, collapsed — CLI-safe.
-fn slug(s: &str) -> String {
+pub fn slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut dash = false;
     for c in s.chars() {
@@ -289,16 +303,17 @@ pub fn tool_available(tool: &AiTool) -> bool {
 /// ansimon (ANSI), pointed at the sibling repos grymmjack keeps next to pixel-viewer. Paths that
 /// don't exist are harmless — the user edits them in the AI tab.
 pub fn starter_tools(home: &Path) -> Vec<AiTool> {
-    let img_args =
-        "\"{prompt}\" --size {sw}x{sh} --seed {seed} --output-to {outdir} --name {outname}"
-            .to_string();
+    // Each generator has its OWN CLI. pixelmon takes a pixel --size; soundmon has NO --size;
+    // ansimon's --size is in CHARACTERS (not pixels), so it's left off here — add `--size bbs`
+    // etc. via a style's Args if wanted. All three accept --seed/--output-to/--name.
+    let common = "--seed {seed} --output-to {outdir} --name {outname}";
     vec![
         AiTool {
             name: "echo (test)".into(),
             exe: "bash".into(),
             dir: String::new(),
             args: format!(
-                "{} \"{{prompt}}\" --size {{sw}}x{{sh}} --seed {{seed}} --output-to {{outdir}} --name {{outname}} --delay 1",
+                "{} \"{{prompt}}\" --size {{sw}}x{{sh}} {common} --delay 1",
                 home.join("git/DRAW/DEV/ai-echo.sh").display()
             ),
             audio: false,
@@ -307,21 +322,23 @@ pub fn starter_tools(home: &Path) -> Vec<AiTool> {
             name: "pixelmon".into(),
             exe: home.join("git/pixelmon/bin/pixelmon").to_string_lossy().into_owned(),
             dir: home.join("git/pixelmon").to_string_lossy().into_owned(),
-            args: img_args.clone(),
+            args: format!("\"{{prompt}}\" --size {{sw}}x{{sh}} {common}"),
             audio: false,
         },
         AiTool {
             name: "soundmon".into(),
             exe: home.join("git/soundmon/bin/soundmon").to_string_lossy().into_owned(),
             dir: home.join("git/soundmon").to_string_lossy().into_owned(),
-            args: img_args.clone(),
+            // No --size for soundmon; add --music/--chip/--chipfx/etc via a style's Args.
+            args: format!("\"{{prompt}}\" {common} --create-dirs"),
             audio: true,
         },
         AiTool {
             name: "ansimon".into(),
             exe: home.join("git/ansimon/bin/ansimon").to_string_lossy().into_owned(),
             dir: home.join("git/ansimon").to_string_lossy().into_owned(),
-            args: img_args,
+            // ansimon --size is in CHARACTERS — omit it (defaults to 80x40); set a preset via a style.
+            args: format!("\"{{prompt}}\" {common}"),
             audio: false,
         },
     ]
@@ -356,6 +373,14 @@ mod tests {
         assert_eq!(expand("{pal:slug}", &c), "ansi-32");
         assert_eq!(expand("{unknown}", &c), ""); // unknown → empty
         assert_eq!(expand("{outdir}/{outname}", &c), "/tmp/out/draw-ai");
+    }
+
+    #[test]
+    fn filename_base_slugs_and_bounds() {
+        assert_eq!(filename_base("A Fierce Dragon!", 42, 64), "a-fierce-dragon_42");
+        assert_eq!(filename_base("", 7, 64), "ai_7");
+        let long = filename_base(&"word ".repeat(40), 1, 20);
+        assert!(long.len() <= 20 + 3 && long.ends_with("_1") && !long.contains("-_"));
     }
 
     #[test]

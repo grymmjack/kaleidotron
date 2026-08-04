@@ -1276,6 +1276,10 @@ pub struct PixelView {
     ai_gen_seed: i64,
     ai_gen_target: Option<PathBuf>, // folder to import generated files into
     ai_gen_pad: Option<usize>,      // Some(i) = load the (audio) result into pad i
+    ai_sizes: Vec<[u32; 2]>,        // editable size presets for the Generate dialog (persisted)
+    ai_gen_save_prompt_name: String, // transient — "save prompt as preset" name buffer
+    ai_gen_save_style_name: String,  // transient — "save style" name buffer
+    ai_gen_save_style_text: String,  // transient — "save style" suffix/text buffer
     // AI editor inline selections.
     ai_tool_sel: usize,
     ai_style_sel: usize,
@@ -1850,6 +1854,7 @@ impl PixelView {
     const AI_TOOLS_KEY: &'static str = "ai_tools";
     const AI_STYLES_KEY: &'static str = "ai_styles";
     const AI_PROMPTS_KEY: &'static str = "ai_prompts";
+    const AI_SIZES_KEY: &'static str = "ai_sizes";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2555,6 +2560,19 @@ impl PixelView {
             ai_gen_seed: 0,
             ai_gen_target: None,
             ai_gen_pad: None,
+            ai_sizes: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<[u32; 2]>>(s, Self::AI_SIZES_KEY))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    vec![
+                        [16, 16], [32, 32], [64, 64], [128, 128], [256, 256], [320, 200],
+                        [512, 512], [640, 400], [640, 480], [1024, 768], [1920, 1080],
+                    ]
+                }),
+            ai_gen_save_prompt_name: String::new(),
+            ai_gen_save_style_name: String::new(),
+            ai_gen_save_style_text: String::new(),
             ai_tool_sel: 0,
             ai_style_sel: 0,
             ai_prompt_sel: 0,
@@ -5177,6 +5195,44 @@ impl PixelView {
         self.set_pad(i, buf, name, source);
     }
 
+    /// Load an explicit `[start, end]` region of the current editor buffer into pad `i` — the
+    /// drag-a-selection-onto-a-pad path (the region is captured at drag-start, so it's exact even
+    /// if the live selection later changes). Falls back to `load_pad` if the region is degenerate.
+    fn load_pad_region(&mut self, i: usize, start: f32, end: f32) {
+        if i >= self.pads.len() || self.audio_player.is_none() {
+            return;
+        }
+        let editor_source = self.editor_source.clone();
+        let ap = self.audio_player.as_ref().unwrap();
+        if ap.samples.is_empty() {
+            return;
+        }
+        // A full-file (or empty) selection → the whole sample.
+        let (s, e) = if (end - start).abs() < 0.001 || (start <= 0.001 && end >= ap.duration - 0.001)
+        {
+            (0.0, ap.duration)
+        } else {
+            (start, end)
+        };
+        let buf = ap.region_buf(s, e);
+        let (name, source) = if let Some(src) = &editor_source {
+            (short_name(src), Some(src.to_string_lossy().into_owned()))
+        } else {
+            let name = ap
+                .active_sample
+                .and_then(|s| ap.tracker_samples.get(s))
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| short_name(&ap.path));
+            let source = if ap.path == kit_editor_path() {
+                None
+            } else {
+                Some(ap.path.to_string_lossy().into_owned())
+            };
+            (name, source)
+        };
+        self.set_pad(i, buf, name, source);
+    }
+
     /// Install `buf` into pad `i`: write its WAV through to disk and build the `Pad`, keeping the
     /// replaced pad's note / mix / pitch / loop-type (a fresh load resets the sample-relative loop
     /// region). Shared by the editor "⟲ load", a dropped sample file, and a dropped tracker sample.
@@ -7182,6 +7238,11 @@ impl PixelView {
         if !self.plugin_audio {
             return;
         }
+        // A video may be up — tear it down, else `ui_single` keeps drawing the video (its
+        // `video_player.is_some()` branch runs before the kit editor) and the kit is "stuck".
+        self.video_player = None;
+        self.video_loading = None;
+        self.video_tex = None;
         self.kit_editor = true;
         self.mode = Mode::Single;
         self.pad_list_focus = true; // arrows drive the Pads list right away
@@ -7882,7 +7943,9 @@ impl PixelView {
                          (No selection = the whole sample.)"
                     ));
                 if r.dragged() {
-                    egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Selection);
+                    // Capture the selection NOW (at drag-start) so a later selection change
+                    // can't make the pad load the whole sample.
+                    egui::DragAndDrop::set_payload(ui.ctx(), PadDrop::Selection(sel_lo, sel_hi));
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
             }
@@ -10829,12 +10892,12 @@ impl PixelView {
         if let Some((i, drop)) = want_drop {
             // A sample load drills into the pad afterwards (below); a pad move/swap/clone doesn't.
             let sample_load =
-                matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection);
+                matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection(..));
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
-                // The current waveform selection (trimmed) — reuses the "⟲ load" path.
-                PadDrop::Selection => self.load_pad(i),
+                // The waveform selection captured at drag-start (trimmed to exactly [s, e]).
+                PadDrop::Selection(s, e) => self.load_pad_region(i, s, e),
                 // Alt = clone the whole pad; plain = move/swap.
                 PadDrop::Pad(src) if alt_down => self.clone_pad(src, i),
                 PadDrop::Pad(src) => self.move_pad(src, i),
@@ -14266,6 +14329,77 @@ impl PixelView {
         std::env::temp_dir().join("pixelview_ai_out")
     }
 
+    /// Build the final prompt from the dialog (style prefix + prompt + suffix).
+    fn ai_final_prompt(&self) -> String {
+        let style = (self.ai_gen_style > 0)
+            .then(|| self.ai_styles.get(self.ai_gen_style - 1))
+            .flatten();
+        match style {
+            Some(s) => {
+                let mut p = String::new();
+                if !s.prefix.trim().is_empty() {
+                    p.push_str(s.prefix.trim());
+                    p.push_str(", ");
+                }
+                p.push_str(self.ai_gen_prompt.trim());
+                if !s.suffix.trim().is_empty() {
+                    p.push_str(", ");
+                    p.push_str(s.suffix.trim());
+                }
+                p
+            }
+            None => self.ai_gen_prompt.trim().to_string(),
+        }
+    }
+
+    /// The exact command Generate will run (for the dialog's Command disclosure). Uses the base
+    /// seed (batch item 1); actual runs step the seed per item.
+    fn ai_command_preview(&self) -> String {
+        let Some(tool) = self.ai_tools.get(self.ai_gen_tool) else {
+            return String::new();
+        };
+        let style = (self.ai_gen_style > 0)
+            .then(|| self.ai_styles.get(self.ai_gen_style - 1))
+            .flatten();
+        let extra = style.map(|s| s.args_extra.clone()).unwrap_or_default();
+        let seed = if let Some(s) = style.filter(|s| s.seed != 0) {
+            s.seed
+        } else {
+            self.ai_gen_seed
+        };
+        let final_prompt = self.ai_final_prompt();
+        let ctx = crate::ai::AiCtx {
+            prompt: final_prompt.clone(),
+            style: style.map(|s| s.name.clone()).unwrap_or_default(),
+            seed,
+            outdir: self.ai_out_dir().to_string_lossy().into_owned(),
+            outname: crate::ai::filename_base(&final_prompt, seed, 64),
+            iw: self.ai_gen_w,
+            ih: self.ai_gen_h,
+            sw: self.ai_gen_w,
+            sh: self.ai_gen_h,
+            ..Default::default()
+        };
+        let tmpl = if extra.trim().is_empty() {
+            tool.args.clone()
+        } else {
+            format!("{} {}", tool.args, extra)
+        };
+        let argv = crate::ai::tokenize(&crate::ai::expand(&tmpl, &ctx));
+        let mut s = tool.exe.clone();
+        for a in argv {
+            s.push(' ');
+            if a.is_empty() || a.contains(char::is_whitespace) {
+                s.push('"');
+                s.push_str(&a);
+                s.push('"');
+            } else {
+                s.push_str(&a);
+            }
+        }
+        s
+    }
+
     /// Kick off an AI generation batch on a worker: run the selected tool `count` times (seeds
     /// `seed..seed+count`), applying the selected style (prefix/suffix/args/seed-lock). Each result
     /// is imported by `poll_ai_job` (copied into the target folder, or loaded onto a pad). Refuses
@@ -14343,7 +14477,8 @@ impl PixelView {
                     style: style_name.clone(),
                     seed: seed0 + i as i64,
                     outdir: outdir.to_string_lossy().into_owned(),
-                    outname: format!("pv-{:04}", i + 1),
+                    // Safe-for-shell filename base from the prompt (≤64) + this item's seed.
+                    outname: crate::ai::filename_base(&final_prompt, seed0 + i as i64, 64),
                     iw: w,
                     ih: h,
                     sw: w,
@@ -14486,9 +14621,14 @@ impl PixelView {
         let prompts: Vec<(String, String)> =
             self.ai_prompts.iter().map(|p| (p.name.clone(), p.text.clone())).collect();
         let running = self.ai_job_rx.is_some();
+        let sizes = self.ai_sizes.clone();
+        let cmd_preview = self.ai_command_preview();
         let mut open = self.ai_gen_open;
         let mut do_gen = false;
         let mut do_cancel = false;
+        let mut save_prompt = false;
+        let mut save_style = false;
+        let mut add_size = false;
         egui::Window::new("🤖 AI — Generate")
             .open(&mut open)
             .collapsible(false)
@@ -14556,18 +14696,72 @@ impl PixelView {
                         .desired_rows(3)
                         .desired_width(f32::INFINITY),
                 );
+                // Save the current prompt as a preset.
+                ui.horizontal(|ui| {
+                    ui.weak("Save prompt:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_gen_save_prompt_name)
+                            .hint_text("preset name")
+                            .desired_width(140.0),
+                    );
+                    if ui.small_button("💾 Save").clicked() {
+                        save_prompt = true;
+                    }
+                });
+                // Save a quick style (name + a wider suffix/style-text), scoped to the tool.
+                ui.horizontal(|ui| {
+                    ui.weak("Save style:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_gen_save_style_name)
+                            .hint_text("style name")
+                            .desired_width(120.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_gen_save_style_text)
+                            .hint_text("style text (suffix) / --flags in Args later")
+                            .desired_width(240.0),
+                    );
+                    if ui.small_button("💾").clicked() {
+                        save_style = true;
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Size");
+                    // Preset dropdown (editable list) — pick to apply.
+                    egui::ComboBox::from_id_salt("ai_gen_size")
+                        .selected_text(format!("{}×{}", self.ai_gen_w, self.ai_gen_h))
+                        .show_ui(ui, |ui| {
+                            for s in &sizes {
+                                if ui
+                                    .selectable_label(
+                                        [self.ai_gen_w, self.ai_gen_h] == *s,
+                                        format!("{}×{}", s[0], s[1]),
+                                    )
+                                    .clicked()
+                                {
+                                    self.ai_gen_w = s[0];
+                                    self.ai_gen_h = s[1];
+                                }
+                            }
+                        });
                     ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
                     ui.label("×");
                     ui.add(egui::DragValue::new(&mut self.ai_gen_h).range(8..=4096));
+                    if ui
+                        .small_button("＋")
+                        .on_hover_text("Add this size to the presets")
+                        .clicked()
+                    {
+                        add_size = true;
+                    }
                     if ui.small_button("From image").on_hover_text("Use the open image's size").clicked() {
                         if let Some((w, h)) = self.img_meta.values().next().map(|m| (m.w, m.h)) {
                             self.ai_gen_w = w;
                             self.ai_gen_h = h;
                         }
                     }
-                    ui.separator();
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Count");
                     ui.add(egui::DragValue::new(&mut self.ai_gen_count).range(1..=20));
                     ui.separator();
@@ -14577,6 +14771,15 @@ impl PixelView {
                         self.ai_gen_seed = 0;
                     }
                 });
+                // Show the exact command (macros expanded) — live, and during the run.
+                egui::CollapsingHeader::new("Command")
+                    .id_salt("ai_cmd")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&cmd_preview).monospace())
+                                .wrap(),
+                        );
+                    });
                 match self.ai_gen_pad {
                     Some(p) => {
                         ui.weak(format!("→ load result onto pad {}", p + 1));
@@ -14616,6 +14819,46 @@ impl PixelView {
         }
         if do_cancel {
             self.cancel_ai_job();
+        }
+        if add_size {
+            let sz = [self.ai_gen_w, self.ai_gen_h];
+            if !self.ai_sizes.contains(&sz) {
+                self.ai_sizes.push(sz);
+            }
+        }
+        if save_prompt {
+            let name = self.ai_gen_save_prompt_name.trim().to_string();
+            if !name.is_empty() && !self.ai_gen_prompt.trim().is_empty() {
+                let text = self.ai_gen_prompt.trim().to_string();
+                if let Some(p) = self.ai_prompts.iter_mut().find(|p| p.name == name) {
+                    p.text = text;
+                } else {
+                    self.ai_prompts.push(crate::ai::AiPrompt { name: name.clone(), text });
+                }
+                self.status = format!("Saved prompt “{name}”");
+                self.ai_gen_save_prompt_name.clear();
+            }
+        }
+        if save_style {
+            let name = self.ai_gen_save_style_name.trim().to_string();
+            if !name.is_empty() {
+                let tool = self.ai_tools.get(self.ai_gen_tool).map(|t| t.name.clone()).unwrap_or_default();
+                let suffix = self.ai_gen_save_style_text.trim().to_string();
+                if let Some(s) = self.ai_styles.iter_mut().find(|s| s.name == name) {
+                    s.suffix = suffix;
+                    s.tool = tool;
+                } else {
+                    self.ai_styles.push(crate::ai::AiStyle {
+                        name: name.clone(),
+                        tool,
+                        suffix,
+                        ..Default::default()
+                    });
+                }
+                self.status = format!("Saved style “{name}”");
+                self.ai_gen_save_style_name.clear();
+                self.ai_gen_save_style_text.clear();
+            }
         }
     }
 
@@ -14664,13 +14907,29 @@ impl PixelView {
                     self.ai_tools.remove(i);
                     self.ai_tool_sel = self.ai_tool_sel.saturating_sub(1);
                 }
-                if ui.small_button("＋ Add tool").clicked() {
-                    self.ai_tools.push(crate::ai::AiTool {
-                        name: "new tool".into(),
-                        ..Default::default()
-                    });
-                    self.ai_tool_sel = self.ai_tools.len() - 1;
-                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("＋ Add tool").clicked() {
+                        self.ai_tools.push(crate::ai::AiTool {
+                            name: "new tool".into(),
+                            ..Default::default()
+                        });
+                        self.ai_tool_sel = self.ai_tools.len() - 1;
+                    }
+                    if ui
+                        .small_button("↺ Reset to defaults")
+                        .on_hover_text(
+                            "Re-seed echo/pixelmon/soundmon/ansimon with correct args (soundmon has \
+                             no --size; ansimon --size is in characters). Overwrites your tool list.",
+                        )
+                        .clicked()
+                    {
+                        let home = std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        self.ai_tools = crate::ai::starter_tools(&home);
+                        self.ai_tool_sel = 0;
+                    }
+                });
                 if let Some(t) = self.ai_tools.get_mut(self.ai_tool_sel) {
                     ui.add_space(4.0);
                     egui::Grid::new("ai_tool_edit").num_columns(2).show(ui, |ui| {
@@ -14688,7 +14947,13 @@ impl PixelView {
                         ui.end_row();
                     });
                     ui.checkbox(&mut t.audio, "Audio generator (offer on pads)");
-                    ui.weak("Macros: {prompt} {style} {seed} {outdir} {outname} {sw} {sh} {pal}");
+                    ui.weak("Macros: {prompt} {style} {seed} {outdir} {outname} {sw} {sh} {pal}")
+                        .on_hover_text(
+                            "{sw}/{sh} = the requested GENERATION width/height (from the dialog's \
+                             Size), NOT the screen. {iw}/{ih} are the same here. {outname} is a \
+                             prompt-slug + seed. Uppercase names → uppercase values; {pal:slug} \
+                             is CLI-safe.",
+                        );
                 }
             });
 
@@ -25263,6 +25528,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_TOOLS_KEY, &self.ai_tools);
         eframe::set_value(storage, Self::AI_STYLES_KEY, &self.ai_styles);
         eframe::set_value(storage, Self::AI_PROMPTS_KEY, &self.ai_prompts);
+        eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
@@ -28658,7 +28924,7 @@ enum PadDrop {
     File(PathBuf),  // a sample file (Samples explorer)
     Tracker(usize), // a tracker/bank sample index in the current player
     Pad(usize),     // another pad (drag one pad onto another to move/swap them)
-    Selection,      // the current waveform-editor selection (drag the ⠿ handle onto a pad)
+    Selection(f32, f32), // a waveform-editor selection (start, end) captured at drag-start
 }
 
 /// An in-progress waveform-editor drag. The selection itself lives on `AudioPlayer`
@@ -30036,11 +30302,16 @@ impl AudioPlayer {
     /// A `SampleBuf` of the current editor selection (or the whole buffer when no sub-region is
     /// set) — what the pad "load" (⟲) button captures. Region math mirrors `play_source`.
     fn current_region_buf(&self) -> SampleBuf {
+        self.region_buf(self.sel_start, self.sel_end)
+    }
+
+    /// Build a `SampleBuf` from an explicit `[start, end]` (seconds) slice of this buffer.
+    fn region_buf(&self, start: f32, end: f32) -> SampleBuf {
         let ch = self.channels.get() as usize;
         let sr = self.sample_rate.get() as f32;
         let n = self.samples.len();
-        let start = self.sel_start.clamp(0.0, self.duration);
-        let end = self.sel_end.clamp(start, self.duration);
+        let start = start.clamp(0.0, self.duration);
+        let end = end.clamp(start, self.duration);
         let s = (((start * sr) as usize) * ch).min(n);
         let e = (((end * sr) as usize) * ch).min(n).max(s);
         let region: Vec<rodio::Sample> = self.samples[s..e].to_vec();
