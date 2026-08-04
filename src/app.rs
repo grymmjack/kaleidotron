@@ -30712,7 +30712,8 @@ impl AudioPlayer {
 fn is_pdf_path(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        // `.ai` (Adobe Illustrator) is PDF-compatible → opens in the same multi-page viewer.
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf") || e.eq_ignore_ascii_case("ai"))
 }
 
 /// Is `p` an XMind mind map (`.xmind`)? Opens the in-app multi-sheet viewer.
@@ -33461,6 +33462,8 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::mesh3d::AUX_EXTS.contains(&x.as_str())
                 || crate::decode::VIDEO_EXTS.contains(&x.as_str())
                 || crate::decode::font::FONT_EXTS.contains(&x.as_str())
+                || crate::decode::EPS_EXTS.contains(&x.as_str())
+                || x == "ai"
         }
         // Extensionless scene/BBS art (rendered as CP437 text). Dirs are filtered
         // out by an `is_dir()` check at every call site before reaching here.

@@ -12,6 +12,7 @@ mod bin;
 mod builtin;
 mod c64_font;
 mod code;
+mod eps;
 pub mod font;
 mod cp437_font;
 mod cp437_font_8x8;
@@ -51,6 +52,9 @@ pub use code::CODE_EXTS;
 /// PDF metadata (page count / size / title / author) for the Details pane, and a
 /// single-page renderer for the in-app multi-page viewer.
 pub use pdf::{pdf_meta, render_page as render_pdf_page, PdfMeta};
+
+/// EPS/PostScript extensions handled by the ghostscript-backed decoder (for `is_image_ext`).
+pub use eps::EPS_EXTS;
 
 /// Audio metadata (duration / sample rate / channels / codec) + the extension list, for
 /// the Details pane and `is_image_ext`.
@@ -133,7 +137,8 @@ impl Registry {
                 Box::new(petmate::PetmateDecoder), // .petmate (nurpax/petmate JSON PETSCII)
                 Box::new(rip::RipDecoder),         // .rip (RIPscript vector; icy_parser_core)
                 Box::new(bin::BinDecoder),         // .bin (raw char/attr pairs, SAUCE width)
-                Box::new(pdf::PdfDecoder),         // .pdf placeholder page tile + metadata (lopdf)
+                Box::new(pdf::PdfDecoder),         // .pdf/.ai (PDF-compatible) page tile + metadata
+                Box::new(eps::EpsDecoder),         // .eps/.ps rasterized via ghostscript (gs)
                 Box::new(audio::SoundDecoder), // audio waveform / icon tile + metadata (symphonia)
                 Box::new(code::CodeDecoder),   // source code / text (CP437 + hand-rolled highlight)
                 Box::new(mesh3d::MeshDecoder), // .obj/.stl/.ply/.gltf/.glb/.dae → CPU-shaded tile
@@ -162,7 +167,10 @@ impl Registry {
     /// Whether the extension belongs to a plugin that's currently switched OFF.
     fn plugin_disabled(&self, ext: &str) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        (!self.pdf_on.load(Relaxed) && ext == "pdf")
+        // PDF plugin covers .pdf + .ai (PDF-compatible) + EPS/PS (ghostscript) — all "document"
+        // formats needing an external renderer.
+        (!self.pdf_on.load(Relaxed)
+            && (ext == "pdf" || ext == "ai" || eps::EPS_EXTS.contains(&ext)))
             || (!self.audio_on.load(Relaxed) && audio::AUDIO_EXTS.contains(&ext))
             || (!self.code_on.load(Relaxed) && code::CODE_EXTS.contains(&ext))
             || (!self.mesh_on.load(Relaxed)
