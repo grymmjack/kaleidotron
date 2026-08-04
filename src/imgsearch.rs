@@ -44,7 +44,7 @@ pub struct ImgResult {
     pub provider: String, // e.g. "flickr", "wikimedia"
     pub img_url: String,  // the full-resolution image
     pub thumb_url: String, // an Openverse-hosted thumbnail endpoint
-    pub page_url: String, // the source landing page (attribution)
+    pub page_url: String, // the source landing page (attribution — shown on open / right-click)
     pub width: u32,
     pub height: u32,
     pub ext: String, // "jpg" / "png" / … (inferred if the API omits `filetype`)

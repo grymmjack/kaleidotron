@@ -415,6 +415,7 @@ struct AnimState {
 struct VideoStrip {
     path: PathBuf,
     frames: Vec<egui::TextureHandle>,
+    #[allow(clippy::type_complexity)]
     rx: Option<std::sync::mpsc::Receiver<Vec<(u32, u32, Vec<u8>)>>>,
 }
 
@@ -4129,7 +4130,15 @@ impl PixelView {
             Ok(Ok((vpath, local))) => {
                 let credit = self.img_results.get(&vpath).map(|r| {
                     let who = if r.creator.is_empty() { r.provider.clone() } else { r.creator.clone() };
-                    format!("{} — {who} · {}", r.title, r.license_label())
+                    let mut s = format!("{} — {who} · {}", r.title, r.license_label());
+                    let dims = r.dims();
+                    if !dims.is_empty() {
+                        s.push_str(&format!(" · {dims}"));
+                    }
+                    if !r.page_url.is_empty() {
+                        s.push_str(&format!(" · {}", r.page_url));
+                    }
+                    s
                 });
                 self.img_files.insert(vpath.clone(), local);
                 self.img_open_rx = None;
@@ -15248,7 +15257,7 @@ impl PixelView {
                     .num_columns(2)
                     .spacing([12.0, 5.0])
                     .show(ui, |ui| {
-                        let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                        let row = |ui: &mut egui::Ui, k: &str, v: String| {
                             if !v.is_empty() {
                                 ui.weak(k);
                                 ui.label(v);
@@ -15309,14 +15318,14 @@ impl PixelView {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    if info.is_none() && !info_pending {
-                        if ui
+                    if info.is_none()
+                        && !info_pending
+                        && ui
                             .button("📝 Get transcript + comments")
                             .on_hover_text("Fetch the captions transcript + top comments")
                             .clicked()
-                        {
-                            want_fetch_info = true;
-                        }
+                    {
+                        want_fetch_info = true;
                     }
                     if ui
                         .button("📋 Copy for LLM")

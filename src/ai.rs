@@ -282,23 +282,6 @@ pub fn run(
     Ok(fresh.into_iter().map(|(_, p)| p).collect())
 }
 
-/// Is `exe` runnable (on PATH or an existing absolute path)?
-pub fn tool_available(tool: &AiTool) -> bool {
-    let exe = tool.exe.trim();
-    if exe.is_empty() {
-        return false;
-    }
-    if Path::new(exe).is_absolute() {
-        return Path::new(exe).exists();
-    }
-    // On PATH: try `which`-like resolution.
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|d| d.join(exe).exists())
-        })
-        .unwrap_or(false)
-}
-
 /// Starter tools seeded on first enable: a test echo + pixelmon (images) + soundmon (audio) +
 /// ansimon (ANSI), pointed at the sibling repos grymmjack keeps next to pixel-viewer. Paths that
 /// don't exist are harmless — the user edits them in the AI tab.
