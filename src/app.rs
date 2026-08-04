@@ -1399,7 +1399,8 @@ pub struct PixelView {
     font_bytes: Vec<u8>,
     font_info: Option<crate::decode::font::FontInfo>,
     font_chars: Vec<char>,
-    font_sample: String, // the type-to-sample text (persisted)
+    font_sample: String, // the viewer's type-to-sample text (persisted)
+    font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_size: f32,      // sample render height in px
     font_page: usize,    // glyph-grid page
     font_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "sample|size"
@@ -1411,6 +1412,17 @@ pub struct PixelView {
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
     tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample"
+    // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
+    fon_path: Option<PathBuf>,
+    fon_bytes: Vec<u8>,
+    fon_faces: Vec<(String, u16, usize)>, // (name, points, height) per face
+    fon_index: usize,
+    fon_page: usize,
+    fon_sample_tex: Option<(String, egui::TextureHandle)>, // "index|sample"
+    #[allow(clippy::type_complexity)]
+    fon_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // "index|page|cell", tex, cols, chars
+    font_grid_cell: f32, // glyph-grid cell size (shared by the TTF + FON viewers, persisted)
+    font_block: usize,   // TTF glyph-grid Unicode-block filter (index into UNICODE_BLOCKS; 0 = All)
     recolor_playback: bool, // apply the recolor pipeline to live video frames? off = raw = faster fps (persisted)
     show_fps: bool,         // overlay a UI-fps / video-fps meter on the video (persisted)
     // FPS meter accumulators (not persisted): UI repaints + displayed video frames per window.
@@ -1890,6 +1902,8 @@ impl PixelView {
     const AI_PROMPTS_KEY: &'static str = "ai_prompts";
     const AI_SIZES_KEY: &'static str = "ai_sizes";
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
+    const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
+    const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2750,6 +2764,10 @@ impl PixelView {
                 .unwrap_or_else(|| {
                     "The quick brown fox jumps over the lazy dog\n0123456789 !?@#&".to_string()
                 }),
+            font_preview_text: cc
+                .storage
+                .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
+                .unwrap_or_else(|| crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string()),
             font_size: 48.0,
             font_page: 0,
             font_sample_tex: None,
@@ -2759,6 +2777,19 @@ impl PixelView {
             tdf_fonts: Vec::new(),
             tdf_index: 0,
             tdf_sample_tex: None,
+            fon_path: None,
+            fon_bytes: Vec::new(),
+            fon_faces: Vec::new(),
+            fon_index: 0,
+            fon_page: 0,
+            fon_sample_tex: None,
+            fon_grid_tex: None,
+            font_grid_cell: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_GRID_CELL_KEY))
+                .unwrap_or(40.0)
+                .clamp(20.0, 96.0),
+            font_block: 0,
             recolor_playback: load_bool(Self::RECOLOR_PLAYBACK_KEY, true),
             show_fps: load_bool(Self::SHOW_FPS_KEY, false),
             fps_accum_t: 0.0,
@@ -2954,6 +2985,10 @@ impl PixelView {
             colo_sauce_done: HashSet::new(),
             colo_sauce_pending: 0,
         };
+
+        // Prime the font-thumbnail sample text (the decoder reads a process-global — see
+        // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
+        crate::decode::font::set_thumb_sample(&app.font_preview_text);
 
         // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
         // visible on launch instead of an empty window. `open_folder` itself routes the
@@ -6530,13 +6565,31 @@ impl PixelView {
         ui.separator();
 
         // Sample text + size.
+        let mut copy_img = false;
         ui.horizontal(|ui| {
             ui.label("Sample");
             ui.add(egui::Slider::new(&mut self.font_size, 12.0..=200.0).suffix("px"));
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
                 want_copy = Some(self.font_sample.clone());
             }
+            if ui
+                .small_button("📋 image")
+                .on_hover_text("Copy the rendered sample to the clipboard as a bitmap (paste into any program)")
+                .clicked()
+            {
+                copy_img = true;
+            }
         });
+        if copy_img {
+            if let Some(img) = crate::decode::font::render_text(
+                &self.font_bytes,
+                &self.font_sample,
+                self.font_size,
+                [235, 235, 235],
+            ) {
+                self.copy_image_to_clipboard(&img);
+            }
+        }
         let changed = ui
             .add(
                 egui::TextEdit::multiline(&mut self.font_sample)
@@ -6571,15 +6624,41 @@ impl PixelView {
             });
         ui.separator();
 
-        // Glyph grid (paged) — click a glyph to copy it.
+        // Glyph grid (paged) — click a glyph to copy it. Cell size is the shared slider, and the
+        // glyphs can be filtered to a Unicode block / legacy code page.
         const COLS: usize = 16;
-        const CELL: usize = 40;
         const ROWS: usize = 10;
+        let cell = self.font_grid_cell.round() as usize;
+        // Filter the font's glyphs to the selected Unicode block (index 0 = all).
+        self.font_block = self.font_block.min(UNICODE_BLOCKS.len() - 1);
+        let (_, lo, hi) = UNICODE_BLOCKS[self.font_block];
+        let chars: Vec<char> = if self.font_block == 0 {
+            self.font_chars.clone()
+        } else {
+            self.font_chars
+                .iter()
+                .copied()
+                .filter(|c| (*c as u32) >= lo && (*c as u32) <= hi)
+                .collect()
+        };
         let per_page = COLS * ROWS;
-        let pages = self.font_chars.len().div_ceil(per_page).max(1);
+        let pages = chars.len().div_ceil(per_page).max(1);
         self.font_page = self.font_page.min(pages - 1);
-        ui.horizontal(|ui| {
-            ui.label(format!("Glyphs ({})", self.font_chars.len()));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Glyphs ({})", chars.len()));
+            ui.separator();
+            ui.label("Range");
+            egui::ComboBox::from_id_salt("font_block")
+                .selected_text(UNICODE_BLOCKS[self.font_block].0)
+                .show_ui(ui, |ui| {
+                    for (i, (name, _, _)) in UNICODE_BLOCKS.iter().enumerate() {
+                        if ui.selectable_label(i == self.font_block, *name).clicked() {
+                            self.font_block = i;
+                            self.font_page = 0;
+                            self.font_grid_tex = None;
+                        }
+                    }
+                });
             if ui.add_enabled(self.font_page > 0, egui::Button::new("◀").small()).clicked() {
                 self.font_page -= 1;
                 self.font_grid_tex = None;
@@ -6592,22 +6671,38 @@ impl PixelView {
                 self.font_page += 1;
                 self.font_grid_tex = None;
             }
+            ui.separator();
+            ui.label("Cell");
+            if ui
+                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                .changed()
+            {
+                self.font_grid_tex = None;
+            }
         });
+        if chars.is_empty() {
+            ui.weak("(no glyphs in this range)");
+            if let Some(s) = want_copy {
+                ctx.copy_text(s.clone());
+                self.status = format!("Copied “{}”", elide(&s, 40));
+            }
+            return;
+        }
         let start = self.font_page * per_page;
-        let end = (start + per_page).min(self.font_chars.len());
-        let page_chars: Vec<char> = self.font_chars[start..end].to_vec();
-        // Render the page grid (cached by page).
+        let end = (start + per_page).min(chars.len());
+        let page_chars: Vec<char> = chars[start..end].to_vec();
+        // Render the page grid (cached by page + cell size).
         let need = self
             .font_grid_tex
             .as_ref()
-            .map(|(p, ..)| *p != self.font_page)
+            .map(|(p, _, _, [_, c])| *p != self.font_page || *c != cell)
             .unwrap_or(true);
         if need {
             if let Some((img, rows)) = crate::decode::font::render_glyph_grid(
                 &self.font_bytes,
                 &page_chars,
                 COLS,
-                CELL,
+                cell,
                 [235, 235, 235],
             ) {
                 let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -6615,7 +6710,7 @@ impl PixelView {
                     &img.rgba_bytes(),
                 );
                 let tex = ctx.load_texture("font_grid", color, egui::TextureOptions::LINEAR);
-                self.font_grid_tex = Some((self.font_page, tex, rows, [COLS, CELL]));
+                self.font_grid_tex = Some((self.font_page, tex, rows, [COLS, cell]));
             }
         }
         if let Some((_, tex, rows, [cols, cell])) = self.font_grid_tex.clone() {
@@ -6725,9 +6820,17 @@ impl PixelView {
         ui.separator();
 
         // Sample text (reuses the persisted font_sample) + actions.
+        let mut copy_img = false;
         ui.horizontal(|ui| {
             ui.label("Sample");
-            if ui.small_button("📋 art").on_hover_text("Copy the rendered sample as a PNG path").clicked() {
+            if ui
+                .small_button("📋 image")
+                .on_hover_text("Copy the rendered art to the clipboard as a bitmap (paste into any program)")
+                .clicked()
+            {
+                copy_img = true;
+            }
+            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG beside the file").clicked() {
                 want_export = Some(());
             }
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
@@ -6748,6 +6851,11 @@ impl PixelView {
         } else {
             self.font_sample.clone()
         };
+        if copy_img {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample) {
+                self.copy_image_to_clipboard(&img);
+            }
+        }
         let key = format!("{}|{}", self.tdf_index, sample);
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample) {
@@ -6823,6 +6931,241 @@ impl PixelView {
         ) {
             Ok(()) => self.status = format!("Saved {}", out.display()),
             Err(e) => self.status = format!("Export failed: {e}"),
+        }
+    }
+
+    /// Copy a rendered `PixImage` to the system clipboard **as a bitmap** (Character-Map style —
+    /// paste the styled sample straight into another program). egui's `copy_text` is text-only, so
+    /// this goes through `arboard`. Sets `self.status` with the result. (On X11 the image lives on
+    /// the clipboard only while pixelview runs — an inherent X11 clipboard limitation.)
+    fn copy_image_to_clipboard(&mut self, img: &crate::image_types::PixImage) {
+        let rgba = img.rgba_bytes();
+        let data = arboard::ImageData {
+            width: img.width as usize,
+            height: img.height as usize,
+            bytes: std::borrow::Cow::Owned(rgba),
+        };
+        match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
+            Ok(()) => self.status = format!("Copied sample image ({}×{})", img.width, img.height),
+            Err(e) => self.status = format!("Clipboard image copy failed: {e}"),
+        }
+    }
+
+    fn ensure_fon_loaded(&mut self, path: &Path) {
+        if self.fon_path.as_deref() == Some(path) {
+            return;
+        }
+        self.fon_path = Some(path.to_path_buf());
+        self.fon_index = 0;
+        self.fon_page = 0;
+        self.fon_sample_tex = None;
+        self.fon_grid_tex = None;
+        match std::fs::read(self.resolve_local(path)) {
+            Ok(bytes) => {
+                self.fon_faces = crate::decode::fon::face_list(&bytes);
+                self.fon_bytes = bytes;
+            }
+            Err(_) => {
+                self.fon_bytes.clear();
+                self.fon_faces.clear();
+            }
+        }
+    }
+
+    /// Windows bitmap-font viewer (.fon/.fnt): a size (face) picker, a type-to-sample box (shares
+    /// the persisted `font_sample`), and a paged glyph grid with a cell-size slider.
+    fn draw_fon_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
+        self.ensure_fon_loaded(path);
+        if self.fon_bytes.is_empty() || self.fon_faces.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No bitmap font faces found in this file.");
+            });
+            return;
+        }
+        self.fon_index = self.fon_index.min(self.fon_faces.len() - 1);
+        let mut want_copy: Option<String> = None;
+
+        // Header: file name + face (point-size) picker.
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(
+                egui::RichText::new(
+                    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
+                .heading(),
+            );
+            ui.separator();
+            let (name, _, _) = &self.fon_faces[self.fon_index];
+            ui.strong(name.clone());
+            if self.fon_faces.len() > 1 {
+                let cur = &self.fon_faces[self.fon_index];
+                egui::ComboBox::from_id_salt("fon_face_pick")
+                    .selected_text(format!("{} pt · {} px", cur.1, cur.2))
+                    .show_ui(ui, |ui| {
+                        for (i, (_, pts, h)) in self.fon_faces.iter().enumerate() {
+                            if ui
+                                .selectable_label(i == self.fon_index, format!("{pts} pt · {h} px"))
+                                .clicked()
+                            {
+                                self.fon_index = i;
+                                self.fon_sample_tex = None;
+                                self.fon_grid_tex = None;
+                                self.fon_page = 0;
+                            }
+                        }
+                    });
+            } else {
+                let (_, pts, h) = &self.fon_faces[0];
+                ui.weak(format!("· {pts} pt · {h} px"));
+            }
+        });
+        ui.separator();
+
+        // Sample text (reuses the persisted font_sample).
+        let mut copy_img = false;
+        ui.horizontal(|ui| {
+            ui.label("Sample");
+            if ui.small_button("📋 text").on_hover_text("Copy the sample characters").clicked() {
+                want_copy = Some(self.font_sample.clone());
+            }
+            if ui
+                .small_button("📋 image")
+                .on_hover_text("Copy the rendered sample to the clipboard as a bitmap (paste into any program)")
+                .clicked()
+            {
+                copy_img = true;
+            }
+        });
+        let changed = ui
+            .add(
+                egui::TextEdit::multiline(&mut self.font_sample)
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+        let sample = if self.font_sample.trim().is_empty() {
+            "ABCDEFG abcdefg 0123".to_string()
+        } else {
+            self.font_sample.clone()
+        };
+        if copy_img {
+            if let Some(img) = crate::decode::fon::render_text(
+                &self.fon_bytes,
+                self.fon_index,
+                &sample,
+                [235, 235, 235],
+            ) {
+                self.copy_image_to_clipboard(&img);
+            }
+        }
+        let key = format!("{}|{}", self.fon_index, sample);
+        if changed || self.fon_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            if let Some(img) =
+                crate::decode::fon::render_text(&self.fon_bytes, self.fon_index, &sample, [235, 235, 235])
+            {
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba_bytes(),
+                );
+                let tex = ctx.load_texture("fon_sample", color, egui::TextureOptions::NEAREST);
+                self.fon_sample_tex = Some((key, tex));
+            } else {
+                self.fon_sample_tex = None;
+            }
+        }
+        egui::ScrollArea::horizontal().id_salt("fon_sample_scroll").max_height(160.0).show(ui, |ui| {
+            if let Some((_, tex)) = &self.fon_sample_tex {
+                let native = tex.size_vec2();
+                let avail = ui.available_width().max(64.0);
+                let scale = (avail / native.x).clamp(1.0, 6.0).floor().max(1.0);
+                ui.add(egui::Image::new((tex.id(), native * scale)));
+            }
+        });
+        ui.separator();
+
+        // Glyph grid (paged) with a cell-size slider.
+        let glyphs = crate::decode::fon::face_glyph_count(&self.fon_bytes, self.fon_index);
+        let cols = 16usize;
+        let cell = self.font_grid_cell.round() as usize;
+        let per_page = cols * 8;
+        let pages = glyphs.div_ceil(per_page).max(1);
+        self.fon_page = self.fon_page.min(pages - 1);
+        ui.horizontal(|ui| {
+            ui.label(format!("Glyphs ({glyphs})"));
+            if ui.add_enabled(self.fon_page > 0, egui::Button::new("◀").small()).clicked() {
+                self.fon_page -= 1;
+                self.fon_grid_tex = None;
+            }
+            ui.weak(format!("page {}/{}", self.fon_page + 1, pages));
+            if ui
+                .add_enabled(self.fon_page + 1 < pages, egui::Button::new("▶").small())
+                .clicked()
+            {
+                self.fon_page += 1;
+                self.fon_grid_tex = None;
+            }
+            ui.separator();
+            ui.label("Cell");
+            if ui
+                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                .changed()
+            {
+                self.fon_grid_tex = None;
+            }
+        });
+        let start = self.fon_page * per_page;
+        let gkey = format!("{}|{}|{}", self.fon_index, self.fon_page, cell);
+        if self.fon_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+            if let Some((img, _rows, chars)) = crate::decode::fon::render_glyph_grid(
+                &self.fon_bytes,
+                self.fon_index,
+                start,
+                per_page,
+                cols,
+                cell,
+                [235, 235, 235],
+            ) {
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba_bytes(),
+                );
+                let tex = ctx.load_texture("fon_grid", color, egui::TextureOptions::NEAREST);
+                self.fon_grid_tex = Some((gkey, tex, cols, chars));
+            }
+        }
+        if let Some((_, tex, cols, chars)) = self.fon_grid_tex.clone() {
+            egui::ScrollArea::vertical().id_salt("fon_grid_scroll").show(ui, |ui| {
+                let size = tex.size_vec2();
+                let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+                if let Some(pos) = resp.hover_pos() {
+                    let local = pos - resp.rect.min;
+                    let c = (local.x / cell as f32) as usize;
+                    let r = (local.y / cell as f32) as usize;
+                    let idx = r * cols + c;
+                    if c < cols {
+                        if let Some(&ch) = chars.get(idx) {
+                            let cr = egui::Rect::from_min_size(
+                                resp.rect.min + egui::vec2((c * cell) as f32, (r * cell) as f32),
+                                egui::vec2(cell as f32, cell as f32),
+                            );
+                            ui.painter().rect_stroke(
+                                cr,
+                                2.0,
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
+                                egui::StrokeKind::Inside,
+                            );
+                            resp.clone().on_hover_text(format!("{ch}   U+{:04X}", ch as u32));
+                            if resp.clicked() {
+                                want_copy = Some(ch.to_string());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(s) = want_copy {
+            ctx.copy_text(s.clone());
+            self.status = format!("Copied “{}”", elide(&s, 40));
         }
     }
 
@@ -19831,6 +20174,11 @@ impl PixelView {
                 self.draw_tdf_ui(ctx, ui, &p);
                 return;
             }
+            // Windows bitmap-font viewer (.fon/.fnt): size picker + type-to-sample + glyph grid.
+            if is_fon_ext(&p) {
+                self.draw_fon_ui(ctx, ui, &p);
+                return;
+            }
         }
 
         // Video: transport (play/pause, seek, speed, PNG/audio/markers) + the frame.
@@ -25407,6 +25755,7 @@ impl eframe::App for PixelView {
             let mut color_change: Option<(String, [u8; 3])> = None; // a format-color edit
             let mut reset_colors = false; // "Reset" the format colors
             let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
+            let mut font_preview_changed = false; // font-tile sample text edited → refresh tiles
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
@@ -25454,6 +25803,30 @@ impl eframe::App for PixelView {
                                         "Draw a border around each grid tile so they read as \
                                          separate cards instead of one continuous row.",
                                     );
+
+                                ui.add_space(10.0);
+                                ui.label("Font preview sample");
+                                let resp = ui.add(
+                                    egui::TextEdit::multiline(&mut self.font_preview_text)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(crate::decode::font::DEFAULT_THUMB_SAMPLE),
+                                );
+                                // Re-render tiles only when editing settles (focus lost), not on
+                                // every keystroke (a font folder can hold hundreds of tiles).
+                                if resp.lost_focus() && resp.changed() {
+                                    font_preview_changed = true;
+                                }
+                                resp.on_hover_text(
+                                    "The text drawn on font (.ttf/.otf) grid tiles. One line per \
+                                     row; leave blank for the default. The Font viewer has its own \
+                                     live type-to-sample box.",
+                                );
+                                if ui.small_button("↺ Reset to default").clicked() {
+                                    self.font_preview_text =
+                                        crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
+                                    font_preview_changed = true;
+                                }
 
                                 ui.add_space(10.0);
                                 ui.label("Window title bar");
@@ -25952,6 +26325,22 @@ impl eframe::App for PixelView {
                 }
                 self.status = "3D render cache cleared".into();
             }
+            if font_preview_changed {
+                crate::decode::font::set_thumb_sample(&self.font_preview_text);
+                // Drop cached font tiles so they re-render with the new sample text.
+                let fonts: Vec<PathBuf> = self
+                    .entries
+                    .iter()
+                    .filter(|e| is_font_ext(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                for p in fonts {
+                    self.thumb_tex.remove(&p);
+                    self.thumb_rgba.remove(&p);
+                    self.img_meta.remove(&p);
+                    self.thumbs.forget(&p);
+                }
+            }
         }
 
         // File-type associations editor (View → Associations…).
@@ -26188,6 +26577,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_PROMPTS_KEY, &self.ai_prompts);
         eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
+        eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
+        eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
@@ -31354,6 +31745,45 @@ fn is_tdf_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::tdf::TDF_EXTS.contains(&e.as_str()))
 }
 
+/// Unicode blocks / legacy code pages offered in the font viewer's glyph-grid filter. `(name, lo,
+/// hi)` inclusive codepoint range; the first entry (0,0) is the sentinel "All glyphs".
+const UNICODE_BLOCKS: &[(&str, u32, u32)] = &[
+    ("All glyphs", 0, 0),
+    ("Basic Latin (ASCII)", 0x0020, 0x007F),
+    ("Latin-1 Supplement", 0x00A0, 0x00FF),
+    ("Latin Extended-A", 0x0100, 0x017F),
+    ("Latin Extended-B", 0x0180, 0x024F),
+    ("IPA Extensions", 0x0250, 0x02AF),
+    ("Greek & Coptic", 0x0370, 0x03FF),
+    ("Cyrillic", 0x0400, 0x04FF),
+    ("Hebrew", 0x0590, 0x05FF),
+    ("Arabic", 0x0600, 0x06FF),
+    ("General Punctuation", 0x2000, 0x206F),
+    ("Currency Symbols", 0x20A0, 0x20CF),
+    ("Letterlike Symbols", 0x2100, 0x214F),
+    ("Arrows", 0x2190, 0x21FF),
+    ("Mathematical Operators", 0x2200, 0x22FF),
+    ("Box Drawing", 0x2500, 0x257F),
+    ("Block Elements", 0x2580, 0x259F),
+    ("Geometric Shapes", 0x25A0, 0x25FF),
+    ("Miscellaneous Symbols", 0x2600, 0x26FF),
+    ("Dingbats", 0x2700, 0x27BF),
+    ("Braille Patterns", 0x2800, 0x28FF),
+    ("CJK Symbols & Punctuation", 0x3000, 0x303F),
+    ("Hiragana", 0x3040, 0x309F),
+    ("Katakana", 0x30A0, 0x30FF),
+    ("CJK Unified Ideographs", 0x4E00, 0x9FFF),
+    ("Private Use Area", 0xE000, 0xF8FF),
+];
+
+/// A Windows bitmap font (.fon/.fnt) → the interactive FON viewer (size picker + type-to-sample).
+fn is_fon_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::fon::FON_EXTS.contains(&e.as_str()))
+}
+
 /// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
 /// (favorites split, etc.) on a non-local path.
 fn any_remote(p: &Path) -> bool {
@@ -33937,6 +34367,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::VIDEO_EXTS.contains(&x.as_str())
                 || crate::decode::font::FONT_EXTS.contains(&x.as_str())
                 || crate::decode::tdf::TDF_EXTS.contains(&x.as_str())
+                || crate::decode::fon::FON_EXTS.contains(&x.as_str())
                 || crate::decode::EPS_EXTS.contains(&x.as_str())
                 || x == "ai"
         }

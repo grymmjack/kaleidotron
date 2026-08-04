@@ -148,3 +148,28 @@ the exact virtual-source pattern as 16colo/YouTube/Steam.
 - **Also answered**: SWF/Flash — Ruffle (Rust) exists but full embedding is a major lift (own AVM +
   wgpu renderer fighting egui's); recommended a shell-out-to-`ruffle` placeholder as the pragmatic
   path, deferred. Pexels/Unsplash/Pixabay noted as key-required alternatives to Openverse.
+
+### Font viewing improvements + Windows .fon support (branch `font-improvements`)
+User feedback on the font browser (+ new asks). Batch:
+- **Configurable tile preview text** — the font grid tile had "Grymm!" baked in. Now a process-
+  global (`decode::font::set_thumb_sample`, primed from a persisted `font_preview_text`), editable
+  in **Preferences → "Font preview sample"** (multiline; default name-free "AaBbCcDdEe / 0123456789").
+  Editing it drops cached font tiles so they re-render. Shared by the .ttf AND .fon tiles.
+- **Windows bitmap fonts (.fon/.fnt)** — `decode/fon.rs`, hand-rolled (NO crate exists: the crates.io
+  `*fnt*` are BMFont/Infinity-Engine, unrelated). Walks MZ→NE→resource table→each `RT_FONT` FNT,
+  parses the header + glyph table, decodes the **column-major** 1bpp bitmaps (`data[off + (col/8)*h +
+  row]`). Handles v1/v2/v3, proportional + monospace, multi-size files. Confirmed against the FNT spec
+  (Q65123 / sgtatham's mkwinfont) + rendered across the user's real corpus (MS Sans Serif ×6 sizes,
+  Fixedsys, Terminal). Viewer `draw_fon_ui`: size(face) picker + type-to-sample + paged glyph grid.
+- **Glyph-grid cell-size slider** — shared `font_grid_cell` (persisted), added to BOTH the TTF and
+  FON viewers.
+- **Unicode block / code-page picker** — the TTF glyph grid filters to a chosen block (ASCII, Latin-1,
+  Cyrillic, Box Drawing, Braille, CJK, Private Use, …) via `UNICODE_BLOCKS`.
+- **Copy sample as image (Character-Map style)** — egui's clipboard is text-only, so added `arboard`
+  (already transitive via egui-winit) + `copy_image_to_clipboard`; a **📋 image** button in all three
+  font viewers copies the rendered sample as a bitmap to paste into any program. (X11: lives on the
+  clipboard while pixelview runs.)
+- 286 tests pass.
+- **DRAW font-format survey** (user asked for "every format DRAW supports"): DRAW has ttf/otf ✅,
+  .FON ✅ (now), plus **.psf** (Linux console) + **.F16/.F08** (raw 8×16/8×8 bitmap dumps) — both
+  small + fit this same viewer pattern; next up.

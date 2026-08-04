@@ -14,6 +14,7 @@ mod c64_font;
 mod code;
 mod eps;
 pub mod font;
+pub mod fon;
 pub mod tdf;
 mod cp437_font;
 mod cp437_font_8x8;
@@ -129,6 +130,7 @@ impl Registry {
                 Box::new(svg::SvgDecoder),            // .svg rasterized (resvg)
                 Box::new(font::FontDecoder),          // .ttf/.otf/.ttc sample render (ab_glyph)
                 Box::new(tdf::TdfDecoder),            // .tdf TheDraw fonts (retrofont → CP437 render)
+                Box::new(fon::FonDecoder),            // .fon/.fnt Windows bitmap fonts (hand-rolled FNT)
                 Box::new(xmind::XMindDecoder),        // .xmind mind map → SVG → raster (resvg)
                 Box::new(ansi::AnsiDecoder),          // .ans/.asc/.nfo/.diz (CP437 + ANSI)
                 Box::new(xbin::XBinDecoder),          // .xb/.xbin (binary ANSI: palette/font/RLE)
