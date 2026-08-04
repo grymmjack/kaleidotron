@@ -4053,6 +4053,7 @@ impl PixelView {
         self.img_rx = Some(rx);
         self.img_cancel = Some(cancel.clone());
         self.status = format!("Searching images: {query}");
+        self.want_repaint = true; // keep polling until the async results land
         std::thread::spawn(move || img_walk(query, &dir, cancel, tx));
     }
 
@@ -4080,7 +4081,12 @@ impl PixelView {
                     done = true;
                     break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still fetching — keep the repaint loop alive so the results are drained the
+                    // frame they arrive (otherwise the grid only updates on the next input event).
+                    self.want_repaint = true;
+                    break;
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
                     break;
@@ -6614,7 +6620,7 @@ impl PixelView {
             .changed();
         // Rendered preview (cached by "sample|size|recolor"). The recolor pipeline applies so the
         // sample tints/palettizes live via the Recolor pane.
-        let key = format!("{}|{:.0}|{}", self.font_sample, self.font_size, self.pipeline_key());
+        let key = format!("{}|{:.0}|{}|{}", self.font_sample, self.font_size, self.pipeline_key(), self.recolor_ident());
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) = crate::decode::font::render_text(
                 &self.font_bytes,
@@ -6902,7 +6908,7 @@ impl PixelView {
         if want_tdf {
             self.export_tdf_file();
         }
-        let key = format!("{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.pipeline_key());
+        let key = format!("{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.pipeline_key(), self.recolor_ident());
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing) {
                 let img = self.recolor_sample(path, img);
@@ -7144,7 +7150,7 @@ impl PixelView {
                 self.copy_image_to_clipboard(&img);
             }
         }
-        let key = format!("{}|{}|{}", self.fon_index, sample, self.pipeline_key());
+        let key = format!("{}|{}|{}|{}", self.fon_index, sample, self.pipeline_key(), self.recolor_ident());
         if changed || self.fon_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) =
                 crate::decode::fon::render_text(&self.fon_bytes, self.fon_index, &sample, [235, 235, 235])
@@ -12256,6 +12262,8 @@ impl PixelView {
             || self.colo_sauce_pending > 0
             || self.bulk_dl.as_ref().is_some_and(|b| !b.finished)
             || self.blend_render_pending > 0
+            || self.img_rx.is_some()
+            || self.img_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -14557,6 +14565,22 @@ impl PixelView {
         None
     }
 
+    /// A cheap `&self` identity of the active recolor *palette* (custom / selected `.gpl` / reduce),
+    /// WITHOUT computing it — for cache keys. `pipeline_key()` covers adjustments/dither/post-FX but
+    /// NOT the palette selection, so the font viewers append this too (else picking a palette
+    /// doesn't invalidate the sample and the recolor only shows after navigating away and back).
+    fn recolor_ident(&self) -> String {
+        if let Some(cp) = &self.custom_palette {
+            format!("custom:{}", palette_hash(cp))
+        } else if let Some(pp) = &self.selected_palette {
+            format!("pal:{}", pp.display())
+        } else if self.quantize_on {
+            format!("reduce:{}", self.quantize_n)
+        } else {
+            "none".into()
+        }
+    }
+
     /// Cache key for the active *grid* recolor, or None if "Apply to grid" is off
     /// or nothing is selected.
     fn grid_recolor_key(&self) -> Option<String> {
@@ -16257,6 +16281,21 @@ impl PixelView {
         let mut want_download = false;
         let mut want_pack: Option<PathBuf> = None;
         let mut want_open_default = false; // "Open in default app" (PDF)
+        let mut det_open_with: Option<usize> = None; // Details "Open in…" → this opener index
+        let mut det_open_other = false; // Details "Open in… → Other program…"
+        // Snapshot the configured "Open in…" programs matching this file's extension (so the menu
+        // needn't borrow `self`). Built once per Details render.
+        let det_ext = entry
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let det_openers: Vec<OpenerItem> = self
+            .opener_items()
+            .into_iter()
+            .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == &det_ext))
+            .collect();
                                            // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
@@ -16609,6 +16648,28 @@ impl PixelView {
                         {
                             want_open_default = true;
                         }
+                        // Configured "Open in…" associations for this extension (e.g. a `.ans`
+                        // editor like PabloDraw / Moebius). Set up in View → Associations…
+                        ui.menu_button("📂 Open in…", |ui| {
+                            if det_openers.is_empty() {
+                                ui.weak("No programs for this type");
+                                ui.weak("(add one in View → Associations…)");
+                            } else {
+                                for o in &det_openers {
+                                    if ui.button(&o.name).clicked() {
+                                        det_open_with = Some(o.idx);
+                                        ui.close();
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Other program…").clicked() {
+                                det_open_other = true;
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text("Open this file in one of your configured programs");
                     });
                     // SAUCE metadata — always shown for scene art / 16colo pieces so the
                     // panel doesn't vanish when a file has no record (it reads "no record"
@@ -16681,6 +16742,17 @@ impl PixelView {
         }
         if want_open_default {
             self.open_in_default_app(&entry.path);
+        }
+        if let Some(oi) = det_open_with {
+            if let Some(o) = self.openers.get(oi).cloned() {
+                self.open_external_for(entry.path.clone(), o.exec, o.args, o.env);
+            }
+        }
+        if det_open_other {
+            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+                let exec = exec.to_string_lossy().to_string();
+                self.open_external_for(entry.path.clone(), exec, String::new(), String::new());
+            }
         }
     }
 
