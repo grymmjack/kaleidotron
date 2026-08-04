@@ -1420,6 +1420,8 @@ pub struct PixelView {
     tdf_font_9px: bool, // TDF: render the 9-dot VGA cell (like the ANSI viewer), persisted
     tdf_crt: bool,      // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
     tdf_snap: bool,     // TDF: snap the preview zoom to an integer scale (pixel-perfect), persisted
+    tdf_ruler: bool,    // TDF: draw a column-width guide line down the preview (persisted)
+    tdf_ruler_cols: u32, // TDF: the ruler column count (40 / 80 / 132), persisted
     tdf_page: usize,    // TDF glyph-grid page
     #[allow(clippy::type_complexity)]
     tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
@@ -1923,6 +1925,8 @@ impl PixelView {
     const TDF_9PX_KEY: &'static str = "tdf_font_9px";
     const TDF_CRT_KEY: &'static str = "tdf_crt";
     const TDF_SNAP_KEY: &'static str = "tdf_snap";
+    const TDF_RULER_KEY: &'static str = "tdf_ruler";
+    const TDF_RULER_COLS_KEY: &'static str = "tdf_ruler_cols";
     const TDF_PRESETS_KEY: &'static str = "tdf_presets";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
@@ -2825,6 +2829,14 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_SNAP_KEY))
                 .unwrap_or(false),
+            tdf_ruler: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_RULER_KEY))
+                .unwrap_or(false),
+            tdf_ruler_cols: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u32>(s, Self::TDF_RULER_COLS_KEY))
+                .unwrap_or(80),
             tdf_page: 0,
             tdf_grid_tex: None,
             tdf_presets: cc
@@ -6923,6 +6935,7 @@ impl PixelView {
             if n > 1 {
                 let cur = self.tdf_fonts[self.tdf_index].0.clone();
                 egui::ComboBox::from_id_salt("tdf_font_pick")
+                    .width(300.0)
                     .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
                     .show_ui(ui, |ui| {
                         for (i, (name, ty, gc)) in self.tdf_fonts.iter().enumerate() {
@@ -6955,6 +6968,7 @@ impl PixelView {
             let names: Vec<String> = self.tdf_presets.iter().map(|p| p.name.clone()).collect();
             let sel = if self.tdf_preset_name.is_empty() { "— pick —".to_string() } else { self.tdf_preset_name.clone() };
             egui::ComboBox::from_id_salt("tdf_preset_pick")
+                .width(220.0)
                 .selected_text(sel)
                 .show_ui(ui, |ui| {
                     for p in &self.tdf_presets {
@@ -7079,6 +7093,14 @@ impl PixelView {
                 .on_hover_text("Stretch ~1.2× vertically for the 4:3 CRT look (display only)");
             ui.checkbox(&mut self.tdf_snap, "Snap")
                 .on_hover_text("Snap the preview zoom to a whole pixel scale — every pixel stays crisp (no blur)");
+            ui.separator();
+            ui.checkbox(&mut self.tdf_ruler, "Ruler")
+                .on_hover_text("Draw a column-width guide line down the preview — check your logo fits a BBS screen");
+            ui.add_enabled_ui(self.tdf_ruler, |ui| {
+                for c in [40u32, 80, 132] {
+                    ui.selectable_value(&mut self.tdf_ruler_cols, c, c.to_string());
+                }
+            });
             if ui.small_button("Reset").clicked() {
                 self.tdf_spacing = 0;
                 self.tdf_line_gap = 1;
@@ -7131,7 +7153,31 @@ impl PixelView {
                 self.tdf_sample_tex = None;
             }
         }
+        // Character dimensions of the rendered art (each cell is 8 or 9 px wide × 16 tall).
+        let cell_w = if self.tdf_font_9px { 9.0f32 } else { 8.0 };
+        let (chars_w, chars_h) = self
+            .tdf_sample_tex
+            .as_ref()
+            .map(|(_, t)| {
+                let s = t.size_vec2();
+                ((s.x / cell_w).round() as u32, (s.y / 16.0).round() as u32)
+            })
+            .unwrap_or((0, 0));
+        ui.horizontal(|ui| {
+            ui.weak(format!("Design: {chars_w} × {chars_h} chars"));
+            if self.tdf_ruler {
+                let over = chars_w > self.tdf_ruler_cols;
+                let msg = if over {
+                    egui::RichText::new(format!("· ⚠ exceeds {} cols by {}", self.tdf_ruler_cols, chars_w - self.tdf_ruler_cols))
+                        .color(egui::Color32::from_rgb(230, 120, 90))
+                } else {
+                    egui::RichText::new(format!("· fits {} cols", self.tdf_ruler_cols)).weak()
+                };
+                ui.label(msg);
+            }
+        });
         let crt_y = if self.tdf_crt { 1.2 } else { 1.0 };
+        let (ruler_on, ruler_cols) = (self.tdf_ruler, self.tdf_ruler_cols);
         egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
             if let Some((_, tex)) = &self.tdf_sample_tex {
                 // Explicit zoom (user slider); CRT stretches Y ~1.2× (display only, texture unchanged).
@@ -7143,7 +7189,18 @@ impl PixelView {
                     self.tdf_zoom.max(0.25)
                 };
                 let size = egui::vec2(native.x * scale, native.y * scale * crt_y);
-                ui.add(egui::Image::new((tex.id(), size)));
+                let resp = ui.add(egui::Image::new((tex.id(), size)));
+                // Column ruler: a vertical guide line at `ruler_cols` characters from the left of the
+                // art, spanning the whole preview height, so a sysop sees if the logo overflows a
+                // 40/80/132-column BBS screen.
+                if ruler_on {
+                    let x = resp.rect.left() + ruler_cols as f32 * cell_w * scale;
+                    let (top, bot) = (resp.rect.top(), resp.rect.bottom().max(ui.clip_rect().bottom()));
+                    ui.painter().line_segment(
+                        [egui::pos2(x, top), egui::pos2(x, bot)],
+                        egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 90, 90, 200)),
+                    );
+                }
             } else {
                 ui.weak("(nothing to render — the font may lack these characters)");
             }
@@ -7482,6 +7539,7 @@ impl PixelView {
             if self.fon_faces.len() > 1 {
                 let cur = &self.fon_faces[self.fon_index];
                 egui::ComboBox::from_id_salt("fon_face_pick")
+                    .width(200.0)
                     .selected_text(format!("{} pt · {} px", cur.1, cur.2))
                     .show_ui(ui, |ui| {
                         for (i, (_, pts, h)) in self.fon_faces.iter().enumerate() {
@@ -27346,6 +27404,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::TDF_9PX_KEY, &self.tdf_font_9px);
         eframe::set_value(storage, Self::TDF_CRT_KEY, &self.tdf_crt);
         eframe::set_value(storage, Self::TDF_SNAP_KEY, &self.tdf_snap);
+        eframe::set_value(storage, Self::TDF_RULER_KEY, &self.tdf_ruler);
+        eframe::set_value(storage, Self::TDF_RULER_COLS_KEY, &self.tdf_ruler_cols);
         eframe::set_value(storage, Self::TDF_PRESETS_KEY, &self.tdf_presets);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
