@@ -21,6 +21,7 @@ mod soundfont;
 mod steam;
 mod thumb;
 mod video;
+mod imgsearch;
 mod viewdb;
 mod xi;
 mod youtube;
