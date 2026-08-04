@@ -46,15 +46,6 @@ pub fn entries(b: &[u8]) -> Vec<IcoEntry> {
     out
 }
 
-/// How many images the icon file holds (0 = not a multi-parse-able icon).
-pub fn count(b: &[u8]) -> usize {
-    if is_icon_dir(b) {
-        u16le(b, 4) as usize
-    } else {
-        0
-    }
-}
-
 /// Decode embedded image `idx` → RGBA. Builds a synthetic 1-entry ICO around that image's bytes and
 /// decodes it with the `image` crate (so PNG-compressed + BMP/DIB entries both work).
 pub fn render_entry(b: &[u8], idx: usize) -> Option<PixImage> {
@@ -139,5 +130,28 @@ mod tests {
         assert_eq!((d0.width, d0.height), (1, 1));
         let d1 = render_entry(&ico, 1).expect("entry 1 decodes");
         assert_eq!((d1.width, d1.height), (2, 2));
+    }
+}
+
+#[cfg(test)]
+mod real {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dump_vlc_ico() {
+        let Ok(bytes) = std::fs::read("/usr/share/vlc/vlc.ico") else { return };
+        let es = entries(&bytes);
+        eprintln!("vlc.ico: {} embedded images", es.len());
+        for (i, e) in es.iter().enumerate() {
+            let ok = render_entry(&bytes, i).is_some();
+            eprintln!("  [{i}] {}x{} {}bpp → decode {}", e.w, e.h, e.bpp, if ok {"ok"} else {"FAIL"});
+        }
+        // decode the biggest → PNG
+        if let Some((i,_)) = es.iter().enumerate().max_by_key(|(_,e)| e.w*e.h) {
+            if let Some(img) = render_entry(&bytes, i) {
+                image::save_buffer("/tmp/ico_biggest.png", &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8).unwrap();
+                eprintln!("wrote /tmp/ico_biggest.png {}x{}", img.width, img.height);
+            }
+        }
     }
 }

@@ -1105,6 +1105,7 @@ pub struct PixelView {
     pdf_cache: HashMap<PathBuf, Option<crate::decode::PdfMeta>>, // lazy PDF metadata for Details
     pdf_view: Option<PdfView>, // in-app multi-page PDF viewer state (None = not viewing a PDF)
     xmind_view: Option<XMindView>, // in-app multi-sheet XMind viewer state (None = not viewing one)
+    ico_view: Option<IcoView>, // in-app multi-image .ico/.cur viewer (None = not a multi-image icon)
     three_d: Option<ThreeDView>, // in-app interactive 3D model viewer (None = not viewing a mesh)
     // Pseudo-vector zoom: a deferred request to re-rasterize the open XMind/PDF at this
     // longest-side px (set while drawing when the texture is being upscaled; applied after).
@@ -2502,6 +2503,7 @@ impl PixelView {
             pdf_cache: HashMap::new(),
             pdf_view: None,
             xmind_view: None,
+            ico_view: None,
             three_d: None,
             want_rerender: None,
             audio_cache: HashMap::new(),
@@ -13393,6 +13395,7 @@ impl PixelView {
         self.video_trim_out = None;
         self.pdf_view = None;
         self.xmind_view = None;
+        self.ico_view = None;
         self.three_d = None;
         self.full_tex = None;
         self.full_src = None;
@@ -13430,6 +13433,19 @@ impl PixelView {
             });
             self.render_pdf_to_full(ctx);
             return;
+        }
+
+        // A .ico/.cur with MORE THAN ONE embedded image → the multi-image viewer (a size
+        // picker + Left/Right). A single-image icon falls through to the normal image path.
+        if is_ico_path(&path) {
+            if let Ok(bytes) = std::fs::read(&src) {
+                let entries = crate::decode::ico::entries(&bytes);
+                if entries.len() > 1 {
+                    self.ico_view = Some(IcoView { path: path.clone(), entries, index: 0 });
+                    self.render_ico_to_full(ctx);
+                    return;
+                }
+            }
         }
 
         // XMind → the in-app multi-sheet viewer. Render the current sheet now; the
@@ -13669,6 +13685,41 @@ impl PixelView {
         self.offset = egui::Vec2::ZERO;
         self.view_to_top = true;
         self.fit_requested = true;
+    }
+
+    /// Render the open `.ico`'s current embedded image into `full_tex`.
+    fn render_ico_to_full(&mut self, ctx: &egui::Context) {
+        let Some(v) = &self.ico_view else { return };
+        let (path, idx) = (v.path.clone(), v.index);
+        let Ok(bytes) = std::fs::read(self.resolve_local(&path)) else {
+            self.status = "Couldn't read the icon".into();
+            return;
+        };
+        let Some(img) = crate::decode::ico::render_entry(&bytes, idx) else {
+            self.status = "Couldn't decode this icon image".into();
+            return;
+        };
+        let size = [img.width as usize, img.height as usize];
+        let rgba = img.rgba_bytes();
+        // NEAREST — icons are pixel art; keep them crisp when zoomed.
+        let tex = TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+        self.full_src = Some((path.clone(), size, rgba));
+        self.full_tex = Some((path, tex));
+        self.full_reduced = None;
+        self.minimap = None;
+        self.offset = egui::Vec2::ZERO;
+        self.fit_requested = true;
+    }
+
+    /// Step the open icon's embedded image by `delta` (clamped) and re-render.
+    fn ico_step(&mut self, ctx: &egui::Context, delta: isize) {
+        let Some(v) = &mut self.ico_view else { return };
+        let last = v.count() as isize;
+        let next = (v.index as isize + delta).clamp(0, (last - 1).max(0));
+        if next as usize != v.index {
+            v.index = next as usize;
+            self.render_ico_to_full(ctx);
+        }
     }
 
     /// Step the open XMind's sheet by `delta` (clamped) and re-render.
@@ -20552,11 +20603,14 @@ impl PixelView {
             // SHEETS (stepping to another file mid-read is rarely what you want);
             // everywhere else they step images.
             let xmind_multi = self.xmind_view.as_ref().is_some_and(|v| v.sheets() > 1);
+            let ico_multi = self.ico_view.as_ref().is_some_and(|v| v.count() > 1);
             if prev {
                 if self.pdf_view.is_some() {
                     self.pdf_step_page(ctx, -1);
                 } else if xmind_multi {
                     self.xmind_step_sheet(ctx, -1);
+                } else if ico_multi {
+                    self.ico_step(ctx, -1);
                 } else {
                     self.step_image(ctx, false);
                 }
@@ -20566,6 +20620,8 @@ impl PixelView {
                     self.pdf_step_page(ctx, 1);
                 } else if xmind_multi {
                     self.xmind_step_sheet(ctx, 1);
+                } else if ico_multi {
+                    self.ico_step(ctx, 1);
                 } else {
                     self.step_image(ctx, true);
                 }
@@ -20820,6 +20876,39 @@ impl PixelView {
                     v.sheet = g.min(sheets - 1);
                 }
                 self.render_xmind_to_full(ctx);
+            }
+        }
+
+        // A multi-image .ico/.cur: a size picker + Prev/Next (⬅/➡ also step images).
+        if self.ico_view.as_ref().is_some_and(|v| v.count() > 1) && !immersive {
+            let (index, n, labels) = {
+                let v = self.ico_view.as_ref().unwrap();
+                (v.index, v.count(), (0..v.count()).map(|i| v.label(i)).collect::<Vec<_>>())
+            };
+            let mut goto: Option<usize> = None;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(index > 0, egui::Button::new("⬅ Prev")).clicked() {
+                    goto = Some(index.saturating_sub(1));
+                }
+                egui::ComboBox::from_id_salt("ico_image_picker")
+                    .selected_text(format!("Image {} / {}: {}", index + 1, n, labels.get(index).cloned().unwrap_or_default()))
+                    .show_ui(ui, |ui| {
+                        for (i, lab) in labels.iter().enumerate() {
+                            if ui.selectable_label(i == index, format!("{}. {lab}", i + 1)).clicked() {
+                                goto = Some(i);
+                            }
+                        }
+                    });
+                if ui.add_enabled(index + 1 < n, egui::Button::new("Next ➡")).clicked() {
+                    goto = Some(index + 1);
+                }
+                ui.weak("· embedded icon images · ⬅/➡ turn");
+            });
+            if let Some(g) = goto {
+                if let Some(v) = &mut self.ico_view {
+                    v.index = g.min(n - 1);
+                }
+                self.render_ico_to_full(ctx);
             }
         }
 
@@ -29651,6 +29740,29 @@ impl XMindView {
     }
 }
 
+/// In-app multi-image `.ico`/`.cur` viewer: which file, its embedded images, the current one.
+struct IcoView {
+    path: PathBuf,
+    entries: Vec<crate::decode::ico::IcoEntry>,
+    index: usize,
+}
+
+impl IcoView {
+    fn count(&self) -> usize {
+        self.entries.len().max(1)
+    }
+    /// `"WxH · Nbpp"` label for image `i`.
+    fn label(&self, i: usize) -> String {
+        self.entries
+            .get(i)
+            .map(|e| {
+                let bpp = if e.bpp == 0 { String::new() } else { format!(" · {}bpp", e.bpp) };
+                format!("{}×{}{bpp}", e.w, e.h)
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// A decoded audio buffer + its precomputed waveform peaks — the *swappable* playback unit:
 /// the whole file/song, or one individual sample pulled out of a tracker module. Selecting a
 /// tracker sample stashes the song buffer and loads the sample's here, so the transport,
@@ -32099,6 +32211,13 @@ fn is_xmind_path(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("xmind"))
+}
+
+/// Is `p` a Windows icon/cursor (`.ico`/`.cur`)? A multi-image one opens the embedded-image viewer.
+fn is_ico_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ico") || e.eq_ignore_ascii_case("cur"))
 }
 
 /// A cheap change-signature for the 3D viewport: the active camera + scene options + the
@@ -34912,7 +35031,7 @@ fn read_file_tail(path: &Path, n: u64) -> Option<Vec<u8>> {
 fn is_image_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
-        "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "svg", "ans", "asc",
+        "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
         "petscii", "petmate", "rip", "pdf", "xmind",
     ];
