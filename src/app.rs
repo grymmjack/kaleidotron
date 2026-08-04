@@ -1197,6 +1197,12 @@ pub struct PixelView {
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
     folder_info: HashMap<PathBuf, FolderInfo>, // cached montage previews + counts per folder
+    // Archive thumbnails: extract-to-cache on a worker, then a folder-style montage of the contents
+    // (clutch for font .zips). Keyed by the archive path; a pending set dedupes the workers.
+    archive_montage: HashMap<PathBuf, FolderInfo>,
+    archive_montage_pending: std::collections::HashSet<PathBuf>,
+    archive_montage_tx: std::sync::mpsc::Sender<(PathBuf, FolderInfo)>,
+    archive_montage_rx: std::sync::mpsc::Receiver<(PathBuf, FolderInfo)>,
 
     mode: Mode,
     selected: usize,
@@ -2513,6 +2519,8 @@ impl PixelView {
 
         // Shared channel for background pack-SAUCE fetches (see `ensure_colo_sauce`).
         let (colo_sauce_tx, colo_sauce_rx) = std::sync::mpsc::channel();
+        // Shared channel for background archive-thumbnail (montage) builds.
+        let (archive_montage_tx, archive_montage_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
             registry,
@@ -2616,6 +2624,10 @@ impl PixelView {
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
             folder_info: HashMap::new(),
+            archive_montage: HashMap::new(),
+            archive_montage_pending: std::collections::HashSet::new(),
+            archive_montage_tx,
+            archive_montage_rx,
             mode: Mode::Grid,
             compare_source: None,
             compare_diff: None,
@@ -6455,6 +6467,8 @@ impl PixelView {
             self.grid_recolor.remove(p); // recolored grid tile
             self.sauce_cache.remove(p); // parsed SAUCE
             self.folder_info.remove(p); // montage + count (for directory entries)
+            self.archive_montage.remove(p); // archive content montage
+            self.archive_montage_pending.remove(p);
             self.thumbs.forget(p); // local thumbnailer dedupe set
             self.colo_thumbs.forget(p); // remote (16colo) thumbnailer dedupe set
         }
@@ -19386,15 +19400,56 @@ impl PixelView {
                             }
                             // (folder name is rendered in the caption strip below)
                         } else if entry.is_archive {
-                            // Archive = a virtual folder: folder glyph + a format badge
-                            // so it reads as enterable but distinct from a real folder.
-                            ui.painter_at(rect).text(
-                                rect.center() - egui::vec2(0.0, tile * 0.10),
-                                egui::Align2::CENTER_CENTER,
-                                "📁",
-                                egui::FontId::proportional(tile * 0.42),
-                                ui.visuals().text_color(),
-                            );
+                            // Archive = a virtual folder. Show a 2×2 montage of its contents once
+                            // extracted in the background (clutch for font .zips); until then, the
+                            // folder glyph. A format badge always marks it as an archive.
+                            let montage = self.archive_montage.get(path).map(|i| i.previews.clone());
+                            match montage {
+                                Some(previews) if !previews.is_empty() => {
+                                    let inner = rect.shrink(7.0);
+                                    let half = inner.size() * 0.5;
+                                    let origins = [
+                                        inner.min,
+                                        inner.min + egui::vec2(half.x, 0.0),
+                                        inner.min + egui::vec2(0.0, half.y),
+                                        inner.min + half,
+                                    ];
+                                    for (qi, ppath) in previews.iter().enumerate().take(4) {
+                                        let cell = egui::Rect::from_min_size(origins[qi], half).shrink(2.0);
+                                        if let Some(tex) = self.thumb_tex.get(ppath) {
+                                            let fit = fit_centered(cell, tex.size_vec2());
+                                            ui.painter().image(
+                                                tex.id(),
+                                                fit,
+                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            self.thumbs.request(ppath, THUMB_PX);
+                                            self.want_repaint = true;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    ui.painter_at(rect).text(
+                                        rect.center() - egui::vec2(0.0, tile * 0.10),
+                                        egui::Align2::CENTER_CENTER,
+                                        "📁",
+                                        egui::FontId::proportional(tile * 0.42),
+                                        ui.visuals().text_color(),
+                                    );
+                                    // Kick off the background extract + montage scan once per archive.
+                                    if montage.is_none() && self.archive_montage_pending.insert(path.clone()) {
+                                        let tx = self.archive_montage_tx.clone();
+                                        let ap = path.clone();
+                                        std::thread::spawn(move || {
+                                            let info = archive_montage_info(&ap);
+                                            let _ = tx.send((ap, info));
+                                        });
+                                        self.want_repaint = true;
+                                    }
+                                }
+                            }
                             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                             if !ext.is_empty() {
                                 paint_format_badge(
@@ -26453,6 +26508,11 @@ impl eframe::App for PixelView {
         self.poll_yt_open(&ctx);
         self.poll_img();
         self.poll_img_open(&ctx);
+        // Drain finished archive-montage builds.
+        while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
+            self.archive_montage.insert(p, info);
+            self.want_repaint = true;
+        }
         self.poll_yt_meta();
         self.poll_yt_info();
         self.poll_ai_job();
@@ -35649,6 +35709,20 @@ struct FolderInfo {
     previews: Vec<PathBuf>,
     images: usize,
     subdirs: usize,
+}
+
+/// Build a montage `FolderInfo` for an archive by extracting it to the cache (idempotent) and
+/// scanning the extracted tree — so an archive tile shows a preview of its contents. Skips very
+/// large archives (a thumbnail isn't worth a huge extract) → an empty info (folder-glyph fallback).
+fn archive_montage_info(archive: &Path) -> FolderInfo {
+    const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024; // don't extract >64 MiB just for a thumbnail
+    if std::fs::metadata(archive).map(|m| m.len() > MAX_ARCHIVE_BYTES).unwrap_or(true) {
+        return FolderInfo::default();
+    }
+    match crate::archive::extract_to_cache(archive) {
+        Ok(root) => scan_folder_info(&root),
+        Err(_) => FolderInfo::default(),
+    }
 }
 
 /// Read up to the last `n` bytes of a file (the whole file if shorter) — used to
