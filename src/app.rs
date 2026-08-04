@@ -1419,9 +1419,12 @@ pub struct PixelView {
     tdf_zoom: f32,      // TDF preview zoom multiplier, persisted
     tdf_font_9px: bool, // TDF: render the 9-dot VGA cell (like the ANSI viewer), persisted
     tdf_crt: bool,      // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
+    tdf_snap: bool,     // TDF: snap the preview zoom to an integer scale (pixel-perfect), persisted
     tdf_page: usize,    // TDF glyph-grid page
     #[allow(clippy::type_complexity)]
     tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
+    tdf_presets: Vec<TdfPreset>, // saved TDF "setups" (BBS menu configs), persisted
+    tdf_preset_name: String,     // the Save-as name field
     // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
     fon_path: Option<PathBuf>,
     fon_bytes: Vec<u8>,
@@ -1919,6 +1922,8 @@ impl PixelView {
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
     const TDF_9PX_KEY: &'static str = "tdf_font_9px";
     const TDF_CRT_KEY: &'static str = "tdf_crt";
+    const TDF_SNAP_KEY: &'static str = "tdf_snap";
+    const TDF_PRESETS_KEY: &'static str = "tdf_presets";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2816,8 +2821,17 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_CRT_KEY))
                 .unwrap_or(false),
+            tdf_snap: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_SNAP_KEY))
+                .unwrap_or(false),
             tdf_page: 0,
             tdf_grid_tex: None,
+            tdf_presets: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<TdfPreset>>(s, Self::TDF_PRESETS_KEY))
+                .unwrap_or_default(),
+            tdf_preset_name: String::new(),
             fon_path: None,
             fon_bytes: Vec::new(),
             fon_faces: Vec::new(),
@@ -6732,7 +6746,7 @@ impl PixelView {
             ui.separator();
             ui.label("Cell");
             if ui
-                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
                 .changed()
             {
                 self.font_grid_tex = None;
@@ -6811,6 +6825,56 @@ impl PixelView {
         }
     }
 
+    /// Snapshot the current TDF viewer setup as a named preset (upserts by name).
+    fn save_tdf_preset(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "Name the preset first.".into();
+            return;
+        }
+        let preset = TdfPreset {
+            name: name.to_string(),
+            font_path: self.tdf_path.as_ref().map(|p| self.to_display(p).display().to_string()).unwrap_or_default(),
+            font_index: self.tdf_index,
+            sample: self.font_sample.clone(),
+            spacing: self.tdf_spacing,
+            line_gap: self.tdf_line_gap,
+            zoom: self.tdf_zoom,
+            font_9px: self.tdf_font_9px,
+            crt: self.tdf_crt,
+        };
+        if let Some(slot) = self.tdf_presets.iter_mut().find(|p| p.name == name) {
+            *slot = preset;
+            self.status = format!("Updated preset “{name}”");
+        } else {
+            self.tdf_presets.push(preset);
+            self.status = format!("Saved preset “{name}”");
+        }
+    }
+
+    /// Recall a TDF preset: open its font file if different, then apply every setting.
+    fn apply_tdf_preset(&mut self, ctx: &egui::Context, preset: &TdfPreset) {
+        // Open the preset's font if it isn't the one on screen (recall across files).
+        let cur = self.tdf_path.as_ref().map(|p| self.to_display(p).display().to_string());
+        if !preset.font_path.is_empty() && cur.as_deref() != Some(preset.font_path.as_str()) {
+            let p = PathBuf::from(&preset.font_path);
+            if p.exists() {
+                self.load_full(ctx, p);
+            }
+        }
+        self.font_sample = preset.sample.clone();
+        self.tdf_index = preset.font_index;
+        self.tdf_spacing = preset.spacing;
+        self.tdf_line_gap = preset.line_gap;
+        self.tdf_zoom = if preset.zoom > 0.0 { preset.zoom } else { 1.0 };
+        self.tdf_font_9px = preset.font_9px;
+        self.tdf_crt = preset.crt;
+        self.tdf_preset_name = preset.name.clone();
+        self.tdf_sample_tex = None;
+        self.tdf_grid_tex = None;
+        self.status = format!("Recalled preset “{}”", preset.name);
+    }
+
     fn ensure_tdf_loaded(&mut self, path: &Path) {
         if self.tdf_path.as_deref() == Some(path) {
             return;
@@ -6879,6 +6943,51 @@ impl PixelView {
             let (_, ty, gc) = &self.tdf_fonts[self.tdf_index];
             ui.weak(format!("· {ty} · {gc} glyphs"));
         });
+        ui.separator();
+
+        // Presets: save/recall the whole TDF "setup" by name (for BBS menu sets — main menu /
+        // messages / email, each remembering font + settings). Deferred (needs `&mut self` + ctx).
+        let mut recall_preset: Option<TdfPreset> = None;
+        let mut save_preset = false;
+        let mut delete_preset: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let names: Vec<String> = self.tdf_presets.iter().map(|p| p.name.clone()).collect();
+            let sel = if self.tdf_preset_name.is_empty() { "— pick —".to_string() } else { self.tdf_preset_name.clone() };
+            egui::ComboBox::from_id_salt("tdf_preset_pick")
+                .selected_text(sel)
+                .show_ui(ui, |ui| {
+                    for p in &self.tdf_presets {
+                        if ui.selectable_label(p.name == self.tdf_preset_name, &p.name).clicked() {
+                            recall_preset = Some(p.clone());
+                        }
+                    }
+                    let _ = names;
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tdf_preset_name)
+                    .desired_width(140.0)
+                    .hint_text("name…"),
+            );
+            if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
+                save_preset = true;
+            }
+            let can_del = self.tdf_presets.iter().any(|p| p.name == self.tdf_preset_name.trim());
+            if ui.add_enabled(can_del, egui::Button::new("✕")).on_hover_text("Delete this preset").clicked() {
+                delete_preset = Some(self.tdf_preset_name.trim().to_string());
+            }
+        });
+        if let Some(p) = recall_preset {
+            self.apply_tdf_preset(ctx, &p);
+        }
+        if save_preset {
+            let name = self.tdf_preset_name.clone();
+            self.save_tdf_preset(&name);
+        }
+        if let Some(name) = delete_preset {
+            self.tdf_presets.retain(|p| p.name != name);
+            self.status = format!("Deleted preset “{name}”");
+        }
         ui.separator();
 
         // Sample text (reuses the persisted font_sample) + export actions.
@@ -6968,6 +7077,8 @@ impl PixelView {
                 .on_hover_text("Render the authentic 9-dot VGA cell (box rules join), like the ANSI viewer");
             ui.checkbox(&mut self.tdf_crt, "CRT")
                 .on_hover_text("Stretch ~1.2× vertically for the 4:3 CRT look (display only)");
+            ui.checkbox(&mut self.tdf_snap, "Snap")
+                .on_hover_text("Snap the preview zoom to a whole pixel scale — every pixel stays crisp (no blur)");
             if ui.small_button("Reset").clicked() {
                 self.tdf_spacing = 0;
                 self.tdf_line_gap = 1;
@@ -7024,8 +7135,13 @@ impl PixelView {
         egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
             if let Some((_, tex)) = &self.tdf_sample_tex {
                 // Explicit zoom (user slider); CRT stretches Y ~1.2× (display only, texture unchanged).
+                // Snap rounds the scale to a whole number so NEAREST sampling is pixel-perfect.
                 let native = tex.size_vec2();
-                let scale = self.tdf_zoom.max(0.25);
+                let scale = if self.tdf_snap {
+                    self.tdf_zoom.round().max(1.0)
+                } else {
+                    self.tdf_zoom.max(0.25)
+                };
                 let size = egui::vec2(native.x * scale, native.y * scale * crt_y);
                 ui.add(egui::Image::new((tex.id(), size)));
             } else {
@@ -7064,7 +7180,7 @@ impl PixelView {
                 ui.separator();
                 ui.label("Cell");
                 if ui
-                    .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                    .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
                     .changed()
                 {
                     self.tdf_grid_tex = None;
@@ -7475,7 +7591,7 @@ impl PixelView {
             ui.separator();
             ui.label("Cell");
             if ui
-                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=96.0).show_value(false))
+                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
                 .changed()
             {
                 self.fon_grid_tex = None;
@@ -27229,6 +27345,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
         eframe::set_value(storage, Self::TDF_9PX_KEY, &self.tdf_font_9px);
         eframe::set_value(storage, Self::TDF_CRT_KEY, &self.tdf_crt);
+        eframe::set_value(storage, Self::TDF_SNAP_KEY, &self.tdf_snap);
+        eframe::set_value(storage, Self::TDF_PRESETS_KEY, &self.tdf_presets);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
@@ -28306,6 +28424,24 @@ struct ListItem {
 struct VideoList {
     name: String,
     items: Vec<ListItem>, // in add-order
+}
+
+/// A saved TheDraw "setup" — the whole TDF viewer configuration under a name, so a sysop building a
+/// BBS menu set can recall "main menu" / "messages" / "email" exactly (the font file, which font in
+/// it, the sample text, spacing/line-height/zoom, and 9px/CRT). `#[serde(default)]` so old saves
+/// survive new fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct TdfPreset {
+    name: String,
+    font_path: String, // the .tdf display path (recall opens it if not already open)
+    font_index: usize, // which font within the file
+    sample: String,    // the sample text (may be multi-line)
+    spacing: i32,
+    line_gap: i32,
+    zoom: f32,
+    font_9px: bool,
+    crt: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
