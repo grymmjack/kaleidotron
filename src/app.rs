@@ -19900,6 +19900,10 @@ impl PixelView {
                     left
                 })
             })
+        } else if is_svg_path(&path) {
+            std::fs::read(self.resolve_local(&path))
+                .ok()
+                .and_then(|b| crate::decode::render_svg_at(&b, target).ok())
         } else {
             None
         };
@@ -21132,12 +21136,14 @@ impl PixelView {
         // *device* pixels per source pixel — the only scale nearest-neighbor keeps
         // undistorted (see the blit below). `ppp` folds in fractional desktop scaling.
         let ppp = ui.ctx().pixels_per_point();
-        // XMind maps / PDF pages are smooth vector renders (no native pixel grid), and
+        // XMind maps / PDF pages / SVGs are smooth vector renders (no native pixel grid), and
         // they re-render on zoom — pixel-perfect would make them blocky AND fight the
         // re-render's zoom preservation, so they always scale smoothly.
+        let viewing_svg_pp = self.full_tex.as_ref().is_some_and(|(p, _)| is_svg_path(p));
         let pixel_perfect = (self.viewing_textmode || self.zoom_lock)
             && self.xmind_view.is_none()
-            && self.pdf_view.is_none();
+            && self.pdf_view.is_none()
+            && !viewing_svg_pp;
         if resp.hovered() {
             if pixel_perfect {
                 // One device-pixel ladder step per *physical notch*. `zoom_delta()` is
@@ -21209,7 +21215,11 @@ impl PixelView {
         // past ~1.5 device-px per source-px looks blurry — schedule a higher-res re-raster
         // (applied after this borrow of the texture ends) so it stays crisp like the real
         // app. `scale.x * ppp` is the true device-px/source-px factor.
-        if (self.xmind_view.is_some() || self.pdf_view.is_some())
+        let viewing_svg = self
+            .full_tex
+            .as_ref()
+            .is_some_and(|(p, _)| is_svg_path(p));
+        if (self.xmind_view.is_some() || self.pdf_view.is_some() || viewing_svg)
             && self.player.is_none()
             && self.anim.is_none()
             && self.want_rerender.is_none()
@@ -30892,6 +30902,13 @@ fn is_video_ext(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .is_some_and(|e| crate::decode::VIDEO_EXTS.contains(&e.as_str()))
+}
+
+/// An SVG file → gets the pseudo-vector zoom re-render (crisp zoom, like XMind/PDF).
+fn is_svg_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 
 /// A previewable font file (.ttf/.otf/.ttc) → the interactive font viewer.
