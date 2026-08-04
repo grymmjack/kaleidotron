@@ -173,3 +173,20 @@ User feedback on the font browser (+ new asks). Batch:
 - **DRAW font-format survey** (user asked for "every format DRAW supports"): DRAW has ttf/otf ✅,
   .FON ✅ (now), plus **.psf** (Linux console) + **.F16/.F08** (raw 8×16/8×8 bitmap dumps) — both
   small + fit this same viewer pattern; next up.
+
+### More bitmap fonts + recolor + TDF export (branch `more-bitmap-fonts`)
+Continuing the font work from user feedback:
+- **PSF + raw .fNN fonts** — extended `decode/fon.rs`: **PSF1/PSF2** (Linux console, magic-sniffed)
+  and the **raw fixed-width `.fNN` dumps** (`.f08`…`.f20`, 8×NN row-major; height derived from file
+  size) used by Fontraption / **Moebius** / TheDraw. All feed the same `FonFace` model → same tile +
+  viewer. Verified across the user's moebius corpus (F08/F16/F19 = PETSCII/Topaz/CP851) + DRAW's PSFs.
+- **Recolor works for fonts (incl. TDF)** — new `recolor_sample(path, img)` runs the full recolor
+  pipeline (palette remap + adjustments + dither + post-FX) on the rendered sample, preserving
+  transparency. Wired into the .ttf / .tdf / .fon viewers (live preview + the 📋 image copy + PNG
+  export), keyed off `pipeline_key()`. So the Recolor pane now tints/palettizes font art.
+- **TDF viewer extras** (user asks): a **letter-spacing slider** (negative overlaps letters — i32
+  gap, i32 layout so glyphs can overlap without erasing), a **preview zoom slider**, and three
+  exports — **💾 PNG** (recolored), **💾 ANS** (renders to ANSI art: CP437 bytes + SGR colour runs,
+  VGA→SGR colour fix; round-trips through our own ANSI decoder), **💾 TDF** (the selected font as a
+  standalone `.tdf` via retrofont's serializer). All persisted (`tdf_spacing`/`tdf_zoom`).
+- 286 tests pass; export round-trips unit-verified (`ans_and_tdf_export_roundtrip`).
