@@ -690,3 +690,4 @@ mod color_test {
         }
     }
 }
+
