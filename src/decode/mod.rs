@@ -64,6 +64,9 @@ pub use video::{grab_frame as grab_video_frame, probe as probe_video, VideoInfo,
 /// pseudo-vector zoom re-render), for the in-app multi-sheet viewer.
 pub use xmind::{render_xmind_sheet, render_xmind_sheet_at, xmind_sheet_titles};
 
+/// Rasterize an SVG at a target longest-side — the pseudo-vector zoom re-render (crisp zoom).
+pub use svg::render_svg_at;
+
 #[derive(Debug)]
 pub enum DecodeError {
     Unsupported,

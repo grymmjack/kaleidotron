@@ -91,3 +91,11 @@ transitive, no heavy new deps.
 - Unit-tested (parse + render + grid). Verified the thumbnail render on DejaVu Sans.
 - **Deferred**: bitmap/scene font formats (.fon, TheDraw .tdf, PSF/BDF/PCF, Type-1 .pfb) — each
   needs its own parser; TDF (scene) is the highest-value next.
+
+### SVG resample-on-zoom (branch `svg-zoom`)
+SVG now gets the same **pseudo-vector zoom** as XMind/PDF: zooming in **re-rasterizes from the
+SVG source** at a higher resolution instead of upscaling a fixed raster → crisp at any zoom.
+- `decode/svg.rs`: `render_svg_at(bytes, target_longest)` (+ shared `rasterize`); `decode` stays
+  at intrinsic size (capped) and the re-render bumps it up on zoom.
+- Wired into `draw_image_view`'s re-render trigger + `rerender_at` + excluded from pixel-perfect
+  (smooth sampling), all keyed off `is_svg_path(open)`. Unit-tested.
