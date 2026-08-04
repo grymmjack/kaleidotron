@@ -159,28 +159,137 @@ pub fn glyph_svg(bytes: &[u8], ch: char, fill: &str) -> Option<String> {
     ))
 }
 
-/// Rasterize `text` in the font at `px` em-height into an RGBA `PixImage` (glyphs in `color` over
-/// transparent). Honors `\n`, advance widths + kerning. `None` if the font can't be parsed. The
-/// output is bounded to a sane max so a giant paste can't allocate wildly.
-pub fn render_text(bytes: &[u8], text: &str, px: f32, color: [u8; 3]) -> Option<PixImage> {
-    let font = FontRef::try_from_slice(bytes).ok()?;
-    let px = px.clamp(6.0, 512.0);
-    let scaled = font.as_scaled(px);
-    let ascent = scaled.ascent();
-    let line_h = scaled.height() + scaled.line_gap();
+/// Render the whole `text` composition (spacing / line-height / colours / z-order) as a **vector
+/// SVG** — the logo, not a bitmap — so it exports crisp at any size. Glyph outlines via ttf-parser,
+/// laid out to match [`render_text`]. `None` if the font can't be parsed.
+pub fn text_svg(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<String> {
+    let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    let upem = face.units_per_em() as f32;
+    let scale = opts.px.clamp(6.0, 512.0) / upem;
+    let asc = face.ascender() as f32 * scale;
+    let desc = face.descender() as f32 * scale; // negative
+    let line_pitch = (face.height() as f32 * scale) + opts.line_gap;
     const PAD: f32 = 4.0;
 
-    // Layout pass: place each glyph, track width + line count.
-    let mut glyphs: Vec<Glyph> = Vec::new();
+    struct PB {
+        d: String,
+    }
+    impl ttf_parser::OutlineBuilder for PB {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.d.push_str(&format!("M{x:.1} {y:.1} "));
+        }
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.d.push_str(&format!("L{x:.1} {y:.1} "));
+        }
+        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+            self.d.push_str(&format!("Q{x1:.1} {y1:.1} {x:.1} {y:.1} "));
+        }
+        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+            self.d.push_str(&format!("C{x1:.1} {y1:.1} {x2:.1} {y2:.1} {x:.1} {y:.1} "));
+        }
+        fn close(&mut self) {
+            self.d.push_str("Z ");
+        }
+    }
+
+    // Lay out each glyph → (line, x, baseline_y, path-in-font-units). One <path> per glyph, placed
+    // by a transform (translate to the pen, scale + flip Y from font units to px).
+    let mut items: Vec<(usize, f32, f32, String)> = Vec::new();
+    let (mut x, mut base, mut line) = (PAD, PAD + asc, 0usize);
+    let (mut max_x, mut prev) = (PAD, None::<ttf_parser::GlyphId>);
+    for c in text.chars() {
+        if c == '\n' {
+            x = PAD;
+            base += line_pitch;
+            line += 1;
+            prev = None;
+            continue;
+        }
+        if c == '\r' {
+            continue;
+        }
+        let Some(gid) = face.glyph_index(c) else { continue };
+        let _ = prev; // kerning omitted in the SVG path (the raster preview keeps it)
+        let mut pb = PB { d: String::new() };
+        let _ = face.outline_glyph(gid, &mut pb);
+        if !pb.d.trim().is_empty() {
+            items.push((line, x, base, pb.d.trim().to_string()));
+        }
+        x += face.glyph_hor_advance(gid).unwrap_or(0) as f32 * scale + opts.letter_spacing;
+        max_x = max_x.max(x);
+        prev = Some(gid);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let total_w = (max_x + PAD).max(1.0);
+    let total_h = (PAD * 2.0 + asc + line as f32 * line_pitch + desc.abs()).max(1.0);
+    // z-order: top_down draws the upper lines last (on top).
+    if opts.top_down {
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+    } else {
+        items.sort_by_key(|i| i.0);
+    }
+    let hex = |c: [u8; 3]| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {total_w:.0} {total_h:.0}\" width=\"{total_w:.0}\" height=\"{total_h:.0}\">"
+    );
+    if let Some(bg) = opts.bg {
+        svg.push_str(&format!("<rect width=\"{total_w:.0}\" height=\"{total_h:.0}\" fill=\"{}\"/>", hex(bg)));
+    }
+    let ink = hex(opts.ink);
+    for (_, gx, gy, d) in items {
+        // translate to the pen, then scale glyph units→px with a Y flip.
+        svg.push_str(&format!(
+            "<path transform=\"translate({gx:.1} {gy:.1}) scale({scale:.5} {:.5})\" d=\"{d}\" fill=\"{ink}\"/>",
+            -scale
+        ));
+    }
+    svg.push_str("</svg>");
+    Some(svg)
+}
+
+/// Layout + colour options for [`render_text`] — a mini logo maker (parity with the TDF viewer).
+#[derive(Clone, Copy)]
+pub struct TextOpts {
+    pub px: f32,               // em size
+    pub ink: [u8; 3],          // glyph colour
+    pub bg: Option<[u8; 3]>,   // background fill (None = transparent)
+    pub letter_spacing: f32,   // extra px between glyphs (may be negative → overlap)
+    pub line_gap: f32,         // extra px added to the line pitch (may be negative → overlap)
+    pub top_down: bool,        // multi-line overlap order: true = upper lines drawn on top
+}
+
+impl Default for TextOpts {
+    fn default() -> Self {
+        Self { px: 48.0, ink: [235, 235, 235], bg: None, letter_spacing: 0.0, line_gap: 0.0, top_down: true }
+    }
+}
+
+/// Rasterize `text` in the font per `opts` into an RGBA `PixImage`. Honors `\n`, advance widths +
+/// kerning, letter-spacing, line-height, an optional background, and the multi-line z-order. `None`
+/// if the font can't be parsed. Output is bounded so a giant paste can't allocate wildly.
+pub fn render_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage> {
+    let font = FontRef::try_from_slice(bytes).ok()?;
+    let px = opts.px.clamp(6.0, 512.0);
+    let scaled = font.as_scaled(px);
+    let ascent = scaled.ascent();
+    let line_pitch = scaled.height() + scaled.line_gap() + opts.line_gap;
+    const PAD: f32 = 4.0;
+
+    // Layout pass: place each glyph, tagged with its line index (for z-order).
+    let mut glyphs: Vec<(usize, Glyph)> = Vec::new();
     let mut caret = point(PAD, PAD + ascent);
     let mut max_x = PAD;
     let mut prev: Option<GlyphId> = None;
+    let mut line_idx = 0usize;
     let mut lines = 1usize;
     for c in text.chars() {
         if c == '\n' {
             caret.x = PAD;
-            caret.y += line_h;
+            caret.y += line_pitch;
             prev = None;
+            line_idx += 1;
             lines += 1;
             continue;
         }
@@ -191,16 +300,30 @@ pub fn render_text(bytes: &[u8], text: &str, px: f32, color: [u8; 3]) -> Option<
         if let Some(p) = prev {
             caret.x += scaled.kern(p, gid);
         }
-        glyphs.push(gid.with_scale_and_position(px, caret));
-        caret.x += scaled.h_advance(gid);
+        glyphs.push((line_idx, gid.with_scale_and_position(px, caret)));
+        caret.x += scaled.h_advance(gid) + opts.letter_spacing;
         max_x = max_x.max(caret.x);
         prev = Some(gid);
     }
 
     let w = ((max_x + PAD).ceil() as usize).clamp(1, 8192);
-    let h = ((PAD * 2.0 + lines as f32 * line_h).ceil() as usize).clamp(1, 8192);
-    let mut px = vec![[0u8; 4]; w * h];
-    for g in glyphs {
+    let h = ((PAD * 2.0 + ascent + (lines as f32 - 1.0) * line_pitch + scaled.descent().abs()).ceil()
+        as usize)
+        .clamp(1, 8192);
+    // Background fill (opaque) or transparent.
+    let mut buf = match opts.bg {
+        Some(bg) => vec![[bg[0], bg[1], bg[2], 255]; w * h],
+        None => vec![[0u8; 4]; w * h],
+    };
+    // Draw order = z-order: for top_down the upper lines must land LAST (on top), so sort by line
+    // index descending; bottom-up keeps reading order (later lines on top).
+    if opts.top_down {
+        glyphs.sort_by(|a, b| b.0.cmp(&a.0));
+    } else {
+        glyphs.sort_by_key(|g| g.0);
+    }
+    let ink = opts.ink;
+    for (_, g) in glyphs {
         if let Some(outlined) = font.outline_glyph(g) {
             let bb = outlined.px_bounds();
             outlined.draw(|dx, dy, cov| {
@@ -210,14 +333,21 @@ pub fn render_text(bytes: &[u8], text: &str, px: f32, color: [u8; 3]) -> Option<
                     return;
                 }
                 let i = y as usize * w + x as usize;
-                let a = (cov * 255.0) as u8;
-                if a > px[i][3] {
-                    px[i] = [color[0], color[1], color[2], a];
+                // Proper alpha-over so glyphs composite on the bg + each other (any z-order).
+                let a = cov.clamp(0.0, 1.0);
+                let dst = buf[i];
+                let da = dst[3] as f32 / 255.0;
+                let oa = a + da * (1.0 - a);
+                if oa > 0.0 {
+                    let mix = |s: u8, d: u8| -> u8 {
+                        (((s as f32 * a + d as f32 * da * (1.0 - a)) / oa).round()).clamp(0.0, 255.0) as u8
+                    };
+                    buf[i] = [mix(ink[0], dst[0]), mix(ink[1], dst[1]), mix(ink[2], dst[2]), (oa * 255.0) as u8];
                 }
             });
         }
     }
-    Some(PixImage::from_rgba(w as u32, h as u32, px))
+    Some(PixImage::from_rgba(w as u32, h as u32, buf))
 }
 
 /// Render `chars` as a fixed grid of `cols` columns, each glyph centred in a `cell`×`cell` box,
@@ -278,7 +408,7 @@ impl Decoder for FontDecoder {
         is_font(bytes)
     }
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
-        render_text(bytes, &thumb_sample(), 44.0, [235, 235, 235])
+        render_text(bytes, &thumb_sample(), &TextOpts { px: 44.0, ..Default::default() })
             .ok_or(DecodeError::Unsupported)
     }
 }
@@ -311,7 +441,7 @@ mod tests {
         assert!(info.glyphs > 100);
         let chars = glyph_chars(&bytes);
         assert!(chars.contains(&'A') && chars.contains(&'g'));
-        let img = render_text(&bytes, "Ag", 48.0, [255, 255, 255]).unwrap();
+        let img = render_text(&bytes, "Ag", &TextOpts { px: 48.0, ink: [255, 255, 255], ..Default::default() }).unwrap();
         assert!(img.width > 4 && img.height > 4);
         // Some pixel got drawn.
         assert!(img.rgba_bytes().chunks(4).any(|p| p[3] > 0));
@@ -346,6 +476,28 @@ mod svg_test {
             assert!(tree.is_ok(), "svg should parse");
             // a space typically has no outline → None
             assert!(glyph_svg(&bytes, ' ', "#000").is_none());
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod logo_test {
+    use super::*;
+    #[test]
+    fn text_opts_and_svg() {
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans.ttf"] {
+            let Ok(bytes) = std::fs::read(p) else { continue };
+            // letter-spacing widens; bg fills opaque
+            let a = render_text(&bytes, "AB", &TextOpts { px: 48.0, letter_spacing: 0.0, ..Default::default() }).unwrap().width;
+            let b = render_text(&bytes, "AB", &TextOpts { px: 48.0, letter_spacing: 20.0, ..Default::default() }).unwrap().width;
+            assert!(b > a, "letter spacing should widen");
+            let bg = render_text(&bytes, "A", &TextOpts { px: 48.0, bg: Some([10,20,30]), ..Default::default() }).unwrap();
+            assert!(bg.rgba_bytes().chunks(4).any(|px| px == [10,20,30,255]), "bg fill present");
+            // composition SVG valid
+            let svg = text_svg(&bytes, "Hi", &TextOpts { px: 64.0, ink: [255,0,0], ..Default::default() }).unwrap();
+            eprintln!("svg len {} head {}", svg.len(), &svg[..svg.len().min(90)]);
+            assert!(resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).is_ok());
             return;
         }
     }

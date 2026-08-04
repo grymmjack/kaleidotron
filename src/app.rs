@@ -1409,6 +1409,11 @@ pub struct PixelView {
     font_chars: Vec<char>,
     font_sample: String, // the viewer's type-to-sample text (persisted)
     font_ink: [u8; 3],   // TTF/OTF viewer ink colour (the base render colour; recolor pipeline runs on top), persisted
+    font_bg: [u8; 3],    // TTF/OTF background colour (used when font_bg_on), persisted
+    font_bg_on: bool,    // fill the TTF/OTF preview background (else transparent), persisted
+    font_letter_spacing: f32, // TTF/OTF extra px between glyphs (negative overlaps), persisted
+    font_line_gap: f32,  // TTF/OTF extra px between lines (negative overlaps), persisted
+    font_top_down: bool, // TTF/OTF multi-line overlap order (upper lines on top), persisted
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1933,6 +1938,11 @@ impl PixelView {
     const AI_SIZES_KEY: &'static str = "ai_sizes";
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
     const FONT_INK_KEY: &'static str = "font_ink";
+    const FONT_BG_KEY: &'static str = "font_bg";
+    const FONT_BG_ON_KEY: &'static str = "font_bg_on";
+    const FONT_LSP_KEY: &'static str = "font_lsp";
+    const FONT_LGAP_KEY: &'static str = "font_lgap";
+    const FONT_TOPDOWN_KEY: &'static str = "font_topdown";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2819,6 +2829,26 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_INK_KEY))
                 .unwrap_or([235, 235, 235]),
+            font_bg: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_BG_KEY))
+                .unwrap_or([20, 20, 24]),
+            font_bg_on: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_BG_ON_KEY))
+                .unwrap_or(false),
+            font_letter_spacing: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_LSP_KEY))
+                .unwrap_or(0.0),
+            font_line_gap: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_LGAP_KEY))
+                .unwrap_or(0.0),
+            font_top_down: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_TOPDOWN_KEY))
+                .unwrap_or(true),
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -6712,10 +6742,23 @@ impl PixelView {
     /// The interactive font viewer (.ttf/.otf/.ttc): metadata header, a type-to-sample box with a
     /// live rendered preview, and a paged glyph grid — click a glyph to copy it, click Copy to grab
     /// the family name or the sample text.
-    /// Save the current TTF/OTF sample render (ink colour + recolor applied, transparent bg) as a
-    /// PNG via a save dialog — a quick logo export.
+    /// The TTF/OTF render options from the viewer's current settings (size, ink, bg, spacing,
+    /// line-height, z-order).
+    fn font_text_opts(&self) -> crate::decode::font::TextOpts {
+        crate::decode::font::TextOpts {
+            px: self.font_size,
+            ink: self.font_ink,
+            bg: self.font_bg_on.then_some(self.font_bg),
+            letter_spacing: self.font_letter_spacing,
+            line_gap: self.font_line_gap,
+            top_down: self.font_top_down,
+        }
+    }
+
+    /// Save the current TTF/OTF sample render (colours + recolor applied) as a PNG via a save dialog.
     fn export_font_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, self.font_size, self.font_ink)
+        let opts = self.font_text_opts();
+        let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &opts)
             .map(|img| self.recolor_sample(&self.font_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
@@ -6732,6 +6775,43 @@ impl PixelView {
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
         }
+    }
+
+    /// Save the whole composition as a **vector SVG** (crisp at any size) via a save dialog.
+    fn export_font_svg(&mut self, sample: &str) {
+        let Some(svg) = crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts()) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let base = self.font_info.as_ref().map(|i| i.family.clone()).unwrap_or_default();
+        let clean = |s: &str, n: usize| -> String {
+            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+        };
+        let default = format!("{}_{}.svg", clean(&base, 24), clean(sample, 24));
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+            match std::fs::write(&p, svg) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Render the composition to a temp PNG and open it in an external image editor.
+    fn open_font_png_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
+        let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &self.font_text_opts())
+            .map(|img| self.recolor_sample(&self.font_path.clone().unwrap_or_default(), img))
+        else {
+            self.status = "Nothing to render.".into();
+            return;
+        };
+        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let slug = if slug.is_empty() { "font".into() } else { slug };
+        let out = std::env::temp_dir().join(format!("pixelview_{slug}.png"));
+        if let Err(e) = image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+            self.status = format!("Couldn't write temp PNG: {e}");
+            return;
+        }
+        self.launch_external(exec, args, env, &out);
     }
 
     fn draw_font_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
@@ -6766,41 +6846,106 @@ impl PixelView {
         });
         ui.separator();
 
-        // Sample text + size + ink colour + exports — a mini logo maker.
+        // Sample text + size + colours + exports — a mini logo maker.
         let mut copy_img = false;
         let mut want_png = false;
+        let mut want_svg = false;
+        let mut copy_svg = false;
+        let mut open_png_in: Option<usize> = None; // "Open in…" opener index for the rendered PNG
+        let png_openers: Vec<OpenerItem> = self
+            .opener_items()
+            .into_iter()
+            .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == "png"))
+            .collect();
         ui.horizontal_wrapped(|ui| {
-            ui.label("Sample");
+            ui.label("Size");
             ui.add(egui::Slider::new(&mut self.font_size, 12.0..=400.0).suffix("px"));
-            ui.color_edit_button_srgb(&mut self.font_ink).on_hover_text("Ink colour (the Recolor pane runs on top)");
+            ui.label("Ink");
+            ui.color_edit_button_srgb(&mut self.font_ink).on_hover_text("Glyph colour (the Recolor pane runs on top)");
+            ui.checkbox(&mut self.font_bg_on, "BG");
+            ui.add_enabled_ui(self.font_bg_on, |ui| {
+                ui.color_edit_button_srgb(&mut self.font_bg).on_hover_text("Background fill colour");
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Letter spacing");
+            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -50.0..=50.0).fixed_decimals(0));
             ui.separator();
+            ui.label("Line height");
+            ui.add(egui::Slider::new(&mut self.font_line_gap, -100.0..=100.0).fixed_decimals(0));
+            if self.font_sample.contains('\n') {
+                ui.separator();
+                ui.label("Lines");
+                let cur = if self.font_top_down { "Top Down" } else { "Bottom Up" };
+                egui::ComboBox::from_id_salt("font_zorder").selected_text(cur).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.font_top_down, true, "Top Down");
+                    ui.selectable_value(&mut self.font_top_down, false, "Bottom Up");
+                });
+            }
+            if ui.small_button("Reset").clicked() {
+                self.font_letter_spacing = 0.0;
+                self.font_line_gap = 0.0;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
                 want_copy = Some(self.font_sample.clone());
             }
-            if ui
-                .small_button("📋 image")
-                .on_hover_text("Copy the rendered sample to the clipboard as a bitmap")
-                .clicked()
-            {
+            if ui.small_button("📋 image").on_hover_text("Copy the rendered sample as a bitmap").clicked() {
                 copy_img = true;
             }
-            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG (transparent bg)").clicked() {
+            if ui.small_button("📋 SVG").on_hover_text("Copy the whole composition as vector SVG").clicked() {
+                copy_svg = true;
+            }
+            ui.separator();
+            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG").clicked() {
                 want_png = true;
             }
+            if ui.small_button("💾 SVG").on_hover_text("Save the whole composition as a vector SVG (crisp at any size)").clicked() {
+                want_svg = true;
+            }
+            // Open the rendered PNG in an external image editor (DRAW / Aseprite / GIMP / …).
+            ui.menu_button("📂 Open in…", |ui| {
+                if png_openers.is_empty() {
+                    ui.weak("No PNG programs — add one in");
+                    ui.weak("View → Associations…");
+                }
+                for o in &png_openers {
+                    if ui.button(&o.name).clicked() {
+                        open_png_in = Some(o.idx);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Render the sample to a PNG and open it in an image editor");
         });
         if copy_img {
-            if let Some(img) = crate::decode::font::render_text(
-                &self.font_bytes,
-                &self.font_sample,
-                self.font_size,
-                self.font_ink,
-            ) {
+            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
         if want_png {
             self.export_font_png(&self.font_sample.clone());
+        }
+        if want_svg {
+            self.export_font_svg(&self.font_sample.clone());
+        }
+        if copy_svg {
+            match crate::decode::font::text_svg(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
+                Some(svg) => {
+                    ctx.copy_text(svg);
+                    self.status = "Copied composition SVG".into();
+                }
+                None => self.status = "Nothing to copy as SVG".into(),
+            }
+        }
+        if let Some(oi) = open_png_in {
+            let prog = self.openers.get(oi).map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
+            if let Some((exec, args, env)) = prog {
+                self.open_font_png_in(&self.font_sample.clone(), &exec, &args, &env);
+            }
         }
         let changed = ui
             .add(
@@ -6809,16 +6954,14 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Rendered preview (cached by "sample|size|ink|recolor"). The recolor pipeline applies so the
-        // sample tints/palettizes live via the Recolor pane.
-        let key = format!("{}|{:.0}|{:?}|{}|{}", self.font_sample, self.font_size, self.font_ink, self.pipeline_key(), self.recolor_ident());
+        // Rendered preview (cached by every option that affects it + recolor).
+        let key = format!(
+            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{}|{}",
+            self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
+            self.font_letter_spacing, self.font_line_gap, self.font_top_down, self.pipeline_key(), self.recolor_ident()
+        );
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::font::render_text(
-                &self.font_bytes,
-                &self.font_sample,
-                self.font_size,
-                self.font_ink,
-            ) {
+            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -27822,6 +27965,11 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
         eframe::set_value(storage, Self::FONT_INK_KEY, &self.font_ink);
+        eframe::set_value(storage, Self::FONT_BG_KEY, &self.font_bg);
+        eframe::set_value(storage, Self::FONT_BG_ON_KEY, &self.font_bg_on);
+        eframe::set_value(storage, Self::FONT_LSP_KEY, &self.font_letter_spacing);
+        eframe::set_value(storage, Self::FONT_LGAP_KEY, &self.font_line_gap);
+        eframe::set_value(storage, Self::FONT_TOPDOWN_KEY, &self.font_top_down);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
