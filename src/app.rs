@@ -6853,8 +6853,16 @@ impl PixelView {
 
         // Sample text (reuses the persisted font_sample) + export actions.
         let mut copy_img = false;
-        let mut want_ans = false;
+        let mut want_ans = false; // save the ANSI to disk
         let mut want_tdf = false;
+        let mut ans_open: Option<usize> = None; // render → open in this .ans opener
+        let mut ans_open_other = false; // render → open in a picked program
+        // The configured programs that handle `.ans` (so the ANS menu can open the render in them).
+        let ans_openers: Vec<OpenerItem> = self
+            .opener_items()
+            .into_iter()
+            .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == "ans"))
+            .collect();
         ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
@@ -6871,9 +6879,35 @@ impl PixelView {
             if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG beside the file").clicked() {
                 want_export = Some(());
             }
-            if ui.small_button("💾 ANS").on_hover_text("Export the rendered text as ANSI art (.ans) — CP437 + colour").clicked() {
-                want_ans = true;
-            }
+            // ANS is a menu: save to disk, or render + open in a configured .ans editor.
+            ui.menu_button("💾 ANS", |ui| {
+                if ui
+                    .button("💾 Save to disk…")
+                    .on_hover_text("Export the rendered text as ANSI art (.ans) — CP437 + colour")
+                    .clicked()
+                {
+                    want_ans = true;
+                    ui.close();
+                }
+                ui.separator();
+                ui.weak("Open in…");
+                for o in &ans_openers {
+                    if ui.button(&o.name).clicked() {
+                        ans_open = Some(o.idx);
+                        ui.close();
+                    }
+                }
+                if ans_openers.is_empty() {
+                    ui.weak("(no .ans programs — add one in");
+                    ui.weak("View → Associations…)");
+                }
+                if ui.button("Other program…").clicked() {
+                    ans_open_other = true;
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Export the rendered text as ANSI art, or open it in an editor");
             if ui.small_button("💾 TDF").on_hover_text("Export the selected font as a standalone TheDraw .tdf file").clicked() {
                 want_tdf = true;
             }
@@ -6913,6 +6947,18 @@ impl PixelView {
         }
         if want_ans {
             self.export_tdf_ans(&sample);
+        }
+        if let Some(oi) = ans_open {
+            let prog = self.openers.get(oi).map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
+            if let Some((exec, args, env)) = prog {
+                self.open_tdf_ans_in(&sample, &exec, &args, &env);
+            }
+        }
+        if ans_open_other {
+            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+                let exec = exec.to_string_lossy().to_string();
+                self.open_tdf_ans_in(&sample, &exec, "", "");
+            }
         }
         if want_tdf {
             self.export_tdf_file();
@@ -7012,6 +7058,30 @@ impl PixelView {
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
         }
+    }
+
+    /// Render the current TDF text to a temp `.ans` file and open it in an external program
+    /// (`exec`/`args`/`env` from a configured `.ans` association, or a one-off pick). Lets you
+    /// send TheDraw art straight into PabloDraw / Moebius / an ANSI editor.
+    fn open_tdf_ans_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
+        let Some(bytes) =
+            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
+        else {
+            self.status = "Nothing to render.".into();
+            return;
+        };
+        let slug: String = sample
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(24)
+            .collect();
+        let slug = if slug.is_empty() { "tdf".into() } else { slug };
+        let out = std::env::temp_dir().join(format!("pixelview_{slug}.ans"));
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            self.status = format!("Couldn't write temp ANSI: {e}");
+            return;
+        }
+        self.launch_external(exec, args, env, &out);
     }
 
     /// Export the selected TheDraw font as a standalone `.tdf` file via a save dialog.
