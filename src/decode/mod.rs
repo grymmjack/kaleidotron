@@ -15,6 +15,7 @@ mod code;
 mod eps;
 pub mod font;
 pub mod fon;
+pub mod ico;
 pub mod tdf;
 mod cp437_font;
 mod cp437_font_8x8;

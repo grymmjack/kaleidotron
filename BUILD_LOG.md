@@ -213,3 +213,15 @@ for the file's ext + Default app + Other program…) is now in the **status bar 
 viewer** — image / font / TDF / FON / PDF / GIF / audio / video / 3D / compare (`current_open_file`
 resolves the open file per `Mode`). So you can bounce whatever you're viewing into PabloDraw / an
 editor / etc. from anywhere, not just the grid right-click. 286 tests pass.
+
+### Multi-image .ico/.cur viewer (branch `ico-multi`)
+`.ico` decoded before but the image crate only hands back the best single image. Now a `.ico`/`.cur`
+holding >1 image opens a viewer that flips through every embedded size/depth.
+- `decode/ico.rs`: parse the ICONDIR (`entries` → w/h/bpp per image); `render_entry(bytes, idx)`
+  wraps that image's bytes in a synthetic 1-entry ICO and hands it to the image crate (reuses its
+  PNG + BMP/DIB per-entry handling). Unit-tested (hand-built 2-image ICO) + verified on vlc.ico
+  (6 images, 16–256px, 8/32bpp all decode).
+- `IcoView` + `render_ico_to_full`/`ico_step`; load_full enters it for a multi-image icon (single
+  stays a normal image). A size-picker combo + Prev/Next; ⬅/➡ turn images. `is_ico_path`; `.cur`
+  added to is_image_ext + the builtin decoder. 287 tests pass.
+- Confirmed already-supported (answered in-thread): **PBM/PGM/PPM/PNM pixmaps** (image crate `pnm`).
