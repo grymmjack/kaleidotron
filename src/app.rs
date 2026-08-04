@@ -3074,6 +3074,25 @@ impl PixelView {
 
     /// Scan `dir` into folder + image entries (directories first, then images,
     /// each name-sorted — the default order; Phase 5 makes this configurable).
+    /// Write the embedded TheDraw font library to a stable cache file (once) and open it as a
+    /// virtual folder — the existing archive machinery browses the 1240 bundled `.tdf` fonts, each
+    /// tile rendering the font's name, click to open in the TDF viewer.
+    fn open_bundled_tdf(&mut self) {
+        const ZIP: &[u8] = include_bytes!("../assets/tdf/thedraw_fonts.zip");
+        let dir = self.data_dir.join("bundled");
+        let path = dir.join("TheDraw Fonts.zip");
+        // Extract once; re-extract if missing or a different size (e.g. after an app update).
+        let need = std::fs::metadata(&path).map(|m| m.len() != ZIP.len() as u64).unwrap_or(true);
+        if need {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::write(&path, ZIP) {
+                self.status = format!("Couldn't unpack the bundled fonts: {e}");
+                return;
+            }
+        }
+        self.open_folder(path);
+    }
+
     fn open_folder(&mut self, dir: PathBuf) {
         self.kit_editor = false; // navigating leaves the standalone pad editor
                                  // Visiting a folder (incl. a 16colo.rs pack) marks it viewed — recorded here,
@@ -24751,6 +24770,7 @@ impl PixelView {
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
+        let mut open_bundled_tdf = false; // "🎨 TheDraw Fonts" → mount the bundled font library
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
         let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
@@ -24829,6 +24849,15 @@ impl PixelView {
                         // Local: Home + on-disk favorites + smart filters (local searches).
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
+                        }
+                        // The bundled TheDraw font library (1240 public-domain .tdf fonts) — opens
+                        // as a virtual folder you can browse + open in the TDF viewer.
+                        if ui
+                            .button("🎨 TheDraw Fonts")
+                            .on_hover_text("Browse the bundled library of 1240 TheDraw (.tdf) fonts")
+                            .clicked()
+                        {
+                            open_bundled_tdf = true;
                         }
                         if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
                         {
@@ -25803,6 +25832,8 @@ impl PixelView {
                     self.status = "Saved search to Places (click it to re-run)".into();
                 }
             }
+        } else if open_bundled_tdf {
+            self.open_bundled_tdf();
         } else if let Some(p) = nav {
             self.open_folder(p);
         }
