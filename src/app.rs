@@ -1430,6 +1430,8 @@ pub struct PixelView {
     tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
     tdf_presets: Vec<TdfPreset>, // saved TDF "setups" (BBS menu configs), persisted
     tdf_preset_name: String,     // the Save-as name field
+    tdf_pending_index: Option<usize>, // a font variant to select once the .tdf finishes loading
+                                      // (preset recall across files — survives ensure_tdf_loaded's reset)
     // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
     fon_path: Option<PathBuf>,
     fon_bytes: Vec<u8>,
@@ -2862,6 +2864,7 @@ impl PixelView {
                 .and_then(|s| eframe::get_value::<Vec<TdfPreset>>(s, Self::TDF_PRESETS_KEY))
                 .unwrap_or_default(),
             tdf_preset_name: String::new(),
+            tdf_pending_index: None,
             fon_path: None,
             fon_bytes: Vec::new(),
             fon_faces: Vec::new(),
@@ -3096,18 +3099,32 @@ impl PixelView {
     /// Color` / `Multi-color` subfolders). `category` deep-links into one of those (None = the root,
     /// showing all three). The zip is written to a stable cache file once, then mounted + browsed by
     /// the existing archive machinery — each tile renders the font's name; click to open the viewer.
-    fn open_bundled_tdf(&mut self, category: Option<&str>) {
+    /// Write the embedded font-library zip to its stable cache path (once) and return it. `None`
+    /// only if the write fails.
+    fn bundle_zip_path(&self) -> Option<PathBuf> {
         const ZIP: &[u8] = include_bytes!("../assets/tdf/thedraw_fonts.zip");
         let dir = self.data_dir.join("bundled");
         let path = dir.join("TheDraw Fonts.zip");
         let need = std::fs::metadata(&path).map(|m| m.len() != ZIP.len() as u64).unwrap_or(true);
         if need {
-            let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = std::fs::write(&path, ZIP) {
-                self.status = format!("Couldn't unpack the bundled fonts: {e}");
-                return;
-            }
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::write(&path, ZIP).ok()?;
         }
+        Some(path)
+    }
+
+    /// Ensure the bundled fonts are extracted to their (deterministic) cache dir — so a preset that
+    /// references a bundled font by its cache path can reload it even in a fresh session.
+    fn ensure_bundle_extracted(&self) -> Option<PathBuf> {
+        let zip = self.bundle_zip_path()?;
+        crate::archive::extract_to_cache(&zip).ok()
+    }
+
+    fn open_bundled_tdf(&mut self, category: Option<&str>) {
+        let Some(path) = self.bundle_zip_path() else {
+            self.status = "Couldn't unpack the bundled fonts".into();
+            return;
+        };
         match category {
             None => self.open_folder(path),
             Some(cat) => {
@@ -6899,6 +6916,7 @@ impl PixelView {
         let preset = TdfPreset {
             name: name.to_string(),
             font_path: self.tdf_path.as_ref().map(|p| self.to_display(p).display().to_string()).unwrap_or_default(),
+            font_real: self.tdf_path.as_ref().map(|p| self.resolve_local(p).display().to_string()).unwrap_or_default(),
             font_index: self.tdf_index,
             sample: self.font_sample.clone(),
             spacing: self.tdf_spacing,
@@ -6922,18 +6940,39 @@ impl PixelView {
         }
     }
 
-    /// Recall a TDF preset: open its font file if different, then apply every setting.
+    /// Recall a TDF preset: open its font file if different (the pending variant survives the load),
+    /// then apply every setting incl. the full recolor.
     fn apply_tdf_preset(&mut self, ctx: &egui::Context, preset: &TdfPreset) {
-        // Open the preset's font if it isn't the one on screen (recall across files).
-        let cur = self.tdf_path.as_ref().map(|p| self.to_display(p).display().to_string());
-        if !preset.font_path.is_empty() && cur.as_deref() != Some(preset.font_path.as_str()) {
-            let p = PathBuf::from(&preset.font_path);
-            if p.exists() {
-                self.load_full(ctx, p);
+        // The font to load is the *resolvable* path (bundled fonts live in a cache temp dir, not at
+        // their pretty display path — the old `font_path.exists()` check silently failed on them).
+        let target = if preset.font_real.is_empty() {
+            PathBuf::from(&preset.font_path)
+        } else {
+            PathBuf::from(&preset.font_real)
+        };
+        let cur_real = self.tdf_path.as_ref().map(|p| self.resolve_local(p));
+        let mut loaded = false;
+        if !target.as_os_str().is_empty() && cur_real.as_deref() != Some(target.as_path()) {
+            // A bundled font's temp may not exist yet (fresh session) — re-extract the library.
+            if !target.exists() {
+                self.ensure_bundle_extracted();
+            }
+            if target.exists() {
+                self.tdf_pending_index = Some(preset.font_index); // survives ensure_tdf_loaded's reset
+                self.load_full(ctx, target);
+                loaded = true;
+            } else {
+                self.status = format!(
+                    "Preset “{}”: font not found — open the TheDraw Fonts library once, then retry.",
+                    preset.name
+                );
             }
         }
         self.font_sample = preset.sample.clone();
-        self.tdf_index = preset.font_index;
+        // Same font already open → set the variant directly (the load path used the pending index).
+        if !loaded {
+            self.tdf_index = preset.font_index.min(self.tdf_fonts.len().saturating_sub(1));
+        }
         self.tdf_spacing = preset.spacing;
         self.tdf_line_gap = preset.line_gap;
         self.tdf_zoom = if preset.zoom > 0.0 { preset.zoom } else { 1.0 };
@@ -6970,7 +7009,6 @@ impl PixelView {
             return;
         }
         self.tdf_path = Some(path.to_path_buf());
-        self.tdf_index = 0;
         self.tdf_sample_tex = None;
         self.tdf_grid_tex = None;
         self.tdf_page = 0;
@@ -6984,6 +7022,10 @@ impl PixelView {
                 self.tdf_fonts.clear();
             }
         }
+        // A preset recall stashed which variant to select once the (possibly different) font
+        // finished loading — apply it now (survives this load's reset), else default to font 0.
+        let want = self.tdf_pending_index.take().unwrap_or(0);
+        self.tdf_index = want.min(self.tdf_fonts.len().saturating_sub(1));
     }
 
     /// TheDraw font viewer: a font picker (one .tdf holds several), a type-to-sample box (shares
@@ -28707,7 +28749,9 @@ fn vga_swatch_menu(ui: &mut egui::Ui, label: &str, cur: &mut u8) -> bool {
 #[serde(default)]
 struct TdfPreset {
     name: String,
-    font_path: String, // the .tdf display path (recall opens it if not already open)
+    font_path: String, // the .tdf display path (human-readable breadcrumb)
+    #[serde(default)]
+    font_real: String, // the resolvable on-disk path (may be a cache temp for a bundled font)
     font_index: usize, // which font within the file
     sample: String,    // the sample text (may be multi-line)
     spacing: i32,
