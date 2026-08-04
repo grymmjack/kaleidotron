@@ -127,3 +127,24 @@ text-mode decoders).
 - Verified against the user's real corpus (~1200 .tdf): ARCHANA (dripping magenta colour font),
   4Max Colour, Thin Cyan (outline), multi-font files (ASSYLUM/THINX = 4 fonts each) all render
   correctly. Unit-tested (sniff + Unicode round-trip) + an `#[ignore]` corpus dump. 283 tests pass.
+
+### Free image search — Openverse (branch `image-search`)
+The user's ask for a "free image search … unlimited art/photos". **Openverse** (`api.openverse.org`,
+the CC-search WordPress runs — ~800M CC/public-domain images) is keyless + JSON, so it slots into
+the exact virtual-source pattern as 16colo/YouTube/Steam.
+- `src/imgsearch.rs` (pure, unit-tested): `<images>` ROOT / `is_remote` / `rel_parts`, `ImgResult`
+  (title/creator/license/provider/img+thumb+page urls/dims/ext), `parse_results`, `search(q,n)` via
+  the shared HTTP cache (1-day TTL). Ext inferred from `filetype`→url→jpg; licence label "CC BY-…".
+- `app.rs` wiring (a leaner `yt_*` sibling — opening a result is a cache-first `cache::get_file`,
+  no yt-dlp): `img_results`/`img_files`/`img_rx`/`img_open_rx`/`img_search_cache` fields, `ImgMsg`,
+  `img_walk` worker, `open_images` route, `start_img_search`/`poll_img`, `start_img_open`/
+  `poll_img_open` (status credits creator + licence for CC attribution), `cancel_img` on nav.
+  Folded into `resolve_local`, `activate`, `open_folder`, the poll battery, `any_remote`, and the
+  grid/table thumbnail dispatch.
+- **Places → Images tab** (idx 8): a search box + "★ Save" pinned searches (re-run on click).
+  Results stream as normal grid tiles (Openverse thumbnails), so **recolor / palette / Save** all
+  work on them. Click → download-in-place → view locally.
+- Verified live against the real API (pixel-art query returns CC-licensed jpgs); unit-tested; 285 tests pass.
+- **Also answered**: SWF/Flash — Ruffle (Rust) exists but full embedding is a major lift (own AVM +
+  wgpu renderer fighting egui's); recommended a shell-out-to-`ruffle` placeholder as the pragmatic
+  path, deferred. Pexels/Unsplash/Pixabay noted as key-required alternatives to Openverse.
