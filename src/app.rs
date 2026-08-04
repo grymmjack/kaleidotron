@@ -1403,6 +1403,8 @@ pub struct PixelView {
     font_chars: Vec<char>,
     font_sample: String, // the viewer's type-to-sample text (persisted)
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
+    font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
+    show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
     font_size: f32,      // sample render height in px
     font_page: usize,    // glyph-grid page
     font_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "sample|size"
@@ -1923,6 +1925,7 @@ impl PixelView {
     const AI_SIZES_KEY: &'static str = "ai_sizes";
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
+    const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
@@ -2801,6 +2804,11 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
                 .unwrap_or_else(|| crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string()),
+            font_preview_on: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_PREVIEW_ON_KEY))
+                .unwrap_or(false),
+            show_font_preview_edit: false,
             font_size: 48.0,
             font_page: 0,
             font_sample_tex: None,
@@ -3076,7 +3084,7 @@ impl PixelView {
 
         // Prime the font-thumbnail sample text (the decoder reads a process-global — see
         // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
-        crate::decode::font::set_thumb_sample(&app.font_preview_text);
+        crate::decode::font::set_thumb_sample(if app.font_preview_on { &app.font_preview_text } else { "" });
 
         // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
         // visible on launch instead of an empty window. `open_folder` itself routes the
@@ -6990,6 +6998,29 @@ impl PixelView {
         self.tdf_sample_tex = None;
         self.tdf_grid_tex = None;
         self.status = format!("Recalled preset “{}”", preset.name);
+    }
+
+    /// Re-prime the font-tile preview text (custom when enabled, else defaults) and drop cached
+    /// font/TDF/FON thumbnails so they re-render at a glance across every open folder + library.
+    fn refresh_font_thumbs(&mut self) {
+        crate::decode::font::set_thumb_sample(if self.font_preview_on {
+            &self.font_preview_text
+        } else {
+            ""
+        });
+        let fonts: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| is_font_ext(&e.path) || is_fon_ext(&e.path) || is_tdf_ext(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        for p in fonts {
+            self.thumb_tex.remove(&p);
+            self.thumb_rgba.remove(&p);
+            self.img_meta.remove(&p);
+            self.thumbs.forget(&p);
+        }
+        self.want_repaint = true;
     }
 
     /// Build the shared render options from the viewer's current TDF settings.
@@ -24268,6 +24299,19 @@ impl PixelView {
                     }
                     Mode::Grid => {
                         if !self.entries.is_empty() {
+                            // Font-thumbnail preview text (TTF/OTF/FON/TDF): a toggle + a … editor,
+                            // so you can see your own text across every font at a glance.
+                            if ui.small_button("…").on_hover_text("Edit the font-thumbnail preview text (multiline)").clicked() {
+                                self.show_font_preview_edit = true;
+                            }
+                            if ui
+                                .checkbox(&mut self.font_preview_on, "Font text")
+                                .on_hover_text("Render your own sample text on all font thumbnails")
+                                .changed()
+                            {
+                                self.refresh_font_thumbs();
+                            }
+                            ui.separator();
                             ui.weak("Ctrl + wheel to zoom");
                             ui.separator();
                             // Thumbnail zoom, where 100% = DEFAULT_TILE. Three ways to
@@ -27332,25 +27376,54 @@ impl eframe::App for PixelView {
                 self.status = "3D render cache cleared".into();
             }
             if font_preview_changed {
-                crate::decode::font::set_thumb_sample(&self.font_preview_text);
-                // Drop cached font tiles so they re-render with the new sample text.
-                let fonts: Vec<PathBuf> = self
-                    .entries
-                    .iter()
-                    .filter(|e| is_font_ext(&e.path))
-                    .map(|e| e.path.clone())
-                    .collect();
-                for p in fonts {
-                    self.thumb_tex.remove(&p);
-                    self.thumb_rgba.remove(&p);
-                    self.img_meta.remove(&p);
-                    self.thumbs.forget(&p);
-                }
+                // Editing the Preferences text implies "use it".
+                self.font_preview_on = true;
+                self.refresh_font_thumbs();
             }
         }
 
         // File-type associations editor (View → Associations…).
         self.ui_associations(&ctx);
+
+        // Font-thumbnail preview-text editor (the "…" button in the grid status bar).
+        if self.show_font_preview_edit {
+            let mut open = true;
+            let mut changed = false;
+            egui::Window::new("Font thumbnail preview text")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([420.0, 200.0])
+                .show(&ctx, |ui| {
+                    ui.label("Shown on every font thumbnail (TTF · OTF · FON · TDF) when enabled.");
+                    ui.label("One line per row; TDF tiles fall back to the font's own name when blank.");
+                    ui.add_space(6.0);
+                    // Re-render tiles when editing settles (focus lost), not per keystroke.
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut self.font_preview_text)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(crate::decode::font::DEFAULT_THUMB_SAMPLE),
+                    );
+                    changed |= resp.lost_focus() && resp.changed();
+                    ui.horizontal(|ui| {
+                        changed |= ui.checkbox(&mut self.font_preview_on, "Use this text on font tiles").changed();
+                        if ui.button("↺ Default").clicked() {
+                            self.font_preview_text = crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
+                            changed = true;
+                        }
+                        if ui.button("Apply").on_hover_text("Re-render the font thumbnails now").clicked() {
+                            changed = true;
+                        }
+                    });
+                });
+            if changed {
+                // Editing implies "use it".
+                self.font_preview_on = self.font_preview_on || !self.font_preview_text.trim().is_empty();
+                self.refresh_font_thumbs();
+            }
+            self.show_font_preview_edit = open;
+        }
 
         // Rename dialog (F2 / Edit menu / right-click / new-folder). The buffer is
         // owned by `self.renaming`; we lift it out for editing and decide its fate.
@@ -27584,6 +27657,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
+        eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
