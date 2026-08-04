@@ -12,6 +12,7 @@ mod bin;
 mod builtin;
 mod c64_font;
 mod code;
+pub mod font;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
@@ -118,6 +119,7 @@ impl Registry {
                 Box::new(psd::PsdDecoder),            // .psd flattened (psd crate)
                 Box::new(xcf::XcfDecoder),            // .xcf composited (xcf crate)
                 Box::new(svg::SvgDecoder),            // .svg rasterized (resvg)
+                Box::new(font::FontDecoder),          // .ttf/.otf/.ttc sample render (ab_glyph)
                 Box::new(xmind::XMindDecoder),        // .xmind mind map → SVG → raster (resvg)
                 Box::new(ansi::AnsiDecoder),          // .ans/.asc/.nfo/.diz (CP437 + ANSI)
                 Box::new(xbin::XBinDecoder),          // .xb/.xbin (binary ANSI: palette/font/RLE)

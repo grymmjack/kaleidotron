@@ -78,3 +78,16 @@ timing quirk, not from any of this work).
 supports it), the AI `[?]` live macro reference, steering images, and saved generation batches
 beyond `count`. Dice `.obj` mirroring is **not a bug** (qb64-dungeon needs the inside-out winding)
 — left as-is.
+
+### Font viewer (branch `font-viewer`)
+Preview `.ttf` / `.otf` / `.ttc` / `.otc` (sniffed + by extension). New `decode/font.rs` using
+`ab_glyph` (glyph raster, the crate egui uses) + `ttf-parser` (names/metadata) — both already
+transitive, no heavy new deps.
+- ✅ **Grid thumbnail**: a rendered sample ("AaBbCcDdEe / 0123456789 / Grymm!") in the font.
+- ✅ **Interactive viewer**: family/style/glyph-count/monospace/upem header; a **type-to-sample**
+  box with a live rendered preview + size slider; a **paged glyph grid** of the font's real glyphs
+  — hover shows `U+XXXX`, click copies the char; **📋 Copy** family name / sample text.
+- ✅ In `is_image_ext` (prev/next, montages); sample text persisted.
+- Unit-tested (parse + render + grid). Verified the thumbnail render on DejaVu Sans.
+- **Deferred**: bitmap/scene font formats (.fon, TheDraw .tdf, PSF/BDF/PCF, Type-1 .pfb) — each
+  needs its own parser; TDF (scene) is the highest-value next.
