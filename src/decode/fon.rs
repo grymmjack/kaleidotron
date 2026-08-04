@@ -12,8 +12,14 @@
 use super::{DecodeError, Decoder};
 use crate::image_types::PixImage;
 
-/// Extensions handled here (`.fnt` = a bare FNT with no NE wrapper).
-pub const FON_EXTS: &[&str] = &["fon", "fnt"];
+/// Extensions handled here: `.fon`/`.fnt` (Windows FNT), `.psf` (PC Screen Font — Linux console),
+/// and the raw fixed-width **`.fNN`** dumps (8×NN, one byte per row) used by Fontraption / Moebius /
+/// TheDraw — `.f08`…`.f20` (the height is derived from the file size, so the extension only routes).
+/// All decode to the same [`FonFace`] model, so the tile + viewer are shared.
+pub const FON_EXTS: &[&str] = &[
+    "fon", "fnt", "psf", "f08", "f09", "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17",
+    "f18", "f19", "f20",
+];
 
 /// A decoded glyph: a `w×h` 1bpp bitmap flattened row-major (`true` = ink).
 #[derive(Clone)]
@@ -130,19 +136,93 @@ fn parse_fnt(b: &[u8], base: usize) -> Option<FonFace> {
     Some(FonFace { name, points, height: pix_height, ascent, glyphs })
 }
 
-/// Parse every raster face in a `.fon` (NE) or bare `.fnt`. Empty if none decode.
+/// Decode a fixed-width row-major bitmap font into a face: `count` glyphs, each `bpg` bytes tall
+/// (one row per byte, `width` px wide, MSB = leftmost). Covers PSF glyph data + raw F16/F08 dumps.
+fn face_from_rows(
+    data: &[u8],
+    count: usize,
+    width: usize,
+    height: usize,
+    row_bytes: usize,
+    name: &str,
+    points: u16,
+) -> Option<FonFace> {
+    if width == 0 || height == 0 || row_bytes * height == 0 {
+        return None;
+    }
+    let bpg = row_bytes * height;
+    let mut glyphs = Vec::with_capacity(count);
+    for i in 0..count {
+        let g = &data.get(i * bpg..i * bpg + bpg)?;
+        let mut bits = vec![false; width * height];
+        for row in 0..height {
+            for col in 0..width {
+                let byte = g[row * row_bytes + col / 8];
+                if (byte >> (7 - (col % 8))) & 1 == 1 {
+                    bits[row * width + col] = true;
+                }
+            }
+        }
+        glyphs.push(FonGlyph { ch: byte_to_char(i as u8), w: width, bits });
+    }
+    (!glyphs.is_empty()).then(|| FonFace { name: name.into(), points, height, ascent: height, glyphs })
+}
+
+/// PC Screen Font (PSF1 magic `36 04`, or PSF2 magic `72 b5 4a 86`) — Linux console bitmap fonts.
+fn parse_psf(b: &[u8]) -> Option<FonFace> {
+    if b.len() >= 4 && b[0] == 0x72 && b[1] == 0xb5 && b[2] == 0x4a && b[3] == 0x86 {
+        // PSF2: version, headersize, flags, length, charsize, height, width (all u32 LE).
+        let headersize = le32(b, 8) as usize;
+        let length = le32(b, 16) as usize;
+        let charsize = le32(b, 20) as usize;
+        let height = le32(b, 24) as usize;
+        let width = le32(b, 28) as usize;
+        let row_bytes = width.div_ceil(8);
+        if row_bytes * height != charsize {
+            return None;
+        }
+        return face_from_rows(&b[headersize..], length.min(512), width, height, row_bytes, "PSF2", 0);
+    }
+    if b.len() >= 4 && b[0] == 0x36 && b[1] == 0x04 {
+        // PSF1: mode, charsize (bytes/glyph = height; width fixed 8). 256 or 512 glyphs.
+        let mode = b[2];
+        let charsize = b[3] as usize;
+        let count = if mode & 0x01 != 0 { 512 } else { 256 };
+        return face_from_rows(&b[4..], count, 8, charsize, 1, "PSF1", 0);
+    }
+    None
+}
+
+/// A raw fixed-width dump (`.f16`/`.f08`): `256 × bytes-per-glyph`, 8px wide, row-major.
+fn parse_raw(b: &[u8]) -> Option<FonFace> {
+    if b.len() < 256 || b.len() % 256 != 0 {
+        return None;
+    }
+    let bpg = b.len() / 256;
+    if !(6..=64).contains(&bpg) {
+        return None; // implausible glyph height for a raw 8×N font
+    }
+    face_from_rows(b, 256, 8, bpg, 1, &format!("Raw 8×{bpg}"), 0)
+}
+
+/// Parse every raster face in a `.fon` (NE) / `.fnt` / `.psf` / raw `.f16`/`.f08`. Empty if none.
 pub fn parse_faces(b: &[u8]) -> Vec<FonFace> {
+    // PC Screen Font (magic-detected).
+    if let Some(f) = parse_psf(b) {
+        return vec![f];
+    }
     // Bare FNT (no MZ header): the whole file is one FNT.
     if b.len() >= 2 && matches!(le16(b, 0), 0x0100 | 0x0200 | 0x0300) {
         return parse_fnt(b, 0).into_iter().collect();
     }
     // NE .fon: MZ → e_lfanew → NE → resource table → RT_FONT (type 0x8008) resources.
+    // Not an MZ/NE? Fall back to a raw fixed-width dump (.f16/.f08 have no magic).
     if b.len() < 0x40 || &b[0..2] != b"MZ" {
-        return Vec::new();
+        return parse_raw(b).into_iter().collect();
     }
     let ne = le32(b, 0x3C) as usize;
     if ne + 0x26 > b.len() || &b[ne..ne + 2] != b"NE" {
-        return Vec::new();
+        return parse_raw(b).into_iter().collect();
     }
     let rsrc = ne + le16(b, ne + 0x24) as usize;
     if rsrc + 2 > b.len() {
@@ -291,8 +371,15 @@ impl Decoder for FonDecoder {
         FON_EXTS
     }
     fn sniff(&self, header: &[u8]) -> bool {
-        // A bare FNT: version 0x0100/0200/0300 as the first LE u16 + a plausible header. (.fon
-        // NE files are matched by extension — "MZ" alone is far too broad to sniff.)
+        // PC Screen Font magics (PSF1 36 04, PSF2 72 b5 4a 86) — distinctive, safe to sniff.
+        if header.len() >= 4
+            && ((header[0] == 0x36 && header[1] == 0x04)
+                || (header[0] == 0x72 && header[1] == 0xb5 && header[2] == 0x4a && header[3] == 0x86))
+        {
+            return true;
+        }
+        // A bare FNT: version 0x0100/0200/0300 as the first LE u16 + a plausible header. (.fon NE
+        // files + raw .f16/.f08 are matched by extension — "MZ"/raw are too broad to sniff.)
         header.len() >= 0x62
             && matches!(le16(header, 0), 0x0100 | 0x0200 | 0x0300)
             && le16(header, 0x58) as usize <= 256 // dfPixHeight plausible
@@ -328,16 +415,39 @@ mod tests {
     #[test]
     #[ignore]
     fn fon_dump() {
-        let dir = "/home/grymmjack/FontBase/Fonts/!FROM-K Drive/Sorted/Bitmap";
-        for name in ["sseriff0.fon", "8514fix0.fon", "8514oem0.fon"] {
-            let p = format!("{dir}/{name}");
-            let Ok(bytes) = std::fs::read(&p) else { continue };
+        let files = [
+            "/home/grymmjack/FontBase/Fonts/!FROM-K Drive/Sorted/Bitmap/sseriff0.fon",
+            "/home/grymmjack/git/DRAW/ASSETS/FONTS/BITMAP/IDC-MicroKnight.8X8.psf",
+            "/home/grymmjack/git/DRAW/ASSETS/FONTS/BITMAP/FONTRAPTION/newschool_5.F16",
+        ];
+        for p in files {
+            let name = std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string();
+            let Ok(bytes) = std::fs::read(p) else { continue };
             let faces = face_list(&bytes);
             eprintln!("{name}: {} faces {:?}", faces.len(), faces);
             if let Some(img) = render_text(&bytes, faces.len().saturating_sub(1), "Hello 123!", [235, 235, 235]) {
                 let out = format!("/tmp/fon_{}.png", name.replace('.', "_"));
                 image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8).unwrap();
                 eprintln!("  wrote {out} ({}×{})", img.width, img.height);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod moebius {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn renders_moebius_fnn() {
+        let base = format!("{}/git/moebius/app/fonts", std::env::var("HOME").unwrap());
+        for rel in ["ibm", "amiga", "c64"] {
+            let d = format!("{base}/{rel}");
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            if let Some(f) = rd.flatten().map(|e| e.path()).find(|p| p.extension().is_some()) {
+                let Ok(bytes) = std::fs::read(&f) else { continue };
+                let faces = face_list(&bytes);
+                eprintln!("{}: {:?}", f.file_name().unwrap().to_string_lossy(), faces);
             }
         }
     }

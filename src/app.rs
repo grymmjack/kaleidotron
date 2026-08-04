@@ -1411,7 +1411,9 @@ pub struct PixelView {
     tdf_bytes: Vec<u8>,
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
-    tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample"
+    tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample|recolor"
+    tdf_spacing: i32, // TDF letter-spacing delta (negative overlaps), persisted
+    tdf_zoom: f32,    // TDF preview zoom multiplier, persisted
     // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
     fon_path: Option<PathBuf>,
     fon_bytes: Vec<u8>,
@@ -1904,6 +1906,8 @@ impl PixelView {
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
+    const TDF_SPACING_KEY: &'static str = "tdf_spacing";
+    const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
     /// Whether the table draws subtle row/column dividing lines.
@@ -2777,6 +2781,16 @@ impl PixelView {
             tdf_fonts: Vec::new(),
             tdf_index: 0,
             tdf_sample_tex: None,
+            tdf_spacing: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::TDF_SPACING_KEY))
+                .unwrap_or(0)
+                .clamp(-40, 40),
+            tdf_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::TDF_ZOOM_KEY))
+                .unwrap_or(1.0)
+                .clamp(0.25, 8.0),
             fon_path: None,
             fon_bytes: Vec::new(),
             fon_faces: Vec::new(),
@@ -6587,6 +6601,7 @@ impl PixelView {
                 self.font_size,
                 [235, 235, 235],
             ) {
+                let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
@@ -6597,8 +6612,9 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Rendered preview (cached by "sample|size").
-        let key = format!("{}|{:.0}", self.font_sample, self.font_size);
+        // Rendered preview (cached by "sample|size|recolor"). The recolor pipeline applies so the
+        // sample tints/palettizes live via the Recolor pane.
+        let key = format!("{}|{:.0}|{}", self.font_sample, self.font_size, self.pipeline_key());
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) = crate::decode::font::render_text(
                 &self.font_bytes,
@@ -6606,6 +6622,7 @@ impl PixelView {
                 self.font_size,
                 [235, 235, 235],
             ) {
+                let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
@@ -6819,22 +6836,31 @@ impl PixelView {
         });
         ui.separator();
 
-        // Sample text (reuses the persisted font_sample) + actions.
+        // Sample text (reuses the persisted font_sample) + export actions.
         let mut copy_img = false;
-        ui.horizontal(|ui| {
+        let mut want_ans = false;
+        let mut want_tdf = false;
+        ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
+            if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
+                want_copy = Some(self.font_sample.clone());
+            }
             if ui
                 .small_button("📋 image")
-                .on_hover_text("Copy the rendered art to the clipboard as a bitmap (paste into any program)")
+                .on_hover_text("Copy the rendered art to the clipboard as a bitmap")
                 .clicked()
             {
                 copy_img = true;
             }
+            ui.separator();
             if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG beside the file").clicked() {
                 want_export = Some(());
             }
-            if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
-                want_copy = Some(self.font_sample.clone());
+            if ui.small_button("💾 ANS").on_hover_text("Export the rendered text as ANSI art (.ans) — CP437 + colour").clicked() {
+                want_ans = true;
+            }
+            if ui.small_button("💾 TDF").on_hover_text("Export the selected font as a standalone TheDraw .tdf file").clicked() {
+                want_tdf = true;
             }
         });
         let changed = ui
@@ -6844,21 +6870,42 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
+        // Letter-spacing (negative = overlap) + preview zoom.
+        ui.horizontal(|ui| {
+            ui.label("Spacing");
+            ui.add(egui::Slider::new(&mut self.tdf_spacing, -20..=20).show_value(true))
+                .on_hover_text("Adjust inter-letter gap; negative overlaps letters");
+            ui.separator();
+            ui.label("Zoom");
+            ui.add(egui::Slider::new(&mut self.tdf_zoom, 0.25..=8.0).show_value(true).suffix("×"));
+            if ui.small_button("Reset").clicked() {
+                self.tdf_spacing = 0;
+                self.tdf_zoom = 1.0;
+            }
+        });
 
-        // Rendered preview (cached by "index|sample"). Empty sample → the font's own sample text.
+        // Rendered preview (cached by "index|sample|spacing|recolor"). Empty sample → a stock string.
         let sample = if self.font_sample.trim().is_empty() {
             "ABCDEFG abcdefg 0123".to_string()
         } else {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing) {
+                let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
-        let key = format!("{}|{}", self.tdf_index, sample);
+        if want_ans {
+            self.export_tdf_ans(&sample);
+        }
+        if want_tdf {
+            self.export_tdf_file();
+        }
+        let key = format!("{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.pipeline_key());
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing) {
+                let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
@@ -6872,10 +6919,9 @@ impl PixelView {
         }
         egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
             if let Some((_, tex)) = &self.tdf_sample_tex {
-                // Fit-to-width but never below native (nearest stays integer-ish).
+                // Explicit zoom (user slider), integer-snapped so nearest sampling stays crisp.
                 let native = tex.size_vec2();
-                let avail = ui.available_width().max(64.0);
-                let scale = (avail / native.x).clamp(1.0, 4.0);
+                let scale = self.tdf_zoom.max(0.25);
                 ui.add(egui::Image::new((tex.id(), native * scale)));
             } else {
                 ui.weak("(nothing to render — the font may lack these characters)");
@@ -6894,7 +6940,8 @@ impl PixelView {
 
     /// Save the current TDF sample render as a PNG beside the font file and report the path.
     fn export_tdf_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample)
+        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
+            .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
             return;
@@ -6931,6 +6978,45 @@ impl PixelView {
         ) {
             Ok(()) => self.status = format!("Saved {}", out.display()),
             Err(e) => self.status = format!("Export failed: {e}"),
+        }
+    }
+
+    /// Export the rendered TDF text as ANSI art (`.ans`) via a save dialog.
+    fn export_tdf_ans(&mut self, sample: &str) {
+        let Some(bytes) =
+            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing)
+        else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let default = format!("{slug}.ans");
+        if let Some(path) = rfd::FileDialog::new().set_file_name(default).add_filter("ANSI art", &["ans"]).save_file() {
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Export the selected TheDraw font as a standalone `.tdf` file via a save dialog.
+    fn export_tdf_file(&mut self) {
+        let Some(bytes) = crate::decode::tdf::export_font(&self.tdf_bytes, self.tdf_index) else {
+            self.status = "Couldn't serialize this font.".into();
+            return;
+        };
+        let name = self
+            .tdf_fonts
+            .get(self.tdf_index)
+            .map(|(n, _, _)| n.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "font".into());
+        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{slug}.tdf")).add_filter("TheDraw font", &["tdf"]).save_file() {
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
         }
     }
 
@@ -7054,14 +7140,16 @@ impl PixelView {
                 &sample,
                 [235, 235, 235],
             ) {
+                let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
-        let key = format!("{}|{}", self.fon_index, sample);
+        let key = format!("{}|{}|{}", self.fon_index, sample, self.pipeline_key());
         if changed || self.fon_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) =
                 crate::decode::fon::render_text(&self.fon_bytes, self.fon_index, &sample, [235, 235, 235])
             {
+                let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
@@ -14622,6 +14710,45 @@ impl PixelView {
         let (w, h) = (vp.disp_w as usize, vp.disp_h as usize);
         let bytes = vp.cur.clone()?;
         (bytes.len() == w * h * 4).then_some((w, h, bytes, vp.cur_pts))
+    }
+
+    /// Apply the active recolor pipeline (palette remap + adjustments + dither + post-FX) to an
+    /// already-rendered `PixImage` — used by the font/TDF/FON viewers so their sample art recolors
+    /// like any image. Returns the input unchanged when no recolor is active. `path` seeds the
+    /// Reduce source (its extracted/decoded palette). Fully transparent pixels stay transparent.
+    fn recolor_sample(
+        &mut self,
+        path: &Path,
+        img: crate::image_types::PixImage,
+    ) -> crate::image_types::PixImage {
+        let recolor = self.active_recolor(path);
+        if recolor.is_none() && !self.pipeline_active() {
+            return img;
+        }
+        let palette = recolor.as_ref().map(|(_, p)| p.as_slice());
+        let (w, h) = (img.width as usize, img.height as usize);
+        // Preserve the alpha channel so the pipeline (which is RGB-oriented) doesn't fill the
+        // transparent background — snapshot it, recolor, then restore transparent pixels.
+        let src = img.rgba_bytes();
+        let (w, h, mut rgba) = self.scale_source(w, h, src.clone());
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(palette, dsx, dsy);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        // Restore transparency where the (unscaled) source was transparent, so only the ink recolors.
+        if w == img.width as usize && h == img.height as usize {
+            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                if src[i * 4 + 3] == 0 {
+                    px[3] = 0;
+                }
+            }
+        }
+        crate::image_types::PixImage::from_rgba(
+            w as u32,
+            h as u32,
+            rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        )
     }
 
     fn make_preview(
@@ -26579,6 +26706,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
+        eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
+        eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
         eframe::set_value(storage, Self::COLO_COLUMNS_KEY, &self.colo_columns);
