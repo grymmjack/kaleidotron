@@ -1422,6 +1422,9 @@ pub struct PixelView {
     tdf_snap: bool,     // TDF: snap the preview zoom to an integer scale (pixel-perfect), persisted
     tdf_ruler: bool,    // TDF: draw a column-width guide line down the preview (persisted)
     tdf_ruler_cols: u32, // TDF: the ruler column count (40 / 80 / 132), persisted
+    tdf_fg: u8,         // TDF single-colour foreground palette index (outline/block fonts), persisted
+    tdf_bg: u8,         // TDF single-colour background palette index, persisted
+    tdf_top_down: bool, // TDF multi-line overlap: true = upper lines on top, persisted
     tdf_page: usize,    // TDF glyph-grid page
     #[allow(clippy::type_complexity)]
     tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
@@ -1927,6 +1930,9 @@ impl PixelView {
     const TDF_SNAP_KEY: &'static str = "tdf_snap";
     const TDF_RULER_KEY: &'static str = "tdf_ruler";
     const TDF_RULER_COLS_KEY: &'static str = "tdf_ruler_cols";
+    const TDF_FG_KEY: &'static str = "tdf_fg";
+    const TDF_BG_KEY: &'static str = "tdf_bg";
+    const TDF_TOPDOWN_KEY: &'static str = "tdf_top_down";
     const TDF_PRESETS_KEY: &'static str = "tdf_presets";
     /// Whether the browse view renders as a table (vs the thumbnail grid).
     const TABLE_VIEW_KEY: &'static str = "table_view";
@@ -2837,6 +2843,18 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<u32>(s, Self::TDF_RULER_COLS_KEY))
                 .unwrap_or(80),
+            tdf_fg: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u8>(s, Self::TDF_FG_KEY))
+                .unwrap_or(15),
+            tdf_bg: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u8>(s, Self::TDF_BG_KEY))
+                .unwrap_or(0),
+            tdf_top_down: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::TDF_TOPDOWN_KEY))
+                .unwrap_or(true),
             tdf_page: 0,
             tdf_grid_tex: None,
             tdf_presets: cc
@@ -6873,6 +6891,11 @@ impl PixelView {
             zoom: self.tdf_zoom,
             font_9px: self.tdf_font_9px,
             crt: self.tdf_crt,
+            fg: self.tdf_fg,
+            bg: self.tdf_bg,
+            top_down: self.tdf_top_down,
+            // The recolor pane's selected palette (so a colour choice on a colour font is recalled).
+            palette: self.selected_palette.as_ref().map(|p| self.to_display(p).display().to_string()),
         };
         if let Some(slot) = self.tdf_presets.iter_mut().find(|p| p.name == name) {
             *slot = preset;
@@ -6900,10 +6923,27 @@ impl PixelView {
         self.tdf_zoom = if preset.zoom > 0.0 { preset.zoom } else { 1.0 };
         self.tdf_font_9px = preset.font_9px;
         self.tdf_crt = preset.crt;
+        self.tdf_fg = preset.fg & 0x0f;
+        self.tdf_bg = preset.bg & 0x0f;
+        self.tdf_top_down = preset.top_down;
+        // Restore the Recolor pane's palette choice (single-choice: a .gpl, else clear to no remap).
+        self.selected_palette = preset.palette.as_ref().map(PathBuf::from);
         self.tdf_preset_name = preset.name.clone();
         self.tdf_sample_tex = None;
         self.tdf_grid_tex = None;
         self.status = format!("Recalled preset “{}”", preset.name);
+    }
+
+    /// Build the shared render options from the viewer's current TDF settings.
+    fn tdf_opts(&self) -> crate::decode::tdf::TdfOpts {
+        crate::decode::tdf::TdfOpts {
+            spacing: self.tdf_spacing,
+            line_gap: self.tdf_line_gap,
+            font_9px: self.tdf_font_9px,
+            fg: self.tdf_fg,
+            bg: self.tdf_bg,
+            top_down: self.tdf_top_down,
+        }
     }
 
     fn ensure_tdf_loaded(&mut self, path: &Path) {
@@ -6955,6 +6995,7 @@ impl PixelView {
                 let cur = self.tdf_fonts[self.tdf_index].0.clone();
                 egui::ComboBox::from_id_salt("tdf_font_pick")
                     .width(300.0)
+                    .height(420.0)
                     .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
                     .show_ui(ui, |ui| {
                         for (i, (name, ty, gc)) in self.tdf_fonts.iter().enumerate() {
@@ -6988,6 +7029,7 @@ impl PixelView {
             let sel = if self.tdf_preset_name.is_empty() { "— pick —".to_string() } else { self.tdf_preset_name.clone() };
             egui::ComboBox::from_id_salt("tdf_preset_pick")
                 .width(220.0)
+                .height(420.0)
                 .selected_text(sel)
                 .show_ui(ui, |ui| {
                     for p in &self.tdf_presets {
@@ -7126,6 +7168,44 @@ impl PixelView {
                 self.tdf_zoom = 1.0;
             }
         });
+        // Single-colour fg/bg (outline/block fonts only — colour fonts carry their own palette) +
+        // the multi-line stacking order.
+        let is_color_font = self.tdf_fonts.get(self.tdf_index).map(|(_, t, _)| *t == "color").unwrap_or(false);
+        let multiline = self.font_sample.contains('\n');
+        if !is_color_font || multiline {
+            ui.horizontal_wrapped(|ui| {
+                if !is_color_font {
+                    if vga_swatch_menu(ui, "FG", &mut self.tdf_fg) {
+                        self.tdf_sample_tex = None;
+                        self.tdf_grid_tex = None;
+                    }
+                    if vga_swatch_menu(ui, "BG", &mut self.tdf_bg) {
+                        self.tdf_sample_tex = None;
+                        self.tdf_grid_tex = None;
+                    }
+                }
+                if multiline {
+                    if !is_color_font {
+                        ui.separator();
+                    }
+                    ui.label("Lines");
+                    let cur = if self.tdf_top_down { "Top Down" } else { "Bottom Up" };
+                    egui::ComboBox::from_id_salt("tdf_zorder")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_value(&mut self.tdf_top_down, true, "Top Down").clicked()
+                                || ui
+                                    .selectable_value(&mut self.tdf_top_down, false, "Bottom Up")
+                                    .clicked()
+                            {
+                                self.tdf_sample_tex = None;
+                            }
+                        })
+                        .response
+                        .on_hover_text("Which line wins where multi-line rows overlap");
+                }
+            });
+        }
 
         // Rendered preview (cached by "index|sample|spacing|recolor"). Empty sample → a stock string.
         let sample = if self.font_sample.trim().is_empty() {
@@ -7134,7 +7214,7 @@ impl PixelView {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, &self.tdf_opts()) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
@@ -7157,9 +7237,9 @@ impl PixelView {
         if want_tdf {
             self.export_tdf_file();
         }
-        let key = format!("{}|{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px, self.pipeline_key(), self.recolor_ident());
+        let key = format!("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px, self.tdf_fg, self.tdf_bg, self.tdf_top_down, self.pipeline_key(), self.recolor_ident());
         if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px) {
+            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, &self.tdf_opts()) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -7265,7 +7345,7 @@ impl PixelView {
             let start = self.tdf_page * per_page;
             let end = (start + per_page).min(all_chars.len());
             let page_chars: Vec<char> = all_chars[start..end].to_vec();
-            let gkey = format!("{}|{}|{}|{}", self.tdf_index, self.tdf_page, cell, self.tdf_font_9px);
+            let gkey = format!("{}|{}|{}|{}|{}", self.tdf_index, self.tdf_page, cell, self.tdf_font_9px, self.tdf_fg);
             if self.tdf_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
                 if let Some((img, _rows)) = crate::decode::tdf::render_glyph_grid(
                     &self.tdf_bytes,
@@ -7273,7 +7353,7 @@ impl PixelView {
                     &page_chars,
                     cols,
                     cell,
-                    self.tdf_font_9px,
+                    &self.tdf_opts(),
                 ) {
                     let color = egui::ColorImage::from_rgba_unmultiplied(
                         [img.width as usize, img.height as usize],
@@ -7345,7 +7425,7 @@ impl PixelView {
 
     /// Save the current TDF sample render as a PNG beside the font file and report the path.
     fn export_tdf_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px)
+        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, &self.tdf_opts())
             .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
@@ -7414,12 +7494,12 @@ impl PixelView {
             comment: &comment,
             date: &date,
         };
+        let opts = self.tdf_opts();
         let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
             &self.tdf_bytes,
             self.tdf_index,
             sample,
-            self.tdf_spacing,
-            self.tdf_line_gap,
+            &opts,
             &sauce,
         ) else {
             self.status = "Nothing to export.".into();
@@ -7447,12 +7527,12 @@ impl PixelView {
             comment: &comment,
             date: &date,
         };
+        let opts = self.tdf_opts();
         let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
             &self.tdf_bytes,
             self.tdf_index,
             sample,
-            self.tdf_spacing,
-            self.tdf_line_gap,
+            &opts,
             &sauce,
         ) else {
             self.status = "Nothing to render.".into();
@@ -27437,6 +27517,9 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::TDF_SNAP_KEY, &self.tdf_snap);
         eframe::set_value(storage, Self::TDF_RULER_KEY, &self.tdf_ruler);
         eframe::set_value(storage, Self::TDF_RULER_COLS_KEY, &self.tdf_ruler_cols);
+        eframe::set_value(storage, Self::TDF_FG_KEY, &self.tdf_fg);
+        eframe::set_value(storage, Self::TDF_BG_KEY, &self.tdf_bg);
+        eframe::set_value(storage, Self::TDF_TOPDOWN_KEY, &self.tdf_top_down);
         eframe::set_value(storage, Self::TDF_PRESETS_KEY, &self.tdf_presets);
         eframe::set_value(storage, Self::TABLE_GRID_KEY, &self.table_grid);
         eframe::set_value(storage, Self::TABLE_COLUMNS_KEY, &self.table_columns);
@@ -28517,6 +28600,71 @@ struct VideoList {
     items: Vec<ListItem>, // in add-order
 }
 
+fn default_fg() -> u8 {
+    15
+}
+fn default_true() -> bool {
+    true
+}
+
+/// The standard 16-colour VGA/EGA palette (VGA attribute order, index 0-15) + names — for the TDF
+/// single-colour fg/bg pickers. Matches `decode::ansi::VGA_PALETTE`.
+const VGA16: [([u8; 3], &str); 16] = [
+    ([0, 0, 0], "Black"),
+    ([0, 0, 170], "Blue"),
+    ([0, 170, 0], "Green"),
+    ([0, 170, 170], "Cyan"),
+    ([170, 0, 0], "Red"),
+    ([170, 0, 170], "Magenta"),
+    ([170, 85, 0], "Brown"),
+    ([170, 170, 170], "Light Gray"),
+    ([85, 85, 85], "Dark Gray"),
+    ([85, 85, 255], "Bright Blue"),
+    ([85, 255, 85], "Bright Green"),
+    ([85, 255, 255], "Bright Cyan"),
+    ([255, 85, 85], "Bright Red"),
+    ([255, 85, 255], "Bright Magenta"),
+    ([255, 255, 85], "Yellow"),
+    ([255, 255, 255], "White"),
+];
+
+/// A 16-colour VGA swatch picker: a menu button (label + current colour name) opening a 2×8 grid of
+/// clickable swatches. Mutates `cur` (0-15); returns true if it changed.
+fn vga_swatch_menu(ui: &mut egui::Ui, label: &str, cur: &mut u8) -> bool {
+    let mut changed = false;
+    let (rgb, name) = VGA16[(*cur & 0x0f) as usize];
+    let sw = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    ui.menu_button(format!("{label}: {name}"), |ui| {
+        egui::Grid::new(format!("{label}_vga_grid")).spacing([3.0, 3.0]).show(ui, |ui| {
+            for i in 0..16u8 {
+                let c = VGA16[i as usize].0;
+                let btn = egui::Button::new("")
+                    .fill(egui::Color32::from_rgb(c[0], c[1], c[2]))
+                    .min_size(egui::vec2(22.0, 22.0))
+                    .stroke(if i == *cur {
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 235))
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+                    });
+                if ui.add(btn).on_hover_text(VGA16[i as usize].1).clicked() {
+                    *cur = i;
+                    changed = true;
+                    ui.close();
+                }
+                if (i + 1) % 8 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    })
+    .response
+    .on_hover_text(format!("{label} colour (current: {name})"));
+    // Also paint a small colour chip after the button for a quick read.
+    let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    ui.painter().rect_filled(r, 2.0, sw);
+    changed
+}
+
 /// A saved TheDraw "setup" — the whole TDF viewer configuration under a name, so a sysop building a
 /// BBS menu set can recall "main menu" / "messages" / "email" exactly (the font file, which font in
 /// it, the sample text, spacing/line-height/zoom, and 9px/CRT). `#[serde(default)]` so old saves
@@ -28533,6 +28681,14 @@ struct TdfPreset {
     zoom: f32,
     font_9px: bool,
     crt: bool,
+    #[serde(default = "default_fg")]
+    fg: u8, // single-colour foreground (outline/block fonts)
+    #[serde(default)]
+    bg: u8, // single-colour background
+    #[serde(default = "default_true")]
+    top_down: bool, // multi-line overlap order
+    #[serde(default)]
+    palette: Option<String>, // the Recolor pane's selected .gpl (so a colour choice is recalled)
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
