@@ -1402,6 +1402,7 @@ pub struct PixelView {
     font_info: Option<crate::decode::font::FontInfo>,
     font_chars: Vec<char>,
     font_sample: String, // the viewer's type-to-sample text (persisted)
+    font_ink: [u8; 3],   // TTF/OTF viewer ink colour (the base render colour; recolor pipeline runs on top), persisted
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1410,6 +1411,7 @@ pub struct PixelView {
     font_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "sample|size"
     #[allow(clippy::type_complexity)]
     font_grid_tex: Option<(usize, egui::TextureHandle, usize, [usize; 2])>, // (page, tex, rows, [cols,cell])
+    font_grid_key: String, // full cache key (page|cell|ink|recolor) so colour changes re-render the grid
     // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
     tdf_path: Option<PathBuf>,
     tdf_bytes: Vec<u8>,
@@ -1924,6 +1926,7 @@ impl PixelView {
     const AI_PROMPTS_KEY: &'static str = "ai_prompts";
     const AI_SIZES_KEY: &'static str = "ai_sizes";
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
+    const FONT_INK_KEY: &'static str = "font_ink";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2800,6 +2803,10 @@ impl PixelView {
                 .unwrap_or_else(|| {
                     "The quick brown fox jumps over the lazy dog\n0123456789 !?@#&".to_string()
                 }),
+            font_ink: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_INK_KEY))
+                .unwrap_or([235, 235, 235]),
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -2813,6 +2820,7 @@ impl PixelView {
             font_page: 0,
             font_sample_tex: None,
             font_grid_tex: None,
+            font_grid_key: String::new(),
             tdf_path: None,
             tdf_bytes: Vec::new(),
             tdf_fonts: Vec::new(),
@@ -6690,6 +6698,28 @@ impl PixelView {
     /// The interactive font viewer (.ttf/.otf/.ttc): metadata header, a type-to-sample box with a
     /// live rendered preview, and a paged glyph grid — click a glyph to copy it, click Copy to grab
     /// the family name or the sample text.
+    /// Save the current TTF/OTF sample render (ink colour + recolor applied, transparent bg) as a
+    /// PNG via a save dialog — a quick logo export.
+    fn export_font_png(&mut self, sample: &str) {
+        let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, self.font_size, self.font_ink)
+            .map(|img| self.recolor_sample(&self.font_path.clone().unwrap_or_default(), img))
+        else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let base = self.font_info.as_ref().map(|i| i.family.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "font".into());
+        let clean = |s: &str, n: usize| -> String {
+            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+        };
+        let default = format!("{}_{}.png", clean(&base, 24), clean(sample, 24));
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&p, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
     fn draw_font_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
         self.ensure_font_loaded(path);
         if self.font_bytes.is_empty() {
@@ -6722,20 +6752,26 @@ impl PixelView {
         });
         ui.separator();
 
-        // Sample text + size.
+        // Sample text + size + ink colour + exports — a mini logo maker.
         let mut copy_img = false;
-        ui.horizontal(|ui| {
+        let mut want_png = false;
+        ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
-            ui.add(egui::Slider::new(&mut self.font_size, 12.0..=200.0).suffix("px"));
+            ui.add(egui::Slider::new(&mut self.font_size, 12.0..=400.0).suffix("px"));
+            ui.color_edit_button_srgb(&mut self.font_ink).on_hover_text("Ink colour (the Recolor pane runs on top)");
+            ui.separator();
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
                 want_copy = Some(self.font_sample.clone());
             }
             if ui
                 .small_button("📋 image")
-                .on_hover_text("Copy the rendered sample to the clipboard as a bitmap (paste into any program)")
+                .on_hover_text("Copy the rendered sample to the clipboard as a bitmap")
                 .clicked()
             {
                 copy_img = true;
+            }
+            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG (transparent bg)").clicked() {
+                want_png = true;
             }
         });
         if copy_img {
@@ -6743,11 +6779,14 @@ impl PixelView {
                 &self.font_bytes,
                 &self.font_sample,
                 self.font_size,
-                [235, 235, 235],
+                self.font_ink,
             ) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
+        }
+        if want_png {
+            self.export_font_png(&self.font_sample.clone());
         }
         let changed = ui
             .add(
@@ -6756,15 +6795,15 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Rendered preview (cached by "sample|size|recolor"). The recolor pipeline applies so the
+        // Rendered preview (cached by "sample|size|ink|recolor"). The recolor pipeline applies so the
         // sample tints/palettizes live via the Recolor pane.
-        let key = format!("{}|{:.0}|{}|{}", self.font_sample, self.font_size, self.pipeline_key(), self.recolor_ident());
+        let key = format!("{}|{:.0}|{:?}|{}|{}", self.font_sample, self.font_size, self.font_ink, self.pipeline_key(), self.recolor_ident());
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             if let Some(img) = crate::decode::font::render_text(
                 &self.font_bytes,
                 &self.font_sample,
                 self.font_size,
-                [235, 235, 235],
+                self.font_ink,
             ) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -6852,26 +6891,25 @@ impl PixelView {
         let start = self.font_page * per_page;
         let end = (start + per_page).min(chars.len());
         let page_chars: Vec<char> = chars[start..end].to_vec();
-        // Render the page grid (cached by page + cell size).
-        let need = self
-            .font_grid_tex
-            .as_ref()
-            .map(|(p, _, _, [_, c])| *p != self.font_page || *c != cell)
-            .unwrap_or(true);
+        // Render the page grid (cached by page + cell + ink + recolor, so a colour change refreshes).
+        let gkey = format!("{}|{}|{:?}|{}|{}", self.font_page, cell, self.font_ink, self.pipeline_key(), self.recolor_ident());
+        let need = self.font_grid_tex.is_none() || self.font_grid_key != gkey;
         if need {
             if let Some((img, rows)) = crate::decode::font::render_glyph_grid(
                 &self.font_bytes,
                 &page_chars,
                 COLS,
                 cell,
-                [235, 235, 235],
+                self.font_ink,
             ) {
+                let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
                 );
                 let tex = ctx.load_texture("font_grid", color, egui::TextureOptions::LINEAR);
                 self.font_grid_tex = Some((self.font_page, tex, rows, [COLS, cell]));
+                self.font_grid_key = gkey;
             }
         }
         if let Some((_, tex, rows, [cols, cell])) = self.font_grid_tex.clone() {
@@ -27665,6 +27703,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_PROMPTS_KEY, &self.ai_prompts);
         eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
+        eframe::set_value(storage, Self::FONT_INK_KEY, &self.font_ink);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
