@@ -220,7 +220,11 @@ pub fn render_glyph_grid(
             continue;
         }
         let avail = cell.saturating_sub(pad).max(1) as f32;
-        let scale = (avail / iw as f32).min(avail / ih as f32).clamp(0.01, 1.0);
+        // Fit the glyph in the cell. When it fits at ≥1×, snap UP to a whole integer scale so the
+        // pixels stay crisp (nearest, no blur) — a big cell shows a big, sharp glyph. A glyph
+        // larger than the cell downscales fractionally (unavoidable) to fit.
+        let raw = (avail / iw as f32).min(avail / ih as f32);
+        let scale = if raw >= 1.0 { raw.floor() } else { raw.max(0.01) };
         let (dw, dh) = ((iw as f32 * scale) as usize, (ih as f32 * scale) as usize);
         let (ox, oy) = (cx + (cell.saturating_sub(dw)) / 2, cy + (cell.saturating_sub(dh)) / 2);
         let src = img.rgba_bytes();
@@ -636,3 +640,4 @@ mod sauce_multiline {
         assert!(ans.windows(5).any(|w| w == b"COMNT"));
     }
 }
+
