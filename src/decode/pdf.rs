@@ -266,7 +266,8 @@ impl Decoder for PdfDecoder {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["pdf"]
+        // `.ai` (Adobe Illustrator) is a PDF-compatible container — renders via the same path.
+        &["pdf", "ai"]
     }
 
     fn sniff(&self, header: &[u8]) -> bool {

@@ -99,3 +99,12 @@ SVG source** at a higher resolution instead of upscaling a fixed raster → cris
   at intrinsic size (capped) and the re-render bumps it up on zoom.
 - Wired into `draw_image_view`'s re-render trigger + `rerender_at` + excluded from pixel-perfect
   (smooth sampling), all keyed off `is_svg_path(open)`. Unit-tested.
+
+### Vector documents: .ai + EPS/PS (branch `vector-docs`)
+- ✅ **Adobe Illustrator `.ai`** — modern `.ai` IS a PDF (`%PDF-`), so it renders through the exact
+  PDF path (pdfium/poppler) + opens in the multi-page PDF viewer. Added `.ai` to the PDF decoder's
+  extensions, `is_pdf_path`, `is_image_ext`. Verified: the PabloDraw logo renders.
+- ✅ **EPS / PostScript (.eps/.epsf/.epsi/.ps)** — new `decode/eps.rs` shells out to **ghostscript
+  (`gs`)** (EPSCrop → PNG), the poppler/ffmpeg ethos; absent `gs` → placeholder. Sniffs `%!PS`.
+- Both gated under the **PDF plugin** (document formats needing an external renderer; default off).
+  Unit-tested; verified end-to-end via `--render`.
