@@ -7000,26 +7000,35 @@ impl PixelView {
         self.status = format!("Recalled preset “{}”", preset.name);
     }
 
-    /// Re-prime the font-tile preview text (custom when enabled, else defaults) and drop cached
-    /// font/TDF/FON thumbnails so they re-render at a glance across every open folder + library.
+    /// Re-prime the font-tile preview text (custom when enabled, else defaults) and drop **every**
+    /// cached font/TDF/FON thumbnail — not just the current view. The thumbnail caches are global
+    /// and path-keyed (never cleared on navigation), so a folder visited earlier would otherwise
+    /// keep showing tiles rendered with the previous text even after F5.
     fn refresh_font_thumbs(&mut self) {
         crate::decode::font::set_thumb_sample(if self.font_preview_on {
             &self.font_preview_text
         } else {
             ""
         });
-        let fonts: Vec<PathBuf> = self
-            .entries
-            .iter()
-            .filter(|e| is_font_ext(&e.path) || is_fon_ext(&e.path) || is_tdf_ext(&e.path))
-            .map(|e| e.path.clone())
+        let is_fonty = |p: &Path| is_font_ext(p) || is_fon_ext(p) || is_tdf_ext(p);
+        // Union of every font path known to any cache (current view + all previously decoded).
+        let mut fonts: std::collections::HashSet<PathBuf> = self
+            .thumb_tex
+            .keys()
+            .chain(self.thumb_rgba.keys())
+            .chain(self.img_meta.keys())
+            .filter(|p| is_fonty(p))
+            .cloned()
             .collect();
+        fonts.extend(self.entries.iter().map(|e| e.path.clone()).filter(|p| is_fonty(p)));
         for p in fonts {
             self.thumb_tex.remove(&p);
             self.thumb_rgba.remove(&p);
             self.img_meta.remove(&p);
             self.thumbs.forget(&p);
         }
+        // Folder montage previews can embed font tiles too — drop them so they re-montage.
+        self.folder_info.clear();
         self.want_repaint = true;
     }
 

@@ -283,3 +283,4 @@ mod tests {
         assert!(img.rgba_bytes().chunks(4).any(|p| p[3] > 0));
     }
 }
+
