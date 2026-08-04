@@ -524,7 +524,9 @@ impl Decoder for TdfDecoder {
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
         let fonts = TdfFont::load(bytes).map_err(|e| DecodeError::Malformed(e.to_string()))?;
         let font = fonts.first().ok_or(DecodeError::Unsupported)?;
-        let (grid, w, h) = build_grid(font, &sample_text(font), &TdfOpts::default()).ok_or(DecodeError::Unsupported)?;
+        // Tile text: the user's custom preview text if set, else the font's own name.
+        let text = super::font::thumb_sample_override().unwrap_or_else(|| sample_text(font));
+        let (grid, w, h) = build_grid(font, &text, &TdfOpts::default()).ok_or(DecodeError::Unsupported)?;
         Ok(rasterize(&grid, w, h, false))
     }
 }
@@ -691,3 +693,21 @@ mod color_test {
     }
 }
 
+
+#[cfg(test)]
+mod tile_text {
+    use super::*;
+    #[test]
+    fn tile_uses_override_else_name() {
+        let dir = format!("{}/git/WAB_Ansi_Logo_Maker/FONTS", std::env::var("HOME").unwrap());
+        let Ok(bytes) = std::fs::read(format!("{dir}/ARCHANA.TDF")) else { return };
+        // default (no override) → tile renders the font name width; with override → the text width
+        super::super::font::set_thumb_sample("");
+        let a = TdfDecoder.decode(&bytes).unwrap().width;
+        super::super::font::set_thumb_sample("WWWWWWWWWW");
+        let b = TdfDecoder.decode(&bytes).unwrap().width;
+        super::super::font::set_thumb_sample(""); // reset for other tests
+        eprintln!("name_width={a} override_width={b}");
+        assert_ne!(a, b, "override should change the tile text");
+    }
+}

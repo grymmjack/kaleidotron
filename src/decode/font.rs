@@ -36,6 +36,13 @@ pub fn thumb_sample() -> String {
         .unwrap_or_else(|| DEFAULT_THUMB_SAMPLE.to_string())
 }
 
+/// The user's explicit override, or `None` when unset. The TDF decoder uses this so its tile shows
+/// the font's own *name* by default (more useful than "AaBb…") but switches to the custom text once
+/// the user sets one — so a single preview string spans TTF / FON / TDF tiles.
+pub fn thumb_sample_override() -> Option<String> {
+    THUMB_SAMPLE.read().unwrap().clone()
+}
+
 /// Parsed font metadata for the Details / viewer header.
 #[derive(Clone, Debug, Default)]
 pub struct FontInfo {
