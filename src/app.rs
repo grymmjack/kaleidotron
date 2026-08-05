@@ -1425,7 +1425,8 @@ pub struct PixelView {
     font_3d_on: bool,          // show the interactive 3D extruded preview instead of the flat one, persisted
     font_3d_depth: f32,        // extrusion depth (em-normalized), persisted
     font_3d_bevel: f32,        // chamfer bevel size (em-normalized; 0 = flat block), persisted
-    font_3d_face: [u8; 3],     // front/back face colour, persisted
+    font_3d_face: [u8; 3],     // front-face colour, persisted
+    font_3d_back: [u8; 3],     // back-face colour, persisted
     font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
     font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
     font_3d_light_pitch: f32,  // key-light elevation, persisted
@@ -1981,6 +1982,7 @@ impl PixelView {
     const FONT_3D_DEPTH_KEY: &'static str = "font_3d_depth";
     const FONT_3D_BEVEL_KEY: &'static str = "font_3d_bevel";
     const FONT_3D_FACE_KEY: &'static str = "font_3d_face";
+    const FONT_3D_BACK_KEY: &'static str = "font_3d_back";
     const FONT_3D_SIDE_KEY: &'static str = "font_3d_side";
     const FONT_3D_LIGHT_YAW_KEY: &'static str = "font_3d_light_yaw";
     const FONT_3D_LIGHT_PITCH_KEY: &'static str = "font_3d_light_pitch";
@@ -2928,6 +2930,7 @@ impl PixelView {
             font_3d_depth: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY)).unwrap_or(0.2),
             font_3d_bevel: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY)).unwrap_or(0.0),
             font_3d_face: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY)).unwrap_or([220, 40, 40]),
+            font_3d_back: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_BACK_KEY)).unwrap_or([220, 40, 40]),
             font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
             font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
             font_3d_light_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY)).unwrap_or(0.7),
@@ -7083,6 +7086,7 @@ impl PixelView {
         crate::decode::font3d::Extrude3d {
             depth: self.font_3d_depth,
             face_rgb: self.font_3d_face,
+            back_rgb: self.font_3d_back,
             side_rgb: self.font_3d_side,
             letter_spacing: self.font_letter_spacing / em,
             line_gap: self.font_line_gap / em,
@@ -7136,8 +7140,9 @@ impl PixelView {
         // while assigning the texture back (no double &mut self borrow).
         let opts = self.font_3d_opts();
         let mesh_key = format!(
-            "{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}",
-            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap, opts.face_rgb, opts.side_rgb
+            "{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}|{:?}",
+            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap,
+            opts.face_rgb, opts.back_rgb, opts.side_rgb
         );
         let mut mesh = self.font_3d_mesh.take();
         if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
@@ -7391,7 +7396,9 @@ impl PixelView {
                     .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
                 ui.separator();
                 ui.label("Face");
-                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front/back face colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front-face colour");
+                ui.label("Back");
+                ui.color_edit_button_srgb(&mut self.font_3d_back).on_hover_text("Back-face colour");
                 ui.label("Body");
                 ui.color_edit_button_srgb(&mut self.font_3d_side).on_hover_text("Extruded side (depth) colour");
                 ui.separator();
@@ -28606,6 +28613,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_3D_DEPTH_KEY, &self.font_3d_depth);
         eframe::set_value(storage, Self::FONT_3D_BEVEL_KEY, &self.font_3d_bevel);
         eframe::set_value(storage, Self::FONT_3D_FACE_KEY, &self.font_3d_face);
+        eframe::set_value(storage, Self::FONT_3D_BACK_KEY, &self.font_3d_back);
         eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_PITCH_KEY, &self.font_3d_light_pitch);

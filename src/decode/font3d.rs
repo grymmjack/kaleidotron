@@ -19,6 +19,7 @@ use ttf_parser::{Face, OutlineBuilder};
 pub struct Extrude3d {
     pub depth: f32,
     pub face_rgb: [u8; 3],
+    pub back_rgb: [u8; 3], // back-face colour (the reverse side; = face_rgb for a uniform look)
     pub side_rgb: [u8; 3],
     pub letter_spacing: f32, // em-normalized
     pub line_gap: f32,       // em-normalized
@@ -31,6 +32,7 @@ impl Default for Extrude3d {
         Extrude3d {
             depth: 0.2,
             face_rgb: [220, 40, 40],
+            back_rgb: [220, 40, 40],
             side_rgb: [120, 20, 20],
             letter_spacing: 0.0,
             line_gap: 0.0,
@@ -155,7 +157,7 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
                 // line-height) don't z-fight on their coplanar caps.
                 let z_off = -(line as f32) * d2 * 0.04;
                 let bevel = opts.bevel.max(0.0).min(d2 * 0.9);
-                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, bevel, opts.face_rgb, opts.side_rgb);
+                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, bevel, opts.face_rgb, opts.back_rgb, opts.side_rgb);
             }
         }
         pen_x += adv + opts.letter_spacing;
@@ -288,6 +290,7 @@ fn append_glyph(
     z_off: f32,
     bevel: f32,
     face_rgb: [u8; 3],
+    back_rgb: [u8; 3],
     side_rgb: [u8; 3],
 ) {
     let (zf, zb) = (d2 + z_off, -d2 + z_off);
@@ -296,7 +299,7 @@ fn append_glyph(
         let buf = fill_caps(contours, tess);
         if !buf.indices.is_empty() {
             push_cap(mesh, &buf, zf, false, face_rgb); // front
-            push_cap(mesh, &buf, zb, true, face_rgb); // back (reversed)
+            push_cap(mesh, &buf, zb, true, back_rgb); // back (reversed)
         }
         for c in contours {
             push_wall(mesh, c, zb, c, zf, side_rgb);
@@ -304,19 +307,19 @@ fn append_glyph(
         return;
     }
     // Beveled: the flat top/bottom faces sit on the INSET outline; a chamfer ramps out to the full
-    // outline, then the straight side wall, then a chamfer back in. Face-coloured chamfers catch the
-    // light for the classic beveled look; side walls take the body colour.
+    // outline, then the straight side wall, then a chamfer back in. Face/back-coloured chamfers catch
+    // the light for the classic beveled look; side walls take the body colour.
     let inner = inset_contours(contours, bevel);
     let buf = fill_caps(&inner, tess);
     if !buf.indices.is_empty() {
         push_cap(mesh, &buf, zf, false, face_rgb); // front face (inset)
-        push_cap(mesh, &buf, zb, true, face_rgb); // back face (inset)
+        push_cap(mesh, &buf, zb, true, back_rgb); // back face (inset)
     }
     let (zfc, zbc) = (zf - bevel, zb + bevel); // chamfer bottoms
     for (o, i) in contours.iter().zip(inner.iter()) {
         push_wall(mesh, o, zfc, i, zf, face_rgb); // front chamfer (outline@zfc → inset@zf)
         push_wall(mesh, o, zbc, o, zfc, side_rgb); // straight side wall
-        push_wall(mesh, i, zb, o, zbc, face_rgb); // back chamfer (inset@zb → outline@zbc)
+        push_wall(mesh, i, zb, o, zbc, back_rgb); // back chamfer (inset@zb → outline@zbc)
     }
 }
 
