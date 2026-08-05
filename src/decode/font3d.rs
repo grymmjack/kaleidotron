@@ -121,11 +121,12 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
     };
     let mut tess = FillTessellator::new();
 
-    let (mut pen_x, mut baseline_y) = (0.0f32, 0.0f32);
+    let (mut pen_x, mut baseline_y, mut line) = (0.0f32, 0.0f32, 0u32);
     for ch in text.chars() {
         if ch == '\n' {
             pen_x = 0.0;
             baseline_y -= line_pitch; // y-up: next line sits below
+            line += 1;
             continue;
         }
         if ch == '\r' {
@@ -148,7 +149,10 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
         if face.outline_glyph(gid, &mut fl).is_some() {
             fl.finish_contour();
             if !fl.contours.is_empty() {
-                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, opts.face_rgb, opts.side_rgb);
+                // Push each successive line very slightly back in z so overlapping lines (negative
+                // line-height) don't z-fight on their coplanar caps.
+                let z_off = -(line as f32) * d2 * 0.04;
+                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, opts.face_rgb, opts.side_rgb);
             }
         }
         pen_x += adv + opts.letter_spacing;
@@ -167,9 +171,11 @@ fn append_glyph(
     contours: &[Vec<[f32; 2]>],
     tess: &mut FillTessellator,
     d2: f32,
+    z_off: f32,
     face_rgb: [u8; 3],
     side_rgb: [u8; 3],
 ) {
+    let (zf, zb) = (d2 + z_off, -d2 + z_off);
     // Build a lyon path of the (already flattened) contours and tessellate the fill.
     let mut pb = LyonPath::builder();
     for c in contours {
@@ -200,7 +206,7 @@ fn append_glyph(
         // way each cap lights as a flat face.
         let front_base = mesh.positions.len() as u32;
         for v in &buf.vertices {
-            mesh.positions.push([v[0], v[1], d2]);
+            mesh.positions.push([v[0], v[1], zf]);
         }
         for t in buf.indices.chunks_exact(3) {
             mesh.indices.extend([front_base + t[0], front_base + t[1], front_base + t[2]]);
@@ -208,7 +214,7 @@ fn append_glyph(
         }
         let back_base = mesh.positions.len() as u32;
         for v in &buf.vertices {
-            mesh.positions.push([v[0], v[1], -d2]);
+            mesh.positions.push([v[0], v[1], zb]);
         }
         for t in buf.indices.chunks_exact(3) {
             mesh.indices.extend([back_base + t[2], back_base + t[1], back_base + t[0]]);
@@ -226,10 +232,10 @@ fn append_glyph(
             let a = c[i];
             let b = c[(i + 1) % n];
             let base = mesh.positions.len() as u32;
-            mesh.positions.push([a[0], a[1], d2]); // 0 front-a
-            mesh.positions.push([b[0], b[1], d2]); // 1 front-b
-            mesh.positions.push([b[0], b[1], -d2]); // 2 back-b
-            mesh.positions.push([a[0], a[1], -d2]); // 3 back-a
+            mesh.positions.push([a[0], a[1], zf]); // 0 front-a
+            mesh.positions.push([b[0], b[1], zf]); // 1 front-b
+            mesh.positions.push([b[0], b[1], zb]); // 2 back-b
+            mesh.positions.push([a[0], a[1], zb]); // 3 back-a
             mesh.indices.extend([base, base + 1, base + 2]);
             mesh.tri_rgb.push(side_rgb);
             mesh.indices.extend([base, base + 2, base + 3]);

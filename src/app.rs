@@ -1432,6 +1432,8 @@ pub struct PixelView {
     font_3d_yaw: f32,          // orbit camera yaw, persisted
     font_3d_pitch: f32,        // orbit camera pitch, persisted
     font_3d_zoom: f32,         // orbit camera zoom, persisted
+    font_3d_pan: [f32; 2],     // orbit camera pan (fraction of viewport), session-only
+    font_3d_spin: bool,        // auto-rotate the 3D view, persisted
     font_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached mesh (key = geometry params)
     font_3d_tex: Option<(String, egui::TextureHandle)>,            // cached render (key = mesh + camera + light + size)
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
@@ -1984,6 +1986,7 @@ impl PixelView {
     const FONT_3D_YAW_KEY: &'static str = "font_3d_yaw";
     const FONT_3D_PITCH_KEY: &'static str = "font_3d_pitch";
     const FONT_3D_ZOOM_KEY: &'static str = "font_3d_zoom";
+    const FONT_3D_SPIN_KEY: &'static str = "font_3d_spin";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2929,6 +2932,8 @@ impl PixelView {
             font_3d_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_YAW_KEY)).unwrap_or(0.5),
             font_3d_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_PITCH_KEY)).unwrap_or(-0.45),
             font_3d_zoom: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_ZOOM_KEY)).unwrap_or(1.0),
+            font_3d_pan: [0.0, 0.0],
+            font_3d_spin: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_SPIN_KEY)).unwrap_or(false),
             font_3d_mesh: None,
             font_3d_tex: None,
             font_preview_text: cc
@@ -7087,8 +7092,14 @@ impl PixelView {
     fn draw_font_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2) {
         use crate::decode::mesh3d::{render, Camera, RenderOpts, View};
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-        // Orbit on drag.
-        if resp.dragged() {
+        // Middle-drag (or Space held) pans; primary drag orbits.
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let panning = resp.dragged_by(egui::PointerButton::Middle) || (resp.dragged() && space);
+        if panning {
+            let d = resp.drag_delta();
+            self.font_3d_pan[0] += d.x / rect.width().max(1.0);
+            self.font_3d_pan[1] += d.y / rect.height().max(1.0);
+        } else if resp.dragged() {
             let d = resp.drag_delta();
             self.font_3d_yaw += d.x * 0.01;
             self.font_3d_pitch = (self.font_3d_pitch + d.y * 0.01).clamp(-1.55, 1.55);
@@ -7100,7 +7111,18 @@ impl PixelView {
                 self.font_3d_zoom = (self.font_3d_zoom * (1.0 + sc * 0.0015)).clamp(0.15, 8.0);
             }
         }
-        if resp.dragged() {
+        // Auto-spin.
+        if self.font_3d_spin {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            self.font_3d_yaw += dt * 0.6;
+            ctx.request_repaint();
+        }
+        // Keep yaw bounded so the persisted value doesn't grow without limit.
+        let tau = std::f32::consts::TAU;
+        self.font_3d_yaw = self.font_3d_yaw.rem_euclid(tau);
+        if panning {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        } else if resp.dragged() {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if resp.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
@@ -7123,7 +7145,7 @@ impl PixelView {
         let wpx = (rect.width() * ppp).round().max(1.0) as usize;
         let hpx = (rect.height() * ppp).round().max(1.0) as usize;
         if let Some((_, m)) = &mesh {
-            let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: [0.0, 0.0] };
+            let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
             let ro = RenderOpts {
                 textured: false,
                 wireframe: false,
@@ -7181,7 +7203,7 @@ impl PixelView {
     fn font_3d_svg(&self, w: usize, h: usize) -> Option<String> {
         use crate::decode::mesh3d::{Camera, View};
         let mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts())?;
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: [0.0, 0.0] };
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
         Some(crate::decode::mesh3d::to_svg(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0])))
     }
 
@@ -7217,7 +7239,7 @@ impl PixelView {
             return;
         };
         let (w, h) = (1600usize, 1200usize);
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: [0.0, 0.0] };
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
         let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
         let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
         let default = format!("{}.png", self.font_export_stem());
@@ -7371,10 +7393,13 @@ impl PixelView {
                 ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
                     .on_hover_text("Light elevation");
                 ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
+                ui.separator();
+                ui.checkbox(&mut self.font_3d_spin, "Spin").on_hover_text("Auto-rotate the logo");
                 if ui.small_button("Reset view").clicked() {
                     self.font_3d_yaw = 0.5;
                     self.font_3d_pitch = -0.45;
                     self.font_3d_zoom = 1.0;
+                    self.font_3d_pan = [0.0, 0.0];
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -28578,6 +28603,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_3D_YAW_KEY, &self.font_3d_yaw);
         eframe::set_value(storage, Self::FONT_3D_PITCH_KEY, &self.font_3d_pitch);
         eframe::set_value(storage, Self::FONT_3D_ZOOM_KEY, &self.font_3d_zoom);
+        eframe::set_value(storage, Self::FONT_3D_SPIN_KEY, &self.font_3d_spin);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
