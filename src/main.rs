@@ -10,6 +10,7 @@ mod dls;
 mod format_color;
 mod gfonts;
 mod git;
+mod httpfs;
 mod image_types;
 mod libxmp;
 mod palettes_builtin;
