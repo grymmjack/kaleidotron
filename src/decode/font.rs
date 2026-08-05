@@ -459,7 +459,9 @@ pub fn stroke_image(
 /// if the font can't be parsed. Output is bounded so a giant paste can't allocate wildly.
 pub fn render_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage> {
     let font = FontRef::try_from_slice(bytes).ok()?;
-    let px = opts.px.clamp(6.0, 512.0);
+    // Upper bound is generous so the viewer can supersample to device resolution × a preview zoom
+    // (crisp, band-free 1:1 display); the output canvas is separately clamped to 8192 px.
+    let px = opts.px.clamp(6.0, 2048.0);
     let scaled = font.as_scaled(px);
     let ascent = scaled.ascent();
     let line_pitch = scaled.height() + scaled.line_gap() + opts.line_gap;
@@ -816,39 +818,6 @@ mod logo_test {
                 resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
                     .is_ok()
             );
-            return;
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn dump_two_line_band() {
-        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans.ttf"] {
-            let Ok(bytes) = std::fs::read(p) else { continue };
-            // Two overlapping lines (negative line_gap), white bg, white outer stroke — the "YOU DIED" case.
-            let img = render_text(&bytes, "YOU\nDIED", &TextOpts {
-                px: 160.0, ink: [230,0,0], bg: Some([255,255,255]),
-                letter_spacing: 4.0, line_gap: -80.0,
-                stroke_w: 12.0, stroke_color: [255,255,255], stroke_mode: StrokeMode::Outer,
-                ..Default::default()
-            }).unwrap();
-            // Scan every row for any grey pixel (r≈g≈b, not near white/red) — the "band".
-            let b = img.rgba_bytes();
-            let (w, h) = (img.width as usize, img.height as usize);
-            let mut band_rows = 0;
-            for y in 0..h {
-                let mut grey = 0;
-                for x in 0..w {
-                    let px = &b[(y*w+x)*4..(y*w+x)*4+4];
-                    let (r,g,bl) = (px[0] as i32, px[1] as i32, px[2] as i32);
-                    let near = (r-g).abs() < 12 && (g-bl).abs() < 12 && (r-bl).abs() < 12;
-                    if near && r > 40 && r < 230 { grey += 1; }
-                }
-                if grey > w/10 { band_rows += 1; }
-            }
-            eprintln!("size {w}x{h}, rows with a grey band: {band_rows}");
-            image::save_buffer("/tmp/band_raw.png", &b, img.width, img.height, image::ColorType::Rgba8).unwrap();
-            eprintln!("wrote /tmp/band_raw.png");
             return;
         }
     }

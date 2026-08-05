@@ -1418,6 +1418,8 @@ pub struct PixelView {
     font_stroke_color: [u8; 3], // TTF/OTF/FON outline colour, persisted
     font_stroke_mode: crate::decode::font::StrokeMode, // outer/center/inner, persisted
     font_apply_recolor: bool, // apply the global Recolor/PixelFX pipeline to the font logo maker (default OFF — the logo maker has its own ink/bg/stroke, and SVG ignores recolor), persisted
+    font_preview_zoom: f32, // logo-maker preview on-screen magnification (the sample is supersampled to device res × this, then shown 1:1 → crisp, no moiré), persisted
+    font_preview_h: f32, // logo-maker preview pane height in points (draggable divider), persisted
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1955,6 +1957,8 @@ impl PixelView {
     const FONT_STROKE_COLOR_KEY: &'static str = "font_stroke_color";
     const FONT_STROKE_MODE_KEY: &'static str = "font_stroke_mode";
     const FONT_RECOLOR_KEY: &'static str = "font_apply_recolor";
+    const FONT_PREVIEW_ZOOM_KEY: &'static str = "font_preview_zoom";
+    const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2878,6 +2882,14 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_RECOLOR_KEY))
                 .unwrap_or(false),
+            font_preview_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_ZOOM_KEY))
+                .unwrap_or(1.0),
+            font_preview_h: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_H_KEY))
+                .unwrap_or(420.0),
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -7119,6 +7131,17 @@ impl PixelView {
             ui.checkbox(&mut self.font_apply_recolor, "Recolor").on_hover_text(
                 "Apply the global Recolor/PixelFX pipeline to this preview + PNG export.\nOff (default) = the clean render, matching the SVG export.",
             );
+            ui.separator();
+            ui.label("Preview");
+            ui.add(
+                egui::Slider::new(&mut self.font_preview_zoom, 0.25..=4.0)
+                    .suffix("×")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Preview on-screen size only (re-rendered crisp at any zoom; doesn't affect the exported logo)");
+            if ui.small_button("1×").on_hover_text("Reset preview zoom").clicked() {
+                self.font_preview_zoom = 1.0;
+            }
         });
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
@@ -7194,35 +7217,57 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Rendered preview (cached by every option that affects it + recolor).
+        // Rendered preview. The font is a VECTOR source, so we don't scale a bitmap (a fractional
+        // device scale on the baked anti-aliasing is what produced the window-size-dependent grey
+        // "shadow" band across the line seam). Instead we RE-RENDER the sample at device resolution ×
+        // the preview zoom — `render_scale = zoom · ppp` — then display it 1:1 (points = pixels / ppp)
+        // so each rendered texel maps to exactly one screen pixel: crisp at any zoom, no resampling,
+        // no band. Zoom 1.0 · ppp reproduces the old (pre-fix) on-screen size.
+        let preview_h = self.font_preview_h.clamp(120.0, 2000.0);
+        let ppp = ctx.pixels_per_point();
+        let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
         let key = format!(
-            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|rc{}|{}|{}",
+            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|rc{}|z{:.3}|{}|{}",
             self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
             self.font_letter_spacing, self.font_line_gap, self.font_top_down,
             self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
-            self.font_apply_recolor, self.pipeline_key(), self.recolor_ident()
+            self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
         );
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
+            // Supersample the whole logo (size + stroke + spacing) by render_scale.
+            let mut opts = self.font_text_opts();
+            opts.px *= render_scale;
+            opts.stroke_w *= render_scale;
+            opts.letter_spacing *= render_scale;
+            opts.line_gap *= render_scale;
+            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &opts) {
                 let img = self.font_recolor(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
                 );
-                // NEAREST: render_text already bakes anti-aliasing, so nearest display keeps the
-                // edges crisp and avoids a soft fringe from LINEAR upscaling by pixels_per_point.
                 let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::NEAREST);
                 self.font_sample_tex = Some((key, tex));
             }
         }
-        egui::ScrollArea::horizontal()
+        egui::ScrollArea::both()
             .id_salt("font_sample_scroll")
-            .max_height(240.0)
+            .min_scrolled_height(preview_h)
+            .max_height(preview_h)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some((_, tex)) = &self.font_sample_tex {
-                    ui.add(egui::Image::new((tex.id(), tex.size_vec2())));
+                    // 1:1 device pixels (points = pixels / ppp). The texture was rendered at
+                    // device-res × zoom, so on-screen size = design × zoom, pixel-exact.
+                    let pts = tex.size_vec2() / ppp;
+                    ui.add(egui::Image::new((tex.id(), pts)));
                 }
             });
+        // Draggable divider to resize the preview pane (persisted).
+        let dy = drag_h_divider(ui, ui.available_width());
+        if dy != 0.0 {
+            self.font_preview_h = (self.font_preview_h + dy).clamp(120.0, 2000.0);
+        }
         ui.separator();
 
         // Glyph grid (paged) — click a glyph to copy it. Cell size is the shared slider, and the
@@ -28263,6 +28308,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_STROKE_COLOR_KEY, &self.font_stroke_color);
         eframe::set_value(storage, Self::FONT_STROKE_MODE_KEY, &self.font_stroke_mode.to_u8());
         eframe::set_value(storage, Self::FONT_RECOLOR_KEY, &self.font_apply_recolor);
+        eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
+        eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
