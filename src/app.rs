@@ -1776,6 +1776,7 @@ pub struct PixelView {
     // cache-first HTTP GET (no yt-dlp). Results keyed by virtual path `<images>/search/<q>/<file>`.
     img_results: HashMap<PathBuf, crate::imgsearch::ImgResult>,
     img_search: String, // the Places search box
+    gif_search: String, // the animated-GIF Places search box
     img_rx: Option<std::sync::mpsc::Receiver<ImgMsg>>,
     img_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     img_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local file
@@ -3290,6 +3291,7 @@ impl PixelView {
             colo_save_rx: None,
             img_results: HashMap::new(),
             img_search: String::new(),
+            gif_search: String::new(),
             img_rx: None,
             img_cancel: None,
             img_files: HashMap::new(),
@@ -3461,7 +3463,9 @@ impl PixelView {
             return;
         }
         // The virtual image-search tree (Openverse: query → results → download-in-place → view).
-        if crate::imgsearch::is_remote(&dir) {
+        // The animated-GIF root shares this handler entirely — same API, same result type, same
+        // download/view path; only the `extension=gif` filter differs.
+        if crate::imgsearch::is_any(&dir) {
             self.open_images(dir);
             return;
         }
@@ -4462,7 +4466,7 @@ impl PixelView {
     /// Route an `<images>/…` virtual path. `[]` = hint; `[search, q]` = run/restore the search;
     /// `[search, q, leaf]` = a pinned result → download + view it.
     fn open_images(&mut self, dir: PathBuf) {
-        let parts = crate::imgsearch::rel_parts(&dir);
+        let parts = crate::imgsearch::rel_parts_any(&dir);
         match parts.as_slice() {
             [] => {
                 self.show_folder(dir, Vec::new());
@@ -4491,7 +4495,8 @@ impl PixelView {
 
     /// Kick off an image search on a worker thread. Results stream into `all_entries` via `poll_img`.
     fn start_img_search(&mut self, dir: PathBuf) {
-        let query = crate::imgsearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::imgsearch::rel_parts_any(&dir).get(1).cloned().unwrap_or_default();
+        let gif = crate::imgsearch::is_gif_remote(&dir);
         self.show_folder(dir.clone(), Vec::new());
         self.img_results.clear();
         if let Some(c) = self.img_cancel.take() {
@@ -4501,9 +4506,9 @@ impl PixelView {
         let (tx, rx) = std::sync::mpsc::channel();
         self.img_rx = Some(rx);
         self.img_cancel = Some(cancel.clone());
-        self.status = format!("Searching images: {query}");
+        self.status = format!("Searching {}: {query}", if gif { "GIFs" } else { "images" });
         self.want_repaint = true; // keep polling until the async results land
-        std::thread::spawn(move || img_walk(query, &dir, cancel, tx));
+        std::thread::spawn(move || img_walk(query, gif, &dir, cancel, tx));
     }
 
     /// Drain the image-search worker each frame: append hits, request thumbnails, rebuild the view.
@@ -27274,6 +27279,7 @@ impl PixelView {
                             (1, "16colo"),
                             (5, "YouTube"),
                             (8, "Images"),
+                            (16, "GIFs"),
                             (9, "Icons"),
                             (10, "Vectors"),
                             (11, "Palettes"),
@@ -27762,6 +27768,50 @@ impl PixelView {
                         });
                         ui.weak("Openverse · CC audio → waveform editor + pads");
                         if let Some(p) = self.favorites_buttons(ui, "🔊", crate::audiosearch::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 16 {
+                        // Animated GIF search — the same Openverse corpus constrained to
+                        // `extension=gif`. Results animate in the grid on hover and in the viewer,
+                        // since a downloaded GIF is just a local GIF.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.gif_search)
+                                    .hint_text("search animated GIFs…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.gif_search.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(
+                                        Path::new(crate::imgsearch::GIF_ROOT)
+                                            .join(crate::imgsearch::SEARCH)
+                                            .join(q),
+                                    );
+                                }
+                            }
+                        });
+                        ui.weak("Openverse · CC animated GIFs (hover a tile to play)");
+                        if let Some((f, label)) = self.folder.as_ref().and_then(|f| {
+                            crate::imgsearch::is_gif_remote(f).then(|| {
+                                let q = crate::imgsearch::rel_parts_any(f).get(1).cloned().unwrap_or_default();
+                                (f.clone(), q)
+                            })
+                        }) {
+                            let saved = self.favorites.contains(&f);
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved { "★ Saved".into() } else { format!("★ Save “{label}”") })
+                                    .on_hover_text("Pin this GIF search to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "🎞", crate::imgsearch::is_gif_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
@@ -35580,6 +35630,7 @@ fn is_fon_ext(p: &Path) -> bool {
 /// (favorites split, etc.) on a non-local path.
 fn any_remote(p: &Path) -> bool {
     crate::sixteen::is_remote(p)
+        || crate::imgsearch::is_gif_remote(p)
         || crate::youtube::is_remote(p)
         || crate::steam::is_remote(p)
         || crate::imgsearch::is_remote(p)
@@ -35688,12 +35739,18 @@ fn yt_walk(
 /// (`<images>/search/<q>/<title [id].ext>`). Mirrors `yt_walk` but with no external tool.
 fn img_walk(
     query: String,
+    gif: bool,
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<ImgMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let results = crate::imgsearch::search(&query, 60).unwrap_or_default();
+    let results = if gif {
+        crate::imgsearch::search_gifs(&query, 60)
+    } else {
+        crate::imgsearch::search(&query, 60)
+    }
+    .unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
     for r in results {

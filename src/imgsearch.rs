@@ -12,6 +12,11 @@ use std::path::Path;
 
 /// Virtual root for image-search browsing.
 pub const ROOT: &str = "<images>";
+/// Virtual root for **animated GIF** search — the same Openverse API constrained to `extension=gif`.
+/// It's a separate root (not a filter on the Images tab) so it gets its own Places entry and its
+/// results can be pinned independently; everything downstream reuses the image pipeline, since a
+/// GIF result *is* an [`ImgResult`] and the two roots' paths can't collide.
+pub const GIF_ROOT: &str = "<gifs>";
 /// The search facet: `<images>/search/<query>`.
 pub const SEARCH: &str = "search";
 
@@ -22,9 +27,32 @@ pub fn is_remote(path: &Path) -> bool {
     path.starts_with(ROOT)
 }
 
+/// Is `path` under the animated-GIF virtual root?
+pub fn is_gif_remote(path: &Path) -> bool {
+    path.starts_with(GIF_ROOT)
+}
+
+/// Under *either* root (the two share all their downstream handling).
+pub fn is_any(path: &Path) -> bool {
+    is_remote(path) || is_gif_remote(path)
+}
+
 /// The path components below [`ROOT`] (e.g. `["search", "sunset"]`).
 pub fn rel_parts(path: &Path) -> Vec<String> {
-    path.strip_prefix(ROOT)
+    rel_parts_of(path, ROOT)
+}
+
+/// The path components below whichever of the two roots `path` sits under.
+pub fn rel_parts_any(path: &Path) -> Vec<String> {
+    if is_gif_remote(path) {
+        rel_parts_of(path, GIF_ROOT)
+    } else {
+        rel_parts_of(path, ROOT)
+    }
+}
+
+fn rel_parts_of(path: &Path, root: &str) -> Vec<String> {
+    path.strip_prefix(root)
         .ok()
         .map(|p| {
             p.components()
@@ -160,17 +188,37 @@ fn enc(q: &str) -> String {
 /// "image search is broken"). So we page in 20s. Do NOT raise this without an API key.
 const PAGE_MAX: usize = 20;
 
-/// The Openverse request URL for `query`, page `page`. Kept separate so a test can assert the
-/// page-size stays within the anonymous limit (the regression that silently emptied the results).
-fn page_url(query: &str, page: usize) -> String {
+/// The Openverse request URL for `query`, page `page`, optionally constrained to one file
+/// `extension` (that's how GIF search is expressed — Openverse has no separate animation endpoint).
+/// Kept separate so a test can assert the page-size stays within the anonymous limit (the
+/// regression that silently emptied the results).
+fn page_url(query: &str, page: usize, extension: Option<&str>) -> String {
     // `mature=false` (default) keeps results SFW.
-    format!("{API}?q={}&page_size={PAGE_MAX}&page={page}", enc(query))
+    let mut u = format!("{API}?q={}&page_size={PAGE_MAX}&page={page}", enc(query));
+    if let Some(ext) = extension {
+        u.push_str(&format!("&extension={}", enc(ext)));
+    }
+    u
 }
 
 /// Search Openverse for `query`, up to `n` results. Fetches successive pages of ≤20 (the anonymous
 /// limit) until it has `n` or the results run out. Uses the shared HTTP cache (1-day TTL) so repeat
 /// searches are instant + offline-friendly.
 pub fn search(query: &str, n: usize) -> Result<Vec<ImgResult>, String> {
+    search_ext(query, n, None)
+}
+
+/// Search for **animated GIFs**: the same Openverse corpus constrained to `extension=gif`.
+///
+/// NB Openverse indexes CC/public-domain media (largely Wikimedia), so this is a genuine but
+/// *modest* GIF corpus — good for animation loops and educational clips, thin on meme/reaction GIFs.
+/// A Giphy/Tenor backend would need an API key, so it isn't wired here.
+pub fn search_gifs(query: &str, n: usize) -> Result<Vec<ImgResult>, String> {
+    search_ext(query, n, Some("gif"))
+}
+
+/// Shared paging core for [`search`] / [`search_gifs`].
+pub fn search_ext(query: &str, n: usize, extension: Option<&str>) -> Result<Vec<ImgResult>, String> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
@@ -179,7 +227,7 @@ pub fn search(query: &str, n: usize) -> Result<Vec<ImgResult>, String> {
     let pages = want.div_ceil(PAGE_MAX);
     let mut out: Vec<ImgResult> = Vec::new();
     for page in 1..=pages {
-        let body = crate::cache::get_bytes(&page_url(q, page), Some(86_400))?;
+        let body = crate::cache::get_bytes(&page_url(q, page, extension), Some(86_400))?;
         let batch = parse_results(&body);
         if batch.is_empty() {
             break; // ran out of results
@@ -236,15 +284,53 @@ mod tests {
         // Openverse 401s anonymous requests with page_size > 20 → empty results (the bug that made
         // image search "not work"). Guard both the constant and the built URL.
         assert!(PAGE_MAX <= 20, "anonymous page_size cap is 20");
-        let url = page_url("skull", 1);
+        let url = page_url("skull", 1, None);
         assert!(url.contains(&format!("page_size={PAGE_MAX}")));
         assert!(url.contains("q=skull") && url.contains("page=1"));
+        assert!(!url.contains("extension="), "no filter unless asked");
+    }
+
+    #[test]
+    fn gif_search_constrains_the_extension() {
+        // Animated-GIF search is just the image corpus with `extension=gif` — if this param is
+        // ever dropped the GIF tab silently fills with stills.
+        let url = page_url("cat", 1, Some("gif"));
+        assert!(url.contains("extension=gif"));
+        assert!(url.contains("page_size=20"), "still within the anonymous cap");
+    }
+
+    #[test]
+    fn both_roots_resolve_their_own_parts() {
+        let img = PathBuf::from(ROOT).join(SEARCH).join("sunset");
+        let gif = PathBuf::from(GIF_ROOT).join(SEARCH).join("cat");
+        assert!(is_remote(&img) && !is_gif_remote(&img));
+        assert!(is_gif_remote(&gif) && !is_remote(&gif));
+        assert!(is_any(&img) && is_any(&gif));
+        // `rel_parts_any` must strip whichever root applies (a GIF path under the image root
+        // would otherwise yield an empty vec and route to the "type a query" hint).
+        assert_eq!(rel_parts_any(&img), vec!["search", "sunset"]);
+        assert_eq!(rel_parts_any(&gif), vec!["search", "cat"]);
     }
 }
 
 #[cfg(test)]
 mod live {
     use super::*;
+    #[test]
+    #[ignore]
+    fn live_gif_search() {
+        match search_gifs("cat", 6) {
+            Ok(v) => {
+                eprintln!("GIF results: {}", v.len());
+                for r in v.iter().take(4) {
+                    eprintln!("  {} | .{} | {}", r.title, r.ext, r.dims());
+                }
+                assert!(v.iter().all(|r| r.ext == "gif"), "every result is a GIF");
+            }
+            Err(e) => eprintln!("ERROR: {e}"),
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_search_skull() {
