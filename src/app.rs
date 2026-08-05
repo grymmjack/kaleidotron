@@ -7136,8 +7136,8 @@ impl PixelView {
         // while assigning the texture back (no double &mut self borrow).
         let opts = self.font_3d_opts();
         let mesh_key = format!(
-            "{}|{:.4}|{:.4}|{:.4}|{:?}|{:?}",
-            self.font_sample, opts.depth, opts.letter_spacing, opts.line_gap, opts.face_rgb, opts.side_rgb
+            "{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}",
+            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap, opts.face_rgb, opts.side_rgb
         );
         let mut mesh = self.font_3d_mesh.take();
         if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
@@ -7145,9 +7145,11 @@ impl PixelView {
                 .map(|m| (mesh_key.clone(), m));
         }
 
+        // Clamp the render texture to the GPU limit (the 8192 max texture dim), like the rest of the
+        // app — a wide pane × a high pixels-per-point can otherwise exceed it and crash wgpu.
         let ppp = ctx.pixels_per_point();
-        let wpx = (rect.width() * ppp).round().max(1.0) as usize;
-        let hpx = (rect.height() * ppp).round().max(1.0) as usize;
+        let wpx = ((rect.width() * ppp).round() as usize).clamp(1, 8000);
+        let hpx = ((rect.height() * ppp).round() as usize).clamp(1, 8000);
         if let Some((_, m)) = &mesh {
             let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
             let ro = RenderOpts {
