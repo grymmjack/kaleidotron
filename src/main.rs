@@ -22,6 +22,7 @@ mod steam;
 mod thumb;
 mod video;
 mod imgsearch;
+mod assetsearch;
 mod viewdb;
 mod xi;
 mod youtube;

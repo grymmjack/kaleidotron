@@ -247,6 +247,12 @@ enum ImgMsg {
     Done(usize),
 }
 
+/// Messages from an icon/vector-search worker (`asset_walk`): one SVG result per hit, then the count.
+enum AssetMsg {
+    Hit(Entry, Box<crate::assetsearch::AssetResult>),
+    Done(usize),
+}
+
 /// Messages from an AI-generation worker (`start_ai_job`): one produced file per batch item, then
 /// the final result.
 enum AiJobMsg {
@@ -1750,6 +1756,17 @@ pub struct PixelView {
     img_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[allow(clippy::type_complexity)]
     img_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::imgsearch::ImgResult>)>,
+    // Icon (Iconify) + vector (Wikimedia) search — mirrors img_* but the SVG asset is the download.
+    asset_results: HashMap<PathBuf, crate::assetsearch::AssetResult>,
+    asset_icons_query: String,   // the Icons Places search box
+    asset_vectors_query: String, // the Vectors Places search box
+    asset_rx: Option<std::sync::mpsc::Receiver<AssetMsg>>,
+    asset_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    asset_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local SVG
+    #[allow(clippy::type_complexity)]
+    asset_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    #[allow(clippy::type_complexity)]
+    asset_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::assetsearch::AssetResult>)>,
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -3190,6 +3207,14 @@ impl PixelView {
             img_files: HashMap::new(),
             img_open_rx: None,
             img_search_cache: None,
+            asset_results: HashMap::new(),
+            asset_icons_query: String::new(),
+            asset_vectors_query: String::new(),
+            asset_rx: None,
+            asset_cancel: None,
+            asset_files: HashMap::new(),
+            asset_open_rx: None,
+            asset_search_cache: None,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3320,6 +3345,11 @@ impl PixelView {
         // The virtual image-search tree (Openverse: query → results → download-in-place → view).
         if crate::imgsearch::is_remote(&dir) {
             self.open_images(dir);
+            return;
+        }
+        // Icon (Iconify) + vector (Wikimedia) search — SVG assets, download-in-place → view.
+        if crate::assetsearch::is_remote(&dir) {
+            self.open_assets(dir);
             return;
         }
         // A user video list (`<lists>/<name>`): show its videos in add-order.
@@ -4174,6 +4204,7 @@ impl PixelView {
             .or_else(|| self.yt_files.get(path))
             .or_else(|| self.steam_files.get(path))
             .or_else(|| self.img_files.get(path))
+            .or_else(|| self.asset_files.get(path))
         {
             return f.clone();
         }
@@ -4428,6 +4459,149 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.img_open_rx = None,
+        }
+    }
+
+    // --- Icon (Iconify) + vector (Wikimedia) search — mirrors the img_* machinery; the backend is
+    //     selected by the virtual path's root (`<icons>` / `<vectors>`). ---
+
+    fn open_assets(&mut self, dir: PathBuf) {
+        let parts = crate::assetsearch::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a query in the Places panel".into();
+            }
+            [s, _q] if s == crate::assetsearch::SEARCH => {
+                if let Some((cdir, entries, results)) = &self.asset_search_cache {
+                    if *cdir == dir && !entries.is_empty() {
+                        let (entries, results) = (entries.clone(), results.clone());
+                        self.asset_results = results;
+                        self.show_folder(dir, entries);
+                        self.status = format!("{} result(s)", self.all_entries.len());
+                        return;
+                    }
+                }
+                self.start_asset_search(dir);
+            }
+            // A pinned result leaf → download + view.
+            [s, _q, _leaf] if s == crate::assetsearch::SEARCH => self.start_asset_open(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Kick off an icon/vector search on a worker. Results stream into `all_entries` via `poll_asset`.
+    fn start_asset_search(&mut self, dir: PathBuf) {
+        let Some(source) = crate::assetsearch::source_of(&dir) else {
+            return;
+        };
+        let query = crate::assetsearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.asset_results.clear();
+        if let Some(c) = self.asset_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.asset_rx = Some(rx);
+        self.asset_cancel = Some(cancel.clone());
+        self.status = format!("Searching: {query}");
+        self.want_repaint = true;
+        std::thread::spawn(move || asset_walk(source, query, &dir, cancel, tx));
+    }
+
+    /// Drain the asset-search worker each frame: append hits, request thumbnails, rebuild the view.
+    fn poll_asset(&mut self) {
+        let Some(rx) = &self.asset_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(AssetMsg::Hit(mut entry, r)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    // Icons are SVG thumbnails (decode via the registry); Commons thumbs are PNG.
+                    self.colo_thumbs.request(&entry.path, &r.thumb_url, THUMB_PX, r.thumb_via_registry);
+                    self.asset_results.insert(entry.path.clone(), *r);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(AssetMsg::Done(n)) => {
+                    self.status = format!("{n} result(s)");
+                    if let Some(f) = self.folder.clone() {
+                        self.asset_search_cache = Some((f, self.all_entries.clone(), self.asset_results.clone()));
+                    }
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.asset_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Download an SVG asset (cache-first) on a worker, then view it. One at a time.
+    fn start_asset_open(&mut self, vpath: PathBuf) {
+        let Some(r) = self.asset_results.get(&vpath).cloned() else {
+            self.status = "Unknown asset".into();
+            return;
+        };
+        if self.asset_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.asset_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&r.title, 40));
+        std::thread::spawn(move || {
+            let res = crate::cache::get_file(&r.download_url, &r.filename()).map(|local| (vpath, local));
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish an asset download each frame: map the virtual path → local SVG + open it, with a
+    /// status line crediting the source (attribution + licence).
+    fn poll_asset_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.asset_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self.asset_results.get(&vpath).map(|r| {
+                    let mut s = r.title.clone();
+                    if !r.attribution.is_empty() {
+                        s.push_str(&format!(" — {}", r.attribution));
+                    }
+                    if !r.license.is_empty() {
+                        s.push_str(&format!(" · {}", r.license));
+                    }
+                    if !r.page_url.is_empty() {
+                        s.push_str(&format!(" · {}", r.page_url));
+                    }
+                    s
+                });
+                self.asset_files.insert(vpath.clone(), local);
+                self.asset_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.asset_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.asset_open_rx = None,
         }
     }
 
@@ -13792,6 +13966,8 @@ impl PixelView {
             || self.blend_render_pending > 0
             || self.img_rx.is_some()
             || self.img_open_rx.is_some()
+            || self.asset_rx.is_some()
+            || self.asset_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -15018,6 +15194,12 @@ impl PixelView {
             // An image-search result not yet downloaded → fetch (cache-first), then view.
             self.selected = idx;
             self.start_img_open(entry.path);
+        } else if self.asset_results.contains_key(&entry.path)
+            && !self.asset_files.contains_key(&entry.path)
+        {
+            // An icon/vector result not yet downloaded → fetch the SVG (cache-first), then view.
+            self.selected = idx;
+            self.start_asset_open(entry.path);
         } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
             // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
@@ -25942,6 +26124,8 @@ impl PixelView {
                             (1, "16colo"),
                             (5, "YouTube"),
                             (8, "Images"),
+                            (9, "Icons"),
+                            (10, "Vectors"),
                             (6, "Steam"),
                             (7, "AI"),
                             (2, "Kits"),
@@ -26215,6 +26399,79 @@ impl PixelView {
                         if let Some(p) =
                             self.favorites_buttons(ui, "🖼", crate::imgsearch::is_remote, false)
                         {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 9 || self.places_tab == 10 {
+                        // Free icon (Iconify) + vector (Wikimedia) search — both are SVG; opening one
+                        // downloads the SVG and views it locally (recolor / palette / Save all work).
+                        let icons_tab = self.places_tab == 9;
+                        let (root, hint, note, query) = if icons_tab {
+                            (
+                                crate::assetsearch::ICONS_ROOT,
+                                "search icons…",
+                                "Iconify · 200k+ open-source icons",
+                                &mut self.asset_icons_query,
+                            )
+                        } else {
+                            (
+                                crate::assetsearch::VECTORS_ROOT,
+                                "search vector art…",
+                                "Wikimedia Commons · CC / public-domain SVG",
+                                &mut self.asset_vectors_query,
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(query).hint_text(hint).desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = query.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(Path::new(root).join(crate::assetsearch::SEARCH).join(q));
+                                }
+                            }
+                        });
+                        ui.weak(note);
+                        // Pin the current search to Places (re-runs on click).
+                        let want_source = if icons_tab {
+                            crate::assetsearch::Source::Icons
+                        } else {
+                            crate::assetsearch::Source::Vectors
+                        };
+                        let cur_search = self.folder.as_ref().filter(|f| {
+                            crate::assetsearch::source_of(f) == Some(want_source)
+                                && matches!(
+                                    crate::assetsearch::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::assetsearch::SEARCH
+                                )
+                        });
+                        let saved = cur_search.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur_search {
+                            let label = crate::assetsearch::rel_parts(f).get(1).cloned().unwrap_or_default();
+                            let f = f.clone();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved {
+                                        "★ Saved".to_string()
+                                    } else {
+                                        format!("★ Save “{label}”")
+                                    })
+                                    .on_hover_text("Pin this search to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        let glyph = if icons_tab { "🔲" } else { "🖼" };
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            glyph,
+                            move |p| crate::assetsearch::source_of(p) == Some(want_source),
+                            false,
+                        ) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
@@ -27275,6 +27532,8 @@ impl eframe::App for PixelView {
         self.poll_yt_open(&ctx);
         self.poll_img();
         self.poll_img_open(&ctx);
+        self.poll_asset();
+        self.poll_asset_open(&ctx);
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -34001,6 +34260,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::youtube::is_remote(p)
         || crate::steam::is_remote(p)
         || crate::imgsearch::is_remote(p)
+        || crate::assetsearch::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -34132,6 +34392,43 @@ fn img_walk(
         }
     }
     let _ = tx.send(ImgMsg::Done(n));
+}
+
+/// Worker: search Iconify / Wikimedia (per `source`), streaming one SVG result per hit.
+fn asset_walk(
+    source: crate::assetsearch::Source,
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<AssetMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let results = crate::assetsearch::search(source, &query, 120).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for r in results {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(r.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(AssetMsg::Hit(entry, Box::new(r))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(AssetMsg::Done(n));
 }
 
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace

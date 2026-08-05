@@ -24,7 +24,7 @@ struct Job {
     target: u32,
     // 16colo has no pre-rendered PNG for a PDF piece (its `tn`/`x1` render 404s), so
     // `url` is the *raw* PDF and we render page 1 ourselves via the registry (pdftoppm).
-    is_pdf: bool,
+    via_registry: bool,
 }
 
 pub struct RemoteThumbs {
@@ -66,17 +66,18 @@ impl RemoteThumbs {
         }
     }
 
-    /// Enqueue once per path. Cheap to call every frame for visible rows. `is_pdf` picks
-    /// the render path: `false` = fetch 16colo's pre-rendered PNG at `url`; `true` = `url`
-    /// is the raw PDF, rendered locally (page 1) since 16colo serves no PDF thumbnail.
-    pub fn request(&mut self, path: &Path, url: &str, target: u32, is_pdf: bool) {
+    /// Enqueue once per path. Cheap to call every frame for visible rows. `via_registry` picks
+    /// the decode path: `false` = fetch a pre-rendered raster (PNG/JPEG) at `url` and decode it
+    /// with the `image` crate; `true` = `url` is a raw asset the `image` crate can't read (a PDF,
+    /// an SVG icon) → decode it through the registry (SvgDecoder / pdfium-poppler) instead.
+    pub fn request(&mut self, path: &Path, url: &str, target: u32, via_registry: bool) {
         if self.requested.insert(path.to_path_buf()) {
             let (lock, cvar) = &*self.queue;
             lock.lock().unwrap().push(Job {
                 path: path.to_path_buf(),
                 url: url.to_string(),
                 target,
-                is_pdf,
+                via_registry,
             });
             cvar.notify_one();
         }
@@ -95,13 +96,13 @@ impl RemoteThumbs {
 }
 
 /// Download + decode one thumbnail, area-downscaling if it's bigger than `target`. A
-/// PDF piece (`is_pdf`) downloads its raw file and renders page 1 through the registry
+/// PDF piece (`via_registry`) downloads its raw file and renders page 1 through the registry
 /// (poppler `pdftoppm`, with a labeled placeholder fallback), since 16colo has no PDF
 /// render; everything else fetches 16colo's pre-rendered PNG. Both go through the
 /// persistent disk cache — re-browsing a pack/artist doesn't re-fetch.
 fn fetch(job: &Job, registry: &Registry) -> Option<RemoteThumbResult> {
     let buf = crate::cache::get_bytes(&job.url, None).ok()?;
-    if job.is_pdf {
+    if job.via_registry {
         let img = registry.decode_bytes(&buf, &job.path).ok()?;
         let (w, h, rgba) = crate::thumb::make_thumb(&img, job.target);
         return Some(RemoteThumbResult {
