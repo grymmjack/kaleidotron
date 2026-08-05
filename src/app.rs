@@ -253,6 +253,12 @@ enum AssetMsg {
     Done(usize),
 }
 
+/// Messages from a Lospec palette-browse worker (`lospec_walk`): one palette per hit, then the count.
+enum LospecMsg {
+    Hit(Entry, Box<crate::lospec::LospecPalette>),
+    Done(usize),
+}
+
 /// Messages from an AI-generation worker (`start_ai_job`): one produced file per batch item, then
 /// the final result.
 enum AiJobMsg {
@@ -1767,6 +1773,15 @@ pub struct PixelView {
     asset_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[allow(clippy::type_complexity)]
     asset_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::assetsearch::AssetResult>)>,
+    // Lospec palette browser/downloader. A palette tile renders its swatches (colours are inline in
+    // the API), clicking one downloads the `.gpl` into the palette library + selects it in Recolor.
+    lospec_palettes: HashMap<PathBuf, crate::lospec::LospecPalette>,
+    lospec_query: String,
+    lospec_rx: Option<std::sync::mpsc::Receiver<LospecMsg>>,
+    lospec_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[allow(clippy::type_complexity)]
+    lospec_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, usize), String>>>,
+    lospec_dir: PathBuf, // where downloaded Lospec `.gpl`s are kept (scanned into the palette library)
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -2541,7 +2556,15 @@ impl PixelView {
                     .map(|h| h.join(DEFAULT_PALETTE_SUBDIR))
                     .unwrap_or_default()
             });
-        let palette_files = all_palettes(&palette_dir);
+        // Downloaded Lospec palettes live under the data dir and are folded into the library, so a
+        // palette you grabbed last session is still in the Recolor list this session.
+        let lospec_dir = data_dir.join("lospec");
+        let mut palette_files = all_palettes(&palette_dir);
+        for p in all_palettes(&lospec_dir) {
+            if !palette_files.contains(&p) {
+                palette_files.push(p);
+            }
+        }
         let palette_favorites = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::PALETTE_FAV_KEY))
@@ -3215,6 +3238,12 @@ impl PixelView {
             asset_files: HashMap::new(),
             asset_open_rx: None,
             asset_search_cache: None,
+            lospec_palettes: HashMap::new(),
+            lospec_query: String::new(),
+            lospec_rx: None,
+            lospec_cancel: None,
+            lospec_open_rx: None,
+            lospec_dir,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3350,6 +3379,11 @@ impl PixelView {
         // Icon (Iconify) + vector (Wikimedia) search — SVG assets, download-in-place → view.
         if crate::assetsearch::is_remote(&dir) {
             self.open_assets(dir);
+            return;
+        }
+        // Lospec palette browser (query → swatch tiles → click downloads the .gpl + applies it).
+        if crate::lospec::is_remote(&dir) {
+            self.open_lospec(dir);
             return;
         }
         // A user video list (`<lists>/<name>`): show its videos in add-order.
@@ -4602,6 +4636,135 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.asset_open_rx = None,
+        }
+    }
+
+    // --- Lospec palette browser + downloader. Tiles render swatches (colours are inline); clicking
+    //     one downloads the `.gpl` into the library + selects it in Recolor. ---
+
+    fn open_lospec(&mut self, dir: PathBuf) {
+        let parts = crate::lospec::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a tag in the Places panel (or leave blank to browse all)".into();
+            }
+            // `[search]` (blank query) or `[search, tag]` → browse. The worker reads the tag from the
+            // path (missing = browse all).
+            [s] | [s, _] if s == crate::lospec::SEARCH => self.start_lospec_search(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Kick off a Lospec browse/search on a worker. Palettes stream in via `poll_lospec`.
+    fn start_lospec_search(&mut self, dir: PathBuf) {
+        let query = crate::lospec::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.lospec_palettes.clear();
+        if let Some(c) = self.lospec_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lospec_rx = Some(rx);
+        self.lospec_cancel = Some(cancel.clone());
+        self.status = "Browsing Lospec palettes…".into();
+        self.want_repaint = true;
+        std::thread::spawn(move || lospec_walk(query, &dir, cancel, tx));
+    }
+
+    /// Drain the Lospec worker each frame: generate a swatch thumbnail for each palette (colours are
+    /// inline, so no remote thumbnail), store the palette, rebuild the view.
+    fn poll_lospec(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.lospec_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..64 {
+            match rx.try_recv() {
+                Ok(LospecMsg::Hit(entry, p)) => {
+                    const SZ: usize = 220;
+                    let rgba = crate::lospec::swatch_rgba(&p.colors, SZ);
+                    let flat: Vec<u8> = rgba.iter().flat_map(|c| *c).collect();
+                    let img = egui::ColorImage::from_rgba_unmultiplied([SZ, SZ], &flat);
+                    let tex = ctx.load_texture("lospec_swatch", img, egui::TextureOptions::NEAREST);
+                    self.thumb_tex.insert(entry.path.clone(), tex);
+                    self.lospec_palettes.insert(entry.path.clone(), *p);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(LospecMsg::Done(n)) => {
+                    self.status = format!("{n} palette(s) — click one to add it to your library + Recolor");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.lospec_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Click a Lospec palette → apply it immediately (from the inline colours) + download its `.gpl`
+    /// into the library on a worker (so it persists in the Recolor palette list).
+    fn start_lospec_open(&mut self, vpath: PathBuf) {
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            self.status = "Unknown palette".into();
+            return;
+        };
+        // Instant apply from the inline colours (no wait).
+        self.custom_palette = Some(p.rgba());
+        self.status = format!("Applied “{}” ({} colors) — downloading .gpl…", p.title, p.colors.len());
+        if self.lospec_open_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lospec_open_rx = Some(rx);
+        let dir = self.lospec_dir.clone();
+        std::thread::spawn(move || {
+            let res = (|| {
+                let cached = crate::cache::get_file(&p.gpl_url(), &p.filename())?;
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let dst = dir.join(p.filename());
+                std::fs::copy(&cached, &dst).map_err(|e| e.to_string())?;
+                Ok::<_, String>((vpath, dst, p.colors.len()))
+            })();
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish a Lospec `.gpl` download: add it to the palette library list + select it (so Recolor
+    /// uses the on-disk palette), clearing the transient inline apply.
+    fn poll_lospec_open(&mut self) {
+        let Some(rx) = &self.lospec_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((_vpath, saved, ncolors))) => {
+                if !self.palette_files.contains(&saved) {
+                    self.palette_files.push(saved.clone());
+                    self.palette_files.sort();
+                }
+                self.custom_palette = None; // hand off to the persistent on-disk palette
+                self.selected_palette = Some(saved.clone());
+                let name = saved.file_stem().and_then(|s| s.to_str()).unwrap_or("palette");
+                self.status = format!("Added “{name}” ({ncolors} colors) to your palette library + Recolor");
+                self.lospec_open_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Palette download failed: {e}");
+                self.lospec_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lospec_open_rx = None,
         }
     }
 
@@ -13968,6 +14131,8 @@ impl PixelView {
             || self.img_open_rx.is_some()
             || self.asset_rx.is_some()
             || self.asset_open_rx.is_some()
+            || self.lospec_rx.is_some()
+            || self.lospec_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -15200,6 +15365,10 @@ impl PixelView {
             // An icon/vector result not yet downloaded → fetch the SVG (cache-first), then view.
             self.selected = idx;
             self.start_asset_open(entry.path);
+        } else if self.lospec_palettes.contains_key(&entry.path) {
+            // A Lospec palette → download its .gpl to the library + apply it to Recolor.
+            self.selected = idx;
+            self.start_lospec_open(entry.path);
         } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
             // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
@@ -26126,6 +26295,7 @@ impl PixelView {
                             (8, "Images"),
                             (9, "Icons"),
                             (10, "Vectors"),
+                            (11, "Palettes"),
                             (6, "Steam"),
                             (7, "AI"),
                             (2, "Kits"),
@@ -26472,6 +26642,49 @@ impl PixelView {
                             move |p| crate::assetsearch::source_of(p) == Some(want_source),
                             false,
                         ) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 11 {
+                        // Lospec palette browser: a search box (a Lospec tag; blank = browse all) +
+                        // a Browse button. Clicking a palette tile downloads its .gpl + applies it.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.lospec_query)
+                                    .hint_text("tag (blank = all)…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Browse", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.lospec_query.trim().to_string();
+                                nav = Some(Path::new(crate::lospec::ROOT).join(crate::lospec::SEARCH).join(q));
+                            }
+                        });
+                        ui.weak("Lospec · click a palette → added to your library + Recolor");
+                        // Pin the current browse to Places.
+                        let cur = self.folder.as_ref().filter(|f| {
+                            crate::lospec::is_remote(f)
+                                && matches!(
+                                    crate::lospec::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::lospec::SEARCH
+                                )
+                        });
+                        let saved = cur.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur {
+                            let label = crate::lospec::rel_parts(f).get(1).cloned().unwrap_or_default();
+                            let label = if label.is_empty() { "all".to_string() } else { label };
+                            let f = f.clone();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved { "★ Saved".to_string() } else { format!("★ Save “{label}”") })
+                                    .on_hover_text("Pin this palette browse to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "🎨", crate::lospec::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
@@ -27534,6 +27747,8 @@ impl eframe::App for PixelView {
         self.poll_img_open(&ctx);
         self.poll_asset();
         self.poll_asset_open(&ctx);
+        self.poll_lospec(&ctx);
+        self.poll_lospec_open();
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -34261,6 +34476,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::steam::is_remote(p)
         || crate::imgsearch::is_remote(p)
         || crate::assetsearch::is_remote(p)
+        || crate::lospec::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -34429,6 +34645,42 @@ fn asset_walk(
         }
     }
     let _ = tx.send(AssetMsg::Done(n));
+}
+
+/// Worker: browse/search Lospec, streaming one palette per hit.
+fn lospec_walk(
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<LospecMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let palettes = crate::lospec::search(&query, 60).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for p in palettes {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(p.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(LospecMsg::Hit(entry, Box::new(p))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(LospecMsg::Done(n));
 }
 
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace

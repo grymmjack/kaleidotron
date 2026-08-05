@@ -23,6 +23,7 @@ mod thumb;
 mod video;
 mod imgsearch;
 mod assetsearch;
+mod lospec;
 mod viewdb;
 mod xi;
 mod youtube;
