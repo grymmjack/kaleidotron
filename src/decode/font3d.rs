@@ -213,7 +213,7 @@ pub fn svg_to_contours(bytes: &[u8], steps: u32) -> Option<Vec<Vec<[f32; 2]>>> {
                     let t = p.abs_transform();
                     let map = |x: f32, y: f32| [t.sx * x + t.kx * y + t.tx, t.ky * x + t.sy * y + t.ty];
                     let (mut cur, mut last): (Vec<[f32; 2]>, [f32; 2]) = (Vec::new(), [0.0, 0.0]);
-                    let mut push = |cur: &mut Vec<[f32; 2]>, out: &mut Vec<Vec<[f32; 2]>>| {
+                    let push = |cur: &mut Vec<[f32; 2]>, out: &mut Vec<Vec<[f32; 2]>>| {
                         if cur.len() >= 3 {
                             out.push(std::mem::take(cur));
                         } else {
