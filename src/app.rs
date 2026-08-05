@@ -6989,6 +6989,18 @@ impl PixelView {
         }
     }
 
+    /// Render the current sample string in the open font. For a **colour font** (COLR/CPAL) whose
+    /// sample includes colour glyphs, this renders the colour layers; otherwise the normal outline
+    /// path (stroke / ink / merged silhouette).
+    fn render_font_sample_img(&self, opts: &crate::decode::font::TextOpts) -> Option<crate::image_types::PixImage> {
+        if crate::decode::font::is_color_font(&self.font_bytes) {
+            if let Some(img) = crate::decode::font::render_color_text(&self.font_bytes, &self.font_sample, opts) {
+                return Some(img);
+            }
+        }
+        crate::decode::font::render_text(&self.font_bytes, &self.font_sample, opts)
+    }
+
     /// Apply the global Recolor/PixelFX pipeline to a font sample **only when the logo maker's
     /// Recolor checkbox is on**. Off by default so the bitmap preview + PNG export match the clean
     /// vector SVG (which never runs recolor) — a stray persisted post-FX / palette no longer paints
@@ -7463,7 +7475,7 @@ impl PixelView {
             .on_hover_text("Open the composition in an image/vector editor (SVG or PNG per the program)");
         });
         if copy_img {
-            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
+            if let Some(img) = self.render_font_sample_img(&self.font_text_opts()) {
                 let img = self.font_recolor(path, img);
                 self.copy_image_to_clipboard(&img);
             }
@@ -7529,7 +7541,7 @@ impl PixelView {
                 opts.stroke_w *= render_scale;
                 opts.letter_spacing *= render_scale;
                 opts.line_gap *= render_scale;
-                if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &opts) {
+                if let Some(img) = self.render_font_sample_img(&opts) {
                     let img = self.font_recolor(path, img);
                     let color = egui::ColorImage::from_rgba_unmultiplied(
                         [img.width as usize, img.height as usize],
