@@ -247,6 +247,18 @@ enum ImgMsg {
     Done(usize),
 }
 
+/// Messages from an icon/vector-search worker (`asset_walk`): one SVG result per hit, then the count.
+enum AssetMsg {
+    Hit(Entry, Box<crate::assetsearch::AssetResult>),
+    Done(usize),
+}
+
+/// Messages from a Lospec palette-browse worker (`lospec_walk`): one palette per hit, then the count.
+enum LospecMsg {
+    Hit(Entry, Box<crate::lospec::LospecPalette>),
+    Done(usize),
+}
+
 /// Messages from an AI-generation worker (`start_ai_job`): one produced file per batch item, then
 /// the final result.
 enum AiJobMsg {
@@ -1425,7 +1437,8 @@ pub struct PixelView {
     font_3d_on: bool,          // show the interactive 3D extruded preview instead of the flat one, persisted
     font_3d_depth: f32,        // extrusion depth (em-normalized), persisted
     font_3d_bevel: f32,        // chamfer bevel size (em-normalized; 0 = flat block), persisted
-    font_3d_face: [u8; 3],     // front/back face colour, persisted
+    font_3d_face: [u8; 3],     // front-face colour, persisted
+    font_3d_back: [u8; 3],     // back-face colour, persisted
     font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
     font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
     font_3d_light_pitch: f32,  // key-light elevation, persisted
@@ -1437,6 +1450,8 @@ pub struct PixelView {
     font_3d_spin: bool,        // auto-rotate the 3D view, persisted
     font_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached mesh (key = geometry params)
     font_3d_tex: Option<(String, egui::TextureHandle)>,            // cached render (key = mesh + camera + light + size)
+    svg_3d_on: bool, // view an opened SVG as an interactive 3D extrusion (reuses the font 3D controls), persisted
+    svg_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached extruded-SVG mesh
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1750,6 +1765,30 @@ pub struct PixelView {
     img_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[allow(clippy::type_complexity)]
     img_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::imgsearch::ImgResult>)>,
+    // Icon (Iconify) + vector (Wikimedia) search — mirrors img_* but the SVG asset is the download.
+    asset_results: HashMap<PathBuf, crate::assetsearch::AssetResult>,
+    asset_icons_query: String,   // the Icons Places search box
+    asset_vectors_query: String, // the Vectors Places search box
+    asset_rx: Option<std::sync::mpsc::Receiver<AssetMsg>>,
+    asset_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    asset_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local SVG
+    #[allow(clippy::type_complexity)]
+    asset_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    #[allow(clippy::type_complexity)]
+    asset_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::assetsearch::AssetResult>)>,
+    // Lospec palette browser/downloader. A palette tile renders its swatches (colours are inline in
+    // the API), clicking one downloads the `.gpl` into the palette library + selects it in Recolor.
+    lospec_palettes: HashMap<PathBuf, crate::lospec::LospecPalette>,
+    lospec_query: String,
+    lospec_rx: Option<std::sync::mpsc::Receiver<LospecMsg>>,
+    lospec_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[allow(clippy::type_complexity)]
+    lospec_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, usize), String>>>,
+    lospec_dir: PathBuf, // where downloaded Lospec `.gpl`s are kept (scanned into the palette library)
+    lospec_detail: Option<PathBuf>, // when set, the central panel shows this palette's detail view
+    lospec_authors: HashMap<PathBuf, String>, // palette path → author (fetched lazily from the .json)
+    #[allow(clippy::type_complexity)]
+    lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -1978,9 +2017,11 @@ impl PixelView {
     const FONT_PREVIEW_ZOOM_KEY: &'static str = "font_preview_zoom";
     const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
     const FONT_3D_ON_KEY: &'static str = "font_3d_on";
+    const SVG_3D_ON_KEY: &'static str = "svg_3d_on";
     const FONT_3D_DEPTH_KEY: &'static str = "font_3d_depth";
     const FONT_3D_BEVEL_KEY: &'static str = "font_3d_bevel";
     const FONT_3D_FACE_KEY: &'static str = "font_3d_face";
+    const FONT_3D_BACK_KEY: &'static str = "font_3d_back";
     const FONT_3D_SIDE_KEY: &'static str = "font_3d_side";
     const FONT_3D_LIGHT_YAW_KEY: &'static str = "font_3d_light_yaw";
     const FONT_3D_LIGHT_PITCH_KEY: &'static str = "font_3d_light_pitch";
@@ -2524,7 +2565,15 @@ impl PixelView {
                     .map(|h| h.join(DEFAULT_PALETTE_SUBDIR))
                     .unwrap_or_default()
             });
-        let palette_files = all_palettes(&palette_dir);
+        // Downloaded Lospec palettes live under the data dir and are folded into the library, so a
+        // palette you grabbed last session is still in the Recolor list this session.
+        let lospec_dir = data_dir.join("lospec");
+        let mut palette_files = all_palettes(&palette_dir);
+        for p in all_palettes(&lospec_dir) {
+            if !palette_files.contains(&p) {
+                palette_files.push(p);
+            }
+        }
         let palette_favorites = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::PALETTE_FAV_KEY))
@@ -2928,6 +2977,7 @@ impl PixelView {
             font_3d_depth: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY)).unwrap_or(0.2),
             font_3d_bevel: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY)).unwrap_or(0.0),
             font_3d_face: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY)).unwrap_or([220, 40, 40]),
+            font_3d_back: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_BACK_KEY)).unwrap_or([220, 40, 40]),
             font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
             font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
             font_3d_light_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY)).unwrap_or(0.7),
@@ -2939,6 +2989,8 @@ impl PixelView {
             font_3d_spin: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_SPIN_KEY)).unwrap_or(false),
             font_3d_mesh: None,
             font_3d_tex: None,
+            svg_3d_on: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::SVG_3D_ON_KEY)).unwrap_or(false),
+            svg_3d_mesh: None,
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -3190,6 +3242,23 @@ impl PixelView {
             img_files: HashMap::new(),
             img_open_rx: None,
             img_search_cache: None,
+            asset_results: HashMap::new(),
+            asset_icons_query: String::new(),
+            asset_vectors_query: String::new(),
+            asset_rx: None,
+            asset_cancel: None,
+            asset_files: HashMap::new(),
+            asset_open_rx: None,
+            asset_search_cache: None,
+            lospec_palettes: HashMap::new(),
+            lospec_query: String::new(),
+            lospec_rx: None,
+            lospec_cancel: None,
+            lospec_open_rx: None,
+            lospec_dir,
+            lospec_detail: None,
+            lospec_authors: HashMap::new(),
+            lospec_author_rx: None,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3322,6 +3391,16 @@ impl PixelView {
             self.open_images(dir);
             return;
         }
+        // Icon (Iconify) + vector (Wikimedia) search — SVG assets, download-in-place → view.
+        if crate::assetsearch::is_remote(&dir) {
+            self.open_assets(dir);
+            return;
+        }
+        // Lospec palette browser (query → swatch tiles → click downloads the .gpl + applies it).
+        if crate::lospec::is_remote(&dir) {
+            self.open_lospec(dir);
+            return;
+        }
         // A user video list (`<lists>/<name>`): show its videos in add-order.
         if dir.starts_with(Self::LIST_ROOT) {
             self.open_video_list(&dir);
@@ -3448,6 +3527,7 @@ impl PixelView {
         // file-op message carried over from the folder we're leaving (file ops set
         // their message *after* calling refresh(), so theirs survives this).
         self.status.clear();
+        self.lospec_detail = None; // leaving the palette detail view
         // Navigating leaves any "Search results" view (and stops a running search).
         if self.search_results.is_some() || self.search_running {
             self.cancel_search();
@@ -4174,6 +4254,7 @@ impl PixelView {
             .or_else(|| self.yt_files.get(path))
             .or_else(|| self.steam_files.get(path))
             .or_else(|| self.img_files.get(path))
+            .or_else(|| self.asset_files.get(path))
         {
             return f.clone();
         }
@@ -4428,6 +4509,435 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.img_open_rx = None,
+        }
+    }
+
+    // --- Icon (Iconify) + vector (Wikimedia) search — mirrors the img_* machinery; the backend is
+    //     selected by the virtual path's root (`<icons>` / `<vectors>`). ---
+
+    fn open_assets(&mut self, dir: PathBuf) {
+        let parts = crate::assetsearch::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a query in the Places panel".into();
+            }
+            [s, _q] if s == crate::assetsearch::SEARCH => {
+                if let Some((cdir, entries, results)) = &self.asset_search_cache {
+                    if *cdir == dir && !entries.is_empty() {
+                        let (entries, results) = (entries.clone(), results.clone());
+                        self.asset_results = results;
+                        self.show_folder(dir, entries);
+                        self.status = format!("{} result(s)", self.all_entries.len());
+                        return;
+                    }
+                }
+                self.start_asset_search(dir);
+            }
+            // A pinned result leaf → download + view.
+            [s, _q, _leaf] if s == crate::assetsearch::SEARCH => self.start_asset_open(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Kick off an icon/vector search on a worker. Results stream into `all_entries` via `poll_asset`.
+    fn start_asset_search(&mut self, dir: PathBuf) {
+        let Some(source) = crate::assetsearch::source_of(&dir) else {
+            return;
+        };
+        let query = crate::assetsearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.asset_results.clear();
+        if let Some(c) = self.asset_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.asset_rx = Some(rx);
+        self.asset_cancel = Some(cancel.clone());
+        self.status = format!("Searching: {query}");
+        self.want_repaint = true;
+        std::thread::spawn(move || asset_walk(source, query, &dir, cancel, tx));
+    }
+
+    /// Drain the asset-search worker each frame: append hits, request thumbnails, rebuild the view.
+    fn poll_asset(&mut self) {
+        let Some(rx) = &self.asset_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(AssetMsg::Hit(mut entry, r)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    // Icons are SVG thumbnails (decode via the registry); Commons thumbs are PNG.
+                    self.colo_thumbs.request(&entry.path, &r.thumb_url, THUMB_PX, r.thumb_via_registry);
+                    self.asset_results.insert(entry.path.clone(), *r);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(AssetMsg::Done(n)) => {
+                    self.status = format!("{n} result(s)");
+                    if let Some(f) = self.folder.clone() {
+                        self.asset_search_cache = Some((f, self.all_entries.clone(), self.asset_results.clone()));
+                    }
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.asset_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Download an SVG asset (cache-first) on a worker, then view it. One at a time.
+    fn start_asset_open(&mut self, vpath: PathBuf) {
+        let Some(r) = self.asset_results.get(&vpath).cloned() else {
+            self.status = "Unknown asset".into();
+            return;
+        };
+        if self.asset_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.asset_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&r.title, 40));
+        std::thread::spawn(move || {
+            let res = crate::cache::get_file(&r.download_url, &r.filename()).map(|local| (vpath, local));
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Finish an asset download each frame: map the virtual path → local SVG + open it, with a
+    /// status line crediting the source (attribution + licence).
+    fn poll_asset_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.asset_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self.asset_results.get(&vpath).map(|r| {
+                    let mut s = r.title.clone();
+                    if !r.attribution.is_empty() {
+                        s.push_str(&format!(" — {}", r.attribution));
+                    }
+                    if !r.license.is_empty() {
+                        s.push_str(&format!(" · {}", r.license));
+                    }
+                    if !r.page_url.is_empty() {
+                        s.push_str(&format!(" · {}", r.page_url));
+                    }
+                    s
+                });
+                self.asset_files.insert(vpath.clone(), local);
+                self.asset_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.asset_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.asset_open_rx = None,
+        }
+    }
+
+    // --- Lospec palette browser + downloader. Tiles render swatches (colours are inline); clicking
+    //     one downloads the `.gpl` into the library + selects it in Recolor. ---
+
+    fn open_lospec(&mut self, dir: PathBuf) {
+        let parts = crate::lospec::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a tag in the Places panel (or leave blank to browse all)".into();
+            }
+            // `[search]` (blank query) or `[search, tag]` → browse. The worker reads the tag from the
+            // path (missing = browse all).
+            [s] | [s, _] if s == crate::lospec::SEARCH => self.start_lospec_search(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Kick off a Lospec browse/search on a worker. Palettes stream in via `poll_lospec`.
+    fn start_lospec_search(&mut self, dir: PathBuf) {
+        let query = crate::lospec::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.lospec_palettes.clear();
+        if let Some(c) = self.lospec_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lospec_rx = Some(rx);
+        self.lospec_cancel = Some(cancel.clone());
+        self.status = "Browsing Lospec palettes…".into();
+        self.want_repaint = true;
+        std::thread::spawn(move || lospec_walk(query, &dir, cancel, tx));
+    }
+
+    /// Drain the Lospec worker each frame: generate a swatch thumbnail for each palette (colours are
+    /// inline, so no remote thumbnail), store the palette, rebuild the view.
+    fn poll_lospec(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.lospec_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..64 {
+            match rx.try_recv() {
+                Ok(LospecMsg::Hit(entry, p)) => {
+                    const SZ: usize = 220;
+                    let rgba = crate::lospec::swatch_rgba(&p.colors, SZ);
+                    let flat: Vec<u8> = rgba.iter().flat_map(|c| *c).collect();
+                    let img = egui::ColorImage::from_rgba_unmultiplied([SZ, SZ], &flat);
+                    let tex = ctx.load_texture("lospec_swatch", img, egui::TextureOptions::NEAREST);
+                    self.thumb_tex.insert(entry.path.clone(), tex);
+                    self.lospec_palettes.insert(entry.path.clone(), *p);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(LospecMsg::Done(n)) => {
+                    self.status = format!("{n} palette(s) — click one to add it to your library + Recolor");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.lospec_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// The palette-detail view (author / colours / example art / description + download+apply). Shown
+    /// in the central panel when `lospec_detail` is set.
+    fn ui_lospec_detail(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let Some(vpath) = self.lospec_detail.clone() else { return };
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            self.lospec_detail = None;
+            return;
+        };
+        let author = self.lospec_authors.get(&vpath).cloned();
+        let (mut back, mut download, mut apply, mut export) = (false, false, false, false);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("‹ Grid").clicked() {
+                    back = true;
+                }
+                ui.separator();
+                ui.heading(&p.title);
+            });
+            ui.horizontal_wrapped(|ui| {
+                match &author {
+                    Some(a) => {
+                        ui.label("by");
+                        ui.strong(a);
+                    }
+                    None => {
+                        ui.weak("by …");
+                    }
+                }
+                ui.separator();
+                ui.label(format!("{} colours", p.colors.len()));
+                if !p.downloads.is_empty() {
+                    ui.separator();
+                    ui.label(format!("⬇ {}", p.downloads));
+                }
+                if p.likes > 0 {
+                    ui.separator();
+                    ui.label(format!("♥ {}", p.likes));
+                }
+            });
+            if !p.tags.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for t in &p.tags {
+                        ui.weak(format!("#{t}"));
+                    }
+                });
+            }
+            ui.add_space(8.0);
+
+            // Big swatch strip.
+            let sw = (ui.available_width() / p.colors.len().max(1) as f32).clamp(10.0, 64.0);
+            let h = (sw * 1.6).min(80.0);
+            ui.horizontal_wrapped(|ui| {
+                for c in &p.colors {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(sw, h), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                    resp.on_hover_text(format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]));
+                }
+            });
+            ui.add_space(8.0);
+
+            // Actions.
+            let mut open_page = false;
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("⬇ Download .GPL + apply").on_hover_text("Add to your palette library and apply it to Recolor").clicked() {
+                    download = true;
+                }
+                if ui.button("🎨 Apply to Recolor").on_hover_text("Use these colours now (without saving a file)").clicked() {
+                    apply = true;
+                }
+                if ui.button("💾 Export .GPL as…").clicked() {
+                    export = true;
+                }
+                // Example art is served from Lospec's locked-down CDN (not fetchable), so link out to
+                // the palette page — it shows the example pixel art + more.
+                if !p.examples.is_empty()
+                    && ui.button(format!("{} View on Lospec", icons::GLOBE)).on_hover_text(format!("Open lospec.com — {} example artwork(s)", p.examples.len())).clicked()
+                {
+                    open_page = true;
+                }
+            });
+            if open_page {
+                let url = format!("https://lospec.com/palette-list/{}", p.slug);
+                self.open_url(&url);
+            }
+
+            // Description.
+            if !p.description.trim().is_empty() {
+                ui.add_space(6.0);
+                ui.label(strip_tags(&p.description));
+            }
+        });
+
+        if back {
+            self.lospec_detail = None;
+        }
+        if download {
+            self.start_lospec_open(vpath.clone());
+        }
+        if apply {
+            self.custom_palette = Some(p.rgba());
+            self.status = format!("Applied “{}” ({} colors)", p.title, p.colors.len());
+        }
+        if export {
+            let default = p.filename();
+            if let Some(dst) = rfd::FileDialog::new().set_file_name(default).add_filter("GIMP palette", &["gpl"]).save_file() {
+                match crate::cache::get_file(&p.gpl_url(), &p.filename()) {
+                    Ok(src) => match std::fs::copy(&src, &dst) {
+                        Ok(_) => self.status = format!("Saved {}", short_name(&dst)),
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    },
+                    Err(e) => self.status = format!("Download failed: {e}"),
+                }
+            }
+        }
+        // Esc / Backspace returns to the grid.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace)) {
+            self.lospec_detail = None;
+        }
+    }
+
+    /// Click a Lospec palette → apply it immediately (from the inline colours) + download its `.gpl`
+    /// into the library on a worker (so it persists in the Recolor palette list).
+    fn start_lospec_open(&mut self, vpath: PathBuf) {
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            self.status = "Unknown palette".into();
+            return;
+        };
+        // Instant apply from the inline colours (no wait).
+        self.custom_palette = Some(p.rgba());
+        self.status = format!("Applied “{}” ({} colors) — downloading .gpl…", p.title, p.colors.len());
+        if self.lospec_open_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.lospec_open_rx = Some(rx);
+        let dir = self.lospec_dir.clone();
+        std::thread::spawn(move || {
+            let res = (|| {
+                let cached = crate::cache::get_file(&p.gpl_url(), &p.filename())?;
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let dst = dir.join(p.filename());
+                std::fs::copy(&cached, &dst).map_err(|e| e.to_string())?;
+                Ok::<_, String>((vpath, dst, p.colors.len()))
+            })();
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Open a palette's detail view (author / colours / example art / description + download+apply).
+    /// Kicks off a lazy author fetch (the list endpoint omits it) + requests the example-art images.
+    fn open_lospec_detail(&mut self, vpath: PathBuf) {
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            return;
+        };
+        self.lospec_detail = Some(vpath.clone());
+        self.status = format!("{} · {} colors · {} downloads", p.title, p.colors.len(), p.downloads);
+        // Fetch the author from the per-palette JSON (once).
+        if !self.lospec_authors.contains_key(&vpath) && self.lospec_author_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.lospec_author_rx = Some(rx);
+            let url = p.json_url();
+            std::thread::spawn(move || {
+                if let Ok(body) = crate::cache::get_bytes(&url, Some(86_400)) {
+                    if let Some(author) = crate::lospec::parse_author(&body) {
+                        let _ = tx.send((vpath, author));
+                    }
+                }
+            });
+        }
+    }
+
+    fn poll_lospec_author(&mut self) {
+        let Some(rx) = &self.lospec_author_rx else { return };
+        match rx.try_recv() {
+            Ok((path, author)) => {
+                self.lospec_authors.insert(path, author);
+                self.lospec_author_rx = None;
+                self.want_repaint = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lospec_author_rx = None,
+        }
+    }
+
+    /// Finish a Lospec `.gpl` download: add it to the palette library list + select it (so Recolor
+    /// uses the on-disk palette), clearing the transient inline apply.
+    fn poll_lospec_open(&mut self) {
+        let Some(rx) = &self.lospec_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((_vpath, saved, ncolors))) => {
+                if !self.palette_files.contains(&saved) {
+                    self.palette_files.push(saved.clone());
+                    self.palette_files.sort();
+                }
+                self.custom_palette = None; // hand off to the persistent on-disk palette
+                self.selected_palette = Some(saved.clone());
+                let name = saved.file_stem().and_then(|s| s.to_str()).unwrap_or("palette");
+                self.status = format!("Added “{name}” ({ncolors} colors) to your palette library + Recolor");
+                self.lospec_open_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Palette download failed: {e}");
+                self.lospec_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lospec_open_rx = None,
         }
     }
 
@@ -7095,6 +7605,7 @@ impl PixelView {
         crate::decode::font3d::Extrude3d {
             depth: self.font_3d_depth,
             face_rgb: self.font_3d_face,
+            back_rgb: self.font_3d_back,
             side_rgb: self.font_3d_side,
             letter_spacing: self.font_letter_spacing / em,
             line_gap: self.font_line_gap / em,
@@ -7105,10 +7616,13 @@ impl PixelView {
 
     /// The interactive 3D extruded preview: fills `avail`, drag to orbit, wheel to zoom. Re-tessellates
     /// only when geometry params change; re-renders only when the camera / light / size change.
-    fn draw_font_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2) {
-        use crate::decode::mesh3d::{render, Camera, RenderOpts, View};
+    /// Interactive orbit view of a prebuilt `mesh` (drag=rotate, middle/Space-drag=pan, wheel=zoom,
+    /// Spin). Shared by the font 3D maker and the SVG 3D view — the camera/light state is the same
+    /// `font_3d_*` fields, and `mesh_key` scopes the render-texture cache. The caller owns the mesh
+    /// (so `self` isn't borrowed twice).
+    fn draw_3d_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2, mesh: Option<&crate::decode::mesh3d::Mesh3D>, mesh_key: &str) {
+        use crate::decode::mesh3d::{render, Camera, View};
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-        // Middle-drag (or Space held) pans; primary drag orbits.
         let space = ui.input(|i| i.key_down(egui::Key::Space));
         let panning = resp.dragged_by(egui::PointerButton::Middle) || (resp.dragged() && space);
         if panning {
@@ -7120,22 +7634,18 @@ impl PixelView {
             self.font_3d_yaw += d.x * 0.01;
             self.font_3d_pitch = (self.font_3d_pitch + d.y * 0.01).clamp(-1.55, 1.55);
         }
-        // Wheel = zoom (consume it so nothing else scrolls).
         if resp.hovered() {
             let sc = ctx.input(|i| i.smooth_scroll_delta.y) + ctx.input(|i| (i.zoom_delta() - 1.0) * 200.0);
             if sc.abs() > 0.01 {
                 self.font_3d_zoom = (self.font_3d_zoom * (1.0 + sc * 0.0015)).clamp(0.15, 8.0);
             }
         }
-        // Auto-spin.
         if self.font_3d_spin {
             let dt = ui.input(|i| i.stable_dt).min(0.1);
             self.font_3d_yaw += dt * 0.6;
             ctx.request_repaint();
         }
-        // Keep yaw bounded so the persisted value doesn't grow without limit.
-        let tau = std::f32::consts::TAU;
-        self.font_3d_yaw = self.font_3d_yaw.rem_euclid(tau);
+        self.font_3d_yaw = self.font_3d_yaw.rem_euclid(std::f32::consts::TAU);
         if panning {
             ctx.set_cursor_icon(egui::CursorIcon::Move);
         } else if resp.dragged() {
@@ -7144,35 +7654,13 @@ impl PixelView {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
 
-        // (Re)build the mesh when a geometry param changes. Take it out of `self` so we can render it
-        // while assigning the texture back (no double &mut self borrow).
-        let opts = self.font_3d_opts();
-        let mesh_key = format!(
-            "{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}",
-            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap, opts.face_rgb, opts.side_rgb
-        );
-        let mut mesh = self.font_3d_mesh.take();
-        if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
-            mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &opts)
-                .map(|m| (mesh_key.clone(), m));
-        }
-
-        // Clamp the render texture to the GPU limit (the 8192 max texture dim), like the rest of the
-        // app — a wide pane × a high pixels-per-point can otherwise exceed it and crash wgpu.
+        // Clamp the render texture to the GPU limit (8192), like the rest of the app.
         let ppp = ctx.pixels_per_point();
         let wpx = ((rect.width() * ppp).round() as usize).clamp(1, 8000);
         let hpx = ((rect.height() * ppp).round() as usize).clamp(1, 8000);
-        if let Some((_, m)) = &mesh {
+        if let Some(m) = mesh {
             let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
-            let ro = RenderOpts {
-                textured: false,
-                wireframe: false,
-                wire_color: [30, 32, 38],
-                light_yaw: self.font_3d_light_yaw,
-                light_pitch: self.font_3d_light_pitch,
-                light_rgb: self.font_3d_light_rgb,
-                bg: [22, 22, 26, 255],
-            };
+            let ro = self.font_3d_render_opts([22, 22, 26, 255]);
             let tkey = format!(
                 "{mesh_key}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}|{:?}|{wpx}x{hpx}",
                 self.font_3d_yaw, self.font_3d_pitch, self.font_3d_zoom, self.font_3d_light_yaw,
@@ -7185,7 +7673,7 @@ impl PixelView {
                     flat.extend_from_slice(p);
                 }
                 let img = egui::ColorImage::from_rgba_unmultiplied([wpx, hpx], &flat);
-                let tex = ctx.load_texture("font_3d", img, egui::TextureOptions::LINEAR);
+                let tex = ctx.load_texture("mesh_3d_view", img, egui::TextureOptions::LINEAR);
                 self.font_3d_tex = Some((tkey, tex));
             }
             if let Some((_, tex)) = &self.font_3d_tex {
@@ -7201,7 +7689,42 @@ impl PixelView {
                 ui.visuals().weak_text_color(),
             );
         }
+    }
+
+    fn draw_font_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2) {
+        let opts = self.font_3d_opts();
+        let mesh_key = format!(
+            "font|{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}|{:?}",
+            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap,
+            opts.face_rgb, opts.back_rgb, opts.side_rgb
+        );
+        let mut mesh = self.font_3d_mesh.take();
+        if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
+            mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &opts)
+                .map(|m| (mesh_key.clone(), m));
+        }
+        self.draw_3d_view(ctx, ui, avail, mesh.as_ref().map(|(_, m)| m), &mesh_key);
         self.font_3d_mesh = mesh;
+    }
+
+    /// The interactive 3D extrusion of an opened SVG (icon/vector) — reuses the font 3D controls
+    /// (depth / face / back / body / bevel / light / spin) + the shared `draw_3d_view`.
+    fn draw_svg_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2, path: &Path) {
+        let opts = self.font_3d_opts();
+        let mesh_key = format!(
+            "svg|{}|{:.4}|{:.4}|{:?}|{:?}|{:?}",
+            path.display(), opts.depth, opts.bevel, opts.face_rgb, opts.back_rgb, opts.side_rgb
+        );
+        let mut mesh = self.svg_3d_mesh.take();
+        if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
+            mesh = std::fs::read(self.resolve_local(path))
+                .ok()
+                .and_then(|bytes| crate::decode::font3d::svg_to_contours(&bytes, 12))
+                .and_then(|c| crate::decode::font3d::extrude_contours(&c, &opts))
+                .map(|m| (mesh_key.clone(), m));
+        }
+        self.draw_3d_view(ctx, ui, avail, mesh.as_ref().map(|(_, m)| m), &mesh_key);
+        self.svg_3d_mesh = mesh;
     }
 
     /// The render options for the 3D font (light + a transparent bg for exports).
@@ -7263,6 +7786,49 @@ impl PixelView {
         let default = format!("{}.png", self.font_export_stem());
         if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
             match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Build the extruded mesh for an opened SVG (using the shared font 3D material opts).
+    fn svg_3d_mesh_for(&self, path: &Path) -> Option<crate::decode::mesh3d::Mesh3D> {
+        let bytes = std::fs::read(self.resolve_local(path)).ok()?;
+        let contours = crate::decode::font3d::svg_to_contours(&bytes, 12)?;
+        crate::decode::font3d::extrude_contours(&contours, &self.font_3d_opts())
+    }
+
+    fn export_svg_3d_png(&mut self, path: &Path) {
+        use crate::decode::mesh3d::{render, Camera, View};
+        let Some(mesh) = self.svg_3d_mesh_for(path) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let (w, h) = (1600usize, 1200usize);
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+        let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("svg");
+        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{stem}_3d.png")).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    fn export_svg_3d_svg(&mut self, path: &Path) {
+        use crate::decode::mesh3d::{to_svg, Camera, View};
+        let Some(mesh) = self.svg_3d_mesh_for(path) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+        let svg = to_svg(&mesh, 1600, 1200, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("svg");
+        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{stem}_3d.svg")).add_filter("SVG", &["svg"]).save_file() {
+            match std::fs::write(&p, svg) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
@@ -7403,7 +7969,9 @@ impl PixelView {
                     .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
                 ui.separator();
                 ui.label("Face");
-                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front/back face colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front-face colour");
+                ui.label("Back");
+                ui.color_edit_button_srgb(&mut self.font_3d_back).on_hover_text("Back-face colour");
                 ui.label("Body");
                 ui.color_edit_button_srgb(&mut self.font_3d_side).on_hover_text("Extruded side (depth) colour");
                 ui.separator();
@@ -13804,6 +14372,10 @@ impl PixelView {
             || self.blend_render_pending > 0
             || self.img_rx.is_some()
             || self.img_open_rx.is_some()
+            || self.asset_rx.is_some()
+            || self.asset_open_rx.is_some()
+            || self.lospec_rx.is_some()
+            || self.lospec_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -15030,6 +15602,16 @@ impl PixelView {
             // An image-search result not yet downloaded → fetch (cache-first), then view.
             self.selected = idx;
             self.start_img_open(entry.path);
+        } else if self.asset_results.contains_key(&entry.path)
+            && !self.asset_files.contains_key(&entry.path)
+        {
+            // An icon/vector result not yet downloaded → fetch the SVG (cache-first), then view.
+            self.selected = idx;
+            self.start_asset_open(entry.path);
+        } else if self.lospec_palettes.contains_key(&entry.path) {
+            // A Lospec palette → open its detail view (author / colours / example art / download).
+            self.selected = idx;
+            self.open_lospec_detail(entry.path);
         } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
             // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
@@ -22419,6 +23001,53 @@ impl PixelView {
             });
             return;
         };
+        // SVG 3D: an opened SVG (icon / vector / local .svg) can be extruded into an interactive 3D
+        // object, reusing the font 3D controls + renderer. A compact toggle row sits above the view.
+        if is_svg_path(&path) {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.svg_3d_on, "3D")
+                    .on_hover_text("Extrude this SVG into an interactive 3D object (drag to rotate, wheel to zoom)");
+                if self.svg_3d_on {
+                    ui.separator();
+                    ui.label("Depth");
+                    ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                    ui.label("Bevel");
+                    ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3));
+                    ui.separator();
+                    ui.label("Face");
+                    ui.color_edit_button_srgb(&mut self.font_3d_face);
+                    ui.label("Back");
+                    ui.color_edit_button_srgb(&mut self.font_3d_back);
+                    ui.label("Body");
+                    ui.color_edit_button_srgb(&mut self.font_3d_side);
+                    ui.separator();
+                    ui.label("Light");
+                    let pi = std::f32::consts::PI;
+                    ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2));
+                    ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2));
+                    ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
+                    ui.checkbox(&mut self.font_3d_spin, "Spin");
+                    if ui.small_button("Reset view").clicked() {
+                        self.font_3d_yaw = 0.5;
+                        self.font_3d_pitch = -0.45;
+                        self.font_3d_zoom = 1.0;
+                        self.font_3d_pan = [0.0, 0.0];
+                    }
+                    if ui.small_button("💾 PNG").on_hover_text("Save this 3D view (transparent PNG)").clicked() {
+                        self.export_svg_3d_png(&path);
+                    }
+                    if ui.small_button("💾 SVG").on_hover_text("Save this 3D view as a flat-shaded vector SVG").clicked() {
+                        self.export_svg_3d_svg(&path);
+                    }
+                }
+            });
+            if self.svg_3d_on {
+                let avail = ui.available_size();
+                self.draw_svg_3d(ctx, ui, avail, &path);
+                // Left/Right still step images; handled above. Skip the raster path.
+                return;
+            }
+        }
         // Recolor view: apply the adjustments + swap palette / Reduce (shared with
         // the details pane) to the full image.
         let recolor = self.active_recolor(&path);
@@ -25954,6 +26583,9 @@ impl PixelView {
                             (1, "16colo"),
                             (5, "YouTube"),
                             (8, "Images"),
+                            (9, "Icons"),
+                            (10, "Vectors"),
+                            (11, "Palettes"),
                             (6, "Steam"),
                             (7, "AI"),
                             (2, "Kits"),
@@ -26227,6 +26859,122 @@ impl PixelView {
                         if let Some(p) =
                             self.favorites_buttons(ui, "🖼", crate::imgsearch::is_remote, false)
                         {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 9 || self.places_tab == 10 {
+                        // Free icon (Iconify) + vector (Wikimedia) search — both are SVG; opening one
+                        // downloads the SVG and views it locally (recolor / palette / Save all work).
+                        let icons_tab = self.places_tab == 9;
+                        let (root, hint, note, query) = if icons_tab {
+                            (
+                                crate::assetsearch::ICONS_ROOT,
+                                "search icons…",
+                                "Iconify · 200k+ open-source icons",
+                                &mut self.asset_icons_query,
+                            )
+                        } else {
+                            (
+                                crate::assetsearch::VECTORS_ROOT,
+                                "search vector art…",
+                                "Wikimedia Commons · CC / public-domain SVG",
+                                &mut self.asset_vectors_query,
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(query).hint_text(hint).desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = query.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(Path::new(root).join(crate::assetsearch::SEARCH).join(q));
+                                }
+                            }
+                        });
+                        ui.weak(note);
+                        // Pin the current search to Places (re-runs on click).
+                        let want_source = if icons_tab {
+                            crate::assetsearch::Source::Icons
+                        } else {
+                            crate::assetsearch::Source::Vectors
+                        };
+                        let cur_search = self.folder.as_ref().filter(|f| {
+                            crate::assetsearch::source_of(f) == Some(want_source)
+                                && matches!(
+                                    crate::assetsearch::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::assetsearch::SEARCH
+                                )
+                        });
+                        let saved = cur_search.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur_search {
+                            let label = crate::assetsearch::rel_parts(f).get(1).cloned().unwrap_or_default();
+                            let f = f.clone();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved {
+                                        "★ Saved".to_string()
+                                    } else {
+                                        format!("★ Save “{label}”")
+                                    })
+                                    .on_hover_text("Pin this search to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        let glyph = if icons_tab { "🔲" } else { "🖼" };
+                        if let Some(p) = self.favorites_buttons(
+                            ui,
+                            glyph,
+                            move |p| crate::assetsearch::source_of(p) == Some(want_source),
+                            false,
+                        ) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 11 {
+                        // Lospec palette browser: a search box (a Lospec tag; blank = browse all) +
+                        // a Browse button. Clicking a palette tile downloads its .gpl + applies it.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.lospec_query)
+                                    .hint_text("tag (blank = all)…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Browse", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.lospec_query.trim().to_string();
+                                nav = Some(Path::new(crate::lospec::ROOT).join(crate::lospec::SEARCH).join(q));
+                            }
+                        });
+                        ui.weak("Lospec · click a palette → added to your library + Recolor");
+                        // Pin the current browse to Places.
+                        let cur = self.folder.as_ref().filter(|f| {
+                            crate::lospec::is_remote(f)
+                                && matches!(
+                                    crate::lospec::rel_parts(f).as_slice(),
+                                    [s, _] if s == crate::lospec::SEARCH
+                                )
+                        });
+                        let saved = cur.is_some_and(|f| self.favorites.contains(f));
+                        if let Some(f) = cur {
+                            let label = crate::lospec::rel_parts(f).get(1).cloned().unwrap_or_default();
+                            let label = if label.is_empty() { "all".to_string() } else { label };
+                            let f = f.clone();
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved { "★ Saved".to_string() } else { format!("★ Save “{label}”") })
+                                    .on_hover_text("Pin this palette browse to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "🎨", crate::lospec::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
@@ -27287,6 +28035,11 @@ impl eframe::App for PixelView {
         self.poll_yt_open(&ctx);
         self.poll_img();
         self.poll_img_open(&ctx);
+        self.poll_asset();
+        self.poll_asset_open(&ctx);
+        self.poll_lospec(&ctx);
+        self.poll_lospec_open();
+        self.poll_lospec_author();
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -27701,14 +28454,21 @@ impl eframe::App for PixelView {
         } else {
             central
         };
-        central.show_inside(ui, |ui| match self.mode {
-            // The table is an alternate renderer for the browse mode (not a third
-            // `Mode`), so selection/ratings/keyboard-nav all keep working unchanged.
-            Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
-            Mode::Grid => self.ui_grid(&ctx, ui),
-            Mode::Single => self.ui_single(&ctx, ui),
-            Mode::Compare => self.ui_compare(&ctx, ui),
-            Mode::ThreeD => self.ui_three_d(&ctx, ui),
+        central.show_inside(ui, |ui| {
+            // A Lospec palette detail view overrides the normal browse/single content.
+            if self.lospec_detail.is_some() {
+                self.ui_lospec_detail(&ctx, ui);
+                return;
+            }
+            match self.mode {
+                // The table is an alternate renderer for the browse mode (not a third
+                // `Mode`), so selection/ratings/keyboard-nav all keep working unchanged.
+                Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
+                Mode::Grid => self.ui_grid(&ctx, ui),
+                Mode::Single => self.ui_single(&ctx, ui),
+                Mode::Compare => self.ui_compare(&ctx, ui),
+                Mode::ThreeD => self.ui_three_d(&ctx, ui),
+            }
         });
 
         self.paint_audio_loading_overlay(&ctx);
@@ -28615,9 +29375,11 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
         eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
         eframe::set_value(storage, Self::FONT_3D_ON_KEY, &self.font_3d_on);
+        eframe::set_value(storage, Self::SVG_3D_ON_KEY, &self.svg_3d_on);
         eframe::set_value(storage, Self::FONT_3D_DEPTH_KEY, &self.font_3d_depth);
         eframe::set_value(storage, Self::FONT_3D_BEVEL_KEY, &self.font_3d_bevel);
         eframe::set_value(storage, Self::FONT_3D_FACE_KEY, &self.font_3d_face);
+        eframe::set_value(storage, Self::FONT_3D_BACK_KEY, &self.font_3d_back);
         eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_PITCH_KEY, &self.font_3d_light_pitch);
@@ -28764,6 +29526,21 @@ impl eframe::App for PixelView {
 }
 
 /// File/dir name as a display string (lossy), or the whole path if it has none.
+/// Strip simple HTML tags + collapse whitespace (Lospec descriptions carry a little markup).
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn short_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -34013,6 +34790,8 @@ fn any_remote(p: &Path) -> bool {
         || crate::youtube::is_remote(p)
         || crate::steam::is_remote(p)
         || crate::imgsearch::is_remote(p)
+        || crate::assetsearch::is_remote(p)
+        || crate::lospec::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -34144,6 +34923,79 @@ fn img_walk(
         }
     }
     let _ = tx.send(ImgMsg::Done(n));
+}
+
+/// Worker: search Iconify / Wikimedia (per `source`), streaming one SVG result per hit.
+fn asset_walk(
+    source: crate::assetsearch::Source,
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<AssetMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let results = crate::assetsearch::search(source, &query, 120).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for r in results {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(r.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(AssetMsg::Hit(entry, Box::new(r))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(AssetMsg::Done(n));
+}
+
+/// Worker: browse/search Lospec, streaming one palette per hit.
+fn lospec_walk(
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<LospecMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let palettes = crate::lospec::search(&query, 60).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for p in palettes {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(p.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let entry = Entry {
+            path,
+            is_dir: false,
+            is_archive: false,
+            size: 0,
+            mtime: None,
+            ctime: None,
+            rating: 0,
+        };
+        n += 1;
+        if tx.send(LospecMsg::Hit(entry, Box::new(p))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(LospecMsg::Done(n));
 }
 
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
