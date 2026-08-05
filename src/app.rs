@@ -7093,10 +7093,10 @@ impl PixelView {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Letter spacing");
-            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -50.0..=50.0).fixed_decimals(0));
+            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0).fixed_decimals(0));
             ui.separator();
             ui.label("Line height");
-            ui.add(egui::Slider::new(&mut self.font_line_gap, -100.0..=100.0).fixed_decimals(0));
+            ui.add(egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0));
             if self.font_sample.contains('\n') {
                 ui.separator();
                 ui.label("Lines");
