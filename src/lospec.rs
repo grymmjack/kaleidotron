@@ -34,12 +34,21 @@ pub struct LospecPalette {
     pub title: String,
     pub slug: String,
     pub colors: Vec<[u8; 3]>,
+    pub description: String,   // may contain simple HTML (stripped when shown)
+    pub downloads: String,     // Lospec formats this as a string ("101,790")
+    pub likes: u64,
+    pub tags: Vec<String>,
+    pub examples: Vec<String>, // full example-art image URLs
 }
 
 impl LospecPalette {
     /// The `.gpl` (GIMP palette) download URL — pixelview parses this directly.
     pub fn gpl_url(&self) -> String {
         format!("{DL}/{}.gpl", self.slug)
+    }
+    /// The per-palette JSON (has the `author`, which the list endpoint omits).
+    pub fn json_url(&self) -> String {
+        format!("{DL}/{}.json", self.slug)
     }
     /// A stable library filename for the downloaded palette.
     pub fn filename(&self) -> String {
@@ -49,6 +58,12 @@ impl LospecPalette {
     pub fn rgba(&self) -> Vec<[u8; 4]> {
         self.colors.iter().map(|c| [c[0], c[1], c[2], 255]).collect()
     }
+}
+
+/// Extract the `author` from a per-palette `.json` body (the list endpoint doesn't include it).
+pub fn parse_author(bytes: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    v["author"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
 /// `#rrggbb` / `rrggbb` → RGB.
@@ -96,10 +111,26 @@ pub fn parse(bytes: &[u8]) -> Vec<LospecPalette> {
             if colors.is_empty() {
                 return None;
             }
+            let tags = p["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default();
+            // Example art: each item has an `image` path relative to lospec.com.
+            let examples = p["examples"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e["image"].as_str())
+                        .map(|img| format!("https://lospec.com/{}", img.trim_start_matches('/')))
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(LospecPalette {
                 title: p["title"].as_str().unwrap_or("Untitled").to_string(),
                 slug,
                 colors,
+                description: p["description"].as_str().unwrap_or_default().to_string(),
+                downloads: p["downloads"].as_str().map(String::from).unwrap_or_else(|| p["downloads"].as_u64().map(|n| n.to_string()).unwrap_or_default()),
+                likes: p["likes"].as_u64().unwrap_or(0),
+                tags,
+                examples,
             })
         })
         .collect()

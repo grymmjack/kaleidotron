@@ -1782,6 +1782,10 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     lospec_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf, usize), String>>>,
     lospec_dir: PathBuf, // where downloaded Lospec `.gpl`s are kept (scanned into the palette library)
+    lospec_detail: Option<PathBuf>, // when set, the central panel shows this palette's detail view
+    lospec_authors: HashMap<PathBuf, String>, // palette path → author (fetched lazily from the .json)
+    #[allow(clippy::type_complexity)]
+    lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -3244,6 +3248,9 @@ impl PixelView {
             lospec_cancel: None,
             lospec_open_rx: None,
             lospec_dir,
+            lospec_detail: None,
+            lospec_authors: HashMap::new(),
+            lospec_author_rx: None,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3512,6 +3519,7 @@ impl PixelView {
         // file-op message carried over from the folder we're leaving (file ops set
         // their message *after* calling refresh(), so theirs survives this).
         self.status.clear();
+        self.lospec_detail = None; // leaving the palette detail view
         // Navigating leaves any "Search results" view (and stops a running search).
         if self.search_results.is_some() || self.search_running {
             self.cancel_search();
@@ -4715,6 +4723,127 @@ impl PixelView {
         }
     }
 
+    /// The palette-detail view (author / colours / example art / description + download+apply). Shown
+    /// in the central panel when `lospec_detail` is set.
+    fn ui_lospec_detail(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let Some(vpath) = self.lospec_detail.clone() else { return };
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            self.lospec_detail = None;
+            return;
+        };
+        let author = self.lospec_authors.get(&vpath).cloned();
+        let (mut back, mut download, mut apply, mut export) = (false, false, false, false);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("‹ Grid").clicked() {
+                    back = true;
+                }
+                ui.separator();
+                ui.heading(&p.title);
+            });
+            ui.horizontal_wrapped(|ui| {
+                match &author {
+                    Some(a) => {
+                        ui.label("by");
+                        ui.strong(a);
+                    }
+                    None => {
+                        ui.weak("by …");
+                    }
+                }
+                ui.separator();
+                ui.label(format!("{} colours", p.colors.len()));
+                if !p.downloads.is_empty() {
+                    ui.separator();
+                    ui.label(format!("⬇ {}", p.downloads));
+                }
+                if p.likes > 0 {
+                    ui.separator();
+                    ui.label(format!("♥ {}", p.likes));
+                }
+            });
+            if !p.tags.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for t in &p.tags {
+                        ui.weak(format!("#{t}"));
+                    }
+                });
+            }
+            ui.add_space(8.0);
+
+            // Big swatch strip.
+            let sw = (ui.available_width() / p.colors.len().max(1) as f32).clamp(10.0, 64.0);
+            let h = (sw * 1.6).min(80.0);
+            ui.horizontal_wrapped(|ui| {
+                for c in &p.colors {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(sw, h), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                    resp.on_hover_text(format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]));
+                }
+            });
+            ui.add_space(8.0);
+
+            // Actions.
+            let mut open_page = false;
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("⬇ Download .GPL + apply").on_hover_text("Add to your palette library and apply it to Recolor").clicked() {
+                    download = true;
+                }
+                if ui.button("🎨 Apply to Recolor").on_hover_text("Use these colours now (without saving a file)").clicked() {
+                    apply = true;
+                }
+                if ui.button("💾 Export .GPL as…").clicked() {
+                    export = true;
+                }
+                // Example art is served from Lospec's locked-down CDN (not fetchable), so link out to
+                // the palette page — it shows the example pixel art + more.
+                if !p.examples.is_empty()
+                    && ui.button(format!("{} View on Lospec", icons::GLOBE)).on_hover_text(format!("Open lospec.com — {} example artwork(s)", p.examples.len())).clicked()
+                {
+                    open_page = true;
+                }
+            });
+            if open_page {
+                let url = format!("https://lospec.com/palette-list/{}", p.slug);
+                self.open_url(&url);
+            }
+
+            // Description.
+            if !p.description.trim().is_empty() {
+                ui.add_space(6.0);
+                ui.label(strip_tags(&p.description));
+            }
+        });
+
+        if back {
+            self.lospec_detail = None;
+        }
+        if download {
+            self.start_lospec_open(vpath.clone());
+        }
+        if apply {
+            self.custom_palette = Some(p.rgba());
+            self.status = format!("Applied “{}” ({} colors)", p.title, p.colors.len());
+        }
+        if export {
+            let default = p.filename();
+            if let Some(dst) = rfd::FileDialog::new().set_file_name(default).add_filter("GIMP palette", &["gpl"]).save_file() {
+                match crate::cache::get_file(&p.gpl_url(), &p.filename()) {
+                    Ok(src) => match std::fs::copy(&src, &dst) {
+                        Ok(_) => self.status = format!("Saved {}", short_name(&dst)),
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    },
+                    Err(e) => self.status = format!("Download failed: {e}"),
+                }
+            }
+        }
+        // Esc / Backspace returns to the grid.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace)) {
+            self.lospec_detail = None;
+        }
+    }
+
     /// Click a Lospec palette → apply it immediately (from the inline colours) + download its `.gpl`
     /// into the library on a worker (so it persists in the Recolor palette list).
     fn start_lospec_open(&mut self, vpath: PathBuf) {
@@ -4741,6 +4870,42 @@ impl PixelView {
             })();
             let _ = tx.send(res);
         });
+    }
+
+    /// Open a palette's detail view (author / colours / example art / description + download+apply).
+    /// Kicks off a lazy author fetch (the list endpoint omits it) + requests the example-art images.
+    fn open_lospec_detail(&mut self, vpath: PathBuf) {
+        let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
+            return;
+        };
+        self.lospec_detail = Some(vpath.clone());
+        self.status = format!("{} · {} colors · {} downloads", p.title, p.colors.len(), p.downloads);
+        // Fetch the author from the per-palette JSON (once).
+        if !self.lospec_authors.contains_key(&vpath) && self.lospec_author_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.lospec_author_rx = Some(rx);
+            let url = p.json_url();
+            std::thread::spawn(move || {
+                if let Ok(body) = crate::cache::get_bytes(&url, Some(86_400)) {
+                    if let Some(author) = crate::lospec::parse_author(&body) {
+                        let _ = tx.send((vpath, author));
+                    }
+                }
+            });
+        }
+    }
+
+    fn poll_lospec_author(&mut self) {
+        let Some(rx) = &self.lospec_author_rx else { return };
+        match rx.try_recv() {
+            Ok((path, author)) => {
+                self.lospec_authors.insert(path, author);
+                self.lospec_author_rx = None;
+                self.want_repaint = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lospec_author_rx = None,
+        }
     }
 
     /// Finish a Lospec `.gpl` download: add it to the palette library list + select it (so Recolor
@@ -15366,9 +15531,9 @@ impl PixelView {
             self.selected = idx;
             self.start_asset_open(entry.path);
         } else if self.lospec_palettes.contains_key(&entry.path) {
-            // A Lospec palette → download its .gpl to the library + apply it to Recolor.
+            // A Lospec palette → open its detail view (author / colours / example art / download).
             self.selected = idx;
-            self.start_lospec_open(entry.path);
+            self.open_lospec_detail(entry.path);
         } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
             // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
@@ -27749,6 +27914,7 @@ impl eframe::App for PixelView {
         self.poll_asset_open(&ctx);
         self.poll_lospec(&ctx);
         self.poll_lospec_open();
+        self.poll_lospec_author();
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -28163,14 +28329,21 @@ impl eframe::App for PixelView {
         } else {
             central
         };
-        central.show_inside(ui, |ui| match self.mode {
-            // The table is an alternate renderer for the browse mode (not a third
-            // `Mode`), so selection/ratings/keyboard-nav all keep working unchanged.
-            Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
-            Mode::Grid => self.ui_grid(&ctx, ui),
-            Mode::Single => self.ui_single(&ctx, ui),
-            Mode::Compare => self.ui_compare(&ctx, ui),
-            Mode::ThreeD => self.ui_three_d(&ctx, ui),
+        central.show_inside(ui, |ui| {
+            // A Lospec palette detail view overrides the normal browse/single content.
+            if self.lospec_detail.is_some() {
+                self.ui_lospec_detail(&ctx, ui);
+                return;
+            }
+            match self.mode {
+                // The table is an alternate renderer for the browse mode (not a third
+                // `Mode`), so selection/ratings/keyboard-nav all keep working unchanged.
+                Mode::Grid if self.table_view => self.ui_table(&ctx, ui),
+                Mode::Grid => self.ui_grid(&ctx, ui),
+                Mode::Single => self.ui_single(&ctx, ui),
+                Mode::Compare => self.ui_compare(&ctx, ui),
+                Mode::ThreeD => self.ui_three_d(&ctx, ui),
+            }
         });
 
         self.paint_audio_loading_overlay(&ctx);
@@ -29226,6 +29399,21 @@ impl eframe::App for PixelView {
 }
 
 /// File/dir name as a display string (lossy), or the whole path if it has none.
+/// Strip simple HTML tags + collapse whitespace (Lospec descriptions carry a little markup).
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn short_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
