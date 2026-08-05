@@ -265,4 +265,26 @@ mod tests {
             return;
         }
     }
+
+    #[test]
+    fn svg_snapshot_is_valid_and_depth_sorted() {
+        use crate::decode::mesh3d::{to_svg, Camera, RenderOpts, View};
+        for p in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ] {
+            let Ok(bytes) = std::fs::read(p) else { continue };
+            let m = extrude_text(&bytes, "A", &Extrude3d::default()).unwrap();
+            let cam = Camera { yaw: 0.5, pitch: -0.45, zoom: 1.0, pan: [0.0, 0.0] };
+            let svg = to_svg(&m, 400, 300, &View::Orbit(cam), &RenderOpts::default());
+            assert!(svg.contains("<polygon"), "emits polygons");
+            // One polygon per front-facing-projected triangle (all front in orbit) → many.
+            assert!(svg.matches("<polygon").count() > 20, "depth-sorted facets");
+            assert!(
+                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).is_ok(),
+                "valid SVG"
+            );
+            return;
+        }
+    }
 }

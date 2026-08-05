@@ -532,6 +532,7 @@ pub struct RenderOpts {
     pub wire_color: [u8; 3], // wireframe line colour
     pub light_yaw: f32, // light azimuth (view space)
     pub light_pitch: f32, // light elevation
+    pub light_rgb: [u8; 3], // key-light colour (tints the diffuse term; white = neutral)
     pub bg: [u8; 4],
 }
 
@@ -543,9 +544,27 @@ impl Default for RenderOpts {
             wire_color: [30, 32, 38],
             light_yaw: 0.4,
             light_pitch: 0.6,
+            light_rgb: [255, 255, 255],
             bg: [24, 24, 28, 255],
         }
     }
+}
+
+/// Flat two-sided diffuse shade of a triangle: `base` × (ambient + diffuse·light_colour). Shared by
+/// the rasterizer and the SVG exporter so they agree. `nv` = view-space face normal (pre-flip).
+fn shade_tri(base: [u8; 3], nv: [f32; 3], light: [f32; 3], light_rgb: [u8; 3]) -> [u8; 3] {
+    let mut n = nv;
+    if n[2] < 0.0 {
+        n = [-n[0], -n[1], -n[2]];
+    }
+    let ndl = dot(n, light).max(0.0);
+    let (amb, dif) = (0.28f32, 0.72 * ndl);
+    let mut out = [0u8; 3];
+    for c in 0..3 {
+        let lc = light_rgb[c] as f32 / 255.0;
+        out[c] = (base[c] as f32 * (amb + dif * lc)).clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 // Per-vertex projected data shared by the rasterizer (screen pos, depth, perspective w, u/w, v/w).
@@ -682,7 +701,13 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
         if nv[2] < 0.0 {
             nv = [-nv[0], -nv[1], -nv[2]];
         }
-        let shade = (0.28 + 0.72 * dot(nv, light).max(0.0)).clamp(0.0, 1.0);
+        // Per-channel light factor: ambient + diffuse·light_colour (tints highlights by the light).
+        let ndl = dot(nv, light).max(0.0);
+        let lf = [
+            (0.28 + 0.72 * ndl * opts.light_rgb[0] as f32 / 255.0).clamp(0.0, 1.0),
+            (0.28 + 0.72 * ndl * opts.light_rgb[1] as f32 / 255.0).clamp(0.0, 1.0),
+            (0.28 + 0.72 * ndl * opts.light_rgb[2] as f32 / 255.0).clamp(0.0, 1.0),
+        ];
 
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area.abs() < 1e-6 {
@@ -730,9 +755,9 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                     mesh.tri_rgb.get(tri_idx).copied().unwrap_or(mesh.base_rgb)
                 };
                 let mut out = [
-                    (base[0] as f32 * shade) as u8,
-                    (base[1] as f32 * shade) as u8,
-                    (base[2] as f32 * shade) as u8,
+                    (base[0] as f32 * lf[0]) as u8,
+                    (base[1] as f32 * lf[1]) as u8,
+                    (base[2] as f32 * lf[2]) as u8,
                     255,
                 ];
                 // Wireframe OVERLAY: draw the edge on top of the shaded surface (still
@@ -755,6 +780,112 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
         }
     }
     color
+}
+
+/// Export `mesh` as a flat-shaded **SVG** — a crisp *vector snapshot* of the 3D view (painter's-
+/// algorithm depth sort → one filled `<polygon>` per triangle; curved surfaces become facets). Uses
+/// the SAME projection + shading as [`render`], so it matches the on-screen image. Ideal for a logo
+/// you then edit in Inkscape (the vector is baked at the current angle — no post-export rotation).
+pub fn to_svg(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts) -> String {
+    let (cx, cyc) = (w as f32 * 0.5, h as f32 * 0.5);
+    let r = mesh.radius.max(1e-4);
+    let light = {
+        let (sy, cy) = opts.light_yaw.sin_cos();
+        let (sp, cp) = opts.light_pitch.sin_cos();
+        normalize([cp * sy, sp, cp * cy])
+    };
+    // Project every vertex to (x, y, depth, in_front). Mirrors `render`'s vertex stage.
+    let proj: Vec<(f32, f32, f32, bool)> = match view {
+        View::Orbit(cam) => {
+            let (sy, cy) = cam.yaw.sin_cos();
+            let (sp, cp) = cam.pitch.sin_cos();
+            let scale = (w.min(h) as f32 * 0.5 / r) * 0.9 * cam.zoom;
+            let pan = [cam.pan[0] * w as f32, cam.pan[1] * h as f32];
+            mesh.positions
+                .iter()
+                .map(|p| {
+                    let v = [p[0] - mesh.center[0], p[1] - mesh.center[1], p[2] - mesh.center[2]];
+                    let rv = orbit_rotate(v, sy, cy, sp, cp);
+                    (cx + rv[0] * scale + pan[0], cyc - rv[1] * scale + pan[1], rv[2], true)
+                })
+                .collect()
+        }
+        View::Fly(fc) => {
+            let fwd = fc.forward();
+            let right = fc.right();
+            let up = cross(fwd, right);
+            let focal = (h as f32 * 0.5) / (0.5f32).tan();
+            let near = r * 0.02;
+            mesh.positions
+                .iter()
+                .map(|p| {
+                    let rel = [p[0] - fc.eye[0], p[1] - fc.eye[1], p[2] - fc.eye[2]];
+                    let vz = dot(rel, fwd);
+                    if vz <= near {
+                        return (0.0, 0.0, f32::MIN, false);
+                    }
+                    let inv = 1.0 / vz;
+                    (cx + dot(rel, right) * inv * focal, cyc - dot(rel, up) * inv * focal, inv, true)
+                })
+                .collect()
+        }
+    };
+    let to_view_normal = |n: [f32; 3]| -> [f32; 3] {
+        match view {
+            View::Orbit(cam) => {
+                let (sy, cy) = cam.yaw.sin_cos();
+                let (sp, cp) = cam.pitch.sin_cos();
+                orbit_rotate(n, sy, cy, sp, cp)
+            }
+            View::Fly(fc) => {
+                let fwd = fc.forward();
+                let right = fc.right();
+                let up = cross(fwd, right);
+                [dot(n, right), dot(n, up), dot(n, fwd)]
+            }
+        }
+    };
+
+    // One entry per triangle: (avg depth, polygon points, shaded colour).
+    type SvgTri = (f32, [(f32, f32); 3], [u8; 3]);
+    let mut tris: Vec<SvgTri> = Vec::with_capacity(mesh.tri_count());
+    for (i, t) in mesh.indices.chunks_exact(3).enumerate() {
+        let (ia, ib, ic) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let (a, b, c) = (proj[ia], proj[ib], proj[ic]);
+        if !(a.3 && b.3 && c.3) {
+            continue;
+        }
+        let wn = normalize(cross(
+            sub(mesh.positions[ib], mesh.positions[ia]),
+            sub(mesh.positions[ic], mesh.positions[ia]),
+        ));
+        let nv = to_view_normal(wn);
+        let base = mesh.tri_rgb.get(i).copied().unwrap_or(mesh.base_rgb);
+        let col = shade_tri(base, nv, light, opts.light_rgb);
+        tris.push(((a.2 + b.2 + c.2) / 3.0, [(a.0, a.1), (b.0, b.1), (c.0, c.1)], col));
+    }
+    // Painter's algorithm: far (smaller depth) first, near last (on top).
+    tris.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" width=\"{w}\" height=\"{h}\" shape-rendering=\"geometricPrecision\">"
+    );
+    if opts.bg[3] == 255 {
+        svg.push_str(&format!(
+            "<rect width=\"{w}\" height=\"{h}\" fill=\"#{:02X}{:02X}{:02X}\"/>",
+            opts.bg[0], opts.bg[1], opts.bg[2]
+        ));
+    }
+    for (_, p, c) in &tris {
+        let hexc = format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+        // A thin same-colour stroke hides the 1px seams between adjacent flat facets.
+        svg.push_str(&format!(
+            "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" fill=\"{hexc}\" stroke=\"{hexc}\" stroke-width=\"0.6\" stroke-linejoin=\"round\"/>",
+            p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1
+        ));
+    }
+    svg.push_str("</svg>");
+    svg
 }
 
 /// Apply the orbit rotation R = Rx(pitch)·Ry(yaw) to a vector (sin/cos precomputed).

@@ -1428,6 +1428,7 @@ pub struct PixelView {
     font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
     font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
     font_3d_light_pitch: f32,  // key-light elevation, persisted
+    font_3d_light_rgb: [u8; 3], // key-light colour, persisted
     font_3d_yaw: f32,          // orbit camera yaw, persisted
     font_3d_pitch: f32,        // orbit camera pitch, persisted
     font_3d_zoom: f32,         // orbit camera zoom, persisted
@@ -1979,6 +1980,7 @@ impl PixelView {
     const FONT_3D_SIDE_KEY: &'static str = "font_3d_side";
     const FONT_3D_LIGHT_YAW_KEY: &'static str = "font_3d_light_yaw";
     const FONT_3D_LIGHT_PITCH_KEY: &'static str = "font_3d_light_pitch";
+    const FONT_3D_LIGHT_RGB_KEY: &'static str = "font_3d_light_rgb";
     const FONT_3D_YAW_KEY: &'static str = "font_3d_yaw";
     const FONT_3D_PITCH_KEY: &'static str = "font_3d_pitch";
     const FONT_3D_ZOOM_KEY: &'static str = "font_3d_zoom";
@@ -2923,6 +2925,7 @@ impl PixelView {
             font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
             font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
             font_3d_light_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY)).unwrap_or(0.7),
+            font_3d_light_rgb: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_LIGHT_RGB_KEY)).unwrap_or([255, 255, 255]),
             font_3d_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_YAW_KEY)).unwrap_or(0.5),
             font_3d_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_PITCH_KEY)).unwrap_or(-0.45),
             font_3d_zoom: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_ZOOM_KEY)).unwrap_or(1.0),
@@ -7127,11 +7130,13 @@ impl PixelView {
                 wire_color: [30, 32, 38],
                 light_yaw: self.font_3d_light_yaw,
                 light_pitch: self.font_3d_light_pitch,
+                light_rgb: self.font_3d_light_rgb,
                 bg: [22, 22, 26, 255],
             };
             let tkey = format!(
-                "{mesh_key}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}|{wpx}x{hpx}",
-                self.font_3d_yaw, self.font_3d_pitch, self.font_3d_zoom, self.font_3d_light_yaw, self.font_3d_light_pitch
+                "{mesh_key}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}|{:?}|{wpx}x{hpx}",
+                self.font_3d_yaw, self.font_3d_pitch, self.font_3d_zoom, self.font_3d_light_yaw,
+                self.font_3d_light_pitch, self.font_3d_light_rgb
             );
             if self.font_3d_tex.as_ref().map(|(k, _)| k != &tkey).unwrap_or(true) {
                 let px = render(m, wpx, hpx, &View::Orbit(cam), &ro);
@@ -7157,6 +7162,71 @@ impl PixelView {
             );
         }
         self.font_3d_mesh = mesh;
+    }
+
+    /// The render options for the 3D font (light + a transparent bg for exports).
+    fn font_3d_render_opts(&self, bg: [u8; 4]) -> crate::decode::mesh3d::RenderOpts {
+        crate::decode::mesh3d::RenderOpts {
+            textured: false,
+            wireframe: false,
+            wire_color: [30, 32, 38],
+            light_yaw: self.font_3d_light_yaw,
+            light_pitch: self.font_3d_light_pitch,
+            light_rgb: self.font_3d_light_rgb,
+            bg,
+        }
+    }
+
+    /// Build the SVG vector snapshot of the current 3D view at `w`×`h` (transparent bg).
+    fn font_3d_svg(&self, w: usize, h: usize) -> Option<String> {
+        use crate::decode::mesh3d::{Camera, View};
+        let mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts())?;
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: [0.0, 0.0] };
+        Some(crate::decode::mesh3d::to_svg(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0])))
+    }
+
+    /// Default export basename: `<family>_<sample>`.
+    fn font_export_stem(&self) -> String {
+        let base = self.font_info.as_ref().map(|i| i.family.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "font".into());
+        let clean = |s: &str, n: usize| -> String {
+            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+        };
+        format!("{}_{}_3d", clean(&base, 24), clean(&self.font_sample, 24))
+    }
+
+    /// Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle).
+    fn export_font_3d_svg(&mut self) {
+        let Some(svg) = self.font_3d_svg(1600, 1200) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let default = format!("{}.svg", self.font_export_stem());
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+            match std::fs::write(&p, svg) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Save the current 3D view as a high-res PNG (transparent background).
+    fn export_font_3d_png(&mut self) {
+        use crate::decode::mesh3d::{render, Camera, View};
+        let Some(mesh) = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts()) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let (w, h) = (1600usize, 1200usize);
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: [0.0, 0.0] };
+        let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
+        let default = format!("{}.png", self.font_export_stem());
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
     }
 
     fn draw_font_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
@@ -7300,11 +7370,27 @@ impl PixelView {
                     .on_hover_text("Light azimuth");
                 ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
                     .on_hover_text("Light elevation");
+                ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
                 if ui.small_button("Reset view").clicked() {
                     self.font_3d_yaw = 0.5;
                     self.font_3d_pitch = -0.45;
                     self.font_3d_zoom = 1.0;
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("💾 PNG").on_hover_text("Save the current 3D view as a PNG (transparent background)").clicked() {
+                    self.export_font_3d_png();
+                }
+                if ui.small_button("💾 SVG").on_hover_text("Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle — edit in Inkscape)").clicked() {
+                    self.export_font_3d_svg();
+                }
+                if ui.small_button("📋 SVG").on_hover_text("Copy the 3D view as vector SVG").clicked() {
+                    if let Some(svg) = self.font_3d_svg(1400, 1000) {
+                        ctx.copy_text(svg);
+                        self.status = "Copied 3D composition SVG".into();
+                    }
+                }
+                ui.weak("· drag to rotate · wheel to zoom");
             });
         }
         ui.horizontal_wrapped(|ui| {
@@ -22907,6 +22993,7 @@ impl PixelView {
             wire_color: self.td_wire_color,
             light_yaw: self.td_light_yaw,
             light_pitch: self.td_light_pitch,
+            light_rgb: [255, 255, 255],
             bg: [self.td_bg[0], self.td_bg[1], self.td_bg[2], 255],
         };
 
@@ -28487,6 +28574,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_PITCH_KEY, &self.font_3d_light_pitch);
+        eframe::set_value(storage, Self::FONT_3D_LIGHT_RGB_KEY, &self.font_3d_light_rgb);
         eframe::set_value(storage, Self::FONT_3D_YAW_KEY, &self.font_3d_yaw);
         eframe::set_value(storage, Self::FONT_3D_PITCH_KEY, &self.font_3d_pitch);
         eframe::set_value(storage, Self::FONT_3D_ZOOM_KEY, &self.font_3d_zoom);
