@@ -682,6 +682,180 @@ pub fn render_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage
     Some(PixImage::from_rgba(w as u32, h as u32, buf))
 }
 
+/// True if the font carries a **COLR/CPAL** colour table (a colour/emoji font). ttf-parser 0.25
+/// supports COLR **v0** (layered solid colours — no gradients).
+pub fn is_color_font(bytes: &[u8]) -> bool {
+    ttf_parser::Face::parse(bytes, 0)
+        .map(|f| f.tables().colr.is_some())
+        .unwrap_or(false)
+}
+
+/// For a colour (emoji) font, a short sample string of up to `n` of its **actual colour glyphs** —
+/// so the tile shows colour rather than empty outlines for an ASCII thumb sample. Scans the common
+/// symbol + emoji Unicode ranges for codepoints the font maps to a colour glyph. `None` if not a
+/// colour font (caller uses the normal ASCII [`thumb_sample`]).
+pub fn color_sample(bytes: &[u8], n: usize) -> Option<String> {
+    let f = ttf_parser::Face::parse(bytes, 0).ok()?;
+    f.tables().colr?;
+    // Symbols/dingbats, then the emoji blocks — where colour glyphs live.
+    let ranges = [0x2190u32..0x2800, 0x1F300..0x1FB00];
+    let mut out = String::new();
+    let mut count = 0;
+    for r in ranges {
+        for cp in r {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let Some(gid) = f.glyph_index(c) else { continue };
+            if f.is_color_glyph(gid) {
+                out.push(c);
+                count += 1;
+                if count >= n {
+                    return Some(out);
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Alpha-over a solid `rgb` at coverage·`a` onto `buf[i]`.
+fn over(buf: &mut [[u8; 4]], w: usize, h: usize, x: i32, y: i32, rgb: [u8; 3], a: f32) {
+    if a <= 0.0 || x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+        return;
+    }
+    let i = y as usize * w + x as usize;
+    let dst = buf[i];
+    let da = dst[3] as f32 / 255.0;
+    let oa = a + da * (1.0 - a);
+    if oa > 0.0 {
+        let mix = |s: u8, d: u8| (((s as f32 * a + d as f32 * da * (1.0 - a)) / oa).round()).clamp(0.0, 255.0) as u8;
+        buf[i] = [mix(rgb[0], dst[0]), mix(rgb[1], dst[1]), mix(rgb[2], dst[2]), (oa * 255.0) as u8];
+    }
+}
+
+/// A `ttf_parser` COLR painter that rasterizes each layer glyph via `ab_glyph` and composites it in
+/// its CPAL colour. Only `Solid` paints matter for COLR v0 (all ttf-parser 0.25 supports); clips /
+/// layers / transforms are no-ops (unused by v0).
+struct ColorPainter<'f, 'b> {
+    font: &'f FontRef<'f>,
+    px: f32,
+    origin: ab_glyph::Point, // the glyph's pen position (baseline)
+    buf: &'b mut Vec<[u8; 4]>,
+    w: usize,
+    h: usize,
+    pending: Option<u16>, // the layer glyph awaiting its paint colour
+}
+
+impl<'a> ttf_parser::colr::Painter<'a> for ColorPainter<'_, '_> {
+    fn outline_glyph(&mut self, glyph_id: ttf_parser::GlyphId) {
+        self.pending = Some(glyph_id.0);
+    }
+    fn paint(&mut self, paint: ttf_parser::colr::Paint<'a>) {
+        let ttf_parser::colr::Paint::Solid(c) = paint else {
+            return; // gradients are COLR v1 — not emitted by ttf-parser 0.25
+        };
+        let Some(gid) = self.pending.take() else { return };
+        let alpha = c.alpha as f32 / 255.0;
+        let g = GlyphId(gid).with_scale_and_position(self.px, self.origin);
+        if let Some(o) = self.font.outline_glyph(g) {
+            let bb = o.px_bounds();
+            let rgb = [c.red, c.green, c.blue];
+            o.draw(|dx, dy, cov| {
+                let x = bb.min.x as i32 + dx as i32;
+                let y = bb.min.y as i32 + dy as i32;
+                over(self.buf, self.w, self.h, x, y, rgb, cov.clamp(0.0, 1.0) * alpha);
+            });
+        }
+    }
+    fn push_clip(&mut self) {}
+    fn push_clip_box(&mut self, _: ttf_parser::colr::ClipBox) {}
+    fn pop_clip(&mut self) {}
+    fn push_layer(&mut self, _: ttf_parser::colr::CompositeMode) {}
+    fn pop_layer(&mut self) {}
+    fn push_transform(&mut self, _: ttf_parser::Transform) {}
+    fn pop_transform(&mut self) {}
+}
+
+/// Render `text` using the font's **COLR/CPAL colour layers** (a colour/emoji font), honoring
+/// letter-spacing / line-height / bg. Non-colour glyphs fall back to a mono outline in `ink`. `None`
+/// if the font has no colour table (caller uses [`render_text`]). Stroke is ignored for colour glyphs.
+pub fn render_color_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage> {
+    let ttf = ttf_parser::Face::parse(bytes, 0).ok()?;
+    ttf.tables().colr?;
+    let font = FontRef::try_from_slice(bytes).ok()?;
+    let px = opts.px.clamp(6.0, 2048.0);
+    let scaled = font.as_scaled(px);
+    let ascent = scaled.ascent();
+    let descent = scaled.descent(); // negative
+    let line_pitch = scaled.height() + scaled.line_gap() + opts.line_gap;
+    const PAD: f32 = 4.0;
+
+    // Size the canvas from the advance box (colour glyphs ~fill the em; overhang is rare for emoji).
+    let (mut cx, mut max_x, mut lines, mut prev) = (PAD, PAD, 0usize, None::<GlyphId>);
+    for c in text.chars() {
+        match c {
+            '\n' => {
+                cx = PAD;
+                lines += 1;
+                prev = None;
+            }
+            '\r' => {}
+            _ => {
+                let gid = font.glyph_id(c);
+                if let Some(p) = prev {
+                    cx += scaled.kern(p, gid);
+                }
+                cx += scaled.h_advance(gid) + opts.letter_spacing;
+                max_x = max_x.max(cx);
+                prev = Some(gid);
+            }
+        }
+    }
+    let w = (max_x + PAD).ceil().clamp(1.0, 8192.0) as usize;
+    let h = (PAD * 2.0 + (ascent - descent) + lines as f32 * line_pitch).ceil().clamp(1.0, 8192.0) as usize;
+    let mut buf = match opts.bg {
+        Some(bg) => vec![[bg[0], bg[1], bg[2], 255]; w * h],
+        None => vec![[0u8, 0, 0, 0]; w * h],
+    };
+
+    // Render pass: paint each glyph's colour layers (or a mono outline) at its baseline.
+    let fg = ttf_parser::RgbaColor { red: opts.ink[0], green: opts.ink[1], blue: opts.ink[2], alpha: 255 };
+    let (mut cx, mut base, mut prev) = (PAD, PAD + ascent, None::<GlyphId>);
+    let mut any = false;
+    for c in text.chars() {
+        match c {
+            '\n' => {
+                cx = PAD;
+                base += line_pitch;
+                prev = None;
+            }
+            '\r' => {}
+            _ => {
+                let gid = font.glyph_id(c);
+                if let Some(p) = prev {
+                    cx += scaled.kern(p, gid);
+                }
+                let origin = point(cx, base);
+                let ttf_gid = ttf_parser::GlyphId(gid.0);
+                if ttf.is_color_glyph(ttf_gid) {
+                    let mut painter = ColorPainter { font: &font, px, origin, buf: &mut buf, w, h, pending: None };
+                    if ttf.paint_color_glyph(ttf_gid, 0, fg, &mut painter).is_some() {
+                        any = true;
+                    }
+                } else if let Some(o) = font.outline_glyph(gid.with_scale_and_position(px, origin)) {
+                    let bb = o.px_bounds();
+                    o.draw(|dx, dy, cov| {
+                        over(&mut buf, w, h, bb.min.x as i32 + dx as i32, bb.min.y as i32 + dy as i32, opts.ink, cov.clamp(0.0, 1.0));
+                    });
+                }
+                cx += scaled.h_advance(gid) + opts.letter_spacing;
+                prev = Some(gid);
+            }
+        }
+    }
+    // If nothing colour actually painted (e.g. text has no coloured glyphs), let the caller fall back.
+    any.then(|| PixImage::from_rgba(w as u32, h as u32, buf))
+}
+
 /// Render `chars` as a fixed grid of `cols` columns, each glyph centred in a `cell`×`cell` box,
 /// into one RGBA image (efficient: one render per page). Returns `(image, rows)`. The viewer
 /// overlays a click grid on top to copy a glyph. `None` if the font can't be parsed.
@@ -693,6 +867,9 @@ pub fn render_glyph_grid(
     color: [u8; 3],
 ) -> Option<(PixImage, usize)> {
     let font = FontRef::try_from_slice(bytes).ok()?;
+    // A colour (emoji) font: paint each colour glyph's CPAL layers in colour (mono glyphs still use
+    // `color`), so the browse grid shows the emoji in colour like the preview.
+    let ttf = ttf_parser::Face::parse(bytes, 0).ok().filter(|f| f.tables().colr.is_some());
     let cols = cols.max(1);
     let cell = cell.clamp(8, 256);
     let rows = chars.len().div_ceil(cols).max(1);
@@ -707,6 +884,26 @@ pub fn render_glyph_grid(
         let adv = scaled.h_advance(gid);
         let gx = cx as f32 + (cell as f32 - adv) * 0.5;
         let gy = cy as f32 + cell as f32 * 0.72; // baseline
+        // Colour path: paint the glyph's CPAL layers if this font marks it a colour glyph.
+        if let Some(ttf) = &ttf {
+            if let Some(ttf_gid) = ttf.glyph_index(c) {
+                if ttf.is_color_glyph(ttf_gid) {
+                    let mut painter = ColorPainter {
+                        font: &font,
+                        px: em,
+                        origin: point(gx, gy),
+                        buf: &mut px,
+                        w,
+                        h,
+                        pending: None,
+                    };
+                    let fg = ttf_parser::RgbaColor::new(color[0], color[1], color[2], 255);
+                    if ttf.paint_color_glyph(ttf_gid, 0, fg, &mut painter).is_some() {
+                        continue;
+                    }
+                }
+            }
+        }
         if let Some(outlined) = font.outline_glyph(gid.with_scale_and_position(em, point(gx, gy))) {
             let bb = outlined.px_bounds();
             outlined.draw(|dx, dy, cov| {
@@ -740,6 +937,17 @@ impl Decoder for FontDecoder {
         is_font(bytes)
     }
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
+        // A colour (emoji) font: render a few of its real colour glyphs in colour, so the tile
+        // isn't just empty ASCII outlines. Falls back to the normal mono sample otherwise.
+        if let Some(sample) = color_sample(bytes, 6) {
+            let opts = TextOpts {
+                px: 44.0,
+                ..Default::default()
+            };
+            if let Some(img) = render_color_text(bytes, &sample, &opts) {
+                return Ok(img);
+            }
+        }
         render_text(
             bytes,
             &thumb_sample(),
