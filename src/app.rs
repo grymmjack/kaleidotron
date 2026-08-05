@@ -886,6 +886,7 @@ impl SortKey {
 /// nested menu closures never need to borrow `self` mutably).
 enum MenuAction {
     Open,
+    SelectMask,
     Quit,
     ToggleExplorer,
     ToggleDetails,
@@ -1854,6 +1855,11 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     web_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     web_dir: PathBuf, // <data>/web — downloaded files
+    web_dl_open: bool,      // the "Download folder…" dialog is showing
+    web_dl_mask: String,    // wildcard mask for that dialog (e.g. `*.zip;*.ans`)
+    web_dl_recursive: bool, // recurse into sub-directories
+    sel_mask_open: bool,    // the "Select by pattern" dialog is showing
+    sel_mask: String,       // its wildcard mask
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -3360,6 +3366,11 @@ impl PixelView {
             web_files: HashMap::new(),
             web_open_rx: None,
             web_dir,
+            web_dl_open: false,
+            web_dl_mask: "*.*".into(),
+            web_dl_recursive: true,
+            sel_mask_open: false,
+            sel_mask: "*.*".into(),
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -5538,6 +5549,171 @@ impl PixelView {
     // --- HTTP filesystem browser. A directory is fetched + parsed on a worker; a file is
     // downloaded on click and then opened by the normal decoder path, so any format pixelview
     // already understands works over HTTP with no extra handling.
+
+    /// The "Download folder…" dialog for a remote directory: a Total-Commander-style wildcard mask
+    /// plus a recurse toggle. Kicks off a background crawl that reuses the existing bulk-download
+    /// progress window.
+    fn ui_web_download_dialog(&mut self, ctx: &egui::Context) {
+        if !self.web_dl_open {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Download from web")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let here = self
+                    .folder
+                    .as_ref()
+                    .map(|f| crate::httpfs::rel_parts(f).join("/"))
+                    .unwrap_or_default();
+                ui.label(egui::RichText::new(&here).weak());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Files:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.web_dl_mask)
+                            .hint_text("*.zip;*.ans")
+                            .desired_width(200.0),
+                    )
+                    .on_hover_text(
+                        "Wildcard mask. Several masks with ;   Exclude after |\n\
+                         e.g.  *.zip;*.lha    or    *.*|*.tmp",
+                    );
+                });
+                ui.checkbox(&mut self.web_dl_recursive, "Include sub-directories")
+                    .on_hover_text("Walk the whole tree below this folder");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Download…").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.web_dl_open = false;
+                    }
+                });
+            });
+        if !open {
+            self.web_dl_open = false;
+        }
+        if go {
+            self.web_dl_open = false;
+            self.start_web_download();
+        }
+    }
+
+    /// Crawl the current remote directory and save every matching file, mirroring the remote tree.
+    fn start_web_download(&mut self) {
+        if self.bulk_dl.as_ref().is_some_and(|b| !b.finished) {
+            self.status = "A bulk download is already running".into();
+            return;
+        }
+        let Some(folder) = self.folder.clone().filter(|f| crate::httpfs::is_remote(f)) else {
+            return;
+        };
+        let parts = crate::httpfs::rel_parts(&folder);
+        let host = parts.first().cloned().unwrap_or_default();
+        let http = self.web_http.get(&host).copied().unwrap_or(false);
+        let label = parts.join("/");
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title(format!("Choose a folder to save “{label}”"))
+            .pick_folder()
+        else {
+            return;
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (c2, dest2) = (Arc::clone(&cancel), dest.clone());
+        let (mask, rec) = (self.web_dl_mask.clone(), self.web_dl_recursive);
+        std::thread::spawn(move || web_bulk_walk(parts, http, mask, rec, dest2, c2, tx));
+        self.status = format!("Downloading {label}…");
+        self.bulk_dl = Some(BulkDownload {
+            label,
+            dest,
+            total: 0,
+            done: 0,
+            cached: 0,
+            fetched: 0,
+            skipped: 0,
+            failed: 0,
+            last: String::new(),
+            finished: false,
+            cancel,
+            rx,
+        });
+        self.want_repaint = true;
+    }
+
+    /// "Select by pattern" — Total Commander's `+` / select-by-mask, but it works in **any** folder
+    /// (local, archive, or remote), since it just filters the current view by name.
+    fn ui_select_mask_dialog(&mut self, ctx: &egui::Context) {
+        if !self.sel_mask_open {
+            return;
+        }
+        let mut open = true;
+        let (mut apply, mut add, mut cancelled) = (false, false, false);
+        egui::Window::new("Select by pattern")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut self.sel_mask)
+                        .hint_text("*.zip;*.ans")
+                        .desired_width(240.0),
+                );
+                te.request_focus();
+                ui.weak("Several masks with ;   Exclude after |");
+                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Select").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Add to selection").clicked() {
+                        add = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if apply || add {
+            self.select_by_mask(add);
+            self.sel_mask_open = false;
+        } else if !open || cancelled {
+            self.sel_mask_open = false;
+        }
+    }
+
+    /// Select every entry in the current view whose name matches `sel_mask`. `add` keeps the
+    /// existing selection. Directories are matched too, so `*` selects everything visible.
+    fn select_by_mask(&mut self, add: bool) {
+        if !add {
+            self.selection.clear();
+        }
+        let mask = self.sel_mask.clone();
+        let hits: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| crate::httpfs::glob_any(&mask, n))
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        let n = hits.len();
+        for p in hits {
+            self.selection.insert(p);
+        }
+        self.status = format!("{n} item(s) matched “{mask}”");
+    }
 
     fn open_web(&mut self, dir: PathBuf) {
         let parts = crate::httpfs::rel_parts(&dir);
@@ -26939,6 +27115,15 @@ impl PixelView {
                     ui.close();
                 }
                 ui.separator();
+                if ui
+                    .button("Select by pattern…")
+                    .on_hover_text("Select entries by wildcard mask (Ctrl+D)")
+                    .clicked()
+                {
+                    action = Some(MenuAction::SelectMask);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Copy")).clicked() {
                     action = Some(MenuAction::File(FileAction::Copy));
                     ui.close();
@@ -27320,6 +27505,7 @@ impl PixelView {
                     self.open_folder(d);
                 }
             }
+            MenuAction::SelectMask => self.sel_mask_open = true,
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::ToggleExplorer => self.show_explorer = !self.show_explorer,
             MenuAction::ToggleDetails => self.show_details = !self.show_details,
@@ -27961,6 +28147,15 @@ impl PixelView {
                             }
                         });
                         ui.weak("Any Apache/nginx-style index · click a file to fetch + view");
+                        // Batch/recursive download of whatever folder is open.
+                        if self.folder.as_ref().is_some_and(|f| crate::httpfs::is_remote(f))
+                            && ui
+                                .button(format!("{} Download folder…", icons::DOWNLOAD))
+                                .on_hover_text("Fetch matching files, optionally recursing")
+                                .clicked()
+                        {
+                            self.web_dl_open = true;
+                        }
                         if let Some(f) = self.folder.as_ref().filter(|f| crate::httpfs::is_remote(f)).cloned() {
                             let saved = self.favorites.contains(&f);
                             let label = crate::httpfs::rel_parts(&f).join("/");
@@ -29346,6 +29541,14 @@ impl eframe::App for PixelView {
             self.show_search = true;
             self.focus_adv_search = true;
         }
+        // Ctrl+D — select by wildcard mask (Total Commander's select-by-mask).
+        if self.path_edit.is_none()
+            && self.rebinding.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D))
+        {
+            self.sel_mask_open = true;
+        }
         if self.show_search
             && self.path_edit.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -29526,6 +29729,8 @@ impl eframe::App for PixelView {
         self.paint_audio_loading_overlay(&ctx);
         self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
+        self.ui_web_download_dialog(&ctx);
+        self.ui_select_mask_dialog(&ctx);
         self.ui_ai_generate(&ctx);
 
         if self.show_hotkeys {
@@ -36217,6 +36422,60 @@ fn sanitize_component(seg: &str) -> String {
         .to_string()
 }
 
+/// Worker: crawl a remote directory and save every matching file, mirroring the remote tree under
+/// `dest`. Emits the same [`BulkMsg`] stream the 16colo bulk downloader uses, so it reuses that
+/// progress window unchanged.
+#[allow(clippy::too_many_arguments)]
+fn web_bulk_walk(
+    parts: Vec<String>,
+    http: bool,
+    mask: String,
+    recursive: bool,
+    dest: PathBuf,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<BulkMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Pass 1: enumerate, so the progress bar has a real total instead of counting up blindly.
+    let mut files = Vec::new();
+    if let Err(e) = crate::httpfs::enumerate(&parts, http, &mask, recursive, &cancel, |f| {
+        files.push(f);
+    }) {
+        let _ = tx.send(BulkMsg::Err(e));
+        return;
+    }
+    let _ = tx.send(BulkMsg::Total(files.len()));
+
+    // Pass 2: fetch each file into its mirrored sub-directory.
+    for f in files {
+        if cancel.load(Relaxed) {
+            break;
+        }
+        let mut dir = dest.clone();
+        for seg in &f.rel {
+            dir = dir.join(sanitize_component(seg));
+        }
+        let out = if dir.join(&f.name).exists() {
+            BulkOutcome::Skipped
+        } else {
+            let mut url_parts = parts.clone();
+            url_parts.extend(f.rel.iter().cloned());
+            url_parts.push(f.name.clone());
+            let url = crate::httpfs::url_for(&url_parts, http, false);
+            let cached = crate::cache::contains(&url);
+            match download_to_dir(&url, &f.name, &dir) {
+                Ok(_) if cached => BulkOutcome::Cached,
+                Ok(_) => BulkOutcome::Fetched,
+                Err(e) => BulkOutcome::Failed(e),
+            }
+        };
+        if tx.send(BulkMsg::Item { name: f.name, out }).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(BulkMsg::Done);
+}
+
 /// Worker: fetch + parse one remote directory listing, streaming an entry per item.
 fn web_walk(
     parts: Vec<String>,
@@ -36241,6 +36500,9 @@ fn web_walk(
         let mut e = virtual_entry(root.join(&it.name));
         e.is_dir = it.is_dir;
         e.size = it.size;
+        // A remote .zip/.lha/… is browsable once fetched, so flag it like a local archive — the
+        // grid then paints the folder glyph + format badge and clicking it mounts the contents.
+        e.is_archive = !it.is_dir && crate::archive::is_archive(&e.path);
         n += 1;
         if tx.send(WebMsg::Hit(e)).is_err() {
             return;
