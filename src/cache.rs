@@ -77,10 +77,17 @@ fn key(url: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// A descriptive User-Agent — Wikimedia (and good API etiquette generally) require one; a
+/// missing/blank UA gets 403'd. Kept generic + contactable per the Wikimedia UA policy.
+const USER_AGENT: &str = "pixelview/0.1 (https://github.com/grymmjack/pixel-viewer)";
+
 /// HTTP GET `url` into memory (capped). Errors on a network/HTTP failure (so failures
 /// are never cached).
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let resp = ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(FETCH_CAP)
