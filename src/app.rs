@@ -271,6 +271,14 @@ enum SndMsg {
     Done(usize),
 }
 
+/// Messages from an HTTP directory-listing worker (`web_walk`). Unlike the other sources an entry
+/// carries everything the grid needs (name / dir / size), so there's no side metadata map.
+enum WebMsg {
+    Hit(Entry),
+    Done(usize, bool), // (count, needed_plain_http)
+    Failed(String),
+}
+
 /// Messages from a Google Fonts browse worker (`gf_walk`): one family per hit, then the count.
 enum GfMsg {
     Hit(Entry, Box<crate::gfonts::GFont>),
@@ -1837,6 +1845,15 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     gf_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     gf_dir: PathBuf, // <data>/gfonts — downloaded families
+    // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
+    web_url: String,                             // the Places URL box
+    web_http: HashMap<String, bool>,             // host → needs plain HTTP (remembered per session)
+    web_rx: Option<std::sync::mpsc::Receiver<WebMsg>>,
+    web_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    web_files: HashMap<PathBuf, PathBuf>,        // virtual → downloaded local file
+    #[allow(clippy::type_complexity)]
+    web_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    web_dir: PathBuf, // <data>/web — downloaded files
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -2622,6 +2639,7 @@ impl PixelView {
         let ph_dir = data_dir.join("polyhaven");
         let snd_dir = data_dir.join("audio");
         let gf_dir = data_dir.join("gfonts");
+        let web_dir = data_dir.join("web");
         let mut palette_files = all_palettes(&palette_dir);
         for p in all_palettes(&lospec_dir) {
             if !palette_files.contains(&p) {
@@ -3335,6 +3353,13 @@ impl PixelView {
             gf_files: HashMap::new(),
             gf_open_rx: None,
             gf_dir,
+            web_url: String::new(),
+            web_http: HashMap::new(),
+            web_rx: None,
+            web_cancel: None,
+            web_files: HashMap::new(),
+            web_open_rx: None,
+            web_dir,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3487,6 +3512,11 @@ impl PixelView {
         // Free audio search (Openverse) — results download into the waveform editor / sample pads.
         if crate::audiosearch::is_remote(&dir) {
             self.open_audio_search(dir);
+            return;
+        }
+        // HTTP filesystem browser — any auto-indexed URL, browsed like a folder tree.
+        if crate::httpfs::is_remote(&dir) {
+            self.open_web(dir);
             return;
         }
         // Google Fonts — browse → download the .ttf → the font viewer.
@@ -4351,6 +4381,7 @@ impl PixelView {
             .or_else(|| self.ph_files.get(path))
             .or_else(|| self.snd_files.get(path))
             .or_else(|| self.gf_files.get(path))
+            .or_else(|| self.web_files.get(path))
         {
             return f.clone();
         }
@@ -5501,6 +5532,129 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gf_open_rx = None,
+        }
+    }
+
+    // --- HTTP filesystem browser. A directory is fetched + parsed on a worker; a file is
+    // downloaded on click and then opened by the normal decoder path, so any format pixelview
+    // already understands works over HTTP with no extra handling.
+
+    fn open_web(&mut self, dir: PathBuf) {
+        let parts = crate::httpfs::rel_parts(&dir);
+        if parts.is_empty() {
+            self.show_folder(dir, Vec::new());
+            self.status = "Paste a URL in the Places panel to browse it".into();
+            return;
+        }
+        self.start_web_list(dir);
+    }
+
+    /// Fetch + parse a remote directory listing on a worker thread.
+    fn start_web_list(&mut self, dir: PathBuf) {
+        let parts = crate::httpfs::rel_parts(&dir);
+        let host = parts.first().cloned().unwrap_or_default();
+        let prefer_http = self.web_http.get(&host).copied().unwrap_or(false);
+        self.show_folder(dir.clone(), Vec::new());
+        if let Some(c) = self.web_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.web_rx = Some(rx);
+        self.web_cancel = Some(cancel.clone());
+        self.status = format!("Listing {}…", crate::httpfs::url_for(&parts, prefer_http, true));
+        self.want_repaint = true;
+        std::thread::spawn(move || web_walk(parts, prefer_http, &dir, cancel, tx));
+    }
+
+    fn poll_web(&mut self) {
+        let Some(rx) = &self.web_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..512 {
+            match rx.try_recv() {
+                Ok(WebMsg::Hit(mut entry)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(WebMsg::Done(n, http)) => {
+                    // Remember whether this host needed plain HTTP, so sub-directories don't
+                    // re-pay the failed HTTPS attempt on every navigation.
+                    if let Some(h) = self
+                        .folder
+                        .as_ref()
+                        .map(|f| crate::httpfs::rel_parts(f))
+                        .and_then(|p| p.first().cloned())
+                    {
+                        self.web_http.insert(h, http);
+                    }
+                    self.status = format!("{n} item(s)");
+                    done = true;
+                    break;
+                }
+                Ok(WebMsg::Failed(e)) => {
+                    self.status = format!("Can't browse: {e}");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.web_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Download a remote file, then open it. The URL is rebuilt from the virtual path, so no
+    /// per-entry map is needed and a *pinned* file still resolves in a fresh session.
+    fn start_web_open(&mut self, vpath: PathBuf) {
+        if self.web_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let parts = crate::httpfs::rel_parts(&vpath);
+        let Some(name) = parts.last().cloned() else { return };
+        let host = parts.first().cloned().unwrap_or_default();
+        let http = self.web_http.get(&host).copied().unwrap_or(false);
+        let url = crate::httpfs::url_for(&parts, http, false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.web_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&name, 40));
+        // Keep the remote directory structure locally so same-named files across hosts/dirs
+        // can't collide.
+        let dir = parts[..parts.len().saturating_sub(1)]
+            .iter()
+            .fold(self.web_dir.clone(), |d, seg| d.join(sanitize_component(seg)));
+        std::thread::spawn(move || {
+            let _ = tx.send(download_to_dir(&url, &name, &dir).map(|local| (vpath, local)));
+        });
+    }
+
+    fn poll_web_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.web_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                self.web_files.insert(vpath.clone(), local);
+                self.web_open_rx = None;
+                self.load_full(ctx, vpath);
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.web_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.web_open_rx = None,
         }
     }
 
@@ -14945,6 +15099,8 @@ impl PixelView {
             || self.snd_open_rx.is_some()
             || self.gf_rx.is_some()
             || self.gf_open_rx.is_some()
+            || self.web_rx.is_some()
+            || self.web_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -16193,6 +16349,13 @@ impl PixelView {
             // A free-audio result not yet downloaded → fetch, then open in the waveform editor.
             self.selected = idx;
             self.start_snd_open(entry.path);
+        } else if crate::httpfs::is_remote(&entry.path)
+            && !entry.is_dir
+            && !self.web_files.contains_key(&entry.path)
+        {
+            // A remote file → download it, then open with the normal decoder path.
+            self.selected = idx;
+            self.start_web_open(entry.path);
         } else if self.gf_fonts.contains_key(&entry.path) && !self.gf_files.contains_key(&entry.path)
         {
             // A Google Fonts family not yet downloaded → fetch the .ttf, then open the font viewer.
@@ -27280,6 +27443,7 @@ impl PixelView {
                             (5, "YouTube"),
                             (8, "Images"),
                             (16, "GIFs"),
+                            (17, "Web"),
                             (9, "Icons"),
                             (10, "Vectors"),
                             (11, "Palettes"),
@@ -27768,6 +27932,49 @@ impl PixelView {
                         });
                         ui.weak("Openverse · CC audio → waveform editor + pads");
                         if let Some(p) = self.favorites_buttons(ui, "🔊", crate::audiosearch::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 17 {
+                        // HTTP filesystem browser — paste any auto-indexed URL and browse it.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.web_url)
+                                    .hint_text("https://host/path/…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button("Browse").clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                match crate::httpfs::parts_for_url(&self.web_url) {
+                                    Some((parts, http)) => {
+                                        if let Some(h) = parts.first() {
+                                            self.web_http.insert(h.clone(), http);
+                                        }
+                                        let mut p = Path::new(crate::httpfs::ROOT).to_path_buf();
+                                        for seg in &parts {
+                                            p = p.join(seg);
+                                        }
+                                        nav = Some(p);
+                                    }
+                                    None => self.status = "Enter a http(s):// URL".into(),
+                                }
+                            }
+                        });
+                        ui.weak("Any Apache/nginx-style index · click a file to fetch + view");
+                        if let Some(f) = self.folder.as_ref().filter(|f| crate::httpfs::is_remote(f)).cloned() {
+                            let saved = self.favorites.contains(&f);
+                            let label = crate::httpfs::rel_parts(&f).join("/");
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved { "★ Saved".into() } else { format!("★ Save “{label}”") })
+                                    .on_hover_text("Pin this remote folder to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, icons::GLOBE, crate::httpfs::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 16 {
@@ -28883,6 +29090,8 @@ impl eframe::App for PixelView {
         self.poll_snd_open(&ctx);
         self.poll_gf();
         self.poll_gf_open(&ctx);
+        self.poll_web();
+        self.poll_web_open(&ctx);
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -35639,6 +35848,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::polyhaven::is_remote(p)
         || crate::audiosearch::is_remote(p)
         || crate::gfonts::is_remote(p)
+        || crate::httpfs::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -35996,6 +36206,47 @@ fn gf_walk(
         }
     }
     let _ = tx.send(GfMsg::Done(n));
+}
+
+/// Make one remote path segment safe to use as a local directory name.
+fn sanitize_component(seg: &str) -> String {
+    seg.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "-_. ".contains(c) { c } else { '_' })
+        .collect::<String>()
+        .trim_matches(['.', ' '])
+        .to_string()
+}
+
+/// Worker: fetch + parse one remote directory listing, streaming an entry per item.
+fn web_walk(
+    parts: Vec<String>,
+    prefer_http: bool,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<WebMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (items, http) = match crate::httpfs::fetch_listing(&parts, prefer_http) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WebMsg::Failed(e));
+            return;
+        }
+    };
+    let mut n = 0usize;
+    for it in items {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let mut e = virtual_entry(root.join(&it.name));
+        e.is_dir = it.is_dir;
+        e.size = it.size;
+        n += 1;
+        if tx.send(WebMsg::Hit(e)).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(WebMsg::Done(n, http));
 }
 
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
