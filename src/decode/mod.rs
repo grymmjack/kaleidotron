@@ -14,6 +14,7 @@ mod c64_font;
 mod code;
 mod eps;
 pub mod font;
+pub mod font3d; // 3D font extrusion (the "3D logo maker") → an extruded Mesh3D for mesh3d::render
 pub mod fon;
 pub mod ico;
 pub mod tdf;

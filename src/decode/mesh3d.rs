@@ -53,6 +53,8 @@ pub struct Mesh3D {
     pub texcoords: Vec<[f32; 2]>, // parallel to positions ([] = untextured → falls back to solid)
     pub texture: Option<Texture>, // the material's diffuse map (map_Kd / base colour)
     pub base_rgb: [u8; 3],        // material diffuse colour (Kd) for solid shading
+    pub tri_rgb: Vec<[u8; 3]>,    // optional per-TRIANGLE colour (len = tri_count); [] = use base_rgb.
+    // Lets one mesh carry a face colour vs. an extruded-side colour (the 3D font maker).
     pub center: [f32; 3],
     pub radius: f32,
 }
@@ -64,7 +66,7 @@ impl Mesh3D {
 
     /// Recompute `center` + `radius` from the current positions (bounding-sphere-ish:
     /// AABB centre, then the farthest vertex distance — a safe over-estimate for framing).
-    fn recompute_bounds(&mut self) {
+    pub fn recompute_bounds(&mut self) {
         if self.positions.is_empty() {
             self.center = [0.0; 3];
             self.radius = 1.0;
@@ -665,7 +667,7 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
     let textured = opts.textured && mesh.texture.is_some();
     let wireframe = opts.wireframe;
 
-    for tri in mesh.indices.chunks_exact(3) {
+    for (tri_idx, tri) in mesh.indices.chunks_exact(3).enumerate() {
         let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let (a, b, c) = (sv[ia], sv[ib], sv[ic]);
         if !(a.front && b.front && c.front) {
@@ -725,7 +727,7 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                     let t = mesh.texture.as_ref().unwrap().sample(u, v);
                     [t[0], t[1], t[2]]
                 } else {
-                    mesh.base_rgb
+                    mesh.tri_rgb.get(tri_idx).copied().unwrap_or(mesh.base_rgb)
                 };
                 let mut out = [
                     (base[0] as f32 * shade) as u8,
