@@ -92,12 +92,20 @@ fn unescape(s: &str) -> String {
 }
 
 /// Strip HTML tags from a fragment, leaving its text.
+///
+/// A removed tag becomes a **space**, not nothing: adjacent cells like
+/// `<td>31038</td><td>2004-Sep-13</td>` would otherwise concatenate into `310382004-Sep-13`, and the
+/// size token would stop parsing. (Caught against modland's real markup — nginx has no tags between
+/// its columns and Apache happens to follow the size with an `&nbsp;` cell, so both hid this.)
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0usize;
     for c in s.chars() {
         match c {
-            '<' => depth += 1,
+            '<' => {
+                depth += 1;
+                out.push(' ');
+            }
             '>' => depth = depth.saturating_sub(1),
             _ if depth == 0 => out.push(c),
             _ => {}
@@ -273,6 +281,83 @@ pub fn fetch_listing(parts: &[String], prefer_http: bool) -> Result<(Vec<WebEntr
     Err(last)
 }
 
+/// One file found by [`enumerate`], with its path segments relative to the starting directory
+/// (empty for a file directly in it) — used to mirror the remote tree locally.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundFile {
+    pub rel: Vec<String>,
+    pub name: String,
+    pub size: u64,
+}
+
+/// Depth ceiling for a recursive walk — a guard against a mis-configured server that links a
+/// directory back into itself (a symlink loop renders as an infinitely deep tree).
+pub const MAX_DEPTH: usize = 12;
+
+/// Enumerate the files under `parts`, optionally recursing, keeping only names matching `mask`
+/// (a [`glob_any`] mask set; blank = everything). `cancel` is polled between requests so a long
+/// crawl stops promptly. Directory *names* are never mask-filtered — otherwise `*.zip` would refuse
+/// to descend into any folder and recursion would find nothing.
+///
+/// Visited URLs are tracked so a self-referential listing can't loop forever.
+pub fn enumerate(
+    parts: &[String],
+    http: bool,
+    mask: &str,
+    recursive: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_file: impl FnMut(FoundFile),
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (relative segments, depth)
+    let mut queue: std::collections::VecDeque<(Vec<String>, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((Vec::new(), 0));
+    let mut first_err: Option<String> = None;
+    while let Some((rel, depth)) = queue.pop_front() {
+        if cancel.load(Relaxed) {
+            return Ok(());
+        }
+        let mut full = parts.to_vec();
+        full.extend(rel.iter().cloned());
+        if !seen.insert(url_for(&full, http, true)) {
+            continue; // already walked (loop guard)
+        }
+        let items = match fetch_listing(&full, http) {
+            Ok((v, _)) => v,
+            Err(e) => {
+                // A single unreadable sub-directory shouldn't abort the whole crawl; only the
+                // very first failure (the starting directory) is fatal.
+                if rel.is_empty() {
+                    return Err(e);
+                }
+                first_err.get_or_insert(e);
+                continue;
+            }
+        };
+        for it in items {
+            if cancel.load(Relaxed) {
+                return Ok(());
+            }
+            if it.is_dir {
+                if recursive && depth < MAX_DEPTH {
+                    let mut sub = rel.clone();
+                    sub.push(it.name);
+                    queue.push_back((sub, depth + 1));
+                }
+            } else if glob_any(mask, &it.name) {
+                on_file(FoundFile {
+                    rel: rel.clone(),
+                    name: it.name,
+                    size: it.size,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +388,22 @@ mod tests {
         assert_eq!(e[1].name, "=README");
         assert!(!e[1].is_dir);
         assert_eq!(e[1].size, 1536, "1.5K → bytes");
+    }
+
+    /// Real modland markup for a *file* row: the size cell is immediately followed by a date cell
+    /// with no whitespace between the tags. Regression guard for the strip_tags separator bug —
+    /// without it the tokens merge (`310382004-Sep-13`) and the size silently reads 0.
+    const FANCY_FILE: &str = r#"
+      <tr><td class="link"><a href="krymini%20jingle%201.amc" title="krymini jingle 1.amc">krymini jingle 1.amc</a></td><td class="size">              31038</td><td class="date">2004-Sep-13 17:49</td></tr>
+    "#;
+
+    #[test]
+    fn adjacent_table_cells_do_not_merge_tokens() {
+        let e = parse_listing(FANCY_FILE);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].name, "krymini jingle 1.amc");
+        assert!(!e[0].is_dir);
+        assert_eq!(e[0].size, 31038, "size must survive the adjacent date cell");
     }
 
     #[test]
@@ -393,5 +494,128 @@ mod live {
                 Err(e) => eprintln!("{url} ERROR: {e}"),
             }
         }
+    }
+}
+
+/// Match `name` against a shell-style wildcard `pattern` (`*` = any run, `?` = one char),
+/// case-insensitively. Total Commander's select-by-mask also accepts several masks separated by
+/// `;` (and `|` to exclude), so [`glob_any`] layers that on top.
+///
+/// Iterative with backtracking rather than recursive, so a pathological pattern like `*a*a*a*…`
+/// can't blow the stack on a hostile listing.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Where to resume if the current `*` guess fails.
+    let (mut star, mut resume) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            resume = ni;
+            pi += 1; // try matching zero chars first
+        } else if star != usize::MAX {
+            pi = star + 1; // backtrack: let the `*` swallow one more char
+            resume += 1;
+            ni = resume;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Match against a Total-Commander-style mask set: `*.zip;*.rar` (include any), with an optional
+/// `|` section listing exclusions — `*.*|*.tmp;*.bak`. An empty/blank mask matches everything.
+pub fn glob_any(mask: &str, name: &str) -> bool {
+    let mask = mask.trim();
+    if mask.is_empty() {
+        return true;
+    }
+    let (inc, exc) = match mask.split_once('|') {
+        Some((a, b)) => (a, b),
+        None => (mask, ""),
+    };
+    let listed = |set: &str, name: &str| {
+        set.split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .any(|p| glob_match(p, name))
+    };
+    if !exc.trim().is_empty() && listed(exc, name) {
+        return false;
+    }
+    let inc = inc.trim();
+    inc.is_empty() || listed(inc, name)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+
+    #[test]
+    fn wildcards() {
+        assert!(glob_match("*.zip", "pack.zip"));
+        assert!(glob_match("*.ZIP", "pack.zip"), "case-insensitive");
+        assert!(!glob_match("*.zip", "pack.rar"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a?c.txt", "abc.txt"));
+        assert!(!glob_match("a?c.txt", "ac.txt"));
+        assert!(glob_match("ac*dc*", "acldcx"));
+        assert!(glob_match("*mod*", "a.mod.bak"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exact2"));
+        // Backtracking: the first `*` must give ground for the tail to match.
+        assert!(glob_match("*a*b", "xxaxxb"));
+        assert!(!glob_match("*a*b", "xxaxx"));
+        // Trailing stars collapse.
+        assert!(glob_match("abc***", "abc"));
+    }
+
+    #[test]
+    fn mask_sets_and_exclusions() {
+        assert!(glob_any("*.zip;*.rar", "x.rar"));
+        assert!(!glob_any("*.zip;*.rar", "x.txt"));
+        assert!(glob_any("", "anything"), "blank matches all");
+        assert!(glob_any("   ", "anything"));
+        // `|` excludes.
+        assert!(glob_any("*.*|*.tmp", "a.txt"));
+        assert!(!glob_any("*.*|*.tmp", "a.tmp"));
+        assert!(!glob_any("*|*.bak;*.tmp", "x.bak"));
+        // Exclusion-only mask still includes everything else.
+        assert!(glob_any("|*.tmp", "keep.me"));
+    }
+}
+
+#[cfg(test)]
+mod live_recursive {
+    use super::*;
+    /// Recursive crawl + mask filtering against a real server. Deliberately points at a tiny
+    /// sub-tree so the test stays polite.
+    #[test]
+    #[ignore = "hits the live network"]
+    fn recursive_enumerate_with_mask() {
+        let (parts, http) = parts_for_url("https://modland.com/pub/modules/AM Composer").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found = Vec::new();
+        enumerate(&parts, http, "*", true, &cancel, |f| found.push(f)).unwrap();
+        eprintln!("RECURSIVE: {} file(s)", found.len());
+        for f in found.iter().take(5) {
+            eprintln!("   {}/{}  ({} bytes)", f.rel.join("/"), f.name, f.size);
+        }
+        assert!(!found.is_empty(), "recursion descended into sub-directories");
+        assert!(found.iter().any(|f| !f.rel.is_empty()), "found nested files");
+
+        // Now with a mask that should exclude everything.
+        let mut none = Vec::new();
+        enumerate(&parts, http, "*.zzz", true, &cancel, |f| none.push(f)).unwrap();
+        eprintln!("MASKED(*.zzz): {}", none.len());
+        assert!(none.is_empty(), "mask filters files");
     }
 }
