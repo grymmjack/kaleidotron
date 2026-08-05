@@ -259,6 +259,24 @@ enum LospecMsg {
     Done(usize),
 }
 
+/// Messages from a Poly Haven browse worker (`ph_walk`): one CC0 asset per hit, then the count.
+enum PhMsg {
+    Hit(Entry, Box<crate::polyhaven::PhAsset>),
+    Done(usize),
+}
+
+/// Messages from a free-audio search worker (`snd_walk`): one audio result per hit, then the count.
+enum SndMsg {
+    Hit(Entry, Box<crate::audiosearch::SndResult>),
+    Done(usize),
+}
+
+/// Messages from a Google Fonts browse worker (`gf_walk`): one family per hit, then the count.
+enum GfMsg {
+    Hit(Entry, Box<crate::gfonts::GFont>),
+    Done(usize),
+}
+
 /// Messages from an AI-generation worker (`start_ai_job`): one produced file per batch item, then
 /// the final result.
 enum AiJobMsg {
@@ -1789,6 +1807,35 @@ pub struct PixelView {
     lospec_authors: HashMap<PathBuf, String>, // palette path → author (fetched lazily from the .json)
     #[allow(clippy::type_complexity)]
     lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
+    // Poly Haven (CC0 3D models / textures / HDRIs). A model is a *bundle* (gltf manifest + .bin +
+    // textures), so `ph_files` maps the virtual path to the mounted main file — see `start_ph_open`.
+    ph_assets: HashMap<PathBuf, crate::polyhaven::PhAsset>,
+    ph_queries: [String; 3], // one Places search box per Kind (models / textures / hdris)
+    ph_rx: Option<std::sync::mpsc::Receiver<PhMsg>>,
+    ph_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ph_files: HashMap<PathBuf, PathBuf>, // virtual → the downloaded/mounted local file
+    #[allow(clippy::type_complexity)]
+    ph_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    ph_dir: PathBuf, // <data>/polyhaven — mounted asset bundles
+    // Free audio search (Openverse `/v1/audio/`) — results download to real files and open in the
+    // waveform editor / sample pads, so every existing audio feature applies unchanged.
+    snd_results: HashMap<PathBuf, crate::audiosearch::SndResult>,
+    snd_query: String,
+    snd_rx: Option<std::sync::mpsc::Receiver<SndMsg>>,
+    snd_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    snd_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local audio file
+    #[allow(clippy::type_complexity)]
+    snd_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    snd_dir: PathBuf, // <data>/audio — downloaded clips
+    // Google Fonts browser — downloads the real `.ttf`, which then opens in the font viewer.
+    gf_fonts: HashMap<PathBuf, crate::gfonts::GFont>,
+    gf_query: String,
+    gf_rx: Option<std::sync::mpsc::Receiver<GfMsg>>,
+    gf_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    gf_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local .ttf
+    #[allow(clippy::type_complexity)]
+    gf_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    gf_dir: PathBuf, // <data>/gfonts — downloaded families
     // SteamTube: installed Steam games keyed by virtual path (`<steam>/<Name [appid]>`). Clicking
     // one routes to a YouTube search for the game; right-click launches/opens Steam pages.
     steam_games: HashMap<PathBuf, crate::steam::SteamGame>,
@@ -2568,6 +2615,12 @@ impl PixelView {
         // Downloaded Lospec palettes live under the data dir and are folded into the library, so a
         // palette you grabbed last session is still in the Recolor list this session.
         let lospec_dir = data_dir.join("lospec");
+        // Downloaded Poly Haven bundles / audio clips / Google Fonts. These are real files the user
+        // keeps (a 3D model bundle or a font is not throwaway cache), so they live beside the
+        // palettes under the data dir rather than in the 2 GiB HTTP blob cache.
+        let ph_dir = data_dir.join("polyhaven");
+        let snd_dir = data_dir.join("audio");
+        let gf_dir = data_dir.join("gfonts");
         let mut palette_files = all_palettes(&palette_dir);
         for p in all_palettes(&lospec_dir) {
             if !palette_files.contains(&p) {
@@ -3259,6 +3312,27 @@ impl PixelView {
             lospec_detail: None,
             lospec_authors: HashMap::new(),
             lospec_author_rx: None,
+            ph_assets: HashMap::new(),
+            ph_queries: [String::new(), String::new(), String::new()],
+            ph_rx: None,
+            ph_cancel: None,
+            ph_files: HashMap::new(),
+            ph_open_rx: None,
+            ph_dir,
+            snd_results: HashMap::new(),
+            snd_query: String::new(),
+            snd_rx: None,
+            snd_cancel: None,
+            snd_files: HashMap::new(),
+            snd_open_rx: None,
+            snd_dir,
+            gf_fonts: HashMap::new(),
+            gf_query: String::new(),
+            gf_rx: None,
+            gf_cancel: None,
+            gf_files: HashMap::new(),
+            gf_open_rx: None,
+            gf_dir,
             yt_videos: HashMap::new(),
             yt_playlists: HashMap::new(),
             yt_channel_names: HashMap::new(),
@@ -3399,6 +3473,21 @@ impl PixelView {
         // Lospec palette browser (query → swatch tiles → click downloads the .gpl + applies it).
         if crate::lospec::is_remote(&dir) {
             self.open_lospec(dir);
+            return;
+        }
+        // Poly Haven CC0 assets (3D models / textures / HDRIs) — browse → download → view.
+        if crate::polyhaven::is_remote(&dir) {
+            self.open_polyhaven(dir);
+            return;
+        }
+        // Free audio search (Openverse) — results download into the waveform editor / sample pads.
+        if crate::audiosearch::is_remote(&dir) {
+            self.open_audio_search(dir);
+            return;
+        }
+        // Google Fonts — browse → download the .ttf → the font viewer.
+        if crate::gfonts::is_remote(&dir) {
+            self.open_gfonts(dir);
             return;
         }
         // A user video list (`<lists>/<name>`): show its videos in add-order.
@@ -4255,6 +4344,9 @@ impl PixelView {
             .or_else(|| self.steam_files.get(path))
             .or_else(|| self.img_files.get(path))
             .or_else(|| self.asset_files.get(path))
+            .or_else(|| self.ph_files.get(path))
+            .or_else(|| self.snd_files.get(path))
+            .or_else(|| self.gf_files.get(path))
         {
             return f.clone();
         }
@@ -4938,6 +5030,472 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lospec_open_rx = None,
+        }
+    }
+
+    // --- Poly Haven (CC0 3D models / textures / HDRIs). Paths are `<polyhaven>/<kind>` (browse all)
+    // or `<polyhaven>/<kind>/search/<query>`; a leaf is one asset, downloaded on open.
+
+    fn open_polyhaven(&mut self, dir: PathBuf) {
+        let parts = crate::polyhaven::rel_parts(&dir);
+        match parts.as_slice() {
+            // The root lists the three families as folders (the path segment is the display name).
+            [] => {
+                let entries = crate::polyhaven::Kind::ALL
+                    .iter()
+                    .map(|k| Entry {
+                        path: Path::new(crate::polyhaven::ROOT).join(k.slug()),
+                        is_dir: true,
+                        is_archive: false,
+                        size: 0,
+                        mtime: None,
+                        ctime: None,
+                        rating: 0,
+                    })
+                    .collect();
+                self.show_folder(dir, entries);
+                self.status = "Poly Haven — CC0 models, textures and HDRIs".into();
+            }
+            // `<kind>` = browse all, `<kind>/search[/<q>]` = filtered.
+            [k] if crate::polyhaven::Kind::from_slug(k).is_some() => self.start_ph_search(dir),
+            [k, s] | [k, s, _]
+                if crate::polyhaven::Kind::from_slug(k).is_some() && s == crate::polyhaven::SEARCH =>
+            {
+                self.start_ph_search(dir)
+            }
+            // A pinned asset leaf — either `<kind>/<leaf>` or `<kind>/search/<q>/<leaf>`. Matched
+            // *after* the search arms so a path whose 2nd segment is literally "search" isn't
+            // mistaken for an asset.
+            [k, _leaf] if crate::polyhaven::Kind::from_slug(k).is_some() => self.start_ph_open(dir),
+            [k, s, _q, _leaf]
+                if crate::polyhaven::Kind::from_slug(k).is_some() && s == crate::polyhaven::SEARCH =>
+            {
+                self.start_ph_open(dir)
+            }
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Browse/search a Poly Haven family on a worker. The catalogue is one cached request, so this
+    /// is fast after the first call and the query filters locally.
+    fn start_ph_search(&mut self, dir: PathBuf) {
+        let parts = crate::polyhaven::rel_parts(&dir);
+        let Some(kind) = parts.first().and_then(|k| crate::polyhaven::Kind::from_slug(k)) else {
+            return;
+        };
+        let query = parts.get(2).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.ph_assets.clear();
+        if let Some(c) = self.ph_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ph_rx = Some(rx);
+        self.ph_cancel = Some(cancel.clone());
+        self.status = if query.is_empty() {
+            format!("Loading {}…", kind.label())
+        } else {
+            format!("Searching {}: {query}", kind.label())
+        };
+        self.want_repaint = true;
+        std::thread::spawn(move || ph_walk(kind, query, &dir, cancel, tx));
+    }
+
+    /// Drain the Poly Haven worker each frame: append hits + request their CDN thumbnails.
+    fn poll_ph(&mut self) {
+        let Some(rx) = &self.ph_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(PhMsg::Hit(mut entry, a)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    if !a.thumb_url.is_empty() {
+                        self.colo_thumbs.request(&entry.path, &a.thumb_url, THUMB_PX, false);
+                    }
+                    self.ph_assets.insert(entry.path.clone(), *a);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(PhMsg::Done(n)) => {
+                    self.status = format!("{n} asset(s) — CC0, no attribution required");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.ph_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Download a Poly Haven asset. A **model is a bundle** — the `.gltf` manifest plus its `.bin`
+    /// and textures must land in one directory at the exact relative paths the manifest references,
+    /// which is why this can't reuse the single-URL `cache::get_file` path the other sources use.
+    fn start_ph_open(&mut self, vpath: PathBuf) {
+        // As with fonts: a pinned asset leaf reopened in a fresh session has no catalogue entry, so
+        // recover the slug from the filename — everything the fetch needs is the slug + kind.
+        let a = match self.ph_assets.get(&vpath).cloned() {
+            Some(a) => a,
+            None => {
+                let Some(slug) = vpath
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(crate::polyhaven::parse_slug)
+                else {
+                    self.status = "Unknown asset".into();
+                    return;
+                };
+                crate::polyhaven::PhAsset {
+                    name: slug.clone(),
+                    slug,
+                    ..Default::default()
+                }
+            }
+        };
+        if self.ph_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let Some(kind) = crate::polyhaven::rel_parts(&vpath)
+            .first()
+            .and_then(|k| crate::polyhaven::Kind::from_slug(k))
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ph_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&a.name, 40));
+        let dir = self.ph_dir.join(&a.slug);
+        std::thread::spawn(move || {
+            let _ = tx.send(ph_fetch(kind, &a, &dir).map(|local| (vpath, local)));
+        });
+    }
+
+    /// Finish a Poly Haven download: map virtual → local and open it (a model lands in the 3D
+    /// viewer, a texture/HDRI in the image viewer — `load_full` routes by extension).
+    fn poll_ph_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ph_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self
+                    .ph_assets
+                    .get(&vpath)
+                    .map(|a| format!("{} — by {} · CC0 · {}", a.name, a.author_label(), a.page_url()));
+                self.ph_files.insert(vpath.clone(), local);
+                self.ph_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.ph_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ph_open_rx = None,
+        }
+    }
+
+    /// Is `path` a Poly Haven **HDRI** result? (The tile shows a tonemapped JPG, so the extension
+    /// can't tell us — it's the virtual path's family segment that does.)
+    fn is_ph_hdri(&self, path: &Path) -> bool {
+        crate::polyhaven::is_remote(path)
+            && crate::polyhaven::rel_parts(path).first().map(|k| k.as_str())
+                == Some(crate::polyhaven::Kind::Hdris.slug())
+    }
+
+    /// Save a Poly Haven HDRI's real `.hdr` at `res` to a user-chosen location. The in-app tile is
+    /// only the tonemapped preview; this is the file you'd actually light a scene with.
+    fn save_ph_hdr(&mut self, vpath: &Path, res: &'static str) {
+        let Some(slug) = vpath
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(crate::polyhaven::parse_slug)
+        else {
+            self.status = "Unknown HDRI".into();
+            return;
+        };
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{slug}_{res}.hdr"))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = format!("Fetching {slug} {res} HDR…");
+        match crate::polyhaven::hdri_hdr_url(&slug, res)
+            .and_then(|url| crate::cache::get_file(&url, &format!("{slug}_{res}.hdr")))
+            .and_then(|src| std::fs::copy(&src, &dest).map_err(|e| e.to_string()))
+        {
+            Ok(n) => self.status = format!("Saved {} ({:.1} MB)", dest.display(), n as f64 / 1e6),
+            Err(e) => self.status = format!("HDR download failed: {e}"),
+        }
+    }
+
+    // --- Free audio search (Openverse). A result downloads to a real audio file, so it opens in
+    // the waveform editor and can be dropped onto a sample pad like any local clip.
+
+    fn open_audio_search(&mut self, dir: PathBuf) {
+        let parts = crate::audiosearch::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a query in the Places panel (e.g. “drum loop”)".into();
+            }
+            [s, _q] if s == crate::audiosearch::SEARCH => self.start_snd_search(dir),
+            // A pinned result leaf → download + open.
+            [s, _q, _leaf] if s == crate::audiosearch::SEARCH => self.start_snd_open(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    fn start_snd_search(&mut self, dir: PathBuf) {
+        let query = crate::audiosearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.snd_results.clear();
+        if let Some(c) = self.snd_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.snd_rx = Some(rx);
+        self.snd_cancel = Some(cancel.clone());
+        self.status = format!("Searching audio: {query}");
+        self.want_repaint = true;
+        std::thread::spawn(move || snd_walk(query, &dir, cancel, tx));
+    }
+
+    /// Drain the audio-search worker. Audio has no server thumbnail, so the tile falls through to
+    /// the normal decoder path (a waveform once downloaded, a music-note icon before that).
+    fn poll_snd(&mut self) {
+        let Some(rx) = &self.snd_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(SndMsg::Hit(mut entry, r)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.snd_results.insert(entry.path.clone(), *r);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(SndMsg::Done(n)) => {
+                    self.status = format!("{n} audio result(s)");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.snd_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    fn start_snd_open(&mut self, vpath: PathBuf) {
+        let Some(r) = self.snd_results.get(&vpath).cloned() else {
+            self.status = "Unknown clip".into();
+            return;
+        };
+        if self.snd_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        // Auto-enable the audio plugin — playback/editing IS the audio plugin.
+        if !self.plugin_audio {
+            self.plugin_audio = true;
+            self.registry.set_plugin("audio", true);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.snd_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&r.title, 40));
+        let dir = self.snd_dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(download_to_dir(&r.url, &r.filename(), &dir).map(|local| (vpath, local)));
+        });
+    }
+
+    fn poll_snd_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.snd_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self.snd_results.get(&vpath).map(|r| {
+                    let mut s = r.title.clone();
+                    if !r.creator.is_empty() {
+                        s.push_str(&format!(" — {}", r.creator));
+                    }
+                    s.push_str(&format!(" · {}", r.license_label()));
+                    if !r.page_url.is_empty() {
+                        s.push_str(&format!(" · {}", r.page_url));
+                    }
+                    s
+                });
+                self.snd_files.insert(vpath.clone(), local);
+                self.snd_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.snd_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.snd_open_rx = None,
+        }
+    }
+
+    // --- Google Fonts. Browsing is a local filter over one cached catalogue; opening downloads the
+    // real `.ttf`, which then flows into the existing font viewer / logo maker / 3D extrusion.
+
+    fn open_gfonts(&mut self, dir: PathBuf) {
+        let parts = crate::gfonts::rel_parts(&dir);
+        match parts.as_slice() {
+            // A blank query browses the whole catalogue (most popular first).
+            [] => self.start_gf_search(Path::new(crate::gfonts::ROOT).join(crate::gfonts::SEARCH)),
+            [s] | [s, _] if s == crate::gfonts::SEARCH => self.start_gf_search(dir),
+            [s, _q, _leaf] if s == crate::gfonts::SEARCH => self.start_gf_open(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    fn start_gf_search(&mut self, dir: PathBuf) {
+        let query = crate::gfonts::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.gf_fonts.clear();
+        if let Some(c) = self.gf_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gf_rx = Some(rx);
+        self.gf_cancel = Some(cancel.clone());
+        self.status = if query.is_empty() {
+            "Loading Google Fonts…".into()
+        } else {
+            format!("Searching fonts: {query}")
+        };
+        self.want_repaint = true;
+        std::thread::spawn(move || gf_walk(query, &dir, cancel, tx));
+    }
+
+    fn poll_gf(&mut self) {
+        let Some(rx) = &self.gf_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(GfMsg::Hit(mut entry, f)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.gf_fonts.insert(entry.path.clone(), *f);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(GfMsg::Done(n)) => {
+                    self.status = format!("{n} font famil{}", if n == 1 { "y" } else { "ies" });
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.gf_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    fn start_gf_open(&mut self, vpath: PathBuf) {
+        // A pinned font leaf reopened in a fresh session has no catalogue entry yet, so fall back to
+        // the family encoded in the filename (`parse_family`) — that's what makes a pinned result
+        // still work after a restart, without re-running the whole browse.
+        let f = match self.gf_fonts.get(&vpath).cloned() {
+            Some(f) => f,
+            None => {
+                let Some(family) = vpath
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(crate::gfonts::parse_family)
+                else {
+                    self.status = "Unknown font".into();
+                    return;
+                };
+                crate::gfonts::GFont {
+                    family,
+                    ..Default::default()
+                }
+            }
+        };
+        if self.gf_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gf_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&f.family, 40));
+        let dir = self.gf_dir.clone();
+        std::thread::spawn(move || {
+            let res = crate::gfonts::font_url(&f.family, &f.best_weight())
+                .and_then(|url| download_to_dir(&url, &f.filename(), &dir))
+                .map(|local| (vpath, local));
+            let _ = tx.send(res);
+        });
+    }
+
+    fn poll_gf_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.gf_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self
+                    .gf_fonts
+                    .get(&vpath)
+                    .map(|f| format!("{} — by {} · {}", f.family, f.designer_label(), f.page_url()));
+                self.gf_files.insert(vpath.clone(), local);
+                self.gf_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.gf_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gf_open_rx = None,
         }
     }
 
@@ -14376,6 +14934,12 @@ impl PixelView {
             || self.asset_open_rx.is_some()
             || self.lospec_rx.is_some()
             || self.lospec_open_rx.is_some()
+            || self.ph_rx.is_some()
+            || self.ph_open_rx.is_some()
+            || self.snd_rx.is_some()
+            || self.snd_open_rx.is_some()
+            || self.gf_rx.is_some()
+            || self.gf_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -15612,6 +16176,23 @@ impl PixelView {
             // A Lospec palette → open its detail view (author / colours / example art / download).
             self.selected = idx;
             self.open_lospec_detail(entry.path);
+        } else if self.ph_assets.contains_key(&entry.path) && !self.ph_files.contains_key(&entry.path)
+        {
+            // A Poly Haven asset not yet downloaded → fetch it (a model pulls its whole bundle),
+            // then open — a model lands in the 3D viewer, a texture/HDRI in the image viewer.
+            self.selected = idx;
+            self.start_ph_open(entry.path);
+        } else if self.snd_results.contains_key(&entry.path)
+            && !self.snd_files.contains_key(&entry.path)
+        {
+            // A free-audio result not yet downloaded → fetch, then open in the waveform editor.
+            self.selected = idx;
+            self.start_snd_open(entry.path);
+        } else if self.gf_fonts.contains_key(&entry.path) && !self.gf_files.contains_key(&entry.path)
+        {
+            // A Google Fonts family not yet downloaded → fetch the .ttf, then open the font viewer.
+            self.selected = idx;
+            self.start_gf_open(entry.path);
         } else if let Some(g) = self.steam_games.get(&entry.path).cloned() {
             // A Steam game tile → open its detail view (screenshots + trailers).
             self.selected = idx;
@@ -18617,6 +19198,88 @@ impl PixelView {
                                 fmt
                             });
                             ui.end_row();
+                            // Source-specific metadata for the web sources: shown even before the
+                            // asset is downloaded (it comes from the search result, not the file).
+                            if let Some(a) = self.ph_assets.get(&entry.path) {
+                                ui.weak("Author");
+                                ui.label(a.author_label());
+                                ui.end_row();
+                                ui.weak("License");
+                                ui.label("CC0 (public domain)");
+                                ui.end_row();
+                                if a.polycount > 0 {
+                                    ui.weak("Polygons");
+                                    ui.label(a.polycount.to_string());
+                                    ui.end_row();
+                                }
+                                if !a.categories.is_empty() {
+                                    ui.weak("Categories");
+                                    ui.label(a.categories.join(", "));
+                                    ui.end_row();
+                                }
+                            }
+                            if let Some(r) = self.snd_results.get(&entry.path) {
+                                if !r.creator.is_empty() {
+                                    ui.weak("Creator");
+                                    ui.label(&r.creator);
+                                    ui.end_row();
+                                }
+                                ui.weak("License");
+                                ui.label(r.license_label());
+                                ui.end_row();
+                                let dur = r.duration_label();
+                                if !dur.is_empty() {
+                                    ui.weak("Duration");
+                                    ui.label(dur);
+                                    ui.end_row();
+                                }
+                                let rate = r.rate_label();
+                                if !rate.is_empty() {
+                                    ui.weak("Sample rate");
+                                    ui.label(rate);
+                                    ui.end_row();
+                                }
+                                if r.bit_rate > 0 {
+                                    ui.weak("Bit rate");
+                                    ui.label(format!("{} kbps", r.bit_rate / 1000));
+                                    ui.end_row();
+                                }
+                                if !r.genres.is_empty() {
+                                    ui.weak("Genres");
+                                    ui.label(r.genres.join(", "));
+                                    ui.end_row();
+                                }
+                                if !r.provider.is_empty() {
+                                    ui.weak("Provider");
+                                    ui.label(&r.provider);
+                                    ui.end_row();
+                                }
+                            }
+                            if let Some(f) = self.gf_fonts.get(&entry.path) {
+                                ui.weak("Designer");
+                                ui.label(f.designer_label());
+                                ui.end_row();
+                                if !f.category.is_empty() {
+                                    ui.weak("Category");
+                                    ui.label(&f.category);
+                                    ui.end_row();
+                                }
+                                if !f.weights.is_empty() {
+                                    ui.weak("Weights");
+                                    ui.label(f.weights.join(", "));
+                                    ui.end_row();
+                                }
+                                if f.is_variable {
+                                    ui.weak("Variable");
+                                    ui.label("yes (variable axes)");
+                                    ui.end_row();
+                                }
+                                if !f.subsets.is_empty() {
+                                    ui.weak("Subsets");
+                                    ui.label(f.subsets.join(", "));
+                                    ui.end_row();
+                                }
+                            }
                             if let Some(p) = &pdf {
                                 // PDF-specific info instead of the placeholder tile's dims.
                                 ui.weak("Pages");
@@ -20600,6 +21263,7 @@ impl PixelView {
         let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
+        let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
@@ -20961,6 +21625,12 @@ impl PixelView {
                                         THUMB_PX,
                                         false,
                                     );
+                                } else if let Some(a) = self.ph_assets.get(path) {
+                                    // Poly Haven asset → its CDN preview render.
+                                    if !a.thumb_url.is_empty() {
+                                        self.colo_thumbs
+                                            .request(path, &a.thumb_url, THUMB_PX, false);
+                                    }
                                 } else if let Some(m) = self.steam_media.get(path) {
                                     // A game's screenshot / trailer thumbnail.
                                     self.colo_thumbs
@@ -21166,6 +21836,7 @@ impl PixelView {
                             let list_names: Vec<String> =
                                 self.video_lists.iter().map(|l| l.name.clone()).collect();
                             let is_vid = self.is_video_entry(&entry.path);
+                            let ph_hdri = self.is_ph_hdri(&entry.path);
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -21181,6 +21852,7 @@ impl PixelView {
                                 selected_videos,
                                 is_vid,
                                 &list_names,
+                                ph_hdri,
                             ) {
                                 match pick {
                                     p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -21204,6 +21876,7 @@ impl PixelView {
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
                                     TilePick::JoinVideos => join_sel = true,
                                     TilePick::OpenInBrowser => open_in_browser = Some(idx),
+                                    TilePick::PhHdr(res) => ph_hdr = Some((idx, res)),
                                     TilePick::Steam(a) => steam_act = Some((idx, a)),
                                     TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                                 }
@@ -21307,6 +21980,11 @@ impl PixelView {
         if let Some(i) = open_in_browser {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.open_yt_in_browser(&p);
+            }
+        }
+        if let Some((i, res)) = ph_hdr {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.save_ph_hdr(&p, res);
             }
         }
         if let Some((i, a)) = steam_act {
@@ -21657,6 +22335,7 @@ impl PixelView {
         let mut join_sel = false; // "Join videos" (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
         let mut open_in_browser: Option<usize> = None; // YouTube "Open in browser"
+        let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
@@ -21875,6 +22554,10 @@ impl PixelView {
                         }
                     } else if let Some(r) = self.img_results.get(&path) {
                         self.colo_thumbs.request(&path, &r.thumb_url, THUMB_PX, false);
+                    } else if let Some(a) = self.ph_assets.get(&path) {
+                        if !a.thumb_url.is_empty() {
+                            self.colo_thumbs.request(&path, &a.thumb_url, THUMB_PX, false);
+                        }
                     } else if !any_remote(&path) {
                         self.thumbs.request(&path, THUMB_PX);
                     }
@@ -22157,6 +22840,7 @@ impl PixelView {
                         let list_names: Vec<String> =
                             self.video_lists.iter().map(|l| l.name.clone()).collect();
                         let is_vid = self.is_video_entry(&entry.path);
+                        let ph_hdri = self.is_ph_hdri(&entry.path);
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -22172,6 +22856,7 @@ impl PixelView {
                             selected_videos,
                             is_vid,
                             &list_names,
+                            ph_hdri,
                         ) {
                             match pick {
                                 p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -22195,6 +22880,7 @@ impl PixelView {
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
                                 TilePick::JoinVideos => join_sel = true,
                                 TilePick::OpenInBrowser => open_in_browser = Some(idx),
+                                TilePick::PhHdr(res) => ph_hdr = Some((idx, res)),
                                 TilePick::Steam(a) => steam_act = Some((idx, a)),
                                 TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                             }
@@ -22346,6 +23032,11 @@ impl PixelView {
         if let Some(i) = open_in_browser {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.open_yt_in_browser(&p);
+            }
+        }
+        if let Some((i, res)) = ph_hdr {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.save_ph_hdr(&p, res);
             }
         }
         if let Some((i, a)) = steam_act {
@@ -26586,6 +27277,9 @@ impl PixelView {
                             (9, "Icons"),
                             (10, "Vectors"),
                             (11, "Palettes"),
+                            (12, "3D/CC0"),
+                            (13, "Fonts"),
+                            (14, "Audio"),
                             (6, "Steam"),
                             (7, "AI"),
                             (2, "Kits"),
@@ -26975,6 +27669,99 @@ impl PixelView {
                             });
                         }
                         if let Some(p) = self.favorites_buttons(ui, "🎨", crate::lospec::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 12 {
+                        // Poly Haven: one search box per family (models / textures / HDRIs). The
+                        // catalogue is a single cached request, so filtering is local + instant.
+                        for (i, kind) in crate::polyhaven::Kind::ALL.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let te = ui.add(
+                                    egui::TextEdit::singleline(&mut self.ph_queries[i])
+                                        .hint_text(format!("{}…", kind.label().to_lowercase()))
+                                        .desired_width(120.0),
+                                );
+                                let go = ui.button(kind.label()).clicked()
+                                    || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if go {
+                                    let q = self.ph_queries[i].trim().to_string();
+                                    let base = Path::new(crate::polyhaven::ROOT).join(kind.slug());
+                                    nav = Some(if q.is_empty() {
+                                        base
+                                    } else {
+                                        base.join(crate::polyhaven::SEARCH).join(q)
+                                    });
+                                }
+                            });
+                        }
+                        ui.weak("Poly Haven · CC0 — no attribution required");
+                        if let Some((f, label)) = self.folder.as_ref().and_then(|f| {
+                            crate::polyhaven::is_remote(f).then(|| {
+                                let p = crate::polyhaven::rel_parts(f);
+                                let kind = p.first().cloned().unwrap_or_default();
+                                let q = p.get(2).cloned().unwrap_or_default();
+                                let label = if q.is_empty() { kind } else { format!("{kind}: {q}") };
+                                (f.clone(), label)
+                            })
+                        }) {
+                            let saved = self.favorites.contains(&f);
+                            ui.add_enabled_ui(!saved, |ui| {
+                                if ui
+                                    .button(if saved { "★ Saved".into() } else { format!("★ Save “{label}”") })
+                                    .on_hover_text("Pin this Poly Haven browse to Places")
+                                    .clicked()
+                                {
+                                    self.favorites.push(f.clone());
+                                }
+                            });
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "🧊", crate::polyhaven::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 13 {
+                        // Google Fonts: search the catalogue; opening a family downloads its .ttf,
+                        // which then flows into the existing font viewer / logo maker / 3D extrusion.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.gf_query)
+                                    .hint_text("family / style…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Browse", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.gf_query.trim().to_string();
+                                nav = Some(Path::new(crate::gfonts::ROOT).join(crate::gfonts::SEARCH).join(q));
+                            }
+                        });
+                        ui.weak("Google Fonts · click a family → downloads the .ttf");
+                        if let Some(p) = self.favorites_buttons(ui, "🅰", crate::gfonts::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 14 {
+                        // Free audio (Openverse): results download to real files, so they open in
+                        // the waveform editor and drop onto sample pads like any local clip.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.snd_query)
+                                    .hint_text("drum loop, pad, …")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.snd_query.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(
+                                        Path::new(crate::audiosearch::ROOT)
+                                            .join(crate::audiosearch::SEARCH)
+                                            .join(q),
+                                    );
+                                }
+                            }
+                        });
+                        ui.weak("Openverse · CC audio → waveform editor + pads");
+                        if let Some(p) = self.favorites_buttons(ui, "🔊", crate::audiosearch::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 6 {
@@ -28040,6 +28827,12 @@ impl eframe::App for PixelView {
         self.poll_lospec(&ctx);
         self.poll_lospec_open();
         self.poll_lospec_author();
+        self.poll_ph();
+        self.poll_ph_open(&ctx);
+        self.poll_snd();
+        self.poll_snd_open(&ctx);
+        self.poll_gf();
+        self.poll_gf_open(&ctx);
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -34792,6 +35585,9 @@ fn any_remote(p: &Path) -> bool {
         || crate::imgsearch::is_remote(p)
         || crate::assetsearch::is_remote(p)
         || crate::lospec::is_remote(p)
+        || crate::polyhaven::is_remote(p)
+        || crate::audiosearch::is_remote(p)
+        || crate::gfonts::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -34996,6 +35792,153 @@ fn lospec_walk(
         }
     }
     let _ = tx.send(LospecMsg::Done(n));
+}
+
+/// A bare virtual result entry (no on-disk file behind it yet) — the shape every search worker
+/// streams. Factored out so the four browse workers don't each repeat the struct literal.
+fn virtual_entry(path: PathBuf) -> Entry {
+    Entry {
+        path,
+        is_dir: false,
+        is_archive: false,
+        size: 0,
+        mtime: None,
+        ctime: None,
+        rating: 0,
+    }
+}
+
+/// Download `url` to `<dir>/<filename>`, reusing an existing file (so re-opening a result costs
+/// nothing and a part-built library survives restarts). Unlike `cache::get_file` these land in a
+/// *persistent* user directory, not the evictable 2 GiB HTTP blob cache — a font or a 3D model is
+/// something you keep.
+fn download_to_dir(url: &str, filename: &str, dir: &Path) -> Result<PathBuf, String> {
+    let path = dir.join(filename);
+    if path.exists() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Route through the shared HTTP cache, then copy into place (one fetch even across sources).
+    let cached = crate::cache::get_file(url, filename)?;
+    std::fs::copy(&cached, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Worker: browse/search a Poly Haven family, streaming one asset per hit.
+fn ph_walk(
+    kind: crate::polyhaven::Kind,
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<PhMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let assets = crate::polyhaven::search(kind, &query, 400).unwrap_or_default();
+    let mut n = 0usize;
+    for a in assets {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let entry = virtual_entry(root.join(a.filename(kind)));
+        n += 1;
+        if tx.send(PhMsg::Hit(entry, Box::new(a))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(PhMsg::Done(n));
+}
+
+/// Fetch one Poly Haven asset into `dir`, returning the file to open. Models materialise their
+/// whole bundle (manifest + `.bin` + textures) at the relative paths the glTF references; textures
+/// and HDRIs are a single image.
+fn ph_fetch(
+    kind: crate::polyhaven::Kind,
+    a: &crate::polyhaven::PhAsset,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    use crate::polyhaven::{Kind, DEFAULT_RES};
+    match kind {
+        Kind::Models => {
+            let (main, includes) = crate::polyhaven::model_bundle(&a.slug, DEFAULT_RES)?;
+            // Siblings first, then the manifest — so the manifest is never present-but-broken if a
+            // texture fetch fails midway (the next open retries instead of loading a partial model).
+            for f in &includes {
+                let dest = dir.join(&f.rel);
+                if dest.exists() {
+                    continue;
+                }
+                let name = Path::new(&f.rel)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "asset.bin".into());
+                let parent = dest.parent().unwrap_or(dir);
+                download_to_dir(&f.url, &name, parent)?;
+            }
+            download_to_dir(&main.url, &main.rel, dir)
+        }
+        Kind::Textures => {
+            let url = crate::polyhaven::texture_url(&a.slug, DEFAULT_RES)?;
+            download_to_dir(&url, &a.filename(kind), dir)
+        }
+        Kind::Hdris => {
+            let url = crate::polyhaven::hdri_preview_url(&a.slug)?;
+            download_to_dir(&url, &a.filename(kind), dir)
+        }
+    }
+}
+
+/// Worker: free-audio search, streaming one clip per hit.
+fn snd_walk(
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<SndMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let results = crate::audiosearch::search(&query, 120).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for r in results {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(r.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        n += 1;
+        if tx.send(SndMsg::Hit(virtual_entry(path), Box::new(r))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(SndMsg::Done(n));
+}
+
+/// Worker: browse/search Google Fonts, streaming one family per hit.
+fn gf_walk(
+    query: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<GfMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let fonts = crate::gfonts::search(&query, 400).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for f in fonts {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(f.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        n += 1;
+        if tx.send(GfMsg::Hit(virtual_entry(path), Box::new(f))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(GfMsg::Done(n));
 }
 
 /// Parse a `hh:mm:ss` / `mm:ss` / `ss` timecode (YouTube-chapter style) → seconds. Whitespace
@@ -36026,6 +36969,7 @@ enum TilePick {
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
+    PhHdr(&'static str),   // a Poly Haven HDRI → save the real .hdr at this resolution
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
     YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
     AddToList(String),     // add this video to the named list (Watch Later / a custom list)
@@ -36493,6 +37437,7 @@ fn entry_context_menu(
     selected_videos: usize, // count of currently-selected local video files (≥2 → offer Join)
     is_video: bool,         // a video (youtube or local) → offer "Add to list ▸"
     video_lists: &[String], // existing list names (for the "Add to list" submenu)
+    ph_hdri: bool,          // this entry is a Poly Haven HDRI (→ offer the real .hdr download)
 ) -> Option<TilePick> {
     let mut pick = None;
     // Open in… an external program registered for this file's type (View → Associations).
@@ -36705,6 +37650,19 @@ fn entry_context_menu(
                         pick = Some(TilePick::AddToList(name.clone()));
                         ui.close();
                     }
+                }
+            }
+        });
+        ui.separator();
+    }
+    // Poly Haven HDRI: the tile/viewer shows the tonemapped JPG preview, but the useful artifact is
+    // the real high-dynamic-range file — offer it at the common working resolutions.
+    if !entry.is_dir && crate::polyhaven::is_remote(&entry.path) && ph_hdri {
+        ui.menu_button(format!("{} Save .hdr", icons::DOWNLOAD), |ui| {
+            for res in ["1k", "2k", "4k", "8k"] {
+                if ui.button(res).clicked() {
+                    pick = Some(TilePick::PhHdr(res));
+                    ui.close();
                 }
             }
         });
