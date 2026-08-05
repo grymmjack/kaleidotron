@@ -19,6 +19,7 @@ use ttf_parser::{Face, OutlineBuilder};
 pub struct Extrude3d {
     pub depth: f32,
     pub face_rgb: [u8; 3],
+    pub back_rgb: [u8; 3], // back-face colour (the reverse side; = face_rgb for a uniform look)
     pub side_rgb: [u8; 3],
     pub letter_spacing: f32, // em-normalized
     pub line_gap: f32,       // em-normalized
@@ -31,6 +32,7 @@ impl Default for Extrude3d {
         Extrude3d {
             depth: 0.2,
             face_rgb: [220, 40, 40],
+            back_rgb: [220, 40, 40],
             side_rgb: [120, 20, 20],
             letter_spacing: 0.0,
             line_gap: 0.0,
@@ -155,7 +157,7 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
                 // line-height) don't z-fight on their coplanar caps.
                 let z_off = -(line as f32) * d2 * 0.04;
                 let bevel = opts.bevel.max(0.0).min(d2 * 0.9);
-                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, bevel, opts.face_rgb, opts.side_rgb);
+                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, bevel, opts.face_rgb, opts.back_rgb, opts.side_rgb);
             }
         }
         pen_x += adv + opts.letter_spacing;
@@ -166,6 +168,127 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
     }
     mesh.recompute_bounds();
     Some(mesh)
+}
+
+/// Extrude arbitrary flattened 2D `contours` (already closed polylines, y-up) into a 3D mesh — the
+/// same caps + walls + bevel machinery as the font extruder, but for an SVG icon/vector. The whole
+/// set is filled as ONE shape (non-zero fill → holes handled across all contours). `None` if empty.
+pub fn extrude_contours(contours: &[Vec<[f32; 2]>], opts: &Extrude3d) -> Option<Mesh3D> {
+    if contours.is_empty() {
+        return None;
+    }
+    let d2 = opts.depth.max(0.0) * 0.5;
+    let bevel = opts.bevel.max(0.0).min(d2 * 0.9);
+    let mut mesh = Mesh3D {
+        base_rgb: opts.face_rgb,
+        ..Default::default()
+    };
+    let mut tess = FillTessellator::new();
+    append_glyph(&mut mesh, contours, &mut tess, d2, 0.0, bevel, opts.face_rgb, opts.back_rgb, opts.side_rgb);
+    if mesh.positions.is_empty() || mesh.indices.len() < 3 {
+        return None;
+    }
+    mesh.recompute_bounds();
+    Some(mesh)
+}
+
+/// Parse an SVG's filled paths into flattened, closed polyline contours in a normalized, y-up space
+/// (fit to ~1 unit tall, centred), ready for [`extrude_contours`]. Uses usvg (already in the tree
+/// via resvg); Béziers are flattened to `steps` segments. `None` if the SVG has no fillable geometry.
+pub fn svg_to_contours(bytes: &[u8], steps: u32) -> Option<Vec<Vec<[f32; 2]>>> {
+    use resvg::tiny_skia::PathSegment;
+    use resvg::usvg;
+    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).ok()?;
+    let steps = steps.clamp(1, 60);
+
+    // Recursively collect filled paths, transformed to absolute coords (SVG y-down for now).
+    fn collect(group: &usvg::Group, steps: u32, out: &mut Vec<Vec<[f32; 2]>>) {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(g) => collect(g, steps, out),
+                usvg::Node::Path(p) => {
+                    if p.fill().is_none() {
+                        continue; // stroke-only paths have no fillable interior
+                    }
+                    let t = p.abs_transform();
+                    let map = |x: f32, y: f32| [t.sx * x + t.kx * y + t.tx, t.ky * x + t.sy * y + t.ty];
+                    let (mut cur, mut last): (Vec<[f32; 2]>, [f32; 2]) = (Vec::new(), [0.0, 0.0]);
+                    let push = |cur: &mut Vec<[f32; 2]>, out: &mut Vec<Vec<[f32; 2]>>| {
+                        if cur.len() >= 3 {
+                            out.push(std::mem::take(cur));
+                        } else {
+                            cur.clear();
+                        }
+                    };
+                    for seg in p.data().segments() {
+                        match seg {
+                            PathSegment::MoveTo(pt) => {
+                                push(&mut cur, out);
+                                last = [pt.x, pt.y];
+                                cur.push(map(pt.x, pt.y));
+                            }
+                            PathSegment::LineTo(pt) => {
+                                last = [pt.x, pt.y];
+                                cur.push(map(pt.x, pt.y));
+                            }
+                            PathSegment::QuadTo(c, pt) => {
+                                for i in 1..=steps {
+                                    let u = i as f32 / steps as f32;
+                                    let m = 1.0 - u;
+                                    let x = m * m * last[0] + 2.0 * m * u * c.x + u * u * pt.x;
+                                    let y = m * m * last[1] + 2.0 * m * u * c.y + u * u * pt.y;
+                                    cur.push(map(x, y));
+                                }
+                                last = [pt.x, pt.y];
+                            }
+                            PathSegment::CubicTo(c1, c2, pt) => {
+                                for i in 1..=steps {
+                                    let u = i as f32 / steps as f32;
+                                    let m = 1.0 - u;
+                                    let (m2, u2) = (m * m, u * u);
+                                    let (w0, w1, w2, w3) = (m2 * m, 3.0 * m2 * u, 3.0 * m * u2, u2 * u);
+                                    let x = w0 * last[0] + w1 * c1.x + w2 * c2.x + w3 * pt.x;
+                                    let y = w0 * last[1] + w1 * c1.y + w2 * c2.y + w3 * pt.y;
+                                    cur.push(map(x, y));
+                                }
+                                last = [pt.x, pt.y];
+                            }
+                            PathSegment::Close => push(&mut cur, out),
+                        }
+                    }
+                    push(&mut cur, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut raw: Vec<Vec<[f32; 2]>> = Vec::new();
+    collect(tree.root(), steps, &mut raw);
+    if raw.is_empty() {
+        return None;
+    }
+    // Normalize: fit to ~1 unit tall, centre at the origin, flip Y (SVG y-down → mesh y-up).
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for c in &raw {
+        for p in c {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+    let s = 1.0 / h.max(1e-4);
+    let (cx, cy) = ((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5);
+    let _ = w;
+    for c in &mut raw {
+        for p in c {
+            p[0] = (p[0] - cx) * s;
+            p[1] = -(p[1] - cy) * s; // flip Y
+        }
+    }
+    Some(raw)
 }
 
 /// Fill the (already flattened) contours into 2D cap triangles via lyon (non-zero → holes cut).
@@ -288,6 +411,7 @@ fn append_glyph(
     z_off: f32,
     bevel: f32,
     face_rgb: [u8; 3],
+    back_rgb: [u8; 3],
     side_rgb: [u8; 3],
 ) {
     let (zf, zb) = (d2 + z_off, -d2 + z_off);
@@ -296,7 +420,7 @@ fn append_glyph(
         let buf = fill_caps(contours, tess);
         if !buf.indices.is_empty() {
             push_cap(mesh, &buf, zf, false, face_rgb); // front
-            push_cap(mesh, &buf, zb, true, face_rgb); // back (reversed)
+            push_cap(mesh, &buf, zb, true, back_rgb); // back (reversed)
         }
         for c in contours {
             push_wall(mesh, c, zb, c, zf, side_rgb);
@@ -304,19 +428,19 @@ fn append_glyph(
         return;
     }
     // Beveled: the flat top/bottom faces sit on the INSET outline; a chamfer ramps out to the full
-    // outline, then the straight side wall, then a chamfer back in. Face-coloured chamfers catch the
-    // light for the classic beveled look; side walls take the body colour.
+    // outline, then the straight side wall, then a chamfer back in. Face/back-coloured chamfers catch
+    // the light for the classic beveled look; side walls take the body colour.
     let inner = inset_contours(contours, bevel);
     let buf = fill_caps(&inner, tess);
     if !buf.indices.is_empty() {
         push_cap(mesh, &buf, zf, false, face_rgb); // front face (inset)
-        push_cap(mesh, &buf, zb, true, face_rgb); // back face (inset)
+        push_cap(mesh, &buf, zb, true, back_rgb); // back face (inset)
     }
     let (zfc, zbc) = (zf - bevel, zb + bevel); // chamfer bottoms
     for (o, i) in contours.iter().zip(inner.iter()) {
         push_wall(mesh, o, zfc, i, zf, face_rgb); // front chamfer (outline@zfc → inset@zf)
         push_wall(mesh, o, zbc, o, zfc, side_rgb); // straight side wall
-        push_wall(mesh, i, zb, o, zbc, face_rgb); // back chamfer (inset@zb → outline@zbc)
+        push_wall(mesh, i, zb, o, zbc, back_rgb); // back chamfer (inset@zb → outline@zbc)
     }
 }
 
@@ -390,3 +514,38 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod svg3d {
+    use super::*;
+    use crate::decode::mesh3d::{render, Camera, RenderOpts, View};
+    #[test]
+    fn extrudes_an_svg_with_holes() {
+        // A filled square with a circular hole (even-odd) → the hole must survive tessellation.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><path fill="#000" fill-rule="evenodd" d="M10 10 H90 V90 H10 Z M50 30 A20 20 0 1 0 50 70 A20 20 0 1 0 50 30 Z"/></svg>"##;
+        let contours = svg_to_contours(svg, 8).expect("svg parses to contours");
+        assert!(contours.len() >= 2, "outer square + hole circle");
+        let m = extrude_contours(&contours, &Extrude3d { depth: 0.25, ..Default::default() }).unwrap();
+        assert!(m.tri_count() > 8);
+        // Y was flipped + normalized to ~1 unit tall, centred.
+        let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+        for v in &m.positions { ymin = ymin.min(v[1]); ymax = ymax.max(v[1]); }
+        assert!((ymax - ymin - 0.8).abs() < 0.3, "normalized height ~1 (square is 80/100)");
+    }
+    #[test]
+    #[ignore]
+    fn dump_svg_3d() {
+        let Ok(svg) = std::fs::read("/tmp/heart.svg") else { return };
+        let contours = svg_to_contours(&svg, 12).expect("heart contours");
+        eprintln!("heart: {} contours", contours.len());
+        let opts = Extrude3d { depth: 0.3, face_rgb: [230,60,70], back_rgb: [180,40,50], side_rgb: [120,20,30], bevel: 0.02, ..Default::default() };
+        let m = extrude_contours(&contours, &opts).unwrap();
+        let cam = Camera { yaw: 0.5, pitch: -0.45, zoom: 1.0, pan: [0.0,0.0] };
+        let ro = RenderOpts { bg: [28,28,32,255], light_yaw: 0.5, light_pitch: 0.7, ..Default::default() };
+        let (w,h) = (600usize, 500usize);
+        let px = render(&m, w, h, &View::Orbit(cam), &ro);
+        let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
+        image::save_buffer("/tmp/svg3d.png", &flat, w as u32, h as u32, image::ColorType::Rgba8).unwrap();
+        eprintln!("{} tris; wrote /tmp/svg3d.png", m.tri_count());
+    }
+}
