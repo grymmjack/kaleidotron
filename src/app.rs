@@ -1417,6 +1417,7 @@ pub struct PixelView {
     font_stroke_w: f32,  // TTF/OTF/FON outline width in px (0 = none), persisted
     font_stroke_color: [u8; 3], // TTF/OTF/FON outline colour, persisted
     font_stroke_mode: crate::decode::font::StrokeMode, // outer/center/inner, persisted
+    font_stroke_per_char: bool, // true = outline each glyph; false = one merged silhouette (default), persisted
     font_apply_recolor: bool, // apply the global Recolor/PixelFX pipeline to the font logo maker (default OFF — the logo maker has its own ink/bg/stroke, and SVG ignores recolor), persisted
     font_preview_zoom: f32, // logo-maker preview on-screen magnification (the sample is supersampled to device res × this, then shown 1:1 → crisp, no moiré), persisted
     font_preview_h: f32, // logo-maker preview pane height in points (draggable divider), persisted
@@ -1956,6 +1957,7 @@ impl PixelView {
     const FONT_STROKE_W_KEY: &'static str = "font_stroke_w";
     const FONT_STROKE_COLOR_KEY: &'static str = "font_stroke_color";
     const FONT_STROKE_MODE_KEY: &'static str = "font_stroke_mode";
+    const FONT_STROKE_PER_CHAR_KEY: &'static str = "font_stroke_per_char";
     const FONT_RECOLOR_KEY: &'static str = "font_apply_recolor";
     const FONT_PREVIEW_ZOOM_KEY: &'static str = "font_preview_zoom";
     const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
@@ -2878,6 +2880,10 @@ impl PixelView {
                 .and_then(|s| eframe::get_value::<u8>(s, Self::FONT_STROKE_MODE_KEY))
                 .map(crate::decode::font::StrokeMode::from_u8)
                 .unwrap_or(crate::decode::font::StrokeMode::Outer),
+            font_stroke_per_char: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_STROKE_PER_CHAR_KEY))
+                .unwrap_or(false),
             font_apply_recolor: cc
                 .storage
                 .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_RECOLOR_KEY))
@@ -6812,6 +6818,7 @@ impl PixelView {
             stroke_w: self.font_stroke_w,
             stroke_color: self.font_stroke_color,
             stroke_mode: self.font_stroke_mode.to_u8(),
+            stroke_per_char: self.font_stroke_per_char,
             apply_recolor: self.font_apply_recolor,
             face_index: if is_fon { self.fon_index } else { 0 },
             fx: Some(self.capture_fx_preset(String::new())),
@@ -6863,6 +6870,7 @@ impl PixelView {
         self.font_stroke_w = preset.stroke_w;
         self.font_stroke_color = preset.stroke_color;
         self.font_stroke_mode = crate::decode::font::StrokeMode::from_u8(preset.stroke_mode);
+        self.font_stroke_per_char = preset.stroke_per_char;
         self.font_apply_recolor = preset.apply_recolor;
         if !loaded {
             self.fon_index = preset.face_index.min(self.fon_faces.len().saturating_sub(1));
@@ -6934,6 +6942,7 @@ impl PixelView {
             stroke_w: self.font_stroke_w,
             stroke_color: self.font_stroke_color,
             stroke_mode: self.font_stroke_mode,
+            stroke_per_char: self.font_stroke_per_char,
         }
     }
 
@@ -7126,6 +7135,9 @@ impl PixelView {
                     })
                     .response
                     .on_hover_text("Outer = outside the glyph · Center = straddles the edge · Inner = inside");
+                ui.checkbox(&mut self.font_stroke_per_char, "Per char").on_hover_text(
+                    "On: outline each glyph (strokes cross where glyphs overlap — how Inkscape shows separate paths).\nOff (default): one merged silhouette outline. Both the preview AND the SVG export follow this, so they match.",
+                );
             });
             ui.separator();
             ui.checkbox(&mut self.font_apply_recolor, "Recolor").on_hover_text(
@@ -7227,11 +7239,11 @@ impl PixelView {
         let ppp = ctx.pixels_per_point();
         let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
         let key = format!(
-            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|rc{}|z{:.3}|{}|{}",
+            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|pc{}|rc{}|z{:.3}|{}|{}",
             self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
             self.font_letter_spacing, self.font_line_gap, self.font_top_down,
             self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
-            self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
+            self.font_stroke_per_char, self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
         );
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             // Supersample the whole logo (size + stroke + spacing) by render_scale.
@@ -28307,6 +28319,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_STROKE_W_KEY, &self.font_stroke_w);
         eframe::set_value(storage, Self::FONT_STROKE_COLOR_KEY, &self.font_stroke_color);
         eframe::set_value(storage, Self::FONT_STROKE_MODE_KEY, &self.font_stroke_mode.to_u8());
+        eframe::set_value(storage, Self::FONT_STROKE_PER_CHAR_KEY, &self.font_stroke_per_char);
         eframe::set_value(storage, Self::FONT_RECOLOR_KEY, &self.font_apply_recolor);
         eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
         eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
@@ -29526,6 +29539,8 @@ struct FontPreset {
     stroke_color: [u8; 3],
     #[serde(default)]
     stroke_mode: u8,
+    #[serde(default)]
+    stroke_per_char: bool,
     #[serde(default)]
     apply_recolor: bool,
     face_index: usize, // FON: which embedded face
