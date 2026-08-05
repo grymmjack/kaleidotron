@@ -1414,6 +1414,13 @@ pub struct PixelView {
     font_letter_spacing: f32, // TTF/OTF extra px between glyphs (negative overlaps), persisted
     font_line_gap: f32,  // TTF/OTF extra px between lines (negative overlaps), persisted
     font_top_down: bool, // TTF/OTF multi-line overlap order (upper lines on top), persisted
+    font_stroke_w: f32,  // TTF/OTF/FON outline width in px (0 = none), persisted
+    font_stroke_color: [u8; 3], // TTF/OTF/FON outline colour, persisted
+    font_stroke_mode: crate::decode::font::StrokeMode, // outer/center/inner, persisted
+    font_stroke_per_char: bool, // true = outline each glyph; false = one merged silhouette (default), persisted
+    font_apply_recolor: bool, // apply the global Recolor/PixelFX pipeline to the font logo maker (default OFF — the logo maker has its own ink/bg/stroke, and SVG ignores recolor), persisted
+    font_preview_zoom: f32, // logo-maker preview on-screen magnification (the sample is supersampled to device res × this, then shown 1:1 → crisp, no moiré), persisted
+    font_preview_h: f32, // logo-maker preview pane height in points (draggable divider), persisted
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1947,6 +1954,13 @@ impl PixelView {
     const FONT_LSP_KEY: &'static str = "font_lsp";
     const FONT_LGAP_KEY: &'static str = "font_lgap";
     const FONT_TOPDOWN_KEY: &'static str = "font_topdown";
+    const FONT_STROKE_W_KEY: &'static str = "font_stroke_w";
+    const FONT_STROKE_COLOR_KEY: &'static str = "font_stroke_color";
+    const FONT_STROKE_MODE_KEY: &'static str = "font_stroke_mode";
+    const FONT_STROKE_PER_CHAR_KEY: &'static str = "font_stroke_per_char";
+    const FONT_RECOLOR_KEY: &'static str = "font_apply_recolor";
+    const FONT_PREVIEW_ZOOM_KEY: &'static str = "font_preview_zoom";
+    const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2853,6 +2867,35 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_TOPDOWN_KEY))
                 .unwrap_or(true),
+            font_stroke_w: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_STROKE_W_KEY))
+                .unwrap_or(0.0),
+            font_stroke_color: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_STROKE_COLOR_KEY))
+                .unwrap_or([0, 0, 0]),
+            font_stroke_mode: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u8>(s, Self::FONT_STROKE_MODE_KEY))
+                .map(crate::decode::font::StrokeMode::from_u8)
+                .unwrap_or(crate::decode::font::StrokeMode::Outer),
+            font_stroke_per_char: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_STROKE_PER_CHAR_KEY))
+                .unwrap_or(false),
+            font_apply_recolor: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_RECOLOR_KEY))
+                .unwrap_or(false),
+            font_preview_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_ZOOM_KEY))
+                .unwrap_or(1.0),
+            font_preview_h: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_H_KEY))
+                .unwrap_or(420.0),
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -6772,6 +6815,11 @@ impl PixelView {
             letter_spacing: self.font_letter_spacing,
             line_gap: self.font_line_gap,
             top_down: self.font_top_down,
+            stroke_w: self.font_stroke_w,
+            stroke_color: self.font_stroke_color,
+            stroke_mode: self.font_stroke_mode.to_u8(),
+            stroke_per_char: self.font_stroke_per_char,
+            apply_recolor: self.font_apply_recolor,
             face_index: if is_fon { self.fon_index } else { 0 },
             fx: Some(self.capture_fx_preset(String::new())),
         };
@@ -6819,6 +6867,11 @@ impl PixelView {
         self.font_letter_spacing = preset.letter_spacing;
         self.font_line_gap = preset.line_gap;
         self.font_top_down = preset.top_down;
+        self.font_stroke_w = preset.stroke_w;
+        self.font_stroke_color = preset.stroke_color;
+        self.font_stroke_mode = crate::decode::font::StrokeMode::from_u8(preset.stroke_mode);
+        self.font_stroke_per_char = preset.stroke_per_char;
+        self.font_apply_recolor = preset.apply_recolor;
         if !loaded {
             self.fon_index = preset.face_index.min(self.fon_faces.len().saturating_sub(1));
         }
@@ -6886,6 +6939,22 @@ impl PixelView {
             letter_spacing: self.font_letter_spacing,
             line_gap: self.font_line_gap,
             top_down: self.font_top_down,
+            stroke_w: self.font_stroke_w,
+            stroke_color: self.font_stroke_color,
+            stroke_mode: self.font_stroke_mode,
+            stroke_per_char: self.font_stroke_per_char,
+        }
+    }
+
+    /// Apply the global Recolor/PixelFX pipeline to a font sample **only when the logo maker's
+    /// Recolor checkbox is on**. Off by default so the bitmap preview + PNG export match the clean
+    /// vector SVG (which never runs recolor) — a stray persisted post-FX / palette no longer paints
+    /// a surprise "shadow" on the font.
+    fn font_recolor(&mut self, path: &Path, img: crate::image_types::PixImage) -> crate::image_types::PixImage {
+        if self.font_apply_recolor {
+            self.recolor_sample(path, img)
+        } else {
+            img
         }
     }
 
@@ -6893,7 +6962,7 @@ impl PixelView {
     fn export_font_png(&mut self, sample: &str) {
         let opts = self.font_text_opts();
         let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &opts)
-            .map(|img| self.recolor_sample(&self.font_path.clone().unwrap_or_default(), img))
+            .map(|img| self.font_recolor(&self.font_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to export.".into();
             return;
@@ -6949,7 +7018,7 @@ impl PixelView {
     /// Render the composition to a temp PNG and open it in an external image editor.
     fn open_font_png_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
         let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &self.font_text_opts())
-            .map(|img| self.recolor_sample(&self.font_path.clone().unwrap_or_default(), img))
+            .map(|img| self.font_recolor(&self.font_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to render.".into();
             return;
@@ -7033,10 +7102,10 @@ impl PixelView {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Letter spacing");
-            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -50.0..=50.0).fixed_decimals(0));
+            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0).fixed_decimals(0));
             ui.separator();
             ui.label("Line height");
-            ui.add(egui::Slider::new(&mut self.font_line_gap, -100.0..=100.0).fixed_decimals(0));
+            ui.add(egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0));
             if self.font_sample.contains('\n') {
                 ui.separator();
                 ui.label("Lines");
@@ -7049,6 +7118,41 @@ impl PixelView {
             if ui.small_button("Reset").clicked() {
                 self.font_letter_spacing = 0.0;
                 self.font_line_gap = 0.0;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Stroke");
+            ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
+                .on_hover_text("Outline width (0 = none)");
+            ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
+                ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
+                egui::ComboBox::from_id_salt("font_stroke_mode")
+                    .selected_text(self.font_stroke_mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in crate::decode::font::StrokeMode::ALL {
+                            ui.selectable_value(&mut self.font_stroke_mode, m, m.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Outer = outside the glyph · Center = straddles the edge · Inner = inside");
+                ui.checkbox(&mut self.font_stroke_per_char, "Per char").on_hover_text(
+                    "On: outline each glyph (strokes cross where glyphs overlap — how Inkscape shows separate paths).\nOff (default): one merged silhouette outline. Both the preview AND the SVG export follow this, so they match.",
+                );
+            });
+            ui.separator();
+            ui.checkbox(&mut self.font_apply_recolor, "Recolor").on_hover_text(
+                "Apply the global Recolor/PixelFX pipeline to this preview + PNG export.\nOff (default) = the clean render, matching the SVG export.",
+            );
+            ui.separator();
+            ui.label("Preview");
+            ui.add(
+                egui::Slider::new(&mut self.font_preview_zoom, 0.25..=4.0)
+                    .suffix("×")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Preview on-screen size only (re-rendered crisp at any zoom; doesn't affect the exported logo)");
+            if ui.small_button("1×").on_hover_text("Reset preview zoom").clicked() {
+                self.font_preview_zoom = 1.0;
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -7088,7 +7192,7 @@ impl PixelView {
         });
         if copy_img {
             if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
-                let img = self.recolor_sample(path, img);
+                let img = self.font_recolor(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
@@ -7125,31 +7229,57 @@ impl PixelView {
                     .desired_width(f32::INFINITY),
             )
             .changed();
-        // Rendered preview (cached by every option that affects it + recolor).
+        // Rendered preview. The font is a VECTOR source, so we don't scale a bitmap (a fractional
+        // device scale on the baked anti-aliasing is what produced the window-size-dependent grey
+        // "shadow" band across the line seam). Instead we RE-RENDER the sample at device resolution ×
+        // the preview zoom — `render_scale = zoom · ppp` — then display it 1:1 (points = pixels / ppp)
+        // so each rendered texel maps to exactly one screen pixel: crisp at any zoom, no resampling,
+        // no band. Zoom 1.0 · ppp reproduces the old (pre-fix) on-screen size.
+        let preview_h = self.font_preview_h.clamp(120.0, 2000.0);
+        let ppp = ctx.pixels_per_point();
+        let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
         let key = format!(
-            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{}|{}",
+            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|pc{}|rc{}|z{:.3}|{}|{}",
             self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
-            self.font_letter_spacing, self.font_line_gap, self.font_top_down, self.pipeline_key(), self.recolor_ident()
+            self.font_letter_spacing, self.font_line_gap, self.font_top_down,
+            self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
+            self.font_stroke_per_char, self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
         );
         if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
-                let img = self.recolor_sample(path, img);
+            // Supersample the whole logo (size + stroke + spacing) by render_scale.
+            let mut opts = self.font_text_opts();
+            opts.px *= render_scale;
+            opts.stroke_w *= render_scale;
+            opts.letter_spacing *= render_scale;
+            opts.line_gap *= render_scale;
+            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &opts) {
+                let img = self.font_recolor(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
                 );
-                let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::LINEAR);
+                let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::NEAREST);
                 self.font_sample_tex = Some((key, tex));
             }
         }
-        egui::ScrollArea::horizontal()
+        egui::ScrollArea::both()
             .id_salt("font_sample_scroll")
-            .max_height(240.0)
+            .min_scrolled_height(preview_h)
+            .max_height(preview_h)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some((_, tex)) = &self.font_sample_tex {
-                    ui.add(egui::Image::new((tex.id(), tex.size_vec2())));
+                    // 1:1 device pixels (points = pixels / ppp). The texture was rendered at
+                    // device-res × zoom, so on-screen size = design × zoom, pixel-exact.
+                    let pts = tex.size_vec2() / ppp;
+                    ui.add(egui::Image::new((tex.id(), pts)));
                 }
             });
+        // Draggable divider to resize the preview pane (persisted).
+        let dy = drag_h_divider(ui, ui.available_width());
+        if dy != 0.0 {
+            self.font_preview_h = (self.font_preview_h + dy).clamp(120.0, 2000.0);
+        }
         ui.separator();
 
         // Glyph grid (paged) — click a glyph to copy it. Cell size is the shared slider, and the
@@ -7230,7 +7360,7 @@ impl PixelView {
                 cell,
                 self.font_ink,
             ) {
-                let img = self.recolor_sample(path, img);
+                let img = self.font_recolor(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
@@ -8143,6 +8273,25 @@ impl PixelView {
 
     /// Windows bitmap-font viewer (.fon/.fnt): a size (face) picker, a type-to-sample box (shares
     /// the persisted `font_sample`), and a paged glyph grid with a cell-size slider.
+    /// Render a FON/bitmap sample at ink `[235,235,235]`, applying the shared stroke + background.
+    fn render_fon_sample(&self, sample: &str) -> Option<crate::image_types::PixImage> {
+        const INK: [u8; 3] = [235, 235, 235];
+        let img = crate::decode::fon::render_text(&self.fon_bytes, self.fon_index, sample, INK)?;
+        let bg = self.font_bg_on.then_some(self.font_bg);
+        if self.font_stroke_w > 0.5 || bg.is_some() {
+            Some(crate::decode::font::stroke_image(
+                &img,
+                self.font_stroke_w,
+                self.font_stroke_color,
+                self.font_stroke_mode,
+                INK,
+                bg,
+            ))
+        } else {
+            Some(img)
+        }
+    }
+
     fn draw_fon_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
         self.ensure_fon_loaded(path);
         if self.fon_bytes.is_empty() || self.fon_faces.is_empty() {
@@ -8207,6 +8356,29 @@ impl PixelView {
                 copy_img = true;
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.font_bg_on, "BG");
+            ui.add_enabled_ui(self.font_bg_on, |ui| {
+                ui.color_edit_button_srgb(&mut self.font_bg).on_hover_text("Background fill colour");
+            });
+            ui.separator();
+            ui.label("Stroke");
+            ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
+                .on_hover_text("Outline width (0 = none)");
+            ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
+                ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
+                egui::ComboBox::from_id_salt("fon_stroke_mode")
+                    .selected_text(self.font_stroke_mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in crate::decode::font::StrokeMode::ALL {
+                            ui.selectable_value(&mut self.font_stroke_mode, m, m.label());
+                        }
+                    });
+            });
+            ui.separator();
+            ui.checkbox(&mut self.font_apply_recolor, "Recolor")
+                .on_hover_text("Apply the global Recolor/PixelFX pipeline to this preview. Off (default) = the clean render.");
+        });
         let changed = ui
             .add(
                 egui::TextEdit::multiline(&mut self.font_sample)
@@ -8220,22 +8392,20 @@ impl PixelView {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::fon::render_text(
-                &self.fon_bytes,
-                self.fon_index,
-                &sample,
-                [235, 235, 235],
-            ) {
-                let img = self.recolor_sample(path, img);
+            if let Some(img) = self.render_fon_sample(&sample) {
+                let img = self.font_recolor(path, img);
                 self.copy_image_to_clipboard(&img);
             }
         }
-        let key = format!("{}|{}|{}|{}", self.fon_index, sample, self.pipeline_key(), self.recolor_ident());
+        let key = format!(
+            "{}|{}|{:.0}|{:?}|{}|{}|rc{}|{}|{}",
+            self.fon_index, sample, self.font_stroke_w, self.font_stroke_color,
+            self.font_stroke_mode.to_u8(), self.font_bg_on, self.font_apply_recolor,
+            self.pipeline_key(), self.recolor_ident()
+        );
         if changed || self.fon_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) =
-                crate::decode::fon::render_text(&self.fon_bytes, self.fon_index, &sample, [235, 235, 235])
-            {
-                let img = self.recolor_sample(path, img);
+            if let Some(img) = self.render_fon_sample(&sample) {
+                let img = self.font_recolor(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
@@ -28146,6 +28316,13 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_LSP_KEY, &self.font_letter_spacing);
         eframe::set_value(storage, Self::FONT_LGAP_KEY, &self.font_line_gap);
         eframe::set_value(storage, Self::FONT_TOPDOWN_KEY, &self.font_top_down);
+        eframe::set_value(storage, Self::FONT_STROKE_W_KEY, &self.font_stroke_w);
+        eframe::set_value(storage, Self::FONT_STROKE_COLOR_KEY, &self.font_stroke_color);
+        eframe::set_value(storage, Self::FONT_STROKE_MODE_KEY, &self.font_stroke_mode.to_u8());
+        eframe::set_value(storage, Self::FONT_STROKE_PER_CHAR_KEY, &self.font_stroke_per_char);
+        eframe::set_value(storage, Self::FONT_RECOLOR_KEY, &self.font_apply_recolor);
+        eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
+        eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
@@ -29356,6 +29533,16 @@ struct FontPreset {
     line_gap: f32,
     #[serde(default = "default_true")]
     top_down: bool,
+    #[serde(default)]
+    stroke_w: f32,
+    #[serde(default)]
+    stroke_color: [u8; 3],
+    #[serde(default)]
+    stroke_mode: u8,
+    #[serde(default)]
+    stroke_per_char: bool,
+    #[serde(default)]
+    apply_recolor: bool,
     face_index: usize, // FON: which embedded face
     fx: Option<FxPreset>,
 }
