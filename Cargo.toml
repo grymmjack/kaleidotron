@@ -19,6 +19,9 @@ resvg = "0.47.0"
 # ttf-parser reads the name/metadata tables. Both are already in the tree transitively.
 ab_glyph = "0.2"
 ttf-parser = "0.25"
+# 3D font extrusion (the "3D logo maker"): tessellate glyph outlines (holes + non-zero fill) into
+# the front/back caps, then extrude side walls, feeding the existing mesh3d CPU rasterizer.
+lyon_tessellation = "1.0"
 # Clipboard IMAGE copy (the font viewers' "copy sample as image", Character-Map style). egui's
 # Context only copies text; arboard copies bitmaps. Already in the tree via egui-winit, so a direct
 # dep unifies to that build. `image-data` (default) enables set_image.

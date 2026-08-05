@@ -1421,6 +1421,22 @@ pub struct PixelView {
     font_apply_recolor: bool, // apply the global Recolor/PixelFX pipeline to the font logo maker (default OFF — the logo maker has its own ink/bg/stroke, and SVG ignores recolor), persisted
     font_preview_zoom: f32, // logo-maker preview on-screen magnification (the sample is supersampled to device res × this, then shown 1:1 → crisp, no moiré), persisted
     font_preview_h: f32, // logo-maker preview pane height in points (draggable divider), persisted
+    // --- 3D font extrusion (the "3D logo maker") ---
+    font_3d_on: bool,          // show the interactive 3D extruded preview instead of the flat one, persisted
+    font_3d_depth: f32,        // extrusion depth (em-normalized), persisted
+    font_3d_bevel: f32,        // chamfer bevel size (em-normalized; 0 = flat block), persisted
+    font_3d_face: [u8; 3],     // front/back face colour, persisted
+    font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
+    font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
+    font_3d_light_pitch: f32,  // key-light elevation, persisted
+    font_3d_light_rgb: [u8; 3], // key-light colour, persisted
+    font_3d_yaw: f32,          // orbit camera yaw, persisted
+    font_3d_pitch: f32,        // orbit camera pitch, persisted
+    font_3d_zoom: f32,         // orbit camera zoom, persisted
+    font_3d_pan: [f32; 2],     // orbit camera pan (fraction of viewport), session-only
+    font_3d_spin: bool,        // auto-rotate the 3D view, persisted
+    font_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached mesh (key = geometry params)
+    font_3d_tex: Option<(String, egui::TextureHandle)>,            // cached render (key = mesh + camera + light + size)
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
     font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
@@ -1961,6 +1977,18 @@ impl PixelView {
     const FONT_RECOLOR_KEY: &'static str = "font_apply_recolor";
     const FONT_PREVIEW_ZOOM_KEY: &'static str = "font_preview_zoom";
     const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
+    const FONT_3D_ON_KEY: &'static str = "font_3d_on";
+    const FONT_3D_DEPTH_KEY: &'static str = "font_3d_depth";
+    const FONT_3D_BEVEL_KEY: &'static str = "font_3d_bevel";
+    const FONT_3D_FACE_KEY: &'static str = "font_3d_face";
+    const FONT_3D_SIDE_KEY: &'static str = "font_3d_side";
+    const FONT_3D_LIGHT_YAW_KEY: &'static str = "font_3d_light_yaw";
+    const FONT_3D_LIGHT_PITCH_KEY: &'static str = "font_3d_light_pitch";
+    const FONT_3D_LIGHT_RGB_KEY: &'static str = "font_3d_light_rgb";
+    const FONT_3D_YAW_KEY: &'static str = "font_3d_yaw";
+    const FONT_3D_PITCH_KEY: &'static str = "font_3d_pitch";
+    const FONT_3D_ZOOM_KEY: &'static str = "font_3d_zoom";
+    const FONT_3D_SPIN_KEY: &'static str = "font_3d_spin";
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
@@ -2896,6 +2924,21 @@ impl PixelView {
                 .storage
                 .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_H_KEY))
                 .unwrap_or(420.0),
+            font_3d_on: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_ON_KEY)).unwrap_or(false),
+            font_3d_depth: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY)).unwrap_or(0.2),
+            font_3d_bevel: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY)).unwrap_or(0.0),
+            font_3d_face: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY)).unwrap_or([220, 40, 40]),
+            font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
+            font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
+            font_3d_light_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY)).unwrap_or(0.7),
+            font_3d_light_rgb: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_LIGHT_RGB_KEY)).unwrap_or([255, 255, 255]),
+            font_3d_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_YAW_KEY)).unwrap_or(0.5),
+            font_3d_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_PITCH_KEY)).unwrap_or(-0.45),
+            font_3d_zoom: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_ZOOM_KEY)).unwrap_or(1.0),
+            font_3d_pan: [0.0, 0.0],
+            font_3d_spin: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_SPIN_KEY)).unwrap_or(false),
+            font_3d_mesh: None,
+            font_3d_tex: None,
             font_preview_text: cc
                 .storage
                 .and_then(|s| eframe::get_value::<String>(s, Self::FONT_PREVIEW_KEY))
@@ -7033,6 +7076,187 @@ impl PixelView {
         self.launch_external(exec, args, env, &out);
     }
 
+    /// Build the extrusion options from the current 2D layout (spacing is px-at-font-size → convert
+    /// to the em-normalized units the extruder works in).
+    fn font_3d_opts(&self) -> crate::decode::font3d::Extrude3d {
+        let em = self.font_size.max(1.0);
+        crate::decode::font3d::Extrude3d {
+            depth: self.font_3d_depth,
+            face_rgb: self.font_3d_face,
+            side_rgb: self.font_3d_side,
+            letter_spacing: self.font_letter_spacing / em,
+            line_gap: self.font_line_gap / em,
+            steps: 8,
+            bevel: self.font_3d_bevel,
+        }
+    }
+
+    /// The interactive 3D extruded preview: fills `avail`, drag to orbit, wheel to zoom. Re-tessellates
+    /// only when geometry params change; re-renders only when the camera / light / size change.
+    fn draw_font_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2) {
+        use crate::decode::mesh3d::{render, Camera, RenderOpts, View};
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        // Middle-drag (or Space held) pans; primary drag orbits.
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let panning = resp.dragged_by(egui::PointerButton::Middle) || (resp.dragged() && space);
+        if panning {
+            let d = resp.drag_delta();
+            self.font_3d_pan[0] += d.x / rect.width().max(1.0);
+            self.font_3d_pan[1] += d.y / rect.height().max(1.0);
+        } else if resp.dragged() {
+            let d = resp.drag_delta();
+            self.font_3d_yaw += d.x * 0.01;
+            self.font_3d_pitch = (self.font_3d_pitch + d.y * 0.01).clamp(-1.55, 1.55);
+        }
+        // Wheel = zoom (consume it so nothing else scrolls).
+        if resp.hovered() {
+            let sc = ctx.input(|i| i.smooth_scroll_delta.y) + ctx.input(|i| (i.zoom_delta() - 1.0) * 200.0);
+            if sc.abs() > 0.01 {
+                self.font_3d_zoom = (self.font_3d_zoom * (1.0 + sc * 0.0015)).clamp(0.15, 8.0);
+            }
+        }
+        // Auto-spin.
+        if self.font_3d_spin {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            self.font_3d_yaw += dt * 0.6;
+            ctx.request_repaint();
+        }
+        // Keep yaw bounded so the persisted value doesn't grow without limit.
+        let tau = std::f32::consts::TAU;
+        self.font_3d_yaw = self.font_3d_yaw.rem_euclid(tau);
+        if panning {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        } else if resp.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        // (Re)build the mesh when a geometry param changes. Take it out of `self` so we can render it
+        // while assigning the texture back (no double &mut self borrow).
+        let opts = self.font_3d_opts();
+        let mesh_key = format!(
+            "{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}",
+            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap, opts.face_rgb, opts.side_rgb
+        );
+        let mut mesh = self.font_3d_mesh.take();
+        if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
+            mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &opts)
+                .map(|m| (mesh_key.clone(), m));
+        }
+
+        // Clamp the render texture to the GPU limit (the 8192 max texture dim), like the rest of the
+        // app — a wide pane × a high pixels-per-point can otherwise exceed it and crash wgpu.
+        let ppp = ctx.pixels_per_point();
+        let wpx = ((rect.width() * ppp).round() as usize).clamp(1, 8000);
+        let hpx = ((rect.height() * ppp).round() as usize).clamp(1, 8000);
+        if let Some((_, m)) = &mesh {
+            let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+            let ro = RenderOpts {
+                textured: false,
+                wireframe: false,
+                wire_color: [30, 32, 38],
+                light_yaw: self.font_3d_light_yaw,
+                light_pitch: self.font_3d_light_pitch,
+                light_rgb: self.font_3d_light_rgb,
+                bg: [22, 22, 26, 255],
+            };
+            let tkey = format!(
+                "{mesh_key}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}|{:?}|{wpx}x{hpx}",
+                self.font_3d_yaw, self.font_3d_pitch, self.font_3d_zoom, self.font_3d_light_yaw,
+                self.font_3d_light_pitch, self.font_3d_light_rgb
+            );
+            if self.font_3d_tex.as_ref().map(|(k, _)| k != &tkey).unwrap_or(true) {
+                let px = render(m, wpx, hpx, &View::Orbit(cam), &ro);
+                let mut flat = Vec::with_capacity(px.len() * 4);
+                for p in &px {
+                    flat.extend_from_slice(p);
+                }
+                let img = egui::ColorImage::from_rgba_unmultiplied([wpx, hpx], &flat);
+                let tex = ctx.load_texture("font_3d", img, egui::TextureOptions::LINEAR);
+                self.font_3d_tex = Some((tkey, tex));
+            }
+            if let Some((_, tex)) = &self.font_3d_tex {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+            }
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "(nothing to extrude)",
+                egui::FontId::proportional(14.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        self.font_3d_mesh = mesh;
+    }
+
+    /// The render options for the 3D font (light + a transparent bg for exports).
+    fn font_3d_render_opts(&self, bg: [u8; 4]) -> crate::decode::mesh3d::RenderOpts {
+        crate::decode::mesh3d::RenderOpts {
+            textured: false,
+            wireframe: false,
+            wire_color: [30, 32, 38],
+            light_yaw: self.font_3d_light_yaw,
+            light_pitch: self.font_3d_light_pitch,
+            light_rgb: self.font_3d_light_rgb,
+            bg,
+        }
+    }
+
+    /// Build the SVG vector snapshot of the current 3D view at `w`×`h` (transparent bg).
+    fn font_3d_svg(&self, w: usize, h: usize) -> Option<String> {
+        use crate::decode::mesh3d::{Camera, View};
+        let mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts())?;
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+        Some(crate::decode::mesh3d::to_svg(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0])))
+    }
+
+    /// Default export basename: `<family>_<sample>`.
+    fn font_export_stem(&self) -> String {
+        let base = self.font_info.as_ref().map(|i| i.family.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "font".into());
+        let clean = |s: &str, n: usize| -> String {
+            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+        };
+        format!("{}_{}_3d", clean(&base, 24), clean(&self.font_sample, 24))
+    }
+
+    /// Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle).
+    fn export_font_3d_svg(&mut self) {
+        let Some(svg) = self.font_3d_svg(1600, 1200) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let default = format!("{}.svg", self.font_export_stem());
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+            match std::fs::write(&p, svg) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Save the current 3D view as a high-res PNG (transparent background).
+    fn export_font_3d_png(&mut self) {
+        use crate::decode::mesh3d::{render, Camera, View};
+        let Some(mesh) = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts()) else {
+            self.status = "Nothing to export.".into();
+            return;
+        };
+        let (w, h) = (1600usize, 1200usize);
+        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+        let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
+        let default = format!("{}.png", self.font_export_stem());
+        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&p)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
     fn draw_font_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
         self.ensure_font_loaded(path);
         if self.font_bytes.is_empty() {
@@ -7154,7 +7378,55 @@ impl PixelView {
             if ui.small_button("1×").on_hover_text("Reset preview zoom").clicked() {
                 self.font_preview_zoom = 1.0;
             }
+            ui.separator();
+            ui.checkbox(&mut self.font_3d_on, "3D")
+                .on_hover_text("Extrude the text into an interactive 3D logo (drag to rotate, wheel to zoom)");
         });
+        if self.font_3d_on {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Depth");
+                ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                ui.label("Bevel");
+                ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
+                    .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
+                ui.separator();
+                ui.label("Face");
+                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front/back face colour");
+                ui.label("Body");
+                ui.color_edit_button_srgb(&mut self.font_3d_side).on_hover_text("Extruded side (depth) colour");
+                ui.separator();
+                ui.label("Light");
+                let pi = std::f32::consts::PI;
+                ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2))
+                    .on_hover_text("Light azimuth");
+                ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
+                    .on_hover_text("Light elevation");
+                ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
+                ui.separator();
+                ui.checkbox(&mut self.font_3d_spin, "Spin").on_hover_text("Auto-rotate the logo");
+                if ui.small_button("Reset view").clicked() {
+                    self.font_3d_yaw = 0.5;
+                    self.font_3d_pitch = -0.45;
+                    self.font_3d_zoom = 1.0;
+                    self.font_3d_pan = [0.0, 0.0];
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("💾 PNG").on_hover_text("Save the current 3D view as a PNG (transparent background)").clicked() {
+                    self.export_font_3d_png();
+                }
+                if ui.small_button("💾 SVG").on_hover_text("Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle — edit in Inkscape)").clicked() {
+                    self.export_font_3d_svg();
+                }
+                if ui.small_button("📋 SVG").on_hover_text("Copy the 3D view as vector SVG").clicked() {
+                    if let Some(svg) = self.font_3d_svg(1400, 1000) {
+                        ctx.copy_text(svg);
+                        self.status = "Copied 3D composition SVG".into();
+                    }
+                }
+                ui.weak("· drag to rotate · wheel to zoom");
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
                 want_copy = Some(self.font_sample.clone());
@@ -7237,44 +7509,50 @@ impl PixelView {
         // no band. Zoom 1.0 · ppp reproduces the old (pre-fix) on-screen size.
         let preview_h = self.font_preview_h.clamp(120.0, 2000.0);
         let ppp = ctx.pixels_per_point();
-        let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
-        let key = format!(
-            "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|pc{}|rc{}|z{:.3}|{}|{}",
-            self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
-            self.font_letter_spacing, self.font_line_gap, self.font_top_down,
-            self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
-            self.font_stroke_per_char, self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
-        );
-        if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            // Supersample the whole logo (size + stroke + spacing) by render_scale.
-            let mut opts = self.font_text_opts();
-            opts.px *= render_scale;
-            opts.stroke_w *= render_scale;
-            opts.letter_spacing *= render_scale;
-            opts.line_gap *= render_scale;
-            if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &opts) {
-                let img = self.font_recolor(path, img);
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [img.width as usize, img.height as usize],
-                    &img.rgba_bytes(),
-                );
-                let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::NEAREST);
-                self.font_sample_tex = Some((key, tex));
-            }
-        }
-        egui::ScrollArea::both()
-            .id_salt("font_sample_scroll")
-            .min_scrolled_height(preview_h)
-            .max_height(preview_h)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if let Some((_, tex)) = &self.font_sample_tex {
-                    // 1:1 device pixels (points = pixels / ppp). The texture was rendered at
-                    // device-res × zoom, so on-screen size = design × zoom, pixel-exact.
-                    let pts = tex.size_vec2() / ppp;
-                    ui.add(egui::Image::new((tex.id(), pts)));
+        if self.font_3d_on {
+            // Interactive 3D extruded preview (fills the resizable pane).
+            let avail = egui::vec2(ui.available_width(), preview_h);
+            self.draw_font_3d(ctx, ui, avail);
+        } else {
+            let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
+            let key = format!(
+                "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|pc{}|rc{}|z{:.3}|{}|{}",
+                self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
+                self.font_letter_spacing, self.font_line_gap, self.font_top_down,
+                self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
+                self.font_stroke_per_char, self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
+            );
+            if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                // Supersample the whole logo (size + stroke + spacing) by render_scale.
+                let mut opts = self.font_text_opts();
+                opts.px *= render_scale;
+                opts.stroke_w *= render_scale;
+                opts.letter_spacing *= render_scale;
+                opts.line_gap *= render_scale;
+                if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &opts) {
+                    let img = self.font_recolor(path, img);
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [img.width as usize, img.height as usize],
+                        &img.rgba_bytes(),
+                    );
+                    let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::NEAREST);
+                    self.font_sample_tex = Some((key, tex));
                 }
-            });
+            }
+            egui::ScrollArea::both()
+                .id_salt("font_sample_scroll")
+                .min_scrolled_height(preview_h)
+                .max_height(preview_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some((_, tex)) = &self.font_sample_tex {
+                        // 1:1 device pixels (points = pixels / ppp). The texture was rendered at
+                        // device-res × zoom, so on-screen size = design × zoom, pixel-exact.
+                        let pts = tex.size_vec2() / ppp;
+                        ui.add(egui::Image::new((tex.id(), pts)));
+                    }
+                });
+        }
         // Draggable divider to resize the preview pane (persisted).
         let dy = drag_h_divider(ui, ui.available_width());
         if dy != 0.0 {
@@ -22749,6 +23027,7 @@ impl PixelView {
             wire_color: self.td_wire_color,
             light_yaw: self.td_light_yaw,
             light_pitch: self.td_light_pitch,
+            light_rgb: [255, 255, 255],
             bg: [self.td_bg[0], self.td_bg[1], self.td_bg[2], 255],
         };
 
@@ -28323,6 +28602,18 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_RECOLOR_KEY, &self.font_apply_recolor);
         eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
         eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
+        eframe::set_value(storage, Self::FONT_3D_ON_KEY, &self.font_3d_on);
+        eframe::set_value(storage, Self::FONT_3D_DEPTH_KEY, &self.font_3d_depth);
+        eframe::set_value(storage, Self::FONT_3D_BEVEL_KEY, &self.font_3d_bevel);
+        eframe::set_value(storage, Self::FONT_3D_FACE_KEY, &self.font_3d_face);
+        eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
+        eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);
+        eframe::set_value(storage, Self::FONT_3D_LIGHT_PITCH_KEY, &self.font_3d_light_pitch);
+        eframe::set_value(storage, Self::FONT_3D_LIGHT_RGB_KEY, &self.font_3d_light_rgb);
+        eframe::set_value(storage, Self::FONT_3D_YAW_KEY, &self.font_3d_yaw);
+        eframe::set_value(storage, Self::FONT_3D_PITCH_KEY, &self.font_3d_pitch);
+        eframe::set_value(storage, Self::FONT_3D_ZOOM_KEY, &self.font_3d_zoom);
+        eframe::set_value(storage, Self::FONT_3D_SPIN_KEY, &self.font_3d_spin);
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
