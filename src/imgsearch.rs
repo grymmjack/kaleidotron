@@ -155,18 +155,42 @@ fn enc(q: &str) -> String {
     out
 }
 
-/// Search Openverse for `query`, up to `n` results (page_size ≤ 60 per the API). Uses the shared
-/// HTTP cache (1-day TTL) so repeat searches are instant + offline-friendly.
+/// Openverse caps **anonymous** requests to `page_size ≤ 20` (a larger value 401s with
+/// "page_size may not exceed 20 for anonymous requests" → an empty result set, which reads as
+/// "image search is broken"). So we page in 20s. Do NOT raise this without an API key.
+const PAGE_MAX: usize = 20;
+
+/// The Openverse request URL for `query`, page `page`. Kept separate so a test can assert the
+/// page-size stays within the anonymous limit (the regression that silently emptied the results).
+fn page_url(query: &str, page: usize) -> String {
+    // `mature=false` (default) keeps results SFW.
+    format!("{API}?q={}&page_size={PAGE_MAX}&page={page}", enc(query))
+}
+
+/// Search Openverse for `query`, up to `n` results. Fetches successive pages of ≤20 (the anonymous
+/// limit) until it has `n` or the results run out. Uses the shared HTTP cache (1-day TTL) so repeat
+/// searches are instant + offline-friendly.
 pub fn search(query: &str, n: usize) -> Result<Vec<ImgResult>, String> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let size = n.clamp(1, 60);
-    // `mature=false` (default) keeps results SFW; `license_type=all-cc,commercial` widens coverage.
-    let url = format!("{API}?q={}&page_size={size}", enc(q));
-    let body = crate::cache::get_bytes(&url, Some(86_400))?;
-    Ok(parse_results(&body))
+    let want = n.clamp(1, 240); // a sane ceiling (12 pages)
+    let pages = want.div_ceil(PAGE_MAX);
+    let mut out: Vec<ImgResult> = Vec::new();
+    for page in 1..=pages {
+        let body = crate::cache::get_bytes(&page_url(q, page), Some(86_400))?;
+        let batch = parse_results(&body);
+        if batch.is_empty() {
+            break; // ran out of results
+        }
+        out.extend(batch);
+        if out.len() >= want {
+            break;
+        }
+    }
+    out.truncate(want);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -205,6 +229,16 @@ mod tests {
         assert!(is_remote(&p));
         assert_eq!(rel_parts(&p), vec!["search", "sunset"]);
         assert_eq!(enc("blue sky!"), "blue%20sky%21");
+    }
+
+    #[test]
+    fn request_stays_within_anonymous_page_limit() {
+        // Openverse 401s anonymous requests with page_size > 20 → empty results (the bug that made
+        // image search "not work"). Guard both the constant and the built URL.
+        assert!(PAGE_MAX <= 20, "anonymous page_size cap is 20");
+        let url = page_url("skull", 1);
+        assert!(url.contains(&format!("page_size={PAGE_MAX}")));
+        assert!(url.contains("q=skull") && url.contains("page=1"));
     }
 }
 
