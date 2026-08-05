@@ -1424,6 +1424,7 @@ pub struct PixelView {
     // --- 3D font extrusion (the "3D logo maker") ---
     font_3d_on: bool,          // show the interactive 3D extruded preview instead of the flat one, persisted
     font_3d_depth: f32,        // extrusion depth (em-normalized), persisted
+    font_3d_bevel: f32,        // chamfer bevel size (em-normalized; 0 = flat block), persisted
     font_3d_face: [u8; 3],     // front/back face colour, persisted
     font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
     font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
@@ -1978,6 +1979,7 @@ impl PixelView {
     const FONT_PREVIEW_H_KEY: &'static str = "font_preview_h";
     const FONT_3D_ON_KEY: &'static str = "font_3d_on";
     const FONT_3D_DEPTH_KEY: &'static str = "font_3d_depth";
+    const FONT_3D_BEVEL_KEY: &'static str = "font_3d_bevel";
     const FONT_3D_FACE_KEY: &'static str = "font_3d_face";
     const FONT_3D_SIDE_KEY: &'static str = "font_3d_side";
     const FONT_3D_LIGHT_YAW_KEY: &'static str = "font_3d_light_yaw";
@@ -2924,6 +2926,7 @@ impl PixelView {
                 .unwrap_or(420.0),
             font_3d_on: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_ON_KEY)).unwrap_or(false),
             font_3d_depth: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY)).unwrap_or(0.2),
+            font_3d_bevel: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY)).unwrap_or(0.0),
             font_3d_face: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY)).unwrap_or([220, 40, 40]),
             font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
             font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
@@ -7084,6 +7087,7 @@ impl PixelView {
             letter_spacing: self.font_letter_spacing / em,
             line_gap: self.font_line_gap / em,
             steps: 8,
+            bevel: self.font_3d_bevel,
         }
     }
 
@@ -7380,6 +7384,9 @@ impl PixelView {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Depth");
                 ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                ui.label("Bevel");
+                ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
+                    .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
                 ui.separator();
                 ui.label("Face");
                 ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front/back face colour");
@@ -28595,6 +28602,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
         eframe::set_value(storage, Self::FONT_3D_ON_KEY, &self.font_3d_on);
         eframe::set_value(storage, Self::FONT_3D_DEPTH_KEY, &self.font_3d_depth);
+        eframe::set_value(storage, Self::FONT_3D_BEVEL_KEY, &self.font_3d_bevel);
         eframe::set_value(storage, Self::FONT_3D_FACE_KEY, &self.font_3d_face);
         eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
         eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);

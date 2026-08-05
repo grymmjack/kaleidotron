@@ -23,6 +23,7 @@ pub struct Extrude3d {
     pub letter_spacing: f32, // em-normalized
     pub line_gap: f32,       // em-normalized
     pub steps: u32,          // Bézier flattening steps per curve (higher = smoother, heavier)
+    pub bevel: f32,          // chamfer size (em-normalized; 0 = a flat block, no bevel)
 }
 
 impl Default for Extrude3d {
@@ -34,6 +35,7 @@ impl Default for Extrude3d {
             letter_spacing: 0.0,
             line_gap: 0.0,
             steps: 10,
+            bevel: 0.0,
         }
     }
 }
@@ -152,7 +154,8 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
                 // Push each successive line very slightly back in z so overlapping lines (negative
                 // line-height) don't z-fight on their coplanar caps.
                 let z_off = -(line as f32) * d2 * 0.04;
-                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, opts.face_rgb, opts.side_rgb);
+                let bevel = opts.bevel.max(0.0).min(d2 * 0.9);
+                append_glyph(&mut mesh, &fl.contours, &mut tess, d2, z_off, bevel, opts.face_rgb, opts.side_rgb);
             }
         }
         pen_x += adv + opts.letter_spacing;
@@ -165,18 +168,8 @@ pub fn extrude_text(bytes: &[u8], text: &str, opts: &Extrude3d) -> Option<Mesh3D
     Some(mesh)
 }
 
-/// Tessellate one glyph's contours into front + back caps and add the extruded side walls.
-fn append_glyph(
-    mesh: &mut Mesh3D,
-    contours: &[Vec<[f32; 2]>],
-    tess: &mut FillTessellator,
-    d2: f32,
-    z_off: f32,
-    face_rgb: [u8; 3],
-    side_rgb: [u8; 3],
-) {
-    let (zf, zb) = (d2 + z_off, -d2 + z_off);
-    // Build a lyon path of the (already flattened) contours and tessellate the fill.
+/// Fill the (already flattened) contours into 2D cap triangles via lyon (non-zero → holes cut).
+fn fill_caps(contours: &[Vec<[f32; 2]>], tess: &mut FillTessellator) -> VertexBuffers<[f32; 2], u32> {
     let mut pb = LyonPath::builder();
     for c in contours {
         if c.len() < 3 {
@@ -190,57 +183,140 @@ fn append_glyph(
     }
     let path = pb.build();
     let mut buf: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
-    let ok = tess
-        .tessellate_path(
-            &path,
-            &FillOptions::default().with_fill_rule(FillRule::NonZero),
-            &mut BuffersBuilder::new(&mut buf, |v: FillVertex| {
-                let p = v.position();
-                [p.x, p.y]
-            }),
-        )
-        .is_ok();
-    if ok && !buf.indices.is_empty() {
-        // FRONT cap (z = +d2) and BACK cap (z = -d2, reversed winding). Lighting is two-sided so the
-        // winding only sets which way the flat normal points before the renderer flips it — either
-        // way each cap lights as a flat face.
-        let front_base = mesh.positions.len() as u32;
-        for v in &buf.vertices {
-            mesh.positions.push([v[0], v[1], zf]);
-        }
-        for t in buf.indices.chunks_exact(3) {
-            mesh.indices.extend([front_base + t[0], front_base + t[1], front_base + t[2]]);
-            mesh.tri_rgb.push(face_rgb);
-        }
-        let back_base = mesh.positions.len() as u32;
-        for v in &buf.vertices {
-            mesh.positions.push([v[0], v[1], zb]);
-        }
-        for t in buf.indices.chunks_exact(3) {
-            mesh.indices.extend([back_base + t[2], back_base + t[1], back_base + t[0]]);
-            mesh.tri_rgb.push(face_rgb);
-        }
-    }
+    let _ = tess.tessellate_path(
+        &path,
+        &FillOptions::default().with_fill_rule(FillRule::NonZero),
+        &mut BuffersBuilder::new(&mut buf, |v: FillVertex| {
+            let p = v.position();
+            [p.x, p.y]
+        }),
+    );
+    buf
+}
 
-    // SIDE WALLS: a quad per contour edge, connecting the front loop to the back loop.
-    for c in contours {
-        let n = c.len();
-        if n < 2 {
-            continue;
+/// Signed area of a polygon (shoelace); >0 = CCW.
+fn signed_area(c: &[[f32; 2]]) -> f32 {
+    let n = c.len();
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = c[i];
+        let q = c[(i + 1) % n];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    a * 0.5
+}
+
+/// Inset every contour toward the FILLED side by `amount` (an approximate inward polygon offset via
+/// the per-vertex angle bisector of the adjacent edges' left-normals). Vertex count is preserved so
+/// the bevel chamfer can connect inset↔outline 1:1. Small `amount` only — a large inset self-
+/// intersects on thin glyph features (the caller clamps it).
+fn inset_contours(contours: &[Vec<[f32; 2]>], amount: f32) -> Vec<Vec<[f32; 2]>> {
+    // The filled side is consistent with the outer contour's winding: offset toward the left when the
+    // outer is CCW, toward the right when CW (holes are wound oppositely, so the same signed step
+    // shrinks the solid for both).
+    let outer = contours.iter().map(|c| signed_area(c)).fold(0.0f32, |m, a| if a.abs() > m.abs() { a } else { m });
+    let side = if outer >= 0.0 { 1.0 } else { -1.0 };
+    let left_normal = |a: [f32; 2], b: [f32; 2]| -> [f32; 2] {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        [-dy / len, dx / len] // rotate edge +90°
+    };
+    contours
+        .iter()
+        .map(|c| {
+            let n = c.len();
+            (0..n)
+                .map(|i| {
+                    let prev = c[(i + n - 1) % n];
+                    let cur = c[i];
+                    let next = c[(i + 1) % n];
+                    let n1 = left_normal(prev, cur);
+                    let n2 = left_normal(cur, next);
+                    let mut d = [n1[0] + n2[0], n1[1] + n2[1]];
+                    let len = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+                    d = [d[0] / len, d[1] / len];
+                    [cur[0] + side * d[0] * amount, cur[1] + side * d[1] * amount]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Push cap triangles (from `fill_caps`) at plane `z` into the mesh; `flip` reverses winding.
+fn push_cap(mesh: &mut Mesh3D, buf: &VertexBuffers<[f32; 2], u32>, z: f32, flip: bool, rgb: [u8; 3]) {
+    let base = mesh.positions.len() as u32;
+    for v in &buf.vertices {
+        mesh.positions.push([v[0], v[1], z]);
+    }
+    for t in buf.indices.chunks_exact(3) {
+        if flip {
+            mesh.indices.extend([base + t[2], base + t[1], base + t[0]]);
+        } else {
+            mesh.indices.extend([base + t[0], base + t[1], base + t[2]]);
         }
-        for i in 0..n {
-            let a = c[i];
-            let b = c[(i + 1) % n];
-            let base = mesh.positions.len() as u32;
-            mesh.positions.push([a[0], a[1], zf]); // 0 front-a
-            mesh.positions.push([b[0], b[1], zf]); // 1 front-b
-            mesh.positions.push([b[0], b[1], zb]); // 2 back-b
-            mesh.positions.push([a[0], a[1], zb]); // 3 back-a
-            mesh.indices.extend([base, base + 1, base + 2]);
-            mesh.tri_rgb.push(side_rgb);
-            mesh.indices.extend([base, base + 2, base + 3]);
-            mesh.tri_rgb.push(side_rgb);
+        mesh.tri_rgb.push(rgb);
+    }
+}
+
+/// A quad strip between two matching contours `lo`/`hi` (same vertex count) at planes `z_lo`/`z_hi`.
+fn push_wall(mesh: &mut Mesh3D, lo: &[[f32; 2]], z_lo: f32, hi: &[[f32; 2]], z_hi: f32, rgb: [u8; 3]) {
+    let n = lo.len().min(hi.len());
+    if n < 2 {
+        return;
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let base = mesh.positions.len() as u32;
+        mesh.positions.push([hi[i][0], hi[i][1], z_hi]);
+        mesh.positions.push([hi[j][0], hi[j][1], z_hi]);
+        mesh.positions.push([lo[j][0], lo[j][1], z_lo]);
+        mesh.positions.push([lo[i][0], lo[i][1], z_lo]);
+        mesh.indices.extend([base, base + 1, base + 2]);
+        mesh.tri_rgb.push(rgb);
+        mesh.indices.extend([base, base + 2, base + 3]);
+        mesh.tri_rgb.push(rgb);
+    }
+}
+
+/// Tessellate one glyph's contours into caps + extruded walls (with an optional chamfer bevel).
+#[allow(clippy::too_many_arguments)]
+fn append_glyph(
+    mesh: &mut Mesh3D,
+    contours: &[Vec<[f32; 2]>],
+    tess: &mut FillTessellator,
+    d2: f32,
+    z_off: f32,
+    bevel: f32,
+    face_rgb: [u8; 3],
+    side_rgb: [u8; 3],
+) {
+    let (zf, zb) = (d2 + z_off, -d2 + z_off);
+    if bevel <= 1e-4 {
+        // Flat block: full-outline caps + straight side walls.
+        let buf = fill_caps(contours, tess);
+        if !buf.indices.is_empty() {
+            push_cap(mesh, &buf, zf, false, face_rgb); // front
+            push_cap(mesh, &buf, zb, true, face_rgb); // back (reversed)
         }
+        for c in contours {
+            push_wall(mesh, c, zb, c, zf, side_rgb);
+        }
+        return;
+    }
+    // Beveled: the flat top/bottom faces sit on the INSET outline; a chamfer ramps out to the full
+    // outline, then the straight side wall, then a chamfer back in. Face-coloured chamfers catch the
+    // light for the classic beveled look; side walls take the body colour.
+    let inner = inset_contours(contours, bevel);
+    let buf = fill_caps(&inner, tess);
+    if !buf.indices.is_empty() {
+        push_cap(mesh, &buf, zf, false, face_rgb); // front face (inset)
+        push_cap(mesh, &buf, zb, true, face_rgb); // back face (inset)
+    }
+    let (zfc, zbc) = (zf - bevel, zb + bevel); // chamfer bottoms
+    for (o, i) in contours.iter().zip(inner.iter()) {
+        push_wall(mesh, o, zfc, i, zf, face_rgb); // front chamfer (outline@zfc → inset@zf)
+        push_wall(mesh, o, zbc, o, zfc, side_rgb); // straight side wall
+        push_wall(mesh, i, zb, o, zbc, face_rgb); // back chamfer (inset@zb → outline@zbc)
     }
 }
 
@@ -293,4 +369,24 @@ mod tests {
             return;
         }
     }
+
+    #[test]
+    fn bevel_adds_chamfer_geometry() {
+        for p in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ] {
+            let Ok(bytes) = std::fs::read(p) else { continue };
+            let flat = extrude_text(&bytes, "R", &Extrude3d { depth: 0.2, bevel: 0.0, ..Default::default() }).unwrap();
+            let beveled = extrude_text(&bytes, "R", &Extrude3d { depth: 0.2, bevel: 0.03, ..Default::default() }).unwrap();
+            // The chamfer adds two extra wall rings per contour → materially more triangles.
+            assert!(beveled.tri_count() > flat.tri_count() + 10, "bevel adds chamfer strips");
+            assert_eq!(beveled.tri_rgb.len(), beveled.tri_count());
+            // Signed area sanity: a CCW and a CW ring give opposite signs.
+            let sq_ccw = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            assert!(signed_area(&sq_ccw) > 0.0);
+            return;
+        }
+    }
 }
+
