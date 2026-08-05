@@ -7138,7 +7138,9 @@ impl PixelView {
                     [img.width as usize, img.height as usize],
                     &img.rgba_bytes(),
                 );
-                let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::LINEAR);
+                // NEAREST: render_text already bakes anti-aliasing, so nearest display keeps the
+                // edges crisp and avoids a soft fringe from LINEAR upscaling by pixels_per_point.
+                let tex = ctx.load_texture("font_sample", color, egui::TextureOptions::NEAREST);
                 self.font_sample_tex = Some((key, tex));
             }
         }
