@@ -1423,6 +1423,9 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     font_grid_tex: Option<(usize, egui::TextureHandle, usize, [usize; 2])>, // (page, tex, rows, [cols,cell])
     font_grid_key: String, // full cache key (page|cell|ink|recolor) so colour changes re-render the grid
+    font_presets: Vec<FontPreset>, // saved TTF/OTF/FON logo setups, persisted
+    font_preset_name: String,      // the Save-as name field (shared across the font viewers)
+    font_pending_face: Option<usize>, // FON face to select once the font finishes loading (recall)
     // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
     tdf_path: Option<PathBuf>,
     tdf_bytes: Vec<u8>,
@@ -1938,6 +1941,7 @@ impl PixelView {
     const AI_SIZES_KEY: &'static str = "ai_sizes";
     const FONT_SAMPLE_KEY: &'static str = "font_sample";
     const FONT_INK_KEY: &'static str = "font_ink";
+    const FONT_PRESETS_KEY: &'static str = "font_presets";
     const FONT_BG_KEY: &'static str = "font_bg";
     const FONT_BG_ON_KEY: &'static str = "font_bg_on";
     const FONT_LSP_KEY: &'static str = "font_lsp";
@@ -2863,6 +2867,12 @@ impl PixelView {
             font_sample_tex: None,
             font_grid_tex: None,
             font_grid_key: String::new(),
+            font_presets: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<FontPreset>>(s, Self::FONT_PRESETS_KEY))
+                .unwrap_or_default(),
+            font_preset_name: String::new(),
+            font_pending_face: None,
             tdf_path: None,
             tdf_bytes: Vec::new(),
             tdf_fonts: Vec::new(),
@@ -6742,6 +6752,130 @@ impl PixelView {
     /// The interactive font viewer (.ttf/.otf/.ttc): metadata header, a type-to-sample box with a
     /// live rendered preview, and a paged glyph grid — click a glyph to copy it, click Copy to grab
     /// the family name or the sample text.
+    /// Save the current TTF/OTF/FON logo setup under `name` (upsert). `path` is the open font;
+    /// `is_fon` captures the FON face index.
+    fn save_font_preset(&mut self, name: &str, path: &Path, is_fon: bool) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "Name the preset first.".into();
+            return;
+        }
+        let preset = FontPreset {
+            name: name.to_string(),
+            font_path: self.to_display(path).display().to_string(),
+            font_real: self.resolve_local(path).display().to_string(),
+            sample: self.font_sample.clone(),
+            size: self.font_size,
+            ink: self.font_ink,
+            bg: self.font_bg,
+            bg_on: self.font_bg_on,
+            letter_spacing: self.font_letter_spacing,
+            line_gap: self.font_line_gap,
+            top_down: self.font_top_down,
+            face_index: if is_fon { self.fon_index } else { 0 },
+            fx: Some(self.capture_fx_preset(String::new())),
+        };
+        if let Some(slot) = self.font_presets.iter_mut().find(|p| p.name == name) {
+            *slot = preset;
+            self.status = format!("Updated preset “{name}”");
+        } else {
+            self.font_presets.push(preset);
+            self.status = format!("Saved preset “{name}”");
+        }
+    }
+
+    /// Recall a font preset: open its font if different (variant/face survives the load), then apply
+    /// every setting + the full recolor.
+    fn apply_font_preset(&mut self, ctx: &egui::Context, preset: &FontPreset) {
+        let target = if preset.font_real.is_empty() {
+            PathBuf::from(&preset.font_path)
+        } else {
+            PathBuf::from(&preset.font_real)
+        };
+        // Compare against whichever font viewer is open (TTF `font_path` or FON `fon_path`).
+        let cur = self
+            .font_path
+            .as_ref()
+            .or(self.fon_path.as_ref())
+            .map(|p| self.resolve_local(p));
+        let mut loaded = false;
+        if !target.as_os_str().is_empty() && cur.as_deref() != Some(target.as_path()) {
+            if !target.exists() {
+                self.ensure_bundle_extracted();
+            }
+            if target.exists() {
+                self.font_pending_face = Some(preset.face_index); // survives ensure_fon_loaded's reset
+                self.load_full(ctx, target);
+                loaded = true;
+            } else {
+                self.status = format!("Preset “{}”: font not found.", preset.name);
+            }
+        }
+        self.font_sample = preset.sample.clone();
+        self.font_size = if preset.size > 0.0 { preset.size } else { 48.0 };
+        self.font_ink = preset.ink;
+        self.font_bg = preset.bg;
+        self.font_bg_on = preset.bg_on;
+        self.font_letter_spacing = preset.letter_spacing;
+        self.font_line_gap = preset.line_gap;
+        self.font_top_down = preset.top_down;
+        if !loaded {
+            self.fon_index = preset.face_index.min(self.fon_faces.len().saturating_sub(1));
+        }
+        if let Some(fx) = &preset.fx {
+            let fx = fx.clone();
+            self.apply_fx_preset(&fx);
+        }
+        self.font_preset_name = preset.name.clone();
+        self.font_sample_tex = None;
+        self.font_grid_key.clear();
+        self.fon_sample_tex = None;
+        self.fon_grid_tex = None;
+        self.status = format!("Recalled preset “{}”", preset.name);
+    }
+
+    /// The shared Preset row for the TTF/OTF (is_fon=false) and FON (is_fon=true) viewers.
+    fn font_preset_row(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path, is_fon: bool) {
+        let mut recall: Option<FontPreset> = None;
+        let mut save = false;
+        let mut delete: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let sel = if self.font_preset_name.is_empty() { "— pick —".to_string() } else { self.font_preset_name.clone() };
+            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
+            egui::ComboBox::from_id_salt("font_preset_pick")
+                .width(220.0)
+                .height(max_h)
+                .selected_text(sel)
+                .show_ui(ui, |ui| {
+                    for p in &self.font_presets {
+                        if ui.selectable_label(p.name == self.font_preset_name, &p.name).clicked() {
+                            recall = Some(p.clone());
+                        }
+                    }
+                });
+            ui.add(egui::TextEdit::singleline(&mut self.font_preset_name).desired_width(140.0).hint_text("name…"));
+            if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
+                save = true;
+            }
+            let can_del = self.font_presets.iter().any(|p| p.name == self.font_preset_name.trim());
+            if ui.add_enabled(can_del, egui::Button::new("✕")).on_hover_text("Delete this preset").clicked() {
+                delete = Some(self.font_preset_name.trim().to_string());
+            }
+        });
+        if let Some(p) = recall {
+            self.apply_font_preset(ctx, &p);
+        }
+        if save {
+            let n = self.font_preset_name.clone();
+            self.save_font_preset(&n, path, is_fon);
+        }
+        if let Some(name) = delete {
+            self.font_presets.retain(|p| p.name != name);
+            self.status = format!("Deleted preset “{name}”");
+        }
+    }
+
     /// The TTF/OTF render options from the viewer's current settings (size, ink, bg, spacing,
     /// line-height, z-order).
     fn font_text_opts(&self) -> crate::decode::font::TextOpts {
@@ -6796,6 +6930,22 @@ impl PixelView {
         }
     }
 
+    /// Write the composition to a temp SVG and open it in an external vector editor (Inkscape / …).
+    fn open_font_svg_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
+        let Some(svg) = crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts()) else {
+            self.status = "Nothing to render.".into();
+            return;
+        };
+        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let slug = if slug.is_empty() { "font".into() } else { slug };
+        let out = std::env::temp_dir().join(format!("pixelview_{slug}.svg"));
+        if let Err(e) = std::fs::write(&out, svg) {
+            self.status = format!("Couldn't write temp SVG: {e}");
+            return;
+        }
+        self.launch_external(exec, args, env, &out);
+    }
+
     /// Render the composition to a temp PNG and open it in an external image editor.
     fn open_font_png_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
         let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &self.font_text_opts())
@@ -6845,17 +6995,31 @@ impl PixelView {
             }
         });
         ui.separator();
+        self.font_preset_row(ctx, ui, path, false);
+        ui.separator();
 
         // Sample text + size + colours + exports — a mini logo maker.
         let mut copy_img = false;
         let mut want_png = false;
         let mut want_svg = false;
         let mut copy_svg = false;
-        let mut open_png_in: Option<usize> = None; // "Open in…" opener index for the rendered PNG
-        let png_openers: Vec<OpenerItem> = self
+        let mut open_in: Option<(usize, bool)> = None; // (opener index, is_svg) for "Open in…"
+        // Programs that handle PNG or SVG — each labelled by which format it'll receive.
+        let img_openers: Vec<(OpenerItem, bool)> = self
             .opener_items()
             .into_iter()
-            .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == "png"))
+            .filter_map(|o| {
+                let svg = o.exts.iter().any(|e| e == "svg");
+                let png = o.exts.is_empty() || o.exts.iter().any(|e| e == "png");
+                // Prefer SVG (vector) for a program that handles it; else PNG.
+                if svg {
+                    Some((o, true))
+                } else if png {
+                    Some((o, false))
+                } else {
+                    None
+                }
+            })
             .collect();
         ui.horizontal_wrapped(|ui| {
             ui.label("Size");
@@ -6904,21 +7068,23 @@ impl PixelView {
             if ui.small_button("💾 SVG").on_hover_text("Save the whole composition as a vector SVG (crisp at any size)").clicked() {
                 want_svg = true;
             }
-            // Open the rendered PNG in an external image editor (DRAW / Aseprite / GIMP / …).
+            // Open the composition in an external editor — as SVG (vector) for programs that handle
+            // it (Inkscape/…), else as a rendered PNG (DRAW/Aseprite/GIMP/…).
             ui.menu_button("📂 Open in…", |ui| {
-                if png_openers.is_empty() {
-                    ui.weak("No PNG programs — add one in");
+                if img_openers.is_empty() {
+                    ui.weak("No PNG/SVG programs — add one in");
                     ui.weak("View → Associations…");
                 }
-                for o in &png_openers {
-                    if ui.button(&o.name).clicked() {
-                        open_png_in = Some(o.idx);
+                for (o, is_svg) in &img_openers {
+                    let tag = if *is_svg { "SVG" } else { "PNG" };
+                    if ui.button(format!("{}  ({tag})", o.name)).clicked() {
+                        open_in = Some((o.idx, *is_svg));
                         ui.close();
                     }
                 }
             })
             .response
-            .on_hover_text("Render the sample to a PNG and open it in an image editor");
+            .on_hover_text("Open the composition in an image/vector editor (SVG or PNG per the program)");
         });
         if copy_img {
             if let Some(img) = crate::decode::font::render_text(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
@@ -6941,10 +7107,15 @@ impl PixelView {
                 None => self.status = "Nothing to copy as SVG".into(),
             }
         }
-        if let Some(oi) = open_png_in {
+        if let Some((oi, is_svg)) = open_in {
             let prog = self.openers.get(oi).map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
             if let Some((exec, args, env)) = prog {
-                self.open_font_png_in(&self.font_sample.clone(), &exec, &args, &env);
+                let sample = self.font_sample.clone();
+                if is_svg {
+                    self.open_font_svg_in(&sample, &exec, &args, &env);
+                } else {
+                    self.open_font_png_in(&sample, &exec, &args, &env);
+                }
             }
         }
         let changed = ui
@@ -7952,7 +8123,6 @@ impl PixelView {
             return;
         }
         self.fon_path = Some(path.to_path_buf());
-        self.fon_index = 0;
         self.fon_page = 0;
         self.fon_sample_tex = None;
         self.fon_grid_tex = None;
@@ -7966,6 +8136,9 @@ impl PixelView {
                 self.fon_faces.clear();
             }
         }
+        // A preset recall stashed the face to select once loaded (survives this reset), else 0.
+        let want = self.font_pending_face.take().unwrap_or(0);
+        self.fon_index = want.min(self.fon_faces.len().saturating_sub(1));
     }
 
     /// Windows bitmap-font viewer (.fon/.fnt): a size (face) picker, a type-to-sample box (shares
@@ -8015,6 +8188,8 @@ impl PixelView {
                 ui.weak(format!("· {pts} pt · {h} px"));
             }
         });
+        ui.separator();
+        self.font_preset_row(ctx, ui, path, true);
         ui.separator();
 
         // Sample text (reuses the persisted font_sample).
@@ -27965,6 +28140,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::AI_SIZES_KEY, &self.ai_sizes);
         eframe::set_value(storage, Self::FONT_SAMPLE_KEY, &self.font_sample);
         eframe::set_value(storage, Self::FONT_INK_KEY, &self.font_ink);
+        eframe::set_value(storage, Self::FONT_PRESETS_KEY, &self.font_presets);
         eframe::set_value(storage, Self::FONT_BG_KEY, &self.font_bg);
         eframe::set_value(storage, Self::FONT_BG_ON_KEY, &self.font_bg_on);
         eframe::set_value(storage, Self::FONT_LSP_KEY, &self.font_letter_spacing);
@@ -29070,6 +29246,9 @@ fn default_fg() -> u8 {
 fn default_true() -> bool {
     true
 }
+fn default_ink() -> [u8; 3] {
+    [235, 235, 235]
+}
 
 /// The standard 16-colour VGA/EGA palette (VGA attribute order, index 0-15) + names — for the TDF
 /// single-colour fg/bg pickers. Matches `decode::ansi::VGA_PALETTE`.
@@ -29156,6 +29335,29 @@ struct TdfPreset {
     #[serde(default)]
     fx: Option<FxPreset>, // a full snapshot of the Recolor pane (palette/adjust/dither/…) — so a
                           // colour font recoloured green (or any recolour) is restored on recall
+}
+
+/// A saved logo-maker "setup" for the **TTF/OTF/FON** viewers (parallels [`TdfPreset`]): the font
+/// file + sample text + size/colours/spacing/line-height/z-order (TTF) or face index (FON) + the
+/// full recolor snapshot. `#[serde(default)]` so old saves survive new fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct FontPreset {
+    name: String,
+    font_path: String, // display path (breadcrumb)
+    font_real: String, // resolvable on-disk path (a cache temp for a bundled/zip font)
+    sample: String,
+    size: f32,
+    #[serde(default = "default_ink")]
+    ink: [u8; 3],
+    bg: [u8; 3],
+    bg_on: bool,
+    letter_spacing: f32,
+    line_gap: f32,
+    #[serde(default = "default_true")]
+    top_down: bool,
+    face_index: usize, // FON: which embedded face
+    fx: Option<FxPreset>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
