@@ -5,7 +5,7 @@
 
 use super::{DecodeError, Decoder};
 use crate::image_types::PixImage;
-use ab_glyph::{point, Font, FontRef, Glyph, GlyphId, ScaleFont};
+use ab_glyph::{point, Font, FontRef, GlyphId, ScaleFont};
 
 /// Extensions handled by the font viewer. Sniff-detected too (magic bytes), so extension is only
 /// a fallback.
@@ -277,20 +277,19 @@ pub fn render_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage
     let line_pitch = scaled.height() + scaled.line_gap() + opts.line_gap;
     const PAD: f32 = 4.0;
 
-    // Layout pass: place each glyph, tagged with its line index (for z-order).
-    let mut glyphs: Vec<(usize, Glyph)> = Vec::new();
-    let mut caret = point(PAD, PAD + ascent);
-    let mut max_x = PAD;
+    // Layout + outline pass. Outline every glyph up front so the canvas can be sized from the
+    // *actual ink bounds* — decorative fonts overhang their advance width (and negative letter-
+    // spacing pulls glyphs left/over each other), which a pen-position width would clip.
+    let mut outlined: Vec<(usize, ab_glyph::OutlinedGlyph)> = Vec::new();
+    let mut caret = point(0.0, ascent);
     let mut prev: Option<GlyphId> = None;
     let mut line_idx = 0usize;
-    let mut lines = 1usize;
     for c in text.chars() {
         if c == '\n' {
-            caret.x = PAD;
+            caret.x = 0.0;
             caret.y += line_pitch;
             prev = None;
             line_idx += 1;
-            lines += 1;
             continue;
         }
         if c == '\r' {
@@ -300,52 +299,61 @@ pub fn render_text(bytes: &[u8], text: &str, opts: &TextOpts) -> Option<PixImage
         if let Some(p) = prev {
             caret.x += scaled.kern(p, gid);
         }
-        glyphs.push((line_idx, gid.with_scale_and_position(px, caret)));
+        if let Some(o) = font.outline_glyph(gid.with_scale_and_position(px, caret)) {
+            outlined.push((line_idx, o));
+        }
         caret.x += scaled.h_advance(gid) + opts.letter_spacing;
-        max_x = max_x.max(caret.x);
         prev = Some(gid);
     }
 
-    let w = ((max_x + PAD).ceil() as usize).clamp(1, 8192);
-    let h = ((PAD * 2.0 + ascent + (lines as f32 - 1.0) * line_pitch + scaled.descent().abs()).ceil()
-        as usize)
-        .clamp(1, 8192);
-    // Background fill (opaque) or transparent.
+    // True bounding box across all glyph ink (handles overhang + negative positions).
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (_, o) in &outlined {
+        let bb = o.px_bounds();
+        min_x = min_x.min(bb.min.x);
+        min_y = min_y.min(bb.min.y);
+        max_x = max_x.max(bb.max.x);
+        max_y = max_y.max(bb.max.y);
+    }
+    if outlined.is_empty() {
+        return Some(PixImage::from_rgba(1, 1, vec![[0u8; 4]]));
+    }
+    let w = ((max_x - min_x) + 2.0 * PAD).ceil().clamp(1.0, 8192.0) as usize;
+    let h = ((max_y - min_y) + 2.0 * PAD).ceil().clamp(1.0, 8192.0) as usize;
+    let (ox, oy) = (PAD - min_x, PAD - min_y); // shift so the leftmost/topmost ink lands at PAD
+    let ink = opts.ink;
+    // Transparent areas keep the INK's RGB (alpha 0) so LINEAR edge-filtering blends ink↔ink — no
+    // dark halo from interpolating toward black. With a bg the fill is opaque so this is moot.
     let mut buf = match opts.bg {
         Some(bg) => vec![[bg[0], bg[1], bg[2], 255]; w * h],
-        None => vec![[0u8; 4]; w * h],
+        None => vec![[ink[0], ink[1], ink[2], 0]; w * h],
     };
-    // Draw order = z-order: for top_down the upper lines must land LAST (on top), so sort by line
-    // index descending; bottom-up keeps reading order (later lines on top).
+    // Draw order = z-order: top_down draws the upper lines LAST (on top); bottom-up keeps order.
     if opts.top_down {
-        glyphs.sort_by(|a, b| b.0.cmp(&a.0));
+        outlined.sort_by(|a, b| b.0.cmp(&a.0));
     } else {
-        glyphs.sort_by_key(|g| g.0);
+        outlined.sort_by_key(|g| g.0);
     }
-    let ink = opts.ink;
-    for (_, g) in glyphs {
-        if let Some(outlined) = font.outline_glyph(g) {
-            let bb = outlined.px_bounds();
-            outlined.draw(|dx, dy, cov| {
-                let x = bb.min.x as i32 + dx as i32;
-                let y = bb.min.y as i32 + dy as i32;
-                if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
-                    return;
-                }
-                let i = y as usize * w + x as usize;
-                // Proper alpha-over so glyphs composite on the bg + each other (any z-order).
-                let a = cov.clamp(0.0, 1.0);
-                let dst = buf[i];
-                let da = dst[3] as f32 / 255.0;
-                let oa = a + da * (1.0 - a);
-                if oa > 0.0 {
-                    let mix = |s: u8, d: u8| -> u8 {
-                        (((s as f32 * a + d as f32 * da * (1.0 - a)) / oa).round()).clamp(0.0, 255.0) as u8
-                    };
-                    buf[i] = [mix(ink[0], dst[0]), mix(ink[1], dst[1]), mix(ink[2], dst[2]), (oa * 255.0) as u8];
-                }
-            });
-        }
+    for (_, o) in outlined {
+        let bb = o.px_bounds();
+        o.draw(|dx, dy, cov| {
+            let x = (bb.min.x + ox).round() as i32 + dx as i32;
+            let y = (bb.min.y + oy).round() as i32 + dy as i32;
+            if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                return;
+            }
+            let i = y as usize * w + x as usize;
+            let a = cov.clamp(0.0, 1.0);
+            let dst = buf[i];
+            let da = dst[3] as f32 / 255.0;
+            let oa = a + da * (1.0 - a);
+            if oa > 0.0 {
+                let mix = |s: u8, d: u8| -> u8 {
+                    (((s as f32 * a + d as f32 * da * (1.0 - a)) / oa).round()).clamp(0.0, 255.0) as u8
+                };
+                buf[i] = [mix(ink[0], dst[0]), mix(ink[1], dst[1]), mix(ink[2], dst[2]), (oa * 255.0) as u8];
+            }
+        });
     }
     Some(PixImage::from_rgba(w as u32, h as u32, buf))
 }
@@ -495,6 +503,10 @@ mod logo_test {
             let bg = render_text(&bytes, "A", &TextOpts { px: 48.0, bg: Some([10,20,30]), ..Default::default() }).unwrap();
             assert!(bg.rgba_bytes().chunks(4).any(|px| px == [10,20,30,255]), "bg fill present");
             // composition SVG valid
+            // transparent pixels carry the ink RGB (alpha 0) so LINEAR filtering has no black halo
+            let ti = render_text(&bytes, "i", &TextOpts { px: 48.0, ink: [200,50,50], ..Default::default() }).unwrap();
+            let corner = &ti.rgba_bytes()[0..4];
+            assert_eq!(corner, [200,50,50,0], "transparent bg keeps ink RGB");
             let svg = text_svg(&bytes, "Hi", &TextOpts { px: 64.0, ink: [255,0,0], ..Default::default() }).unwrap();
             eprintln!("svg len {} head {}", svg.len(), &svg[..svg.len().min(90)]);
             assert!(resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).is_ok());
