@@ -5350,7 +5350,13 @@ impl PixelView {
     /// `.css` / page tile from spinning forever waiting on a thumbnail that can never exist.
     fn web_thumb_url(&self, path: &Path) -> Option<String> {
         // A navigable page has no thumbnail.
-        if self.entries.iter().any(|e| e.path == *path && e.is_dir) {
+        let entry = self.entries.iter().find(|e| e.path == *path)?;
+        if entry.is_dir {
+            return None;
+        }
+        // A directory index already told us the size — reject an oversized file for free, with no
+        // extra request. (A page-introspected link reports 0 = unknown; probed below.)
+        if entry.size > Self::WEB_THUMB_MAX_BYTES {
             return None;
         }
         let ext = path
@@ -5362,16 +5368,19 @@ impl PixelView {
         if !self.registry.known_extension(&ext) {
             return None;
         }
-        self.web_urls
-            .get(path)
-            .cloned()
-            .or_else(|| {
-                let parts = crate::httpfs::rel_parts(path);
-                let host = parts.first()?;
-                let http = self.web_http.get(host).copied().unwrap_or(false);
-                Some(crate::httpfs::url_for(&parts, http, false))
-            })
+        // NB no network call here: this runs in the paint loop for every visible tile, so the
+        // unknown-size case is probed on the worker thread via `request_capped` instead.
+        self.web_urls.get(path).cloned().or_else(|| {
+            let parts = crate::httpfs::rel_parts(path);
+            let host = parts.first()?;
+            let http = self.web_http.get(host).copied().unwrap_or(false);
+            Some(crate::httpfs::url_for(&parts, http, false))
+        })
     }
+
+    /// Byte ceiling for a web thumbnail — shared by the free size check above and the worker's
+    /// HEAD probe, so both agree on what "too big for a tile" means.
+    const WEB_THUMB_MAX_BYTES: u64 = 12 * 1024 * 1024;
 
     /// Is `path` a Poly Haven **HDRI** result? (The tile shows a tonemapped JPG, so the extension
     /// can't tell us — it's the virtual path's family segment that does.)
@@ -22454,7 +22463,13 @@ impl PixelView {
                                     // produce a thumbnail, so don't request one — and crucially
                                     // don't spin below, which is what made every web tile hang.
                                     if let Some(u) = self.web_thumb_url(path) {
-                                        self.colo_thumbs.request(path, &u, THUMB_PX, true);
+                                        self.colo_thumbs.request_capped(
+                                            path,
+                                            &u,
+                                            THUMB_PX,
+                                            true,
+                                            Self::WEB_THUMB_MAX_BYTES,
+                                        );
                                     } else {
                                         web_no_thumb = true;
                                     }
@@ -23396,7 +23411,13 @@ impl PixelView {
                         // Viewable remote file → fetch it through the HTTP thumb pool; anything
                         // else simply gets no request (and so no endless spinner).
                         if let Some(u) = self.web_thumb_url(&path) {
-                            self.colo_thumbs.request(&path, &u, THUMB_PX, true);
+                            self.colo_thumbs.request_capped(
+                                &path,
+                                &u,
+                                THUMB_PX,
+                                true,
+                                Self::WEB_THUMB_MAX_BYTES,
+                            );
                         }
                     } else if !any_remote(&path) {
                         self.thumbs.request(&path, THUMB_PX);
