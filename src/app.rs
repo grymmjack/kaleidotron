@@ -1886,6 +1886,7 @@ pub struct PixelView {
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
+    settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
     // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
     // actually browse (Preferences → "Web sources"). A persisted value always wins over the
@@ -2765,6 +2766,7 @@ impl PixelView {
         // `keybindings.json` is the source of truth when it exists; otherwise fall back to the
         // legacy persisted blob (and it gets written out as JSON on the next save, migrating once).
         let kb_file = crate::keybindings::path(&data_dir);
+        let settings_file = crate::settings::path(&data_dir);
         if let Some(entries) = crate::keybindings::load(&kb_file) {
             for (aid, kn) in entries {
                 if let (Some(a), Some(k)) = (Action::from_id(&aid), egui::Key::from_name(&kn)) {
@@ -3470,6 +3472,7 @@ impl PixelView {
             ma_open_rx: None,
             ma_dir,
             keybindings_file: kb_file,
+            settings_file,
             plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
             plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
             plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
@@ -3542,7 +3545,81 @@ impl PixelView {
                 app.open_folder(dir);
             }
         }
+        // `settings.json` overrides the persisted defaults, then is (re)written so a fresh install
+        // finds a documented file immediately rather than after a clean exit.
+        app.apply_settings_file();
+        app.write_settings_file();
         app
+    }
+
+    /// The curated set of settings exposed in `settings.json`, in file order.
+    ///
+    /// Deliberately a *subset*: machine-local state (window geometry, last folder, divider
+    /// positions) stays in eframe storage so two machines don't fight over it, and API keys live
+    /// elsewhere so a dotfile-managed settings file can't leak them.
+    fn settings_entries(&self) -> Vec<crate::settings::Entry> {
+        use crate::settings::entry as e;
+        const A: &str = "Appearance";
+        vec![
+            e(A, "theme", self.theme, "0 = dark, 1 = light"),
+            e(A, "ui_zoom", self.ui_zoom, "whole-UI scale (1.0 = 100%)"),
+            e(A, "thumb_size", self.thumb_size, "grid tile size in points"),
+            e(A, "grid_gap", self.grid_gap, "horizontal gap between grid tiles"),
+            e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
+            e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
+            e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
+            e(A, "table_grid", self.table_grid, "dividing lines in the table view"),
+            e(A, "transp_solid", self.transp_solid, "transparency backdrop: false = checkerboard, true = solid"),
+            e(A, "transp_color", self.transp_color, "solid transparency backdrop colour [r, g, b]"),
+            e(A, "transp_checker_size", self.transp_checker_size, "checker cell: 0 = small, 1 = medium, 2 = large"),
+        ]
+    }
+
+    /// Overlay `settings.json` onto the already-loaded defaults. A missing or wrong-typed value
+    /// leaves the existing setting untouched, so a partial or hand-mangled file degrades gracefully.
+    fn apply_settings_file(&mut self) {
+        use crate::settings as st;
+        let Some(m) = st::load(&self.settings_file) else { return };
+        if let Some(v) = st::get_u64(&m, "theme") {
+            self.theme = v as u8;
+        }
+        if let Some(v) = st::get_f32(&m, "ui_zoom") {
+            self.ui_zoom = v.clamp(0.5, 4.0);
+        }
+        if let Some(v) = st::get_f32(&m, "thumb_size") {
+            self.thumb_size = v.clamp(32.0, 1024.0);
+        }
+        if let Some(v) = st::get_f32(&m, "grid_gap") {
+            self.grid_gap = v.clamp(0.0, 200.0);
+        }
+        if let Some(v) = st::get_f32(&m, "grid_gap_y") {
+            self.grid_gap_y = v.clamp(0.0, 200.0);
+        }
+        if let Some(v) = st::get_bool(&m, "grid_tile_border") {
+            self.grid_tile_border = v;
+        }
+        if let Some(v) = st::get_u64(&m, "caption_fields") {
+            self.caption_fields = v as u16;
+        }
+        if let Some(v) = st::get_bool(&m, "table_grid") {
+            self.table_grid = v;
+        }
+        if let Some(v) = st::get_bool(&m, "transp_solid") {
+            self.transp_solid = v;
+        }
+        if let Some(v) = st::get_rgb(&m, "transp_color") {
+            self.transp_color = v;
+        }
+        if let Some(v) = st::get_u64(&m, "transp_checker_size") {
+            self.transp_checker_size = (v as u8).min(2);
+        }
+    }
+
+    /// Write the documented file (also called on save, so in-app changes round-trip to disk).
+    fn write_settings_file(&self) {
+        if let Err(e) = crate::settings::save(&self.settings_file, &self.settings_entries()) {
+            eprintln!("settings.json: {e}");
+        }
     }
 
     /// Scan `dir` into folder + image entries (directories first, then images,
@@ -31525,6 +31602,7 @@ impl eframe::App for PixelView {
         if let Err(e) = crate::keybindings::save(&self.keybindings_file, &entries, &labels) {
             eprintln!("keybindings.json: {e}");
         }
+        self.write_settings_file();
     }
 
     // Persist only our own keys (above), not all of egui's memory.
