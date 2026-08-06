@@ -60,7 +60,8 @@ pub fn to_json(entries: &[Entry]) -> String {
     let mut s = String::from(
         "// pixelview settings.\n\
          // Edit and save. Delete a line to restore its default; delete the file to reset all.\n\
-         // Machine-local state (window size, last folder) and API keys are deliberately NOT here.\n\
+         // Machine-local state (window size, last folder) is deliberately NOT here.\n\
+         // API keys live in secrets.json — keep THAT file out of dotfile sync.\n\
          {\n",
     );
     let mut section = "";
