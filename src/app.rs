@@ -445,11 +445,18 @@ struct ColoPiece {
 struct AnimState {
     path: PathBuf,
     frames: Vec<egui::TextureHandle>,
+    /// The frames' CPU pixels (RGBA), kept so the Recolor pipeline and PNG export can work on
+    /// them — a `TextureHandle` is write-only from our side.
+    raw: Vec<Vec<u8>>,
     delays_ms: Vec<u16>,
     size: [usize; 2],
     current: usize,
     playing: bool,
     acc_ms: f32, // elapsed time accumulated toward the current frame's delay
+    /// Recoloured frames, keyed by `(frame index, pipeline_key)` — so scrubbing a recoloured GIF
+    /// re-uses work instead of re-running the pipeline every displayed frame. Cleared whenever the
+    /// pipeline changes (the key is part of the map key, so stale entries simply never match).
+    recolored: HashMap<(usize, String), egui::TextureHandle>,
 }
 
 /// A hovered video's **scrub strip**: N evenly-spaced frames extracted by one background ffmpeg
@@ -1864,6 +1871,8 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
+    gif_recolor: bool, // run the Recolor/PixelFX stack on animated GIF frames
+    gif_speed: f32,    // GIF playback rate (0.25×–4×), like the video player's Speed
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
     web_url: String,                             // the Places URL box
     web_http: HashMap<String, bool>,             // host → needs plain HTTP (remembered per session)
@@ -1953,6 +1962,8 @@ impl PixelView {
     const SHOW_FPS_KEY: &'static str = "show_fps";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     const MA_KEY_KEY: &'static str = "modarchive_api_key";
+    const GIF_RECOLOR_KEY: &'static str = "gif_recolor";
+    const GIF_SPEED_KEY: &'static str = "gif_speed";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -3400,6 +3411,11 @@ impl PixelView {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
+            gif_recolor: load_bool(Self::GIF_RECOLOR_KEY, false),
+            gif_speed: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::GIF_SPEED_KEY))
+                .unwrap_or(1.0),
             web_dl_open: false,
             web_dl_mask: "*.*".into(),
             web_dl_recursive: true,
@@ -17923,6 +17939,85 @@ impl PixelView {
     /// A recolored thumbnail texture for grid tile `path`, built from the cached
     /// thumb pixels (no re-decode), memoized per (path, recolor `key`). None until
     /// the thumb is decoded.
+    /// The texture to display for GIF frame `idx` — the plain decoded frame, or a recoloured one
+    /// when `gif_recolor` is on and the pipeline is doing something. Results are cached per
+    /// `(frame, pipeline_key)` on the `AnimState`, so playback re-uses work and a pipeline change
+    /// simply misses the cache instead of needing invalidation.
+    fn gif_frame_tex(&mut self, ctx: &egui::Context, idx: usize) -> Option<egui::TextureHandle> {
+        let anim = self.anim.as_ref()?;
+        let plain = anim.frames.get(idx)?.clone();
+        if !self.gif_recolor || !self.pipeline_active() {
+            return Some(plain);
+        }
+        let key = self.pipeline_key();
+        if let Some(t) = anim.recolored.get(&(idx, key.clone())) {
+            return Some(t.clone());
+        }
+        // Copy everything we need out of `anim` up front, so the borrow ends before any
+        // `&mut self` call below (the pipeline helpers take self).
+        let (ow, oh) = (anim.size[0], anim.size[1]);
+        let rgba = anim.raw.get(idx)?.clone();
+        let path = anim.path.clone();
+
+        let palette = self.tile_palette(&path);
+        let (w, h, mut rgba) = self.scale_source(ow, oh, rgba);
+        let f = self.scale_algo.factor();
+        let (nw, nh) = (ow * f, oh * f);
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, nw);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, nh);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        let tex = ctx.load_texture(format!("giffx{idx}"), color, view_tex_opts());
+        if let Some(a) = self.anim.as_mut() {
+            // Bound the cache so a long GIF with heavy tweaking can't grow without limit.
+            if a.recolored.len() > 512 {
+                a.recolored.clear();
+            }
+            a.recolored.insert((idx, key), tex.clone());
+        }
+        Some(tex)
+    }
+
+    /// Save the current GIF frame as a PNG beside the source file (auto-named, no dialog — the
+    /// same ergonomics as the video player's ⬇ PNG). Exports the **recoloured** pixels when the
+    /// Recolor option is on, so what you save matches what you see.
+    fn export_gif_frame(&mut self, idx: usize) {
+        let Some(anim) = self.anim.as_ref() else { return };
+        let (w, h) = (anim.size[0], anim.size[1]);
+        let src = anim.path.clone();
+        let Some(mut rgba) = anim.raw.get(idx).cloned() else { return };
+        let (mut w, mut h) = (w, h);
+        if self.gif_recolor && self.pipeline_active() {
+            let palette = self.tile_palette(&src);
+            let (sw, sh, scaled) = self.scale_source(w, h, rgba);
+            let f = self.scale_algo.factor();
+            let dsx = self.eff_dither_scale(self.dither_scale_x, sw, w * f);
+            let dsy = self.eff_dither_scale(self.dither_scale_y, sh, h * f);
+            let (tw, th) = self.resize_target(sw, sh);
+            let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+            rgba = scaled;
+            apply_pipeline_resized(&mut rgba, sw, sh, tw, th, &self.adjust, &aux);
+            w = sw;
+            h = sh;
+        }
+        // Auto-name beside the GIF, never overwriting an existing export.
+        let dir = self.resolve_local(&src);
+        let dir = dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame").to_string();
+        let mut out = dir.join(format!("{stem}_frame{}.png", idx + 1));
+        let mut n = 2;
+        while out.exists() {
+            out = dir.join(format!("{stem}_frame{}_{n}.png", idx + 1));
+            n += 1;
+        }
+        match image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
+            Ok(()) => self.status = format!("Saved {}", out.display()),
+            Err(e) => self.status = format!("PNG export failed: {e}"),
+        }
+    }
+
     fn grid_recolored_tex(
         &mut self,
         ctx: &egui::Context,
@@ -23862,11 +23957,15 @@ impl PixelView {
 
         // Animated GIF: a controls row (play/pause, seek, frame info) + the frame.
         if self.anim.is_some() {
+            let speed = self.gif_speed;
+            // Deferred intents — the controls row borrows `self.anim`, so edits apply after it.
+            let (mut want_recolor, mut want_speed, mut want_png) = (self.gif_recolor, None, false);
+            let cur_frame;
             let tex = {
                 let anim = self.anim.as_mut().unwrap();
                 let n = anim.frames.len();
                 if anim.playing && n > 1 {
-                    let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0;
+                    let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0 * speed;
                     anim.acc_ms += dt_ms;
                     let mut guard = 0;
                     while anim.acc_ms >= f32::from(anim.delays_ms[anim.current]) && guard < n {
@@ -23904,6 +24003,26 @@ impl PixelView {
                             anim.acc_ms = 0.0;
                             anim.playing = false;
                         }
+                        want_recolor = self.gif_recolor;
+                        ui.checkbox(&mut want_recolor, "Recolor")
+                            .on_hover_text("Run the Recolor / PixelFX stack on every frame");
+                        egui::ComboBox::from_id_salt("gif_speed")
+                            .selected_text(format!("{speed}×"))
+                            .width(64.0)
+                            .show_ui(ui, |ui| {
+                                for v in [0.25f32, 0.5, 1.0, 1.5, 2.0, 4.0] {
+                                    if ui.selectable_label(speed == v, format!("{v}×")).clicked() {
+                                        want_speed = Some(v);
+                                    }
+                                }
+                            });
+                        if ui
+                            .button(format!("{} PNG", icons::DOWNLOAD))
+                            .on_hover_text("Save this frame beside the GIF (recoloured if on)")
+                            .clicked()
+                        {
+                            want_png = true;
+                        }
                         let delay = anim.delays_ms.get(anim.current).copied().unwrap_or(0);
                         let total: u32 = anim.delays_ms.iter().map(|&d| u32::from(d)).sum();
                         ui.label(format!(
@@ -23916,7 +24035,24 @@ impl PixelView {
                         ));
                     });
                 }
+                cur_frame = anim.current;
                 TiledTexture::single(anim.frames[anim.current].clone(), anim.size)
+            };
+            if want_recolor != self.gif_recolor {
+                self.gif_recolor = want_recolor;
+            }
+            if let Some(v) = want_speed {
+                self.gif_speed = v;
+            }
+            if want_png {
+                self.export_gif_frame(cur_frame);
+            }
+            // Swap in the recoloured frame when the option is on (cached per frame + pipeline).
+            let tex = match self.gif_frame_tex(ctx, cur_frame) {
+                Some(t) if self.gif_recolor && self.pipeline_active() => {
+                    TiledTexture::single(t, self.anim.as_ref().map(|a| a.size).unwrap_or([1, 1]))
+                }
+                _ => tex,
             };
             if self.anim.as_ref().is_some_and(|a| a.playing) {
                 self.want_repaint = true; // keep animating
@@ -29776,11 +29912,16 @@ impl eframe::App for PixelView {
                 self.select_index(self.entries.len() - 1);
             }
         }
-        // '/' opens the grid filename filter (vim-style).
+        // '/' opens the grid filename filter (vim-style). `egui_wants_keyboard_input` is the
+        // load-bearing guard: '/' is a plain character, so without it a slash typed into ANY
+        // focused text field (a URL in the Web tab, a ModArchive/Poly Haven query, …) is stolen by
+        // the filter instead of being typed. The explicit `path_edit`/`search` flags only cover
+        // this file's own two fields, not egui's focus in general.
         if self.mode == Mode::Grid
             && self.path_edit.is_none()
             && self.rebinding.is_none()
             && self.search.is_none()
+            && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Slash))
         {
             self.search = Some(String::new());
@@ -30831,6 +30972,8 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::MA_KEY_KEY, &self.ma_key);
+        eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
+        eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -33356,17 +33499,21 @@ fn build_anim(ctx: &egui::Context, path: &std::path::Path, max_pixels: usize) ->
         return None;
     }
     let size = [af.width as usize, af.height as usize];
-    let frames = af
+    // Keep each frame's CPU pixels alongside its texture: Recolor + PNG export need them.
+    let raws: Vec<Vec<u8>> = af
         .frames
         .iter()
+        .map(|fr| fr.iter().flat_map(|&p| p).collect())
+        .collect();
+    let frames = raws
+        .iter()
         .enumerate()
-        .map(|(i, fr)| {
-            let raw: Vec<u8> = fr.iter().flat_map(|&p| p).collect();
+        .map(|(i, raw)| {
             load_texture_capped(
                 ctx,
                 format!("{}#{i}", path.to_string_lossy()),
                 size,
-                &raw,
+                raw,
                 view_tex_opts(),
             )
         })
@@ -33374,11 +33521,13 @@ fn build_anim(ctx: &egui::Context, path: &std::path::Path, max_pixels: usize) ->
     Some(AnimState {
         path: path.to_path_buf(),
         frames,
+        raw: raws,
         delays_ms: af.delays_ms,
         size,
         current: 0,
         playing: true,
         acc_ms: 0.0,
+        recolored: HashMap::new(),
     })
 }
 
