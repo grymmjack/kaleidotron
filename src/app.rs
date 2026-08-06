@@ -1887,6 +1887,7 @@ pub struct PixelView {
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
+    secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
     // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
     // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
     // actually browse (Preferences → "Web sources"). A persisted value always wins over the
@@ -2767,6 +2768,7 @@ impl PixelView {
         // legacy persisted blob (and it gets written out as JSON on the next save, migrating once).
         let kb_file = crate::keybindings::path(&data_dir);
         let settings_file = crate::settings::path(&data_dir);
+        let secrets_file = crate::secrets::path(&data_dir);
         if let Some(entries) = crate::keybindings::load(&kb_file) {
             for (aid, kn) in entries {
                 if let (Some(a), Some(k)) = (Action::from_id(&aid), egui::Key::from_name(&kn)) {
@@ -3473,6 +3475,7 @@ impl PixelView {
             ma_dir,
             keybindings_file: kb_file,
             settings_file,
+            secrets_file,
             plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
             plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
             plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
@@ -3547,6 +3550,16 @@ impl PixelView {
         }
         // `settings.json` overrides the persisted defaults, then is (re)written so a fresh install
         // finds a documented file immediately rather than after a clean exit.
+        // API keys come from `secrets.json` when present. They're still read from the legacy
+        // storage blob as a fallback, and written out to the secrets file on save — so an existing
+        // install migrates its keys out of the shared config without the user doing anything.
+        let sec = crate::secrets::load(&app.secrets_file);
+        if let Some(v) = sec.get("steam_api_key") {
+            app.steam_api_key = v.clone();
+        }
+        if let Some(v) = sec.get("ma_key") {
+            app.ma_key = v.clone();
+        }
         app.apply_settings_file();
         app.write_settings_file();
         app
@@ -31551,8 +31564,18 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::YT_COOKIES_KEY, &self.yt_cookies_browser);
         eframe::set_value(storage, Self::RECOLOR_PLAYBACK_KEY, &self.recolor_playback);
         eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
-        eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
-        eframe::set_value(storage, Self::MA_KEY_KEY, &self.ma_key);
+        // Deliberately NOT written to the shared storage blob any more — keys go to secrets.json,
+        // which the user can exclude from dotfile sync. Old blobs keep their copy until overwritten;
+        // that's the migration read above, and clearing a key in Preferences removes the file.
+        if let Err(e) = crate::secrets::save(
+            &self.secrets_file,
+            &[
+                ("steam_api_key", &self.steam_api_key, "Steam Web API key — steamcommunity.com/dev/apikey"),
+                ("ma_key", &self.ma_key, "ModArchive API key (optional; browsing works without one)"),
+            ],
+        ) {
+            eprintln!("secrets.json: {e}");
+        }
         eframe::set_value(storage, Self::PLUGIN_GIFS_KEY, &self.plugin_gifs);
         eframe::set_value(storage, Self::PLUGIN_WEB_KEY, &self.plugin_web);
         eframe::set_value(storage, Self::PLUGIN_ICONS_KEY, &self.plugin_icons);
