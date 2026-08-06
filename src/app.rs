@@ -3560,6 +3560,7 @@ impl PixelView {
     fn settings_entries(&self) -> Vec<crate::settings::Entry> {
         use crate::settings::entry as e;
         const A: &str = "Appearance";
+        const V: &str = "Viewer";
         vec![
             e(A, "theme", self.theme, "0 = dark, 1 = light"),
             e(A, "ui_zoom", self.ui_zoom, "whole-UI scale (1.0 = 100%)"),
@@ -3572,6 +3573,24 @@ impl PixelView {
             e(A, "transp_solid", self.transp_solid, "transparency backdrop: false = checkerboard, true = solid"),
             e(A, "transp_color", self.transp_color, "solid transparency backdrop colour [r, g, b]"),
             e(A, "transp_checker_size", self.transp_checker_size, "checker cell: 0 = small, 1 = medium, 2 = large"),
+            // Viewer. NB `baud_ansi`/`baud_rip` are deliberately absent: they're a `Baud` enum and
+            // want a named representation rather than a bare number — a later tranche.
+            e(V, "textmode_zoom", self.textmode_zoom, "device pixels per source pixel for text-mode art"),
+            e(V, "raster_zoom", self.raster_zoom, "remembered zoom for ordinary raster images"),
+            e(V, "fit_mode", self.fit_mode, "sticky: re-fit every newly opened image"),
+            e(V, "zoom_lock", self.zoom_lock, "snap zoom to whole steps (crisp pixels)"),
+            e(V, "black_bg", self.black_bg, "fill the viewer background black"),
+            e(V, "crt_aspect", self.crt_aspect, "stretch text-mode art ~1.2x vertically (4:3 CRT)"),
+            e(V, "font_9px", self.font_9px, "render the VGA font in a 9-dot cell, like real VGA text mode"),
+            e(V, "crt_scanline_dark", self.crt_scanline_dark, "scanline darkness, 0 = off"),
+            e(V, "crt_scanline_scale", self.crt_scanline_scale, "scale scanline spacing with zoom"),
+            e(V, "glow", self.glow, "phosphor-glow bloom around bright pixels"),
+            e(V, "glow_amt", self.glow_amt, "phosphor-glow intensity"),
+            e(V, "osd_enabled", self.osd_enabled, "show the info OSD when an image opens"),
+            e(V, "osd_position", self.osd_position, "OSD anchor 0..=7 (TL,T,TR,L,R,BL,B,BR)"),
+            e(V, "osd_secs", self.osd_secs, "seconds the OSD holds before fading"),
+            e(V, "auto_next", self.auto_next, "slideshow: auto-advance to the next file"),
+            e(V, "auto_next_secs", self.auto_next_secs, "slideshow delay in seconds (1/3/5/10)"),
         ]
     }
 
@@ -3612,6 +3631,59 @@ impl PixelView {
         }
         if let Some(v) = st::get_u64(&m, "transp_checker_size") {
             self.transp_checker_size = (v as u8).min(2);
+        }
+        // Viewer
+        if let Some(v) = st::get_f32(&m, "textmode_zoom") {
+            self.textmode_zoom = v.clamp(1.0, 16.0);
+        }
+        if let Some(v) = st::get_f32(&m, "raster_zoom") {
+            self.raster_zoom = v.clamp(0.01, 64.0);
+        }
+        if let Some(v) = st::get_bool(&m, "fit_mode") {
+            self.fit_mode = v;
+        }
+        if let Some(v) = st::get_bool(&m, "zoom_lock") {
+            self.zoom_lock = v;
+        }
+        if let Some(v) = st::get_bool(&m, "black_bg") {
+            self.black_bg = v;
+        }
+        if let Some(v) = st::get_bool(&m, "crt_aspect") {
+            self.crt_aspect = v;
+        }
+        if let Some(v) = st::get_bool(&m, "font_9px") {
+            self.font_9px = v;
+            // This one flips a process-global the decoders read, so the flag has to be re-primed
+            // when the file overrides what storage loaded — otherwise the setting reads as
+            // applied but tiles decode at the old cell width.
+            crate::decode::set_font_9px(v);
+        }
+        if let Some(v) = st::get_f32(&m, "crt_scanline_dark") {
+            self.crt_scanline_dark = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = st::get_bool(&m, "crt_scanline_scale") {
+            self.crt_scanline_scale = v;
+        }
+        if let Some(v) = st::get_bool(&m, "glow") {
+            self.glow = v;
+        }
+        if let Some(v) = st::get_f32(&m, "glow_amt") {
+            self.glow_amt = v.clamp(0.0, 4.0);
+        }
+        if let Some(v) = st::get_bool(&m, "osd_enabled") {
+            self.osd_enabled = v;
+        }
+        if let Some(v) = st::get_u64(&m, "osd_position") {
+            self.osd_position = (v as u8).min(7);
+        }
+        if let Some(v) = st::get_f32(&m, "osd_secs") {
+            self.osd_secs = v.clamp(0.5, 60.0);
+        }
+        if let Some(v) = st::get_bool(&m, "auto_next") {
+            self.auto_next = v;
+        }
+        if let Some(v) = st::get_u64(&m, "auto_next_secs") {
+            self.auto_next_secs = (v as u8).clamp(1, 60);
         }
     }
 
