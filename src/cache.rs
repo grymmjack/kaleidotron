@@ -79,15 +79,26 @@ fn key(url: &str) -> String {
 
 /// A descriptive User-Agent — Wikimedia (and good API etiquette generally) require one; a
 /// missing/blank UA gets 403'd. Kept generic + contactable per the Wikimedia UA policy.
-const USER_AGENT: &str = "pixelview/0.1 (https://github.com/grymmjack/pixel-viewer)";
+pub const USER_AGENT: &str = "pixelview/0.1 (https://github.com/grymmjack/pixel-viewer)";
 
 /// HTTP GET `url` into memory (capped). Errors on a network/HTTP failure (so failures
 /// are never cached).
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| e.to_string())?;
+    // Every outbound request in the app funnels through here, so this is the one place politeness
+    // has to live: robots.txt, the per-host rate limit, and any server-requested cooldown. Putting
+    // it here means no source can bypass it, now or later.
+    crate::netpolicy::before_request(url)?;
+    let resp = match ureq::get(url).set("User-Agent", USER_AGENT).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            // The server explicitly telling us to slow down — hold off on this host.
+            if code == 429 || code == 503 {
+                crate::netpolicy::note_throttled(url, r.header("Retry-After"));
+            }
+            return Err(format!("HTTP {code}"));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let mut buf = Vec::new();
     resp.into_reader()
         .take(FETCH_CAP)
@@ -100,6 +111,8 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
 /// downloading something huge just to build a thumbnail; `None` means "unknown", and the caller
 /// decides whether to risk it. Never cached — it's a cheap header-only probe.
 pub fn content_length(url: &str) -> Option<u64> {
+    // A HEAD is still a request against someone's server — same rate limit and robots rules.
+    crate::netpolicy::before_request(url).ok()?;
     let resp = ureq::head(url)
         .set("User-Agent", USER_AGENT)
         .call()

@@ -14,6 +14,7 @@ mod httpfs;
 mod image_types;
 mod libxmp;
 mod modarchive;
+mod netpolicy;
 mod palettes_builtin;
 mod polyhaven;
 mod rating;
