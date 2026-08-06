@@ -279,6 +279,12 @@ enum WebMsg {
     Failed(String),
 }
 
+/// Messages from a ModArchive browse worker (`ma_walk`): one tracker module per hit, then the count.
+enum MaMsg {
+    Hit(Entry, Box<crate::modarchive::MaModule>),
+    Done(usize),
+}
+
 /// Messages from a Google Fonts browse worker (`gf_walk`): one family per hit, then the count.
 enum GfMsg {
     Hit(Entry, Box<crate::gfonts::GFont>),
@@ -1846,6 +1852,18 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     gf_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     gf_dir: PathBuf, // <data>/gfonts — downloaded families
+    // The Mod Archive (~170k tracker modules). Downloads are keyless; SEARCH needs a free API key,
+    // so `ma_key` (Preferences, local-only like the Steam key) upgrades to the richer XML API and
+    // an empty key falls back to parsing the public search page.
+    ma_modules: HashMap<PathBuf, crate::modarchive::MaModule>,
+    ma_query: String,
+    ma_key: String,
+    ma_rx: Option<std::sync::mpsc::Receiver<MaMsg>>,
+    ma_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ma_files: HashMap<PathBuf, PathBuf>,
+    #[allow(clippy::type_complexity)]
+    ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
     web_url: String,                             // the Places URL box
     web_http: HashMap<String, bool>,             // host → needs plain HTTP (remembered per session)
@@ -1934,6 +1952,7 @@ impl PixelView {
     const RECOLOR_PLAYBACK_KEY: &'static str = "recolor_playback";
     const SHOW_FPS_KEY: &'static str = "show_fps";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
+    const MA_KEY_KEY: &'static str = "modarchive_api_key";
     /// Audio preview: start on select + loop until stopped.
     const AUDIO_AUTOPLAY_KEY: &'static str = "audio_autoplay";
     /// Master audio volume (0..1) + mute — the menu-bar volume control.
@@ -2159,6 +2178,12 @@ impl PixelView {
         let steam_api_key = cc
             .storage
             .and_then(|s| eframe::get_value::<String>(s, Self::STEAM_KEY_KEY))
+            .unwrap_or_default();
+        // Optional ModArchive API key — browsing works without one (the public search page is
+        // parsed instead), so this is purely an upgrade to richer metadata.
+        let ma_key = cc
+            .storage
+            .and_then(|s| eframe::get_value::<String>(s, Self::MA_KEY_KEY))
             .unwrap_or_default();
         let yt_cookies_browser = cc
             .storage
@@ -2646,6 +2671,7 @@ impl PixelView {
         let snd_dir = data_dir.join("audio");
         let gf_dir = data_dir.join("gfonts");
         let web_dir = data_dir.join("web");
+        let ma_dir = data_dir.join("modules");
         let mut palette_files = all_palettes(&palette_dir);
         for p in all_palettes(&lospec_dir) {
             if !palette_files.contains(&p) {
@@ -3366,6 +3392,14 @@ impl PixelView {
             web_files: HashMap::new(),
             web_open_rx: None,
             web_dir,
+            ma_modules: HashMap::new(),
+            ma_query: String::new(),
+            ma_key,
+            ma_rx: None,
+            ma_cancel: None,
+            ma_files: HashMap::new(),
+            ma_open_rx: None,
+            ma_dir,
             web_dl_open: false,
             web_dl_mask: "*.*".into(),
             web_dl_recursive: true,
@@ -3523,6 +3557,11 @@ impl PixelView {
         // Free audio search (Openverse) — results download into the waveform editor / sample pads.
         if crate::audiosearch::is_remote(&dir) {
             self.open_audio_search(dir);
+            return;
+        }
+        // The Mod Archive — browse → download the module → the tracker player + sample explorer.
+        if crate::modarchive::is_remote(&dir) {
+            self.open_modarchive(dir);
             return;
         }
         // HTTP filesystem browser — any auto-indexed URL, browsed like a folder tree.
@@ -4393,6 +4432,7 @@ impl PixelView {
             .or_else(|| self.snd_files.get(path))
             .or_else(|| self.gf_files.get(path))
             .or_else(|| self.web_files.get(path))
+            .or_else(|| self.ma_files.get(path))
         {
             return f.clone();
         }
@@ -5831,6 +5871,153 @@ impl PixelView {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.web_open_rx = None,
+        }
+    }
+
+    // --- The Mod Archive. A downloaded module plays through the existing tracker path (xmrs /
+    // libxmp) and its instrument bank shows up in the sample explorer, ready for the pads.
+
+    fn open_modarchive(&mut self, dir: PathBuf) {
+        let parts = crate::modarchive::rel_parts(&dir);
+        match parts.as_slice() {
+            [] => {
+                self.show_folder(dir, Vec::new());
+                self.status = "Type a query in the Places panel (e.g. “chiptune”)".into();
+            }
+            [s, _q] if s == crate::modarchive::SEARCH => self.start_ma_search(dir),
+            // A pinned module leaf → download + play.
+            [s, _q, _leaf] if s == crate::modarchive::SEARCH => self.start_ma_open(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    fn start_ma_search(&mut self, dir: PathBuf) {
+        let query = crate::modarchive::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.ma_modules.clear();
+        if let Some(c) = self.ma_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ma_rx = Some(rx);
+        self.ma_cancel = Some(cancel.clone());
+        self.status = format!("Searching ModArchive: {query}");
+        self.want_repaint = true;
+        let key = self.ma_key.trim().to_string();
+        std::thread::spawn(move || ma_walk(query, key, &dir, cancel, tx));
+    }
+
+    /// Drain the ModArchive worker. Modules have no server-side thumbnail, so tiles fall through to
+    /// the normal decoder path (a music-note icon until downloaded).
+    fn poll_ma(&mut self) {
+        let Some(rx) = &self.ma_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..256 {
+            match rx.try_recv() {
+                Ok(MaMsg::Hit(mut entry, m)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.ma_modules.insert(entry.path.clone(), *m);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(MaMsg::Done(n)) => {
+                    self.status = format!("{n} module(s)");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.ma_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    fn start_ma_open(&mut self, vpath: PathBuf) {
+        // As with the other sources, a pinned leaf reopened in a fresh session has no map entry —
+        // the module id is recoverable from the filename, which is all the download needs.
+        let m = match self.ma_modules.get(&vpath).cloned() {
+            Some(m) => m,
+            None => {
+                let Some(leaf) = vpath.file_name().and_then(|s| s.to_str()) else {
+                    self.status = "Unknown module".into();
+                    return;
+                };
+                let Some(id) = crate::modarchive::parse_id(leaf) else {
+                    self.status = "Unknown module".into();
+                    return;
+                };
+                crate::modarchive::MaModule {
+                    id,
+                    filename: leaf.to_string(),
+                    ..Default::default()
+                }
+            }
+        };
+        if self.ma_open_rx.is_some() {
+            self.status = "Already downloading…".into();
+            return;
+        }
+        // Playing a module IS the audio plugin.
+        if !self.plugin_audio {
+            self.plugin_audio = true;
+            self.registry.set_plugin("audio", true);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ma_open_rx = Some(rx);
+        self.status = format!("Fetching: {}", elide(&m.display(), 40));
+        let dir = self.ma_dir.clone();
+        std::thread::spawn(move || {
+            // Save under the module's real filename so the extension drives the tracker decoder.
+            let name = if m.filename.is_empty() {
+                format!("{}.mod", m.id)
+            } else {
+                m.filename.clone()
+            };
+            let _ = tx.send(download_to_dir(&m.download_url(), &name, &dir).map(|local| (vpath, local)));
+        });
+    }
+
+    fn poll_ma_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ma_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self.ma_modules.get(&vpath).map(|m| {
+                    let mut s = m.display();
+                    if !m.artist.is_empty() {
+                        s.push_str(&format!(" — {}", m.artist));
+                    }
+                    if !m.genre.is_empty() {
+                        s.push_str(&format!(" · {}", m.genre));
+                    }
+                    s.push_str(&format!(" · {}", m.page_url()));
+                    s
+                });
+                self.ma_files.insert(vpath.clone(), local);
+                self.ma_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Download failed: {e}");
+                self.ma_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ma_open_rx = None,
         }
     }
 
@@ -15277,6 +15464,8 @@ impl PixelView {
             || self.gf_open_rx.is_some()
             || self.web_rx.is_some()
             || self.web_open_rx.is_some()
+            || self.ma_rx.is_some()
+            || self.ma_open_rx.is_some()
     }
 
     /// Full view record (count + first/last) for `path`, if tracked.
@@ -16525,6 +16714,13 @@ impl PixelView {
             // A free-audio result not yet downloaded → fetch, then open in the waveform editor.
             self.selected = idx;
             self.start_snd_open(entry.path);
+        } else if self.ma_modules.contains_key(&entry.path)
+            && !self.ma_files.contains_key(&entry.path)
+        {
+            // A ModArchive module not yet downloaded → fetch, then play it (and expose its
+            // instrument bank in the sample explorer).
+            self.selected = idx;
+            self.start_ma_open(entry.path);
         } else if crate::httpfs::is_remote(&entry.path)
             && !entry.is_dir
             && !self.web_files.contains_key(&entry.path)
@@ -19598,6 +19794,30 @@ impl PixelView {
                                     ui.label(&r.provider);
                                     ui.end_row();
                                 }
+                            }
+                            if let Some(m) = self.ma_modules.get(&entry.path) {
+                                ui.weak("Module ID");
+                                ui.label(m.id.to_string());
+                                ui.end_row();
+                                if !m.artist.is_empty() {
+                                    ui.weak("Artist");
+                                    ui.label(&m.artist);
+                                    ui.end_row();
+                                }
+                                if !m.genre.is_empty() {
+                                    ui.weak("Genre");
+                                    ui.label(&m.genre);
+                                    ui.end_row();
+                                }
+                                let sz = m.size_label();
+                                if !sz.is_empty() {
+                                    ui.weak("Size");
+                                    ui.label(sz);
+                                    ui.end_row();
+                                }
+                                ui.weak("Tracker");
+                                ui.label(m.ext().to_uppercase());
+                                ui.end_row();
                             }
                             if let Some(f) = self.gf_fonts.get(&entry.path) {
                                 ui.weak("Designer");
@@ -27636,6 +27856,7 @@ impl PixelView {
                             (12, "3D/CC0"),
                             (13, "Fonts"),
                             (14, "Audio"),
+                            (15, "Modules"),
                             (6, "Steam"),
                             (7, "AI"),
                             (2, "Kits"),
@@ -28170,6 +28391,36 @@ impl PixelView {
                             });
                         }
                         if let Some(p) = self.favorites_buttons(ui, icons::GLOBE, crate::httpfs::is_remote, false) {
+                            nav = Some(p);
+                        }
+                    } else if self.places_tab == 15 {
+                        // The Mod Archive: search → download → the tracker player. Modules also
+                        // feed the sample explorer, so this doubles as a sample source for kits.
+                        ui.horizontal(|ui| {
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.ma_query)
+                                    .hint_text("chiptune, jungle, artist…")
+                                    .desired_width(150.0),
+                            );
+                            let go = ui.button(format!("{} Search", icons::SEARCH)).clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if go {
+                                let q = self.ma_query.trim().to_string();
+                                if !q.is_empty() {
+                                    nav = Some(
+                                        Path::new(crate::modarchive::ROOT)
+                                            .join(crate::modarchive::SEARCH)
+                                            .join(q),
+                                    );
+                                }
+                            }
+                        });
+                        ui.weak(if self.ma_key.trim().is_empty() {
+                            "modarchive.org · no key needed (add one in Preferences for more info)"
+                        } else {
+                            "modarchive.org · using your API key"
+                        });
+                        if let Some(p) = self.favorites_buttons(ui, icons::MUSIC, crate::modarchive::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 16 {
@@ -29287,6 +29538,8 @@ impl eframe::App for PixelView {
         self.poll_gf_open(&ctx);
         self.poll_web();
         self.poll_web_open(&ctx);
+        self.poll_ma();
+        self.poll_ma_open(&ctx);
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -30121,6 +30374,24 @@ impl eframe::App for PixelView {
                                     );
                                 }
 
+                                // ModArchive API key — OPTIONAL. Browsing already works without
+                                // one (the public search page is parsed); a key just upgrades to
+                                // the XML API's richer metadata (artist / genre / size).
+                                ui.add_space(8.0);
+                                ui.label("ModArchive API key (optional)");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.ma_key)
+                                            .password(true)
+                                            .hint_text("leave blank — browsing works without it")
+                                            .desired_width(220.0),
+                                    );
+                                    if ui.button("Request…").clicked() {
+                                        self.open_url("https://modarchive.org/index.php?request=view_page&page=api_key");
+                                    }
+                                });
+                                ui.weak("Stored locally only. Adds artist / genre / size to results.");
+
                                 // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
                                 if self.plugin_audio {
                                     ui.add_space(8.0);
@@ -30559,6 +30830,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::RECOLOR_PLAYBACK_KEY, &self.recolor_playback);
         eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
+        eframe::set_value(storage, Self::MA_KEY_KEY, &self.ma_key);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
         eframe::set_value(storage, Self::AUDIO_VOLUME_KEY, &self.audio_volume);
         eframe::set_value(storage, Self::AUDIO_MUTED_KEY, &self.audio_muted);
@@ -36054,6 +36326,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::audiosearch::is_remote(p)
         || crate::gfonts::is_remote(p)
         || crate::httpfs::is_remote(p)
+        || crate::modarchive::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -36474,6 +36747,36 @@ fn web_bulk_walk(
         }
     }
     let _ = tx.send(BulkMsg::Done);
+}
+
+/// Worker: search ModArchive, streaming one module per hit. `key` empty ⇒ the keyless (search-page)
+/// path inside `modarchive::search`.
+fn ma_walk(
+    query: String,
+    key: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<MaMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = (!key.is_empty()).then_some(key);
+    let mods = crate::modarchive::search(&query, key.as_deref(), 120).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for m in mods {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(m.leaf());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        n += 1;
+        if tx.send(MaMsg::Hit(virtual_entry(path), Box::new(m))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(MaMsg::Done(n));
 }
 
 /// Worker: fetch + parse one remote directory listing, streaming an entry per item.
