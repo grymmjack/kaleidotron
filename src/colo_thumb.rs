@@ -25,6 +25,9 @@ struct Job {
     // 16colo has no pre-rendered PNG for a PDF piece (its `tn`/`x1` render 404s), so
     // `url` is the *raw* PDF and we render page 1 ourselves via the registry (pdftoppm).
     via_registry: bool,
+    /// Skip the download when the server reports a body larger than this. Checked on the worker
+    /// thread (a HEAD request), never on the UI thread.
+    max_bytes: Option<u64>,
 }
 
 pub struct RemoteThumbs {
@@ -78,6 +81,31 @@ impl RemoteThumbs {
                 url: url.to_string(),
                 target,
                 via_registry,
+                max_bytes: None,
+            });
+            cvar.notify_one();
+        }
+    }
+
+    /// As [`request`], but skips anything the server reports as larger than `max_bytes` — for
+    /// browsing an arbitrary website, where a tile shouldn't cost a multi-megabyte download. The
+    /// size probe runs on the worker thread, so it never blocks a frame.
+    pub fn request_capped(
+        &mut self,
+        path: &Path,
+        url: &str,
+        target: u32,
+        via_registry: bool,
+        max_bytes: u64,
+    ) {
+        if self.requested.insert(path.to_path_buf()) {
+            let (lock, cvar) = &*self.queue;
+            lock.lock().unwrap().push(Job {
+                path: path.to_path_buf(),
+                url: url.to_string(),
+                target,
+                via_registry,
+                max_bytes: Some(max_bytes),
             });
             cvar.notify_one();
         }
@@ -101,6 +129,13 @@ impl RemoteThumbs {
 /// render; everything else fetches 16colo's pre-rendered PNG. Both go through the
 /// persistent disk cache — re-browsing a pack/artist doesn't re-fetch.
 fn fetch(job: &Job, registry: &Registry) -> Option<RemoteThumbResult> {
+    // Ask before committing to the body. A server that won't report a length is still fetched —
+    // `cache::get_bytes` has its own hard cap as the backstop.
+    if let Some(max) = job.max_bytes {
+        if crate::cache::content_length(&job.url).is_some_and(|n| n > max) {
+            return None;
+        }
+    }
     let buf = crate::cache::get_bytes(&job.url, None).ok()?;
     if job.via_registry {
         let img = registry.decode_bytes(&buf, &job.path).ok()?;

@@ -96,6 +96,17 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// `Content-Length` for `url` via a **HEAD** request, when the server reports one. Used to skip
+/// downloading something huge just to build a thumbnail; `None` means "unknown", and the caller
+/// decides whether to risk it. Never cached — it's a cheap header-only probe.
+pub fn content_length(url: &str) -> Option<u64> {
+    let resp = ureq::head(url)
+        .set("User-Agent", USER_AGENT)
+        .call()
+        .ok()?;
+    resp.header("Content-Length")?.trim().parse().ok()
+}
+
 /// Cached GET → bytes. `ttl` of `None` means the content is immutable (never expires);
 /// `Some(secs)` re-fetches once the entry is older than that. Used for JSON + thumbnails.
 pub fn get_bytes(url: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
