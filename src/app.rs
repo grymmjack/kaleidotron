@@ -1098,6 +1098,20 @@ impl Action {
         Action::ParentDir,
         Action::ToggleView,
     ];
+    /// Stable id used in `keybindings.json`. Unlike the old `to_u8` index this doesn't constrain
+    /// the order of `ALL` — actions can be reordered or removed without rebinding someone's keys.
+    fn id(self) -> &'static str {
+        match self {
+            Action::PrevImage => "prev_image",
+            Action::NextImage => "next_image",
+            Action::BackToGrid => "back_to_grid",
+            Action::ParentDir => "parent_dir",
+            Action::ToggleView => "toggle_view",
+        }
+    }
+    fn from_id(id: &str) -> Option<Action> {
+        Action::ALL.iter().copied().find(|a| a.id() == id)
+    }
     fn label(self) -> &'static str {
         match self {
             Action::PrevImage => "Previous image",
@@ -1871,6 +1885,7 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
+    keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
     // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
     // actually browse (Preferences → "Web sources"). A persisted value always wins over the
@@ -2747,7 +2762,16 @@ impl PixelView {
 
         let mut keymap: HashMap<Action, egui::Key> =
             Action::ALL.iter().map(|&a| (a, a.default_key())).collect();
-        if let Some(saved) = cc
+        // `keybindings.json` is the source of truth when it exists; otherwise fall back to the
+        // legacy persisted blob (and it gets written out as JSON on the next save, migrating once).
+        let kb_file = crate::keybindings::path(&data_dir);
+        if let Some(entries) = crate::keybindings::load(&kb_file) {
+            for (aid, kn) in entries {
+                if let (Some(a), Some(k)) = (Action::from_id(&aid), egui::Key::from_name(&kn)) {
+                    keymap.insert(a, k);
+                }
+            }
+        } else if let Some(saved) = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<(u8, String)>>(s, Self::KEYMAP_KEY))
         {
@@ -2758,6 +2782,16 @@ impl PixelView {
                     keymap.insert(a, k);
                 }
             }
+        }
+        // Seed the file on first run rather than waiting for a save: a config file you can't find
+        // until you've quit cleanly isn't discoverable. Written in `ALL` order, with comments.
+        if !kb_file.exists() {
+            let entries: Vec<(String, String)> = Action::ALL
+                .iter()
+                .filter_map(|a| keymap.get(a).map(|k| (a.id().to_string(), k.name().to_string())))
+                .collect();
+            let labels = |id: &str| Action::from_id(id).map(|a| a.label().to_string());
+            let _ = crate::keybindings::save(&kb_file, &entries, &labels);
         }
 
         // Shared channel for background pack-SAUCE fetches (see `ensure_colo_sauce`).
@@ -3435,6 +3469,7 @@ impl PixelView {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
+            keybindings_file: kb_file,
             plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
             plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
             plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
@@ -31480,6 +31515,16 @@ impl eframe::App for PixelView {
             .map(|(a, k)| (a.to_u8(), k.name().to_string()))
             .collect();
         eframe::set_value(storage, Self::KEYMAP_KEY, &km);
+        // Also write the hand-editable file. Actions are emitted in `ALL` order so the file has a
+        // stable, reviewable diff rather than HashMap iteration order.
+        let entries: Vec<(String, String)> = Action::ALL
+            .iter()
+            .filter_map(|a| self.keymap.get(a).map(|k| (a.id().to_string(), k.name().to_string())))
+            .collect();
+        let labels = |id: &str| Action::from_id(id).map(|a| a.label().to_string());
+        if let Err(e) = crate::keybindings::save(&self.keybindings_file, &entries, &labels) {
+            eprintln!("keybindings.json: {e}");
+        }
     }
 
     // Persist only our own keys (above), not all of egui's memory.
