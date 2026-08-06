@@ -3563,6 +3563,8 @@ impl PixelView {
         const V: &str = "Viewer";
         const P: &str = "Plugins";
         const W: &str = "Web sources";
+        const AU: &str = "Audio";
+        const PA: &str = "Paths";
         vec![
             e(A, "theme", self.theme, "0 = dark, 1 = light"),
             e(A, "ui_zoom", self.ui_zoom, "whole-UI scale (1.0 = 100%)"),
@@ -3609,6 +3611,22 @@ impl PixelView {
             e(W, "plugin_ph", self.plugin_ph, "Poly Haven CC0 models / textures / HDRIs"),
             e(W, "plugin_gfonts", self.plugin_gfonts, "Google Fonts browser"),
             e(W, "plugin_ma", self.plugin_ma, "The Mod Archive (tracker modules)"),
+            // Audio
+            e(AU, "audio_autoplay", self.audio_autoplay, "start playing as soon as a clip is opened"),
+            e(AU, "audio_volume", self.audio_volume, "master playback volume, 0..1"),
+            e(AU, "audio_muted", self.audio_muted, "master mute"),
+            e(AU, "bpm", self.bpm, "tempo for the musical grid"),
+            e(AU, "musical_div", self.musical_div, "grid division: 0=whole 1=half 2=quarter 3=eighth …"),
+            e(AU, "transient_sens", self.transient_sens, "transient detection sensitivity, 0..1 (0 = off)"),
+            e(AU, "snap_transient", self.snap_transient, "snap selection edges to transients / the grid"),
+            e(AU, "zoom_edit_pct", self.zoom_edit_pct, "magnification of the waveform edge inset, %"),
+            e(AU, "pad_base_note", self.pad_base_note, "base MIDI note for auto pad mapping (48 = C3)"),
+            e(AU, "midi_sf", self.midi_sf.clone(), "General MIDI SoundFont path (null = auto-detect)"),
+            // Paths
+            e(PA, "palette_dir", self.palette_dir.clone(), "extra folder scanned for .gpl palettes"),
+            e(PA, "yt_download_dir", self.yt_download_dir.clone(), "where YouTube downloads land (null = default)"),
+            e(PA, "yt_max_height", self.yt_max_height, "YouTube download resolution cap, e.g. 720"),
+            e(PA, "git_enabled", self.git_enabled, "show git status badges in local repos"),
         ]
     }
 
@@ -3717,6 +3735,53 @@ impl PixelView {
                 *flag = v;
                 self.registry.set_plugin(id, v);
             }
+        }
+        // Audio
+        if let Some(v) = st::get_bool(&m, "audio_autoplay") {
+            self.audio_autoplay = v;
+        }
+        if let Some(v) = st::get_f32(&m, "audio_volume") {
+            self.audio_volume = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = st::get_bool(&m, "audio_muted") {
+            self.audio_muted = v;
+        }
+        if let Some(v) = st::get_f32(&m, "bpm") {
+            self.bpm = v.clamp(20.0, 400.0);
+        }
+        if let Some(v) = st::get_u64(&m, "musical_div") {
+            self.musical_div = (v as u8).min(8);
+        }
+        if let Some(v) = st::get_f32(&m, "transient_sens") {
+            self.transient_sens = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = st::get_bool(&m, "snap_transient") {
+            self.snap_transient = v;
+        }
+        if let Some(v) = st::get_u64(&m, "zoom_edit_pct") {
+            self.zoom_edit_pct = (v as u32).clamp(0, 100);
+        }
+        if let Some(v) = m.get("pad_base_note").and_then(|x| x.as_i64()) {
+            self.pad_base_note = v.clamp(0, 127) as i32;
+        }
+        // Optional paths: an explicit `null` means "unset", which is different from the key being
+        // absent (leave whatever we loaded alone) — so check for the key, not just a string value.
+        if let Some(v) = m.get("midi_sf") {
+            self.midi_sf = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+        }
+        if let Some(v) = m.get("yt_download_dir") {
+            self.yt_download_dir = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+        }
+        if let Some(v) = st::get_string(&m, "palette_dir") {
+            if !v.trim().is_empty() {
+                self.palette_dir = PathBuf::from(v);
+            }
+        }
+        if let Some(v) = st::get_u64(&m, "yt_max_height") {
+            self.yt_max_height = (v as u32).clamp(144, 4320);
+        }
+        if let Some(v) = st::get_bool(&m, "git_enabled") {
+            self.git_enabled = v;
         }
         // Plain flags — no registry side effect.
         for (key, flag) in [
