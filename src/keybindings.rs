@@ -33,7 +33,7 @@ pub fn path(data_dir: &Path) -> PathBuf {
 ///
 /// Quote-aware: a `//` inside a string (a URL, a Windows path) must survive. Escapes are tracked so
 /// `"a\"//b"` isn't mistaken for the end of a string.
-fn strip_comments(text: &str) -> String {
+pub(crate) fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         let (mut in_str, mut esc) = (false, false);

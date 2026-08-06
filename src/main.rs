@@ -13,6 +13,7 @@ mod git;
 mod httpfs;
 mod image_types;
 mod keybindings;
+mod settings;
 mod libxmp;
 mod modarchive;
 mod netpolicy;
