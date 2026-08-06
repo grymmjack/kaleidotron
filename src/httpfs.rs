@@ -47,6 +47,11 @@ pub struct WebEntry {
     pub name: String, // decoded (`AM Composer`, not `AM%20Composer`)
     pub is_dir: bool,
     pub size: u64, // 0 when unknown / not shown
+    /// The entry's absolute URL. For a directory index this is just parent+name, but a link found
+    /// on an ordinary page can point anywhere (another branch, a query string), which a
+    /// segment-appending path model cannot express — so the real URL travels with the entry and the
+    /// app remembers it per virtual path.
+    pub url: String,
 }
 
 /// Percent-decode a URL path segment (`AM%20Composer` → `AM Composer`).
@@ -198,7 +203,146 @@ pub fn parse_listing(html: &str) -> Vec<WebEntry> {
             name,
             is_dir,
             size: if is_dir { 0 } else { size },
+            // Filled in by `fetch_listing`, which knows the parent URL.
+            url: String::new(),
         });
+    }
+    out
+}
+
+/// Resolve `href` against the page URL `base` into an absolute URL. Handles absolute URLs,
+/// protocol-relative (`//host/x`), root-relative (`/x`), and plain relative hrefs (including `../`).
+pub fn join_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') || href.starts_with("mailto:") || href.starts_with("javascript:") {
+        return None;
+    }
+    if href.contains("://") {
+        return Some(href.to_string());
+    }
+    let (scheme, rest) = base.split_once("://")?;
+    if let Some(r) = href.strip_prefix("//") {
+        return Some(format!("{scheme}://{r}"));
+    }
+    let (host, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, p),
+        None => (rest, ""),
+    };
+    if let Some(abs) = href.strip_prefix('/') {
+        return Some(format!("{scheme}://{host}/{abs}"));
+    }
+    // Relative: resolve against the page's *directory*.
+    let dir: Vec<&str> = {
+        let p = path.split(['?', '#']).next().unwrap_or("");
+        let mut v: Vec<&str> = p.split('/').collect();
+        if !p.ends_with('/') {
+            v.pop(); // drop the file component
+        }
+        v.into_iter().filter(|c| !c.is_empty()).collect()
+    };
+    let mut segs: Vec<String> = dir.into_iter().map(String::from).collect();
+    for part in href.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other.to_string()),
+        }
+    }
+    let trail = if href.ends_with('/') { "/" } else { "" };
+    Some(format!("{scheme}://{host}/{}{trail}", segs.join("/")))
+}
+
+/// A link discovered on an ordinary web page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageLink {
+    pub name: String,   // display name: the link text, else the URL's last segment
+    pub url: String,    // absolute
+    pub is_dir: bool,   // navigable (another page) vs. a downloadable file
+}
+
+/// Extensions we treat as *files* rather than navigable pages.
+fn looks_like_file(url: &str) -> bool {
+    let tail = url.split(['?', '#']).next().unwrap_or(url);
+    let last = tail.rsplit('/').next().unwrap_or("");
+    let lower = last.to_ascii_lowercase();
+    // Multi-part archive suffixes first.
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tar.bz2") || lower.ends_with(".tar.xz") {
+        return true;
+    }
+    let Some(ext) = lower.rsplit_once('.').map(|(_, e)| e) else {
+        return false;
+    };
+    // A page extension is still "navigable" — you browse into it to find more links.
+    !matches!(ext, "html" | "htm" | "php" | "asp" | "aspx" | "jsp" | "cgi" | "shtml")
+        && ext.len() <= 5
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Extract an attribute's value from a tag fragment (`src="…"` / `href='…'`).
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=");
+    let i = tag.find(&pat)? + pat.len();
+    let rest = &tag[i..];
+    let (q, body) = match rest.chars().next()? {
+        c @ ('"' | '\'') => (c, &rest[1..]),
+        _ => return rest.split_whitespace().next().map(|v| v.trim_end_matches('>').to_string()),
+    };
+    body.find(q).map(|e| body[..e].to_string())
+}
+
+/// Introspect an **ordinary web page**: pull out its links (with their visible text as names) plus
+/// referenced assets — `<img src>`, `<script src>`, `<link href>` — so a site with no directory
+/// index is still browsable. Anchors that lead to more pages become navigable "folders"; anything
+/// with a file extension becomes a downloadable entry.
+///
+/// Only same-host results are kept: following off-site links would turn browsing into an
+/// unbounded crawl of the whole web.
+pub fn parse_page(html: &str, base: &str) -> Vec<PageLink> {
+    let host = base.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or("");
+    let mut out: Vec<PageLink> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |name: String, url: String| {
+        if url.split("://").nth(1).and_then(|r| r.split('/').next()) != Some(host) {
+            return; // off-site
+        }
+        let clean = url.split('#').next().unwrap_or(&url).to_string();
+        if clean.trim_end_matches('/') == base.trim_end_matches('/') || !seen.insert(clean.clone()) {
+            return; // self-link or duplicate
+        }
+        let is_dir = !looks_like_file(&clean);
+        let name = if name.trim().is_empty() {
+            clean.trim_end_matches('/').rsplit('/').next().unwrap_or("link").to_string()
+        } else {
+            name.trim().chars().take(80).collect()
+        };
+        out.push(PageLink { name: pct_decode(&name), url: clean, is_dir });
+    };
+
+    // <a href="…">text</a> — the text is the human name the user asked to see.
+    let mut rest = html;
+    while let Some(i) = rest.find("<a ") {
+        rest = &rest[i + 3..];
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..end];
+        let body = &rest[end + 1..];
+        let text = body.find("</a>").map(|e| strip_tags(&body[..e])).unwrap_or_default();
+        if let Some(u) = attr(tag, "href").and_then(|h| join_url(base, &unescape(&h))) {
+            push(text, u);
+        }
+    }
+    // Assets: images, scripts, stylesheets.
+    for (tag_open, at) in [("<img ", "src"), ("<script ", "src"), ("<link ", "href"), ("<source ", "src")] {
+        let mut rest = html;
+        while let Some(i) = rest.find(tag_open) {
+            rest = &rest[i + tag_open.len()..];
+            let Some(end) = rest.find('>') else { break };
+            if let Some(u) = attr(&rest[..end], at).and_then(|h| join_url(base, &unescape(&h))) {
+                let nm = u.split(['?', '#']).next().unwrap_or(&u).rsplit('/').next().unwrap_or("asset").to_string();
+                push(nm, u);
+            }
+        }
     }
     out
 }
@@ -262,17 +406,47 @@ pub fn parts_for_url(input: &str) -> Option<(Vec<String>, bool)> {
 /// Fetch and parse a directory listing, trying HTTPS first then HTTP. Returns the entries plus
 /// whether plain HTTP was needed (so the caller can remember it for this host).
 pub fn fetch_listing(parts: &[String], prefer_http: bool) -> Result<(Vec<WebEntry>, bool), String> {
+    fetch_listing_at(parts, None, prefer_http)
+}
+
+/// As [`fetch_listing`], but fetches `known_url` when the caller has the entry's real URL — a link
+/// found on an ordinary page can point anywhere, so its URL can't be rebuilt from path segments.
+pub fn fetch_listing_at(
+    parts: &[String],
+    known_url: Option<&str>,
+    prefer_http: bool,
+) -> Result<(Vec<WebEntry>, bool), String> {
     let mut last = String::new();
     // Try the preferred scheme first, then the other one.
     for http in [prefer_http, !prefer_http] {
-        let url = url_for(parts, http, true);
+        let url = match known_url {
+            Some(u) => u.to_string(),
+            None => url_for(parts, http, true),
+        };
         match crate::cache::get_bytes(&url, Some(3600)) {
             Ok(body) => {
                 let html = String::from_utf8_lossy(&body);
-                let entries = parse_listing(&html);
-                if entries.is_empty() && !looks_like_listing(&html) {
-                    return Err("Not a browsable directory listing".into());
+                // A server-generated index gives clean child names; anything else is an ordinary
+                // page, so fall back to introspecting its links + assets rather than refusing.
+                if looks_like_listing(&html) {
+                    let mut entries = parse_listing(&html);
+                    if !entries.is_empty() {
+                        for e in &mut entries {
+                            let mut p = parts.to_vec();
+                            p.push(e.name.clone());
+                            e.url = url_for(&p, http, e.is_dir);
+                        }
+                        return Ok((entries, http));
+                    }
                 }
+                let links = parse_page(&html, &url);
+                if links.is_empty() {
+                    return Err("No links found on that page".into());
+                }
+                let entries = links
+                    .into_iter()
+                    .map(|l| WebEntry { name: l.name, is_dir: l.is_dir, size: 0, url: l.url })
+                    .collect();
                 return Ok((entries, http));
             }
             Err(e) => last = e,
@@ -384,7 +558,8 @@ mod tests {
     fn parses_apache_listing() {
         let e = parse_listing(APACHE);
         assert_eq!(e.len(), 2, "sort links + Parent Directory skipped");
-        assert_eq!(e[0], WebEntry { name: "3dldf".into(), is_dir: true, size: 0 });
+        assert_eq!(e[0].name, "3dldf");
+        assert!(e[0].is_dir);
         assert_eq!(e[1].name, "=README");
         assert!(!e[1].is_dir);
         assert_eq!(e[1].size, 1536, "1.5K → bytes");
@@ -617,5 +792,86 @@ mod live_recursive {
         enumerate(&parts, http, "*.zzz", true, &cancel, |f| none.push(f)).unwrap();
         eprintln!("MASKED(*.zzz): {}", none.len());
         assert!(none.is_empty(), "mask filters files");
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_relative_absolute_and_dotdot() {
+        let b = "https://x.org/a/b/page.html";
+        assert_eq!(join_url(b, "c.png").as_deref(), Some("https://x.org/a/b/c.png"));
+        assert_eq!(join_url(b, "../up.css").as_deref(), Some("https://x.org/a/up.css"));
+        assert_eq!(join_url(b, "/root/x.js").as_deref(), Some("https://x.org/root/x.js"));
+        assert_eq!(join_url(b, "sub/").as_deref(), Some("https://x.org/a/b/sub/"));
+        assert_eq!(join_url(b, "//cdn.org/y.png").as_deref(), Some("https://cdn.org/y.png"));
+        assert_eq!(join_url(b, "https://z.org/q").as_deref(), Some("https://z.org/q"));
+        // Non-navigable hrefs are dropped.
+        for h in ["#frag", "mailto:a@b", "javascript:void(0)", ""] {
+            assert_eq!(join_url(b, h), None, "{h}");
+        }
+    }
+
+    #[test]
+    fn classifies_files_vs_pages() {
+        assert!(looks_like_file("https://x/a.zip"));
+        assert!(looks_like_file("https://x/a.tar.gz"), "multi-part archive suffix");
+        assert!(looks_like_file("https://x/s.css") && looks_like_file("https://x/s.js"));
+        assert!(looks_like_file("https://x/i.png"));
+        // Pages stay navigable — you browse into them for more links.
+        assert!(!looks_like_file("https://x/index.html"));
+        assert!(!looks_like_file("https://x/forum.php?tid=3"));
+        assert!(!looks_like_file("https://x/section/"));
+        assert!(!looks_like_file("https://x/noext"));
+    }
+
+    #[test]
+    fn extracts_named_links_and_assets_same_host_only() {
+        let base = "https://site.org/index.html";
+        // NB `r##"…"##`: the fragment href below contains `"#`, which would close `r#"…"#`.
+        let html = r##"
+          <a href="downloads/">Downloads</a>
+          <a href="pack.zip">Grab the pack</a>
+          <a href="https://other.org/x">Offsite</a>
+          <a href="#top">Top</a>
+          <img src="/img/logo.png">
+          <link rel="stylesheet" href="style.css">
+          <script src="app.js"></script>
+        "##;
+        let l = parse_page(html, base);
+        let by = |n: &str| l.iter().find(|x| x.name == n).cloned();
+        // Link text becomes the display name.
+        let d = by("Downloads").expect("named dir link");
+        assert!(d.is_dir && d.url == "https://site.org/downloads/");
+        let z = by("Grab the pack").expect("named file link");
+        assert!(!z.is_dir && z.url == "https://site.org/pack.zip");
+        // Assets are picked up and named from their filename.
+        assert!(by("logo.png").is_some_and(|x| !x.is_dir));
+        assert!(by("style.css").is_some() && by("app.js").is_some());
+        // Off-site and fragment links are excluded.
+        assert!(by("Offsite").is_none());
+        assert!(!l.iter().any(|x| x.url.contains('#')));
+    }
+}
+
+#[cfg(test)]
+mod live_page {
+    use super::*;
+    #[test]
+    #[ignore = "hits the live network"]
+    fn browses_an_ordinary_site() {
+        let (parts, http) = parts_for_url("https://www.qb64phoenix.com").unwrap();
+        match fetch_listing(&parts, http) {
+            Ok((e, _)) => {
+                let dirs = e.iter().filter(|x| x.is_dir).count();
+                eprintln!("SITE: {} entries ({dirs} navigable)", e.len());
+                for x in e.iter().take(6) {
+                    eprintln!("   {}{}  -> {}", x.name, if x.is_dir { "/" } else { "" }, x.url);
+                }
+            }
+            Err(err) => eprintln!("SITE ERROR: {err}"),
+        }
     }
 }
