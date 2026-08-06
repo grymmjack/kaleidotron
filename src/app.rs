@@ -5344,6 +5344,34 @@ impl PixelView {
         }
     }
 
+    /// The URL to fetch as a thumbnail for a remote web entry — `Some` only when the entry is
+    /// something we can actually decode into a picture. Returning `None` is what stops a `.zip` /
+    /// `.css` / page tile from spinning forever waiting on a thumbnail that can never exist.
+    fn web_thumb_url(&self, path: &Path) -> Option<String> {
+        // A navigable page has no thumbnail.
+        if self.entries.iter().any(|e| e.path == *path && e.is_dir) {
+            return None;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())?;
+        // Only formats the registry can turn into pixels; `known_extension` keeps this in step
+        // with whatever decoders (and format plugins) are actually enabled.
+        if !self.registry.known_extension(&ext) {
+            return None;
+        }
+        self.web_urls
+            .get(path)
+            .cloned()
+            .or_else(|| {
+                let parts = crate::httpfs::rel_parts(path);
+                let host = parts.first()?;
+                let http = self.web_http.get(host).copied().unwrap_or(false);
+                Some(crate::httpfs::url_for(&parts, http, false))
+            })
+    }
+
     /// Is `path` a Poly Haven **HDRI** result? (The tile shows a tonemapped JPG, so the extension
     /// can't tell us — it's the virtual path's family segment that does.)
     fn is_ph_hdri(&self, path: &Path) -> bool {
@@ -22360,6 +22388,7 @@ impl PixelView {
                                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                                 paint_audio_tile(&ui.painter_at(rect), rect, ext);
                             } else {
+                                let mut web_no_thumb = false;
                                 // 16colo piece → fetch its pre-rendered PNG over HTTP (or,
                                 // for a PDF, its raw file rendered locally — 16colo has no
                                 // PDF thumbnail); any other file → decode locally.
@@ -22400,19 +22429,35 @@ impl PixelView {
                                     // A game's screenshot / trailer thumbnail.
                                     self.colo_thumbs
                                         .request(path, &m.thumb_url, THUMB_PX, false);
+                                } else if crate::httpfs::is_remote(path) {
+                                    // A file on a remote site: fetch it through the HTTP thumb pool
+                                    // if it's viewable. Anything else (zip/css/js/a page) can never
+                                    // produce a thumbnail, so don't request one — and crucially
+                                    // don't spin below, which is what made every web tile hang.
+                                    if let Some(u) = self.web_thumb_url(path) {
+                                        self.colo_thumbs.request(path, &u, THUMB_PX, true);
+                                    } else {
+                                        web_no_thumb = true;
+                                    }
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
                                 // Spinner while the thumbnail decodes / downloads.
-                                let t = ui.input(|i| i.time);
-                                paint_spinner(
-                                    &ui.painter_at(rect),
-                                    rect.center(),
-                                    (tile * 0.11).clamp(8.0, 18.0),
-                                    t,
-                                    egui::Color32::from_gray(130),
-                                );
-                                self.want_repaint = true;
+                                if web_no_thumb {
+                                    // Paint the format badge instead of an endless spinner.
+                                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                    paint_audio_tile(&ui.painter_at(rect), rect, ext);
+                                } else {
+                                    let t = ui.input(|i| i.time);
+                                    paint_spinner(
+                                        &ui.painter_at(rect),
+                                        rect.center(),
+                                        (tile * 0.11).clamp(8.0, 18.0),
+                                        t,
+                                        egui::Color32::from_gray(130),
+                                    );
+                                    self.want_repaint = true;
+                                }
                             }
 
                             // Video tiles: a YouTube result shows its duration (a bottom-right
@@ -23322,6 +23367,12 @@ impl PixelView {
                     } else if let Some(a) = self.ph_assets.get(&path) {
                         if !a.thumb_url.is_empty() {
                             self.colo_thumbs.request(&path, &a.thumb_url, THUMB_PX, false);
+                        }
+                    } else if crate::httpfs::is_remote(&path) {
+                        // Viewable remote file → fetch it through the HTTP thumb pool; anything
+                        // else simply gets no request (and so no endless spinner).
+                        if let Some(u) = self.web_thumb_url(&path) {
+                            self.colo_thumbs.request(&path, &u, THUMB_PX, true);
                         }
                     } else if !any_remote(&path) {
                         self.thumbs.request(&path, THUMB_PX);
