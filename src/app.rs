@@ -1871,6 +1871,17 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
+    // Web-source plugins: each hides/shows one Places tab. Unlike the *format* plugins these cost
+    // nothing when unused (they're only tabs), so they default ON — the switch is for decluttering
+    // the Places bar, not for avoiding heavy work.
+    plugin_gifs: bool,
+    plugin_web: bool,
+    plugin_icons: bool,
+    plugin_vectors: bool,
+    plugin_lospec: bool,
+    plugin_ph: bool,
+    plugin_gfonts: bool,
+    plugin_ma: bool,
     gif_recolor: bool, // run the Recolor/PixelFX stack on animated GIF frames
     gif_speed: f32,    // GIF playback rate (0.25×–4×), like the video player's Speed
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
@@ -1962,6 +1973,14 @@ impl PixelView {
     const SHOW_FPS_KEY: &'static str = "show_fps";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     const MA_KEY_KEY: &'static str = "modarchive_api_key";
+    const PLUGIN_GIFS_KEY: &'static str = "plugin_gifs";
+    const PLUGIN_WEB_KEY: &'static str = "plugin_web";
+    const PLUGIN_ICONS_KEY: &'static str = "plugin_icons";
+    const PLUGIN_VECTORS_KEY: &'static str = "plugin_vectors";
+    const PLUGIN_LOSPEC_KEY: &'static str = "plugin_lospec";
+    const PLUGIN_PH_KEY: &'static str = "plugin_polyhaven";
+    const PLUGIN_GFONTS_KEY: &'static str = "plugin_gfonts";
+    const PLUGIN_MA_KEY: &'static str = "plugin_modarchive";
     const GIF_RECOLOR_KEY: &'static str = "gif_recolor";
     const GIF_SPEED_KEY: &'static str = "gif_speed";
     /// Audio preview: start on select + loop until stopped.
@@ -3411,6 +3430,14 @@ impl PixelView {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
+            plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, true),
+            plugin_web: load_bool(Self::PLUGIN_WEB_KEY, true),
+            plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, true),
+            plugin_vectors: load_bool(Self::PLUGIN_VECTORS_KEY, true),
+            plugin_lospec: load_bool(Self::PLUGIN_LOSPEC_KEY, true),
+            plugin_ph: load_bool(Self::PLUGIN_PH_KEY, true),
+            plugin_gfonts: load_bool(Self::PLUGIN_GFONTS_KEY, true),
+            plugin_ma: load_bool(Self::PLUGIN_MA_KEY, true),
             gif_recolor: load_bool(Self::GIF_RECOLOR_KEY, false),
             gif_speed: cc
                 .storage
@@ -28004,6 +28031,20 @@ impl PixelView {
                             if idx == 7 && !self.plugin_ai {
                                 continue;
                             }
+                            // Web-source plugins — each hides its own Places tab.
+                            if !match idx {
+                                9 => self.plugin_icons,
+                                10 => self.plugin_vectors,
+                                11 => self.plugin_lospec,
+                                12 => self.plugin_ph,
+                                13 => self.plugin_gfonts,
+                                15 => self.plugin_ma,
+                                16 => self.plugin_gifs,
+                                17 => self.plugin_web,
+                                _ => true,
+                            } {
+                                continue;
+                            }
                             if ui.selectable_label(self.places_tab == idx, label).clicked() {
                                 self.places_tab = idx;
                                 if idx == 2 {
@@ -28012,6 +28053,22 @@ impl PixelView {
                             }
                         }
                     });
+                    // A disabled source's tab button is gone, but `places_tab` may still point at
+                    // it (it was selected when the user unchecked it) — that would render a blank
+                    // panel with no way back, so fall back to Local.
+                    if !match self.places_tab {
+                        9 => self.plugin_icons,
+                        10 => self.plugin_vectors,
+                        11 => self.plugin_lospec,
+                        12 => self.plugin_ph,
+                        13 => self.plugin_gfonts,
+                        15 => self.plugin_ma,
+                        16 => self.plugin_gifs,
+                        17 => self.plugin_web,
+                        _ => true,
+                    } {
+                        self.places_tab = 0;
+                    }
                     if self.places_tab == 0 {
                         // Local: Home + on-disk favorites + smart filters (local searches).
                         if ui.button("🏠 Home").clicked() {
@@ -30368,6 +30425,21 @@ impl eframe::App for PixelView {
                                 ui.add_space(10.0);
                                 // ── right column (same column as the left when collapsed to 1) ──
                                 let ui = &mut cols[ncols - 1];
+                                ui.label("Web sources");
+                                ui.weak("Show or hide a browsing source in the Places panel.");
+                                for (on, label, hover) in [
+                                    (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
+                                    (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
+                                    (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
+                                    (&mut self.plugin_vectors, "Vector Search", "Vector art (Wikimedia Commons)"),
+                                    (&mut self.plugin_lospec, "Lospec", "Lospec palette browser + downloader"),
+                                    (&mut self.plugin_ph, "3D Search", "Poly Haven CC0 models, textures and HDRIs"),
+                                    (&mut self.plugin_gfonts, "Google Fonts", "Browse + download Google Fonts"),
+                                    (&mut self.plugin_ma, "MOD Archive", "~170k tracker modules"),
+                                ] {
+                                    ui.checkbox(on, label).on_hover_text(hover);
+                                }
+                                ui.add_space(10.0);
                                 ui.label("Format plugins");
                                 ui.weak("Turn off a file type you don't want the viewer to handle.");
                                 let mut plug_changed = false;
@@ -30972,6 +31044,14 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::SHOW_FPS_KEY, &self.show_fps);
         eframe::set_value(storage, Self::STEAM_KEY_KEY, &self.steam_api_key);
         eframe::set_value(storage, Self::MA_KEY_KEY, &self.ma_key);
+        eframe::set_value(storage, Self::PLUGIN_GIFS_KEY, &self.plugin_gifs);
+        eframe::set_value(storage, Self::PLUGIN_WEB_KEY, &self.plugin_web);
+        eframe::set_value(storage, Self::PLUGIN_ICONS_KEY, &self.plugin_icons);
+        eframe::set_value(storage, Self::PLUGIN_VECTORS_KEY, &self.plugin_vectors);
+        eframe::set_value(storage, Self::PLUGIN_LOSPEC_KEY, &self.plugin_lospec);
+        eframe::set_value(storage, Self::PLUGIN_PH_KEY, &self.plugin_ph);
+        eframe::set_value(storage, Self::PLUGIN_GFONTS_KEY, &self.plugin_gfonts);
+        eframe::set_value(storage, Self::PLUGIN_MA_KEY, &self.plugin_ma);
         eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
         eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
