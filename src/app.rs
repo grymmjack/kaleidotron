@@ -3561,6 +3561,8 @@ impl PixelView {
         use crate::settings::entry as e;
         const A: &str = "Appearance";
         const V: &str = "Viewer";
+        const P: &str = "Plugins";
+        const W: &str = "Web sources";
         vec![
             e(A, "theme", self.theme, "0 = dark, 1 = light"),
             e(A, "ui_zoom", self.ui_zoom, "whole-UI scale (1.0 = 100%)"),
@@ -3591,6 +3593,22 @@ impl PixelView {
             e(V, "osd_secs", self.osd_secs, "seconds the OSD holds before fading"),
             e(V, "auto_next", self.auto_next, "slideshow: auto-advance to the next file"),
             e(V, "auto_next_secs", self.auto_next_secs, "slideshow delay in seconds (1/3/5/10)"),
+            // Format plugins — these gate decoders, so changing one re-syncs the Registry.
+            e(P, "plugin_code", self.plugin_code, "syntax-highlighted source & text files"),
+            e(P, "plugin_pdf", self.plugin_pdf, "PDF pages (needs pdfium or poppler)"),
+            e(P, "plugin_audio", self.plugin_audio, "audio waveforms, player and sample pads"),
+            e(P, "plugin_3d", self.plugin_3d, "3D models (obj/stl/ply/gltf/glb/dae)"),
+            e(P, "plugin_video", self.plugin_video, "video thumbnails + player (needs ffmpeg)"),
+            e(P, "plugin_ai", self.plugin_ai, "AI generation tab"),
+            // Web sources — each shows or hides one Places tab.
+            e(W, "plugin_gifs", self.plugin_gifs, "animated GIF search"),
+            e(W, "plugin_web", self.plugin_web, "browse any URL like a folder tree"),
+            e(W, "plugin_icons", self.plugin_icons, "icon search (Iconify)"),
+            e(W, "plugin_vectors", self.plugin_vectors, "vector art search (Wikimedia)"),
+            e(W, "plugin_lospec", self.plugin_lospec, "Lospec palette browser"),
+            e(W, "plugin_ph", self.plugin_ph, "Poly Haven CC0 models / textures / HDRIs"),
+            e(W, "plugin_gfonts", self.plugin_gfonts, "Google Fonts browser"),
+            e(W, "plugin_ma", self.plugin_ma, "The Mod Archive (tracker modules)"),
         ]
     }
 
@@ -3684,6 +3702,37 @@ impl PixelView {
         }
         if let Some(v) = st::get_u64(&m, "auto_next_secs") {
             self.auto_next_secs = (v as u8).clamp(1, 60);
+        }
+        // Format plugins. The Registry was told the storage-loaded values during construction, so
+        // anything the file changes has to be pushed to it again — otherwise the checkbox reads as
+        // on while the decoder stays disabled.
+        for (key, flag, id) in [
+            ("plugin_code", &mut self.plugin_code, "code"),
+            ("plugin_pdf", &mut self.plugin_pdf, "pdf"),
+            ("plugin_audio", &mut self.plugin_audio, "audio"),
+            ("plugin_3d", &mut self.plugin_3d, "3d"),
+            ("plugin_video", &mut self.plugin_video, "video"),
+        ] {
+            if let Some(v) = st::get_bool(&m, key) {
+                *flag = v;
+                self.registry.set_plugin(id, v);
+            }
+        }
+        // Plain flags — no registry side effect.
+        for (key, flag) in [
+            ("plugin_ai", &mut self.plugin_ai),
+            ("plugin_gifs", &mut self.plugin_gifs),
+            ("plugin_web", &mut self.plugin_web),
+            ("plugin_icons", &mut self.plugin_icons),
+            ("plugin_vectors", &mut self.plugin_vectors),
+            ("plugin_lospec", &mut self.plugin_lospec),
+            ("plugin_ph", &mut self.plugin_ph),
+            ("plugin_gfonts", &mut self.plugin_gfonts),
+            ("plugin_ma", &mut self.plugin_ma),
+        ] {
+            if let Some(v) = st::get_bool(&m, key) {
+                *flag = v;
+            }
         }
     }
 
