@@ -274,7 +274,7 @@ enum SndMsg {
 /// Messages from an HTTP directory-listing worker (`web_walk`). Unlike the other sources an entry
 /// carries everything the grid needs (name / dir / size), so there's no side metadata map.
 enum WebMsg {
-    Hit(Entry),
+    Hit(Entry, String), // (entry, its absolute URL)
     Done(usize, bool), // (count, needed_plain_http)
     Failed(String),
 }
@@ -1887,6 +1887,9 @@ pub struct PixelView {
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
     web_url: String,                             // the Places URL box
     web_http: HashMap<String, bool>,             // host → needs plain HTTP (remembered per session)
+    /// Virtual path → the entry's real absolute URL. Needed because a link found on an ordinary
+    /// page can point anywhere, which the segment-appending path model can't express.
+    web_urls: HashMap<PathBuf, String>,
     web_rx: Option<std::sync::mpsc::Receiver<WebMsg>>,
     web_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     web_files: HashMap<PathBuf, PathBuf>,        // virtual → downloaded local file
@@ -3417,6 +3420,7 @@ impl PixelView {
             gf_dir,
             web_url: String::new(),
             web_http: HashMap::new(),
+            web_urls: HashMap::new(),
             web_rx: None,
             web_cancel: None,
             web_files: HashMap::new(),
@@ -5813,6 +5817,8 @@ impl PixelView {
         let parts = crate::httpfs::rel_parts(&dir);
         let host = parts.first().cloned().unwrap_or_default();
         let prefer_http = self.web_http.get(&host).copied().unwrap_or(false);
+        // A page link's real URL isn't derivable from its path — use the one we recorded.
+        let known = self.web_urls.get(&dir).cloned();
         self.show_folder(dir.clone(), Vec::new());
         if let Some(c) = self.web_cancel.take() {
             c.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5823,7 +5829,7 @@ impl PixelView {
         self.web_cancel = Some(cancel.clone());
         self.status = format!("Listing {}…", crate::httpfs::url_for(&parts, prefer_http, true));
         self.want_repaint = true;
-        std::thread::spawn(move || web_walk(parts, prefer_http, &dir, cancel, tx));
+        std::thread::spawn(move || web_walk(parts, known, prefer_http, &dir, cancel, tx));
     }
 
     fn poll_web(&mut self) {
@@ -5831,8 +5837,11 @@ impl PixelView {
         let (mut got, mut done) = (false, false);
         for _ in 0..512 {
             match rx.try_recv() {
-                Ok(WebMsg::Hit(mut entry)) => {
+                Ok(WebMsg::Hit(mut entry, url)) => {
                     entry.rating = self.read_rating(&entry.path);
+                    if !url.is_empty() {
+                        self.web_urls.insert(entry.path.clone(), url);
+                    }
                     self.all_entries.push(entry);
                     got = true;
                 }
@@ -5886,7 +5895,11 @@ impl PixelView {
         let Some(name) = parts.last().cloned() else { return };
         let host = parts.first().cloned().unwrap_or_default();
         let http = self.web_http.get(&host).copied().unwrap_or(false);
-        let url = crate::httpfs::url_for(&parts, http, false);
+        let url = self
+            .web_urls
+            .get(&vpath)
+            .cloned()
+            .unwrap_or_else(|| crate::httpfs::url_for(&parts, http, false));
         let (tx, rx) = std::sync::mpsc::channel();
         self.web_open_rx = Some(rx);
         self.status = format!("Fetching: {}", elide(&name, 40));
@@ -37113,13 +37126,14 @@ fn ma_walk(
 /// Worker: fetch + parse one remote directory listing, streaming an entry per item.
 fn web_walk(
     parts: Vec<String>,
+    known_url: Option<String>,
     prefer_http: bool,
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<WebMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (items, http) = match crate::httpfs::fetch_listing(&parts, prefer_http) {
+    let (items, http) = match crate::httpfs::fetch_listing_at(&parts, known_url.as_deref(), prefer_http) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WebMsg::Failed(e));
@@ -37131,14 +37145,15 @@ fn web_walk(
         if cancel.load(Relaxed) {
             return;
         }
-        let mut e = virtual_entry(root.join(&it.name));
+        let url = it.url.clone();
+        let mut e = virtual_entry(root.join(sanitize_component(&it.name)));
         e.is_dir = it.is_dir;
         e.size = it.size;
         // A remote .zip/.lha/… is browsable once fetched, so flag it like a local archive — the
         // grid then paints the folder glyph + format badge and clicking it mounts the contents.
         e.is_archive = !it.is_dir && crate::archive::is_archive(&e.path);
         n += 1;
-        if tx.send(WebMsg::Hit(e)).is_err() {
+        if tx.send(WebMsg::Hit(e, url)).is_err() {
             return;
         }
     }
