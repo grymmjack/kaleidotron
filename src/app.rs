@@ -8922,6 +8922,72 @@ impl PixelView {
         crate::decode::font3d::extrude_contours(&contours, &self.font_3d_opts())
     }
 
+    /// "Open in…" for an icon/vector, matching the font viewer's behaviour: hand the external
+    /// program **vector SVG** when it handles SVG, else a rendered **PNG**. Writes to a temp file
+    /// rather than prompting — except in the 2D+SVG case, where the real file on disk already *is*
+    /// what the program wants, so it's opened directly (edits in Inkscape land on the actual file).
+    fn svg_open_in(&mut self, path: &Path, opener_idx: usize, as_svg: bool) {
+        use crate::decode::mesh3d::{render, to_svg, Camera, View};
+        let Some((exec, args, env)) = self
+            .openers
+            .get(opener_idx)
+            .map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()))
+        else {
+            return;
+        };
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("icon").to_string();
+        let tmp = std::env::temp_dir();
+        let three_d = self.svg_3d_on;
+
+        // 2D + an SVG-capable program → open the real file, no copy.
+        if !three_d && as_svg {
+            let real = self.resolve_local(path);
+            self.launch_external(&exec, &args, &env, &real);
+            return;
+        }
+
+        let out = if three_d {
+            let Some(mesh) = self.svg_3d_mesh_for(path) else {
+                self.status = "Nothing to open.".into();
+                return;
+            };
+            let cam = Camera {
+                yaw: self.font_3d_yaw,
+                pitch: self.font_3d_pitch,
+                zoom: self.font_3d_zoom,
+                pan: self.font_3d_pan,
+            };
+            let opts = self.font_3d_render_opts([0, 0, 0, 0]);
+            if as_svg {
+                let f = tmp.join(format!("{stem}_3d.svg"));
+                std::fs::write(&f, to_svg(&mesh, 1600, 1200, &View::Orbit(cam), &opts)).ok().map(|_| f)
+            } else {
+                let (w, h) = (1600usize, 1200usize);
+                let px = render(&mesh, w, h, &View::Orbit(cam), &opts);
+                let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
+                let f = tmp.join(format!("{stem}_3d.png"));
+                image::save_buffer(&f, &flat, w as u32, h as u32, image::ColorType::Rgba8).ok().map(|_| f)
+            }
+        } else {
+            // 2D + a PNG-only program → rasterize the vector at a generous size.
+            let real = self.resolve_local(path);
+            std::fs::read(&real)
+                .ok()
+                .and_then(|b| crate::decode::render_svg_at(&b, 1600.0).ok())
+                .and_then(|img| {
+                    let flat: Vec<u8> = img.pixels.iter().flat_map(|c| *c).collect();
+                    let f = tmp.join(format!("{stem}.png"));
+                    image::save_buffer(&f, &flat, img.width, img.height, image::ColorType::Rgba8)
+                        .ok()
+                        .map(|_| f)
+                })
+        };
+        match out {
+            Some(f) => self.launch_external(&exec, &args, &env, &f),
+            None => self.status = "Couldn't prepare the file to open".into(),
+        }
+    }
+
     fn export_svg_3d_png(&mut self, path: &Path) {
         use crate::decode::mesh3d::{render, Camera, View};
         let Some(mesh) = self.svg_3d_mesh_for(path) else {
@@ -24422,6 +24488,23 @@ impl PixelView {
         // SVG 3D: an opened SVG (icon / vector / local .svg) can be extruded into an interactive 3D
         // object, reusing the font 3D controls + renderer. A compact toggle row sits above the view.
         if is_svg_path(&path) {
+            // Programs registered for SVG (vector, preferred) or PNG — same rule as the font view.
+            let svg_openers: Vec<(usize, String, bool)> = self
+                .opener_items()
+                .into_iter()
+                .filter_map(|o| {
+                    let svg = o.exts.iter().any(|e| e == "svg");
+                    let png = o.exts.is_empty() || o.exts.iter().any(|e| e == "png");
+                    if svg {
+                        Some((o.idx, o.name.clone(), true))
+                    } else if png {
+                        Some((o.idx, o.name.clone(), false))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut open_svg_in: Option<(usize, bool)> = None;
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.svg_3d_on, "3D")
                     .on_hover_text("Extrude this SVG into an interactive 3D object (drag to rotate, wheel to zoom)");
@@ -24458,7 +24541,26 @@ impl PixelView {
                         self.export_svg_3d_svg(&path);
                     }
                 }
+                // "Open in…" — shown in BOTH 2D and 3D, matching the font viewer. A program that
+                // handles SVG gets vector; anything else gets a rendered PNG.
+                ui.separator();
+                ui.menu_button("📂 Open in…", |ui| {
+                    if svg_openers.is_empty() {
+                        ui.weak("No PNG/SVG programs — add one in");
+                        ui.weak("View → Associations…");
+                    }
+                    for (idx, name, is_svg) in &svg_openers {
+                        let tag = if *is_svg { "SVG" } else { "PNG" };
+                        if ui.button(format!("{name}  ({tag})")).clicked() {
+                            open_svg_in = Some((*idx, *is_svg));
+                            ui.close();
+                        }
+                    }
+                });
             });
+            if let Some((idx, as_svg)) = open_svg_in {
+                self.svg_open_in(&path, idx, as_svg);
+            }
             if self.svg_3d_on {
                 let avail = ui.available_size();
                 self.draw_svg_3d(ctx, ui, avail, &path);
