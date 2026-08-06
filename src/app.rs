@@ -1871,9 +1871,10 @@ pub struct PixelView {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
-    // Web-source plugins: each hides/shows one Places tab. Unlike the *format* plugins these cost
-    // nothing when unused (they're only tabs), so they default ON — the switch is for decluttering
-    // the Places bar, not for avoiding heavy work.
+    // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
+    // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
+    // actually browse (Preferences → "Web sources"). A persisted value always wins over the
+    // default, so turning one on is remembered.
     plugin_gifs: bool,
     plugin_web: bool,
     plugin_icons: bool,
@@ -3434,14 +3435,14 @@ impl PixelView {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
-            plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, true),
-            plugin_web: load_bool(Self::PLUGIN_WEB_KEY, true),
-            plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, true),
-            plugin_vectors: load_bool(Self::PLUGIN_VECTORS_KEY, true),
-            plugin_lospec: load_bool(Self::PLUGIN_LOSPEC_KEY, true),
-            plugin_ph: load_bool(Self::PLUGIN_PH_KEY, true),
-            plugin_gfonts: load_bool(Self::PLUGIN_GFONTS_KEY, true),
-            plugin_ma: load_bool(Self::PLUGIN_MA_KEY, true),
+            plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
+            plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
+            plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
+            plugin_vectors: load_bool(Self::PLUGIN_VECTORS_KEY, false),
+            plugin_lospec: load_bool(Self::PLUGIN_LOSPEC_KEY, false),
+            plugin_ph: load_bool(Self::PLUGIN_PH_KEY, false),
+            plugin_gfonts: load_bool(Self::PLUGIN_GFONTS_KEY, false),
+            plugin_ma: load_bool(Self::PLUGIN_MA_KEY, false),
             gif_recolor: load_bool(Self::GIF_RECOLOR_KEY, false),
             gif_speed: cc
                 .storage
@@ -30592,7 +30593,7 @@ impl eframe::App for PixelView {
                                 // ── right column (same column as the left when collapsed to 1) ──
                                 let ui = &mut cols[ncols - 1];
                                 ui.label("Web sources");
-                                ui.weak("Show or hide a browsing source in the Places panel.");
+                                ui.weak("Off by default — switch on the sources you browse.");
                                 for (on, label, hover) in [
                                     (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
                                     (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
