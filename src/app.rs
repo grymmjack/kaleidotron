@@ -5426,6 +5426,13 @@ impl PixelView {
     }
 
     fn start_snd_search(&mut self, dir: PathBuf) {
+        // Searching audio implies wanting audio: the waveform thumbnails (and playback) come from
+        // the audio plugin's decoder, so enable it here as `start_snd_open` already does — without
+        // it the results would render as music-note placeholders.
+        if !self.plugin_audio {
+            self.plugin_audio = true;
+            self.registry.set_plugin("audio", true);
+        }
         let query = crate::audiosearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.snd_results.clear();
@@ -22430,6 +22437,17 @@ impl PixelView {
                                     // A game's screenshot / trailer thumbnail.
                                     self.colo_thumbs
                                         .request(path, &m.thumb_url, THUMB_PX, false);
+                                } else if let Some(r) = self.snd_results.get(path) {
+                                    // Free-audio result: fetch the clip and let the registry turn
+                                    // it into a waveform (`via_registry`). That decode is gated by
+                                    // the audio plugin, so with it off there's no waveform coming —
+                                    // paint the music-note tile rather than spin forever.
+                                    if self.plugin_audio {
+                                        let u = r.url.clone();
+                                        self.colo_thumbs.request(path, &u, THUMB_PX, true);
+                                    } else {
+                                        web_no_thumb = true;
+                                    }
                                 } else if crate::httpfs::is_remote(path) {
                                     // A file on a remote site: fetch it through the HTTP thumb pool
                                     // if it's viewable. Anything else (zip/css/js/a page) can never
@@ -23368,6 +23386,11 @@ impl PixelView {
                     } else if let Some(a) = self.ph_assets.get(&path) {
                         if !a.thumb_url.is_empty() {
                             self.colo_thumbs.request(&path, &a.thumb_url, THUMB_PX, false);
+                        }
+                    } else if let Some(r) = self.snd_results.get(&path) {
+                        if self.plugin_audio {
+                            let u = r.url.clone();
+                            self.colo_thumbs.request(&path, &u, THUMB_PX, true);
                         }
                     } else if crate::httpfs::is_remote(&path) {
                         // Viewable remote file → fetch it through the HTTP thumb pool; anything
