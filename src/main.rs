@@ -12,6 +12,7 @@ mod gfonts;
 mod git;
 mod httpfs;
 mod image_types;
+mod keybindings;
 mod libxmp;
 mod modarchive;
 mod netpolicy;
