@@ -1364,6 +1364,10 @@ pub struct PixelView {
     colo_search: String,             // 16colo.rs nav-bar search box (runtime only)
     explorer_tab: u8,                // 0 = Places, 1 = Folders
     rail_section: RailSection, // which group the Places panel is showing
+    /// Recently visited locations, most-recent-first. Stores the **display** path, not the real
+    /// one: inside an archive or a downloaded pack the real path is a temp dir that's gone next
+    /// run, which is the same reason `save()` persists the display path for the last folder.
+    recent_dirs: Vec<PathBuf>,
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -2053,6 +2057,7 @@ impl PixelView {
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     const MA_KEY_KEY: &'static str = "modarchive_api_key";
     const RAIL_SECTION_KEY: &'static str = "rail_section";
+    const RECENTS_KEY: &'static str = "recent_dirs";
     const PLUGIN_GIFS_KEY: &'static str = "plugin_gifs";
     const PLUGIN_WEB_KEY: &'static str = "plugin_web";
     const PLUGIN_ICONS_KEY: &'static str = "plugin_icons";
@@ -3047,6 +3052,10 @@ impl PixelView {
             explorer_filter: String::new(),
             colo_search: String::new(),
             explorer_tab: 0,
+            recent_dirs: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
+                .unwrap_or_default(),
             rail_section: RailSection::from_u8(
                 cc.storage
                     .and_then(|s| eframe::get_value::<u8>(s, Self::RAIL_SECTION_KEY))
@@ -4119,6 +4128,7 @@ impl PixelView {
     /// reset selection, and switch to the grid. Shared by `open_folder` and the
     /// virtual 16colo.rs views.
     fn show_folder(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        self.note_recent(&dir);
         // Folder counts are rendered live in the status bar; clear any transient
         // file-op message carried over from the folder we're leaving (file ops set
         // their message *after* calling refresh(), so theirs survives this).
@@ -27655,6 +27665,23 @@ impl PixelView {
 
     /// Is this Places tab available, given the plugin toggles? Shared by the rail, the section
     /// list, and the stranded-tab guard so all three agree.
+    /// How many recent locations to keep.
+    const MAX_RECENTS: usize = 25;
+
+    /// Remember `dir` as the most recent location. Stores the display path so an archive or
+    /// downloaded-pack entry still resolves next session, and de-dupes so revisiting a place moves
+    /// it to the top rather than filling the list with repeats.
+    fn note_recent(&mut self, dir: &Path) {
+        let key = self.to_display(dir);
+        // A virtual root on its own ("<web>") is a hint screen, not somewhere you'd return to.
+        if key.as_os_str().is_empty() {
+            return;
+        }
+        self.recent_dirs.retain(|p| p != &key);
+        self.recent_dirs.insert(0, key);
+        self.recent_dirs.truncate(Self::MAX_RECENTS);
+    }
+
     fn places_tab_enabled(&self, idx: u8) -> bool {
         match idx {
             2 | 3 => self.plugin_audio,
@@ -28597,6 +28624,8 @@ impl PixelView {
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
         let mut open_bundled_tdf: Option<Option<&'static str>> = None;
+        let mut recent_remove: Option<PathBuf> = None; // Recent → "Remove"
+        let mut recent_clear = false;
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
         let mut steam_random_view = false; // "Random (from this list)" clicked in the Steam tab
         let mut yt_play_random = false; // "Play random" clicked in the YouTube tab
@@ -28701,6 +28730,38 @@ impl PixelView {
                         // Local: Home + on-disk favorites + smart filters (local searches).
                         if ui.button("🏠 Home").clicked() {
                             nav = home_dir();
+                        }
+                        // Recent locations. Works across every source — a 16colo pack, a mounted
+                        // archive, a remote <web> folder — because the stored key is the display
+                        // path and `open_folder` already routes each of those.
+                        if !self.recent_dirs.is_empty() {
+                            egui::CollapsingHeader::new(format!("🕘 Recent ({})", self.recent_dirs.len()))
+                                .id_salt("recent_dirs")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for p in self.recent_dirs.clone() {
+                                        let name = p
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| p.to_string_lossy().to_string());
+                                        let r = ui
+                                            .selectable_label(false, elide(&name, 28))
+                                            .on_hover_text(p.to_string_lossy());
+                                        if r.clicked() {
+                                            nav = Some(p.clone());
+                                        }
+                                        r.context_menu(|ui| {
+                                            if ui.button("Remove from recent").clicked() {
+                                                recent_remove = Some(p.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("Clear all recent").clicked() {
+                                                recent_clear = true;
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                });
                         }
                         // The bundled TheDraw font library (public-domain .tdf fonts) — a virtual
                         // folder you can browse + open in the TDF viewer, plus by-type shortcuts.
@@ -29840,6 +29901,13 @@ impl PixelView {
             if i < self.saved_filters.len() {
                 self.saved_filters.remove(i);
             }
+        }
+        // Recent-locations edits (deferred out of the closure, which can't borrow self twice).
+        if let Some(p) = recent_remove {
+            self.recent_dirs.retain(|x| x != &p);
+        }
+        if recent_clear {
+            self.recent_dirs.clear();
         }
         // Samples-place edits.
         if add_sample {
@@ -31691,6 +31759,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_GFONTS_KEY, &self.plugin_gfonts);
         eframe::set_value(storage, Self::PLUGIN_MA_KEY, &self.plugin_ma);
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
+        eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
         eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
         eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
