@@ -31358,7 +31358,7 @@ impl eframe::App for PixelView {
                             // the label text is the accessibility name, so "  Keyboard  " makes
                             // the tab unfindable by name (which broke a GUI test).
                             if ui
-                                .add_sized([0.0, 26.0], egui::SelectableLabel::new(sec == i, *name))
+                                .add_sized([0.0, 26.0], egui::Button::selectable(sec == i, *name))
                                 .clicked()
                             {
                                 self.prefs_section = i;
