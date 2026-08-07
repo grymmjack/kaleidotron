@@ -914,21 +914,21 @@ impl RailSection {
     /// A rail glyph + tooltip for each source tab. Sources live directly in the activity rail
     /// rather than in a list inside the panel: with the source plugins defaulting off, you get one
     /// button per source you actually enabled, so the rail stays short.
-    fn source_buttons() -> &'static [(u8, &'static str, &'static str)] {
+    fn source_buttons() -> &'static [(u8, &'static str, &'static str, &'static str)] {
         &[
-            (1, icons::BOLT, "16colo.rs — ANSI art archive"),
-            (5, icons::PLAY, "YouTube"),
-            (8, icons::SEARCH, "Image search"),
-            (16, "🎞", "Animated GIF search"),
-            (17, icons::GLOBE, "Web — browse any URL"),
-            (9, "✦", "Icon search"),
-            (10, "✎", "Vector art search"),
-            (11, "🎨", "Lospec palettes"),
-            (12, icons::CUBE, "Poly Haven — 3D / textures / HDRIs"),
-            (13, "🅰", "Google Fonts"),
-            (14, "🔊", "Free audio search"),
-            (15, icons::MUSIC, "The Mod Archive — tracker modules"),
-            (6, "🎮", "Steam library"),
+            (1, icons::BOLT, "16colo", "16colo.rs — ANSI art archive"),
+            (5, icons::PLAY, "YouTube", "YouTube"),
+            (8, icons::SEARCH, "Images", "Image search"),
+            (16, "\u{1F39E}", "GIFs", "Animated GIF search"),
+            (17, icons::GLOBE, "Web", "Web — browse any URL"),
+            (9, "\u{2726}", "Icons", "Icon search"),
+            (10, "\u{270E}", "Vectors", "Vector art search"),
+            (11, "\u{1F3A8}", "Palettes", "Lospec palettes"),
+            (12, icons::CUBE, "3D / CC0", "Poly Haven — 3D / textures / HDRIs"),
+            (13, "\u{1F170}", "Fonts", "Google Fonts"),
+            (14, "\u{1F50A}", "Audio", "Free audio search"),
+            (15, icons::MUSIC, "Modules", "The Mod Archive — tracker modules"),
+            (6, "\u{1F3AE}", "Steam", "Steam library"),
         ]
     }
 
@@ -1390,6 +1390,7 @@ pub struct PixelView {
     /// run, which is the same reason `save()` persists the display path for the last folder.
     recent_dirs: Vec<PathBuf>,
     rail_icon_size: f32, // activity-rail glyph size in points
+    rail_expanded: bool, // rail shows icon + label instead of icon only
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -2080,6 +2081,7 @@ impl PixelView {
     const MA_KEY_KEY: &'static str = "modarchive_api_key";
     const RAIL_SECTION_KEY: &'static str = "rail_section";
     const RECENTS_KEY: &'static str = "recent_dirs";
+    const RAIL_EXPANDED_KEY: &'static str = "rail_expanded";
     const PLUGIN_GIFS_KEY: &'static str = "plugin_gifs";
     const PLUGIN_WEB_KEY: &'static str = "plugin_web";
     const PLUGIN_ICONS_KEY: &'static str = "plugin_icons";
@@ -3075,6 +3077,7 @@ impl PixelView {
             colo_search: String::new(),
             explorer_tab: 0,
             rail_icon_size: 22.0,
+            rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             recent_dirs: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
@@ -27622,97 +27625,190 @@ impl PixelView {
     /// VSCode-style activity rail on the far left: icon toggles for the side docks
     /// plus quick actions. Deliberately narrow with room reserved for more buttons.
     fn ui_rail(&mut self, ui: &mut egui::Ui) {
-        // Scrollable: with every source plugin enabled the rail runs to ~21 icons, which overflows
-        // a short window and would leave the last few unreachable. The bar is hidden so it still
-        // reads as a solid strip.
+        let sz = self.rail_icon_size;
+        // Every rail button gets the SAME rect, so the hover/selected highlight is a uniform strip
+        // rather than shrink-wrapping each glyph (which made the rail look ragged as the pointer
+        // moved down it). Same reasoning as the fixed-width transport buttons elsewhere.
+        let btn_w = if self.rail_expanded { 150.0 } else { sz + 14.0 };
+        let btn_h = sz + 12.0;
+        let expanded = self.rail_expanded;
+
+        // One row: the glyph at icon size, plus a normal-size label when expanded. A LayoutJob is
+        // needed because the two halves want different font sizes within one button.
+        let row = |ui: &mut egui::Ui, glyph: &str, label: &str, on: bool, tip: &str| -> bool {
+            let col = if on {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                glyph,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(sz),
+                    color: col,
+                    ..Default::default()
+                },
+            );
+            if expanded {
+                job.append(
+                    &format!("  {label}"),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(14.0),
+                        color: col,
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+            }
+            ui.add(
+                egui::Button::selectable(on, job)
+                    .min_size(egui::vec2(btn_w, btn_h))
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        };
+
+        // The gear is pinned to the bottom (where VSCode keeps settings), so the scrolling list is
+        // measured against the space left over rather than the full height.
+        let gear_h = btn_h + 16.0;
+        let list_h = (ui.available_height() - gear_h).max(60.0);
+
         egui::ScrollArea::vertical()
+            .max_height(list_h)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(6.0);
-            let big = egui::FontId::proportional(self.rail_icon_size);
-            let icon = |ui: &mut egui::Ui, glyph: &str, on: bool, tip: &str| -> bool {
-                let txt = egui::RichText::new(glyph).font(big.clone());
-                ui.add(egui::Button::selectable(on, txt))
-                    .on_hover_text(tip)
-                    .clicked()
-            };
-            // Glyphs chosen from what egui's bundled emoji font actually renders
-            // (🗂/▤/▦ are tofu; 🗁/☰/ℹ/🔍/⚙ render). Tooltips disambiguate.
-            if icon(ui, "🗁", false, "Open folder…") {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.open_folder(dir);
+                ui.add_space(4.0);
+                if row(
+                    ui,
+                    if expanded { "\u{00AB}" } else { "\u{00BB}" },
+                    "Collapse",
+                    false,
+                    if expanded { "Collapse the rail" } else { "Expand the rail (show labels)" },
+                ) {
+                    self.rail_expanded = !self.rail_expanded;
                 }
-            }
-            ui.add_space(10.0);
-            if icon(ui, "☰", self.show_explorer, "Explorer pane") {
-                self.show_explorer = !self.show_explorer;
-            }
-            ui.add_space(2.0);
-            if icon(ui, "ℹ", self.show_details, "Details pane") {
-                self.show_details = !self.show_details;
-            }
-            ui.add_space(2.0);
-            if icon(ui, "🎨", self.show_recolor, "Recolor pane") {
-                self.show_recolor = !self.show_recolor;
-            }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            // Places sections. Clicking one swaps what the Explorer pane shows (and opens it if
-            // it's hidden — otherwise the click would appear to do nothing).
-            for (sec, glyph, tip) in [
-                (RailSection::Files, "📁", "Files — folders, favorites, filters"),
-                (RailSection::Audio, "🎹", "Audio — kits and samples"),
-                (RailSection::Fx, "✨", "PixelFX presets"),
-                (RailSection::Ai, icons::ROBOT, "AI generation"),
-            ] {
-                // Hide a section with nothing in it — Audio/AI depend on their plugin.
-                let available = match sec {
-                    RailSection::Audio => self.plugin_audio,
-                    RailSection::Ai => self.plugin_ai,
-                    _ => true,
-                };
-                if !available {
-                    continue;
-                }
-                if icon(ui, glyph, self.rail_section == sec, tip) {
-                    self.rail_section = sec;
-                    self.show_explorer = true;
-                    self.explorer_tab = 0;
-                    if let Some((i, _)) = sec.tabs().iter().find(|(i, _)| self.places_tab_enabled(*i)) {
-                        self.places_tab = *i;
-                        if *i == 2 {
-                            self.kit_editor = true;
-                        }
+                ui.add_space(6.0);
+
+                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, "Open folder\u{2026}") {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.open_folder(dir);
                     }
                 }
-                ui.add_space(2.0);
-            }
-            // Online sources, one button each. Only the enabled ones appear, so the rail length
-            // tracks what you actually switched on in Preferences.
-            let mut first_source = true;
-            for (idx, glyph, tip) in RailSection::source_buttons() {
-                if !self.places_tab_enabled(*idx) {
-                    continue;
-                }
-                if first_source {
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    first_source = false;
-                }
-                let on = self.rail_section == RailSection::Sources && self.places_tab == *idx;
-                if icon(ui, glyph, on, tip) {
-                    self.rail_section = RailSection::Sources;
-                    self.places_tab = *idx;
-                    self.show_explorer = true;
-                    self.explorer_tab = 0;
+                ui.add_space(8.0);
+                if row(ui, "\u{2630}", "Explorer", self.show_explorer, "Explorer pane") {
+                    self.show_explorer = !self.show_explorer;
                 }
                 ui.add_space(2.0);
+                if row(ui, "\u{2139}", "Details", self.show_details, "Details pane") {
+                    self.show_details = !self.show_details;
+                }
+                ui.add_space(2.0);
+                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, "Recolor pane") {
+                    self.show_recolor = !self.show_recolor;
+                }
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                // Places sections. Clicking one swaps what the Explorer pane shows (and opens it
+                // if hidden — otherwise the click would appear to do nothing).
+                for (sec, glyph, label, tip) in [
+                    (RailSection::Files, "\u{1F4C1}", "Files", "Files \u{2014} folders, favorites, filters"),
+                    (RailSection::Audio, "\u{1F3B9}", "Audio", "Audio \u{2014} kits and samples"),
+                    (RailSection::Fx, "\u{2728}", "PixelFX", "PixelFX presets"),
+                    (RailSection::Ai, icons::ROBOT, "AI", "AI generation"),
+                ] {
+                    let available = match sec {
+                        RailSection::Audio => self.plugin_audio,
+                        RailSection::Ai => self.plugin_ai,
+                        _ => true,
+                    };
+                    if !available {
+                        continue;
+                    }
+                    if row(ui, glyph, label, self.rail_section == sec, tip) {
+                        self.rail_section = sec;
+                        self.show_explorer = true;
+                        self.explorer_tab = 0;
+                        if let Some((i, _)) =
+                            sec.tabs().iter().find(|(i, _)| self.places_tab_enabled(*i))
+                        {
+                            self.places_tab = *i;
+                            if *i == 2 {
+                                self.kit_editor = true;
+                            }
+                        }
+                    }
+                    ui.add_space(2.0);
+                }
+                // Online sources, one button each — only the enabled ones, so the rail length
+                // tracks what you actually switched on in Preferences.
+                let mut first_source = true;
+                for (idx, glyph, label, tip) in RailSection::source_buttons() {
+                    if !self.places_tab_enabled(*idx) {
+                        continue;
+                    }
+                    if first_source {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        first_source = false;
+                    }
+                    let on = self.rail_section == RailSection::Sources && self.places_tab == *idx;
+                    if row(ui, glyph, label, on, tip) {
+                        self.rail_section = RailSection::Sources;
+                        self.places_tab = *idx;
+                        self.show_explorer = true;
+                        self.explorer_tab = 0;
+                    }
+                    ui.add_space(2.0);
+                }
+            });
+
+        // Settings, pinned to the bottom.
+        // Align::Min so the gear lines up with the buttons above it rather than sitting
+        // centred and visibly indented when the rail is expanded.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(6.0);
+            let clicked = row(ui, "\u{2699}", "Settings", self.show_prefs, "Settings \u{2014} click for Preferences, right-click for the config files");
+            if clicked {
+                self.show_prefs = true;
             }
         });
-            });
+        // The JSON files are the other half of the settings story, so make them reachable without
+        // hunting through the data dir. Attached to the last widget drawn (the gear).
+        let (sf, kf) = (self.settings_file.clone(), self.keybindings_file.clone());
+        let mut act: Option<PathBuf> = None;
+        let mut prefs = false;
+        ui.response().context_menu(|ui| {
+            ui.label(egui::RichText::new(sf.to_string_lossy()).weak().small());
+            ui.separator();
+            if ui.button("Preferences\u{2026}").clicked() {
+                prefs = true;
+                ui.close();
+            }
+            if ui.button("Open settings.json").clicked() {
+                act = Some(sf.clone());
+                ui.close();
+            }
+            if ui.button("Open keybindings.json").clicked() {
+                act = Some(kf.clone());
+                ui.close();
+            }
+            if ui.button("Reveal config folder").clicked() {
+                act = sf.parent().map(|d| d.to_path_buf());
+                ui.close();
+            }
+        });
+        if prefs {
+            self.show_prefs = true;
+        }
+        if let Some(p) = act {
+            self.open_url(&p.to_string_lossy());
+        }
     }
 
     /// Is this Places tab available, given the plugin toggles? Shared by the rail, the section
@@ -30824,8 +30920,16 @@ impl eframe::App for PixelView {
 
         // VSCode-style activity rail, far left, full height below the menu bar.
         if show_left {
+            // Width is derived from the icon size, not fixed: the buttons are `rail_icon_size +
+            // padding` wide, so a hardcoded 46 left a 6px strip of unpainted clear-colour (8,8,8)
+            // beside the panel — the same overflow gap documented for the audio dock — and would
+            // have broken outright once the icon size became user-configurable.
             egui::Panel::left("rail")
-                .exact_size(46.0)
+                .exact_size(if self.rail_expanded {
+                    180.0
+                } else {
+                    self.rail_icon_size + 30.0
+                })
                 .resizable(false)
                 .show_inside(ui, |ui| self.ui_rail(ui));
         }
@@ -31813,6 +31917,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_MA_KEY, &self.plugin_ma);
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
+        eframe::set_value(storage, Self::RAIL_EXPANDED_KEY, &self.rail_expanded);
         eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
         eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
