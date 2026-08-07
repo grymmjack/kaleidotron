@@ -897,6 +897,26 @@ impl SortKey {
 
 /// A deferred menu-bar action, applied after the menu closure returns (so the
 /// nested menu closures never need to borrow `self` mutably).
+/// A transient notification for work that **finished** while you were looking elsewhere.
+///
+/// The status bar is the wrong surface for these: it shows continuous state, it's easy to miss at
+/// the bottom of the window, and the next status message overwrites it. A toast persists for a few
+/// seconds, stacks, and doesn't compete with whatever the status bar is currently saying.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    born: f64,
+    /// Set when clicked — opened by the next frame, then the toast is dropped.
+    open: Option<PathBuf>,
+}
+
 /// Which group the Places panel is showing. VSCode's model: a handful of activity-rail icons, each
 /// swapping the whole side panel, instead of one horizontal strip of every tab. A vertical list
 /// inside a panel scales to any number of sources; a tab strip stops working past about eight.
@@ -1393,6 +1413,7 @@ pub struct PixelView {
     rail_expanded: bool, // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
     prefs_section: u8,        // which Preferences section is showing
+    toasts: Vec<Toast>,       // transient "that finished" notifications
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -3082,6 +3103,7 @@ impl PixelView {
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             rail_settings_menu: false,
             prefs_section: 0,
+            toasts: Vec::new(),
             recent_dirs: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
@@ -5749,6 +5771,7 @@ impl PixelView {
                     .ph_assets
                     .get(&vpath)
                     .map(|a| format!("{} — by {} · CC0 · {}", a.name, a.author_label(), a.page_url()));
+                self.toast_file(format!("Downloaded {}", short_name(&local)), local.clone());
                 self.ph_files.insert(vpath.clone(), local);
                 self.ph_open_rx = None;
                 self.load_full(ctx, vpath);
@@ -5757,6 +5780,7 @@ impl PixelView {
                 }
             }
             Ok(Err(e)) => {
+                self.toast(ToastKind::Error, format!("Download failed: {e}"));
                 self.status = format!("Download failed: {e}");
                 self.ph_open_rx = None;
             }
@@ -5832,8 +5856,17 @@ impl PixelView {
             .and_then(|url| crate::cache::get_file(&url, &format!("{slug}_{res}.hdr")))
             .and_then(|src| std::fs::copy(&src, &dest).map_err(|e| e.to_string()))
         {
-            Ok(n) => self.status = format!("Saved {} ({:.1} MB)", dest.display(), n as f64 / 1e6),
-            Err(e) => self.status = format!("HDR download failed: {e}"),
+            Ok(n) => {
+                self.toast_file(
+                    format!("Saved {} ({:.1} MB)", short_name(&dest), n as f64 / 1e6),
+                    dest.clone(),
+                );
+                self.status = format!("Saved {} ({:.1} MB)", dest.display(), n as f64 / 1e6);
+            }
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("HDR download failed: {e}"));
+                self.status = format!("HDR download failed: {e}");
+            }
         }
     }
 
@@ -5960,6 +5993,7 @@ impl PixelView {
                 }
             }
             Ok(Err(e)) => {
+                self.toast(ToastKind::Error, format!("Download failed: {e}"));
                 self.status = format!("Download failed: {e}");
                 self.snd_open_rx = None;
             }
@@ -6326,6 +6360,9 @@ impl PixelView {
                     break;
                 }
                 Ok(WebMsg::Failed(e)) => {
+                    // A robots.txt refusal or an unbrowsable page is worth surfacing: the folder just
+                    // looks empty otherwise, with no hint as to why.
+                    self.toast(ToastKind::Info, format!("Can't browse: {e}"));
                     self.status = format!("Can't browse: {e}");
                     done = true;
                     break;
@@ -6387,6 +6424,7 @@ impl PixelView {
                 self.load_full(ctx, vpath);
             }
             Ok(Err(e)) => {
+                self.toast(ToastKind::Error, format!("Download failed: {e}"));
                 self.status = format!("Download failed: {e}");
                 self.web_open_rx = None;
             }
@@ -18584,8 +18622,14 @@ impl PixelView {
             n += 1;
         }
         match image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
-            Ok(()) => self.status = format!("Saved {}", out.display()),
-            Err(e) => self.status = format!("PNG export failed: {e}"),
+            Ok(()) => {
+                self.toast_file(format!("Saved {}", short_name(&out)), out.clone());
+                self.status = format!("Saved {}", out.display());
+            }
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("PNG export failed: {e}"));
+                self.status = format!("PNG export failed: {e}");
+            }
         }
     }
 
@@ -27872,6 +27916,100 @@ impl PixelView {
         }
     }
 
+    /// How long a toast holds at full opacity before fading.
+    const TOAST_SECS: f64 = 4.5;
+
+    /// Post a notification. Kept deliberately small at the call site so adding one to a completion
+    /// path is a one-liner and nobody is tempted to skip it.
+    fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        let born = self.egui_ctx.input(|i| i.time);
+        self.toasts.push(Toast {
+            text: text.into(),
+            kind,
+            born,
+            open: None,
+        });
+        // Keep the stack short — older ones are the least relevant.
+        if self.toasts.len() > 5 {
+            self.toasts.remove(0);
+        }
+    }
+
+    /// A "saved / finished" toast whose click opens `path` (the file, or its folder).
+    fn toast_file(&mut self, text: impl Into<String>, path: PathBuf) {
+        self.toast(ToastKind::Success, text);
+        if let Some(t) = self.toasts.last_mut() {
+            t.open = Some(path);
+        }
+    }
+
+    /// Draw the toast stack, bottom-right, fading out with age. Same fade shape as the viewer OSD.
+    fn ui_toasts(&mut self, ctx: &egui::Context) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        // content_rect (not the deprecated screen_rect) so toasts sit inside the window's
+        // content area rather than under any OS-side decoration.
+        let screen = ctx.content_rect();
+        let mut clicked: Option<PathBuf> = None;
+        let mut y = screen.max.y - 12.0;
+        // Newest at the bottom, older stacking upward.
+        for (idx, t) in self.toasts.iter().enumerate().rev() {
+            let age = now - t.born;
+            let fade = ((Self::TOAST_SECS + 0.8 - age) / 0.8).clamp(0.0, 1.0) as f32;
+            let (bg, fg) = match t.kind {
+                ToastKind::Success => (egui::Color32::from_rgb(24, 60, 32), egui::Color32::from_rgb(180, 240, 190)),
+                ToastKind::Error => (egui::Color32::from_rgb(70, 26, 26), egui::Color32::from_rgb(255, 190, 190)),
+                ToastKind::Info => (egui::Color32::from_rgb(30, 34, 42), egui::Color32::from_rgb(215, 220, 230)),
+            };
+            let area = egui::Area::new(egui::Id::new(("toast", idx)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(screen.max.x - 12.0, y))
+                .pivot(egui::Align2::RIGHT_BOTTOM)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(bg.gamma_multiply(fade))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.set_max_width(420.0);
+                            ui.label(
+                                egui::RichText::new(&t.text).color(fg.gamma_multiply(fade)),
+                            );
+                        });
+                });
+            let r = area.response;
+            if r.clicked() {
+                clicked = t.open.clone().or(Some(PathBuf::new()));
+            }
+            y -= r.rect.height() + 6.0;
+        }
+        // Drop faded-out toasts, and whichever was clicked.
+        let expired: Vec<usize> = self
+            .toasts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| now - t.born > Self::TOAST_SECS + 0.8)
+            .map(|(i, _)| i)
+            .collect();
+        for i in expired.into_iter().rev() {
+            self.toasts.remove(i);
+        }
+        if let Some(p) = clicked {
+            self.toasts.clear();
+            if p.as_os_str().is_empty() {
+                // no target — the click just dismisses
+            } else if p.is_dir() {
+                self.open_url(&p.to_string_lossy());
+            } else if let Some(d) = p.parent() {
+                self.open_url(&d.to_string_lossy());
+            }
+        }
+        self.want_repaint = true; // keep fading
+    }
+
     /// Is this Places tab available, given the plugin toggles? Shared by the rail, the section
     /// list, and the stranded-tab guard so all three agree.
     /// How many recent locations to keep.
@@ -31140,6 +31278,7 @@ impl eframe::App for PixelView {
         self.paint_audio_loading_overlay(&ctx);
         self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
+        self.ui_toasts(&ctx);
         self.ui_web_download_dialog(&ctx);
         self.ui_select_mask_dialog(&ctx);
         self.ui_ai_generate(&ctx);
@@ -31207,21 +31346,39 @@ impl eframe::App for PixelView {
                         "Advanced",
                     ];
                     let sec = self.prefs_section;
+                    // Section selector: padded, evenly sized tabs so the row reads as a strip
+                    // rather than as run-together text.
+                    ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         for (i, name) in PREF_SECTIONS.iter().enumerate() {
                             let i = i as u8;
-                            if ui.selectable_label(sec == i, *name).clicked() {
+                            if ui
+                                .add_sized(
+                                    [0.0, 26.0],
+                                    egui::SelectableLabel::new(sec == i, format!("  {name}  ")),
+                                )
+                                .clicked()
+                            {
                                 self.prefs_section = i;
                             }
                         }
                     });
+                    ui.add_space(6.0);
                     ui.separator();
+                    ui.add_space(10.0);
+                    // Roomier controls inside the dialog than the app default — a settings pane is
+                    // read, not skimmed, and the old wall was hard to scan partly from density.
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+                    ui.spacing_mut().slider_width = 180.0;
                     let ncols = 1;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.columns(ncols, |cols| {
                                 let ui = &mut cols[0];
+                                ui.add_space(2.0);
                                 let mut theme = self.theme;
                                 let mut gap = self.grid_gap;
                                 if sec == 0 {
