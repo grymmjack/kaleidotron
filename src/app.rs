@@ -31351,13 +31351,14 @@ impl eframe::App for PixelView {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                         for (i, name) in PREF_SECTIONS.iter().enumerate() {
                             let i = i as u8;
+                            // Real padding via button_padding, NOT spaces baked into the label:
+                            // the label text is the accessibility name, so "  Keyboard  " makes
+                            // the tab unfindable by name (which broke a GUI test).
                             if ui
-                                .add_sized(
-                                    [0.0, 26.0],
-                                    egui::SelectableLabel::new(sec == i, format!("  {name}  ")),
-                                )
+                                .add_sized([0.0, 26.0], egui::SelectableLabel::new(sec == i, *name))
                                 .clicked()
                             {
                                 self.prefs_section = i;
