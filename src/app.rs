@@ -2011,6 +2011,9 @@ pub struct PixelView {
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
+    themes_dir: PathBuf,       // <data>/themes/*.json
+    theme_name: String,        // selected theme; empty = egui's built-in dark/light
+    themes: Vec<crate::theme::Theme>,
     // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
     // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
     // actually browse (Preferences → "Web sources"). A persisted value always wins over the
@@ -2895,6 +2898,17 @@ impl PixelView {
         let kb_file = crate::keybindings::path(&data_dir);
         let settings_file = crate::settings::path(&data_dir);
         let secrets_file = crate::secrets::path(&data_dir);
+        let themes_dir = crate::theme::dir(&data_dir);
+        // Seed the bundled themes on first run — same pattern as the PixelFX presets: a starting
+        // set plus worked examples to copy. Never overwrite a file the user may have edited.
+        let _ = std::fs::create_dir_all(&themes_dir);
+        for (slug, body) in crate::theme::builtin() {
+            let f = themes_dir.join(format!("{slug}.json"));
+            if !f.exists() {
+                let _ = std::fs::write(&f, body);
+            }
+        }
+        let themes = crate::theme::load_all(&themes_dir);
         if let Some(entries) = crate::keybindings::load(&kb_file) {
             for (aid, kn) in entries {
                 if let (Some(a), Some(k)) = (Action::from_id(&aid), egui::Key::from_name(&kn)) {
@@ -3619,6 +3633,9 @@ impl PixelView {
             keybindings_file: kb_file,
             settings_file,
             secrets_file,
+            themes_dir,
+            theme_name: String::new(),
+            themes,
             plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
             plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
             plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
@@ -3704,6 +3721,7 @@ impl PixelView {
             app.ma_key = v.clone();
         }
         app.apply_settings_file();
+        app.apply_theme(&cc.egui_ctx);
         app.write_settings_file();
         app
     }
@@ -3727,6 +3745,7 @@ impl PixelView {
             e(A, "thumb_size", self.thumb_size, "grid tile size in points"),
             e(A, "grid_gap", self.grid_gap, "horizontal gap between grid tiles"),
             e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
+            e(A, "theme_name", self.theme_name.clone(), "themes/<name>.json (blank = built-in dark/light)"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
@@ -3806,6 +3825,9 @@ impl PixelView {
         }
         if let Some(v) = st::get_f32(&m, "grid_gap_y") {
             self.grid_gap_y = v.clamp(0.0, 200.0);
+        }
+        if let Some(v) = st::get_string(&m, "theme_name") {
+            self.theme_name = v;
         }
         if let Some(v) = st::get_f32(&m, "rail_icon_size") {
             self.rail_icon_size = v.clamp(12.0, 48.0);
@@ -27889,8 +27911,7 @@ impl PixelView {
                         for (label, path) in [
                             ("settings.json", Some(self.settings_file.clone())),
                             ("keybindings.json", Some(self.keybindings_file.clone())),
-                            // themes/ doesn't exist yet — the theme system is still to come, so
-                            // this deliberately isn't offered rather than opening a dead path.
+                            ("themes/", Some(self.themes_dir.clone())),
                         ] {
                             if let Some(p) = path {
                                 let exists = p.exists();
@@ -28108,6 +28129,24 @@ impl PixelView {
             } else {
                 self.activate(ctx, idx);
             }
+        }
+    }
+
+    /// Install the selected theme's `Visuals`. An empty or unknown name falls back to the plain
+    /// dark/light base, so deleting a theme file can't leave the UI unstyled.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self
+            .themes
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
+        {
+            ctx.set_visuals(t.to_visuals());
+        } else {
+            ctx.set_visuals(if self.theme == 1 {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            });
         }
     }
 
@@ -31531,6 +31570,7 @@ impl eframe::App for PixelView {
             let mut reset_colors = false; // "Reset" the format colors
             let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
             let mut font_preview_changed = false; // font-tile sample text edited → refresh tiles
+            let mut theme_apply = false; // theme picked → re-install Visuals after the closure
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
@@ -31598,6 +31638,51 @@ impl eframe::App for PixelView {
                                 let mut gap = self.grid_gap;
                                 if sec == 0 {
                                 ui.label("Theme");
+                                // Named themes from <data>/themes/*.json. "Built-in" falls back to
+                                // egui's dark/light base, which the Dark/Light buttons below pick.
+                                let mut pick: Option<String> = None;
+                                egui::ComboBox::from_id_salt("theme_pick")
+                                    .selected_text(if self.theme_name.trim().is_empty() {
+                                        "Built-in".to_string()
+                                    } else {
+                                        self.theme_name.clone()
+                                    })
+                                    .width(200.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(self.theme_name.is_empty(), "Built-in")
+                                            .clicked()
+                                        {
+                                            pick = Some(String::new());
+                                        }
+                                        for t in &self.themes {
+                                            if ui
+                                                .selectable_label(
+                                                    self.theme_name == t.name,
+                                                    format!("{}{}", t.name, if t.dark { "" } else { "  (light)" }),
+                                                )
+                                                .clicked()
+                                            {
+                                                pick = Some(t.name.clone());
+                                            }
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Reload themes").clicked() {
+                                        self.themes = crate::theme::load_all(&self.themes_dir);
+                                        pick = Some(self.theme_name.clone());
+                                    }
+                                    if ui.small_button("Open themes folder").clicked() {
+                                        let d = self.themes_dir.to_string_lossy().to_string();
+                                        self.open_url(&d);
+                                    }
+                                });
+                                ui.weak("Drop a VS Code theme .json in that folder — it's imported directly.");
+                                if let Some(name) = pick {
+                                    self.theme_name = name;
+                                    theme_apply = true;
+                                }
+                                ui.add_space(6.0);
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut theme, 0, "Dark");
                                     ui.selectable_value(&mut theme, 1, "Light");
@@ -32181,6 +32266,9 @@ impl eframe::App for PixelView {
                             });
                         });
                 });
+            if theme_apply {
+                self.apply_theme(&ctx);
+            }
             self.show_prefs = open;
             if prefs_refresh {
                 self.refresh();

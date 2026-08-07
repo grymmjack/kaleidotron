@@ -28,6 +28,7 @@ mod sfz;
 mod sixteen;
 mod soundfont;
 mod steam;
+mod theme;
 mod thumb;
 mod video;
 mod imgsearch;
