@@ -47,7 +47,7 @@ const CURRENT_YEAR: u32 = 2026;
 
 fn cache_dir() -> PathBuf {
     // The persistent cache dir (set at startup); falls back to temp before init / in tests.
-    crate::cache::dir().unwrap_or_else(|| std::env::temp_dir().join("kaleidotron-16colo"))
+    crate::cache::dir().unwrap_or_else(|| std::env::temp_dir().join("kaleidotron-16colors"))
 }
 
 /// A disk-cached pack listing for `year`, if present and still fresh.

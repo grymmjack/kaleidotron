@@ -26,7 +26,7 @@ kaleidotron --render <INPUT>... [-o FILE | --outdir DIR] [--font-9px] [--scale N
 - With neither `-o` nor `--outdir`, output is written **beside each input** as `<name>.png`.
 - Output format is inferred from the output extension; `--format png|bmp|tga|…` forces it.
 - `--font-9px` = authentic **9-dot VGA cell** (line-draw chars join; matches ansilove /
-  16colo widths). Default is the exact 8-dot cell. **Prefer `--font-9px` when the goal is
+  16colors widths). Default is the exact 8-dot cell. **Prefer `--font-9px` when the goal is
   faithful reproduction of how the art looks on 16colo.rs / ansilove.**
 - `--scale N` = integer **nearest-neighbor upscale** (crisp, no blur).
 - **Exit code:** `0` = all ok, `1` = some failed / nothing found, `2` = bad usage

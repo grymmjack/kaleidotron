@@ -153,7 +153,7 @@ pub fn get_file(url: &str, filename: &str) -> Result<PathBuf, String> {
         return Ok(path);
     }
     // Cache disabled → still hand back a (temp) file so callers keep working.
-    let dir = std::env::temp_dir().join("kaleidotron-16colo").join(key(url));
+    let dir = std::env::temp_dir().join("kaleidotron-16colors").join(key(url));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(filename);
     if !path.exists() {

@@ -2,7 +2,7 @@
 name = "kaleidotron"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, pixel-art-first image viewer"
+description = "A fast, pixel-art-first media browser — images, scene art, 3D, video, audio and text"
 
 [dependencies]
 asefile = "0.3.8"
