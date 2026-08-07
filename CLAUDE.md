@@ -1264,6 +1264,12 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
 
 ## Settings & ratings
 
+- **`settings.json` is written atomically** (temp + rename) and **never overwritten when it exists
+  but can't be read**. `fs::write` truncates then fills, so a concurrent reader sees a partial — or
+  empty — file; since unparseable settings load as nothing, the reader then wrote its *defaults* back
+  over the user's file. Launching a second instance while the first flushed reproduced exactly that.
+  `exists_but_unreadable` distinguishes a *missing* file (normal first run → seed it) from a broken
+  one (someone's hand-written settings → copy to `.bak` and leave it alone).
 - **Persistence** uses eframe's `persistence` feature (storage at
   `~/.local/share/pixelview/`). Each setting is its own key (consts on `PixelView`:
   `ZOOM_KEY`, `THUMB_KEY`, `FAV_KEY`, `FOLDER_KEY`, sort/filter keys, `EXPLORER_KEY`,
@@ -1355,6 +1361,26 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   idx)` into `full_tex` (so the existing zoom/pan/fit + Recolor pane + OSD all work on the map).
   `load_full`'s `is_xmind_path` branch sets it up + renders sheet 0; `render_xmind_to_full` /
   `xmind_step_sheet` mirror the PDF pair. `xmind` is in `is_image_ext` (prev/next + montages).
+- **Text editing (`draw_text_ui`).** The viewer is a real `TextEdit` with the brakes on — in view
+  mode the buffer is handed in as `&mut` and the edit *discarded* (`interactive(false)` would kill
+  selection too). **`✎ Edit` opts in**, GitHub-style: nothing can overwrite a file until it's pressed.
+  Then `💾 Save` (Ctrl+S) / `Save as…` / `↶ Revert` / `✕ Done`, a `● modified` marker
+  (`text_is_dirty` = buffer ≠ `text_orig`), and a native confirm before ANY exit that would discard
+  (‹ Grid, Escape, and `load_full` — the choke point every other file-open goes through). **Save
+  refuses a virtual path** (archive / 16colo / YouTube cache): writing there hits a temp copy that's
+  thrown away, so it looks like it worked and silently loses the edit — Save as… instead. The buffer
+  is **normalised to LF on load** (`text_crlf`) so galley/cursor/find offsets all agree, and saving
+  converts back — a CRLF file round-trips byte-identical. **🔍 Find** (Ctrl+F) highlights every match
+  *in the layouter* (so highlighting survives scroll/wrap), current match in a different tint,
+  ⬆/⬇ + Enter/Shift+Enter walk them (seek = set the `TextEdit`'s cursor, which egui scrolls to);
+  **Replace / All** appear only in edit mode and run right-to-left so earlier ranges stay valid.
+  **⬇ Follow** = `tail -f`: `poll_text_follow` re-reads on a 0.5 s timer when the file's length
+  changed and pins to the end. NB `stick_to_bottom` only *holds* a view already at the bottom, so
+  engaging Follow scrolls explicitly via `scroll_to_rect` — a huge `vertical_scroll_offset` is NOT
+  clamped to the content and lands past the end on an empty pane. **Gutter gotcha:** line numbers are
+  *painted* at each galley row's real y, not laid out as a column of labels — a label column's pitch
+  is label height + `item_spacing.y`, which is not the galley's, so the numbers drift from their lines
+  (invisible at the top, whole lines off by ~60). Hidden when wrapping, where one-row-per-line fails.
 - **Pseudo-vector zoom (XMind + PDF).** These are smooth *vector* sources (an SVG re-render,
   a pdfium page), so instead of nearest-upscaling a fixed raster, the viewer **re-renders from
   the source as you zoom in**. `draw_image_view` measures the texture's on-screen upscale

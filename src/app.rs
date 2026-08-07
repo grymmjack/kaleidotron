@@ -1435,6 +1435,32 @@ pub struct PixelView {
     /// stays a raster, the viewer works on the real text.
     text_doc: Option<(PathBuf, String)>,
     text_wrap: bool,
+    /// Editing is opt-in, GitHub-style: a viewer that can silently overwrite source files is a
+    /// different kind of program, so no keystroke does damage until this is deliberately turned on.
+    text_edit: bool,
+    /// The buffer as it was when editing began — what Revert restores and what "modified" compares
+    /// against, so undoing every change by hand correctly reports the file as clean again.
+    text_orig: String,
+    /// The file used CRLF. The buffer is normalised to LF on load so the galley we lay out and the
+    /// string the `TextEdit` holds agree on every offset (find, cursor, selection); save converts
+    /// back, leaving the file's line endings exactly as they were found.
+    text_crlf: bool,
+    text_find_open: bool,
+    text_find: String,
+    text_replace: String,
+    text_find_case: bool,
+    /// Which match is current, so Enter/Shift+Enter can walk them.
+    text_find_idx: usize,
+    /// Set when a match should be scrolled to and selected on the next frame.
+    text_find_seek: bool,
+    /// `tail -f`: re-read the file when it grows and stay pinned to the bottom.
+    text_follow: bool,
+    text_follow_len: u64,
+    text_follow_t: f64,
+    /// Jump the view to the end on the next frame — set when follow is switched on and whenever
+    /// new content arrives, because `stick_to_bottom` alone only holds a view that is already at
+    /// the bottom, and turning Follow on from the top of a file would appear to do nothing.
+    text_follow_jump: bool,
     /// The shared command overlay. `Some(true)` = command palette, `Some(false)` = quick-open.
     /// One widget serves both (and later the Preferences search) so the interaction — focus, arrow
     /// keys, Enter, Esc — is written once.
@@ -3155,6 +3181,19 @@ impl PixelView {
             prefs_section: 0,
             text_doc: None,
             text_wrap: false,
+            text_edit: false,
+            text_orig: String::new(),
+            text_crlf: false,
+            text_find_open: false,
+            text_find: String::new(),
+            text_replace: String::new(),
+            text_find_case: false,
+            text_find_idx: 0,
+            text_find_seek: false,
+            text_follow: false,
+            text_follow_len: 0,
+            text_follow_t: 0.0,
+            text_follow_jump: false,
             palette: None,
             palette_query: String::new(),
             palette_sel: 0,
@@ -3757,7 +3796,19 @@ impl PixelView {
         }
         app.apply_settings_file();
         app.apply_theme(&cc.egui_ctx);
-        app.write_settings_file();
+        // Re-emit the file so a new setting appears in it — but NOT when it exists and could not be
+        // read. That file holds settings somebody typed; replacing it with defaults would destroy
+        // them silently. Keep a copy and leave the original alone instead.
+        if crate::settings::exists_but_unreadable(&app.settings_file) {
+            let bak = app.settings_file.with_extension("json.bak");
+            let _ = std::fs::copy(&app.settings_file, &bak);
+            eprintln!(
+                "settings.json could not be read — left untouched, copy at {}",
+                bak.display()
+            );
+        } else {
+            app.write_settings_file();
+        }
         app
     }
 
@@ -16966,7 +17017,13 @@ impl PixelView {
     }
 
     fn load_full(&mut self, ctx: &egui::Context, path: PathBuf) {
+        // Opening anything else abandons the open document, so this is the choke point where
+        // unsaved edits would otherwise vanish without a word.
+        if !self.confirm_discard_text() {
+            return;
+        }
         self.text_doc = None; // leaving whatever text document was open
+        self.reset_text_editor();
         // Source/text opens in the REAL text viewer (selectable, copyable, searchable) rather than
         // the rasterised tile. Capped: the layouter colours the whole document, so a huge log would
         // stall a frame — beyond the cap it falls through to the raster path, which is bounded.
@@ -16978,8 +17035,14 @@ impl PixelView {
             const MAX_TEXT: u64 = 4 * 1024 * 1024;
             let small = std::fs::metadata(&real).map(|m| m.len() <= MAX_TEXT).unwrap_or(false);
             if small {
-                if let Ok(body) = std::fs::read_to_string(&real) {
+                if let Ok(raw) = std::fs::read_to_string(&real) {
+                    // Normalise to LF so every offset (galley, cursor, find) refers to the same
+                    // thing; `text_crlf` restores the file's own endings on save.
+                    self.text_crlf = raw.contains("\r\n");
+                    let body = if self.text_crlf { raw.replace("\r\n", "\n") } else { raw };
+                    self.text_orig = body.clone();
                     self.text_doc = Some((path.clone(), body));
+                    self.text_follow_len = std::fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
                     self.set_mode(Mode::Single);
                     self.full_tex = None;
                     self.mark_viewed(&path);
@@ -28273,6 +28336,241 @@ impl PixelView {
         }
     }
 
+    /// The find/replace bar. Replace is only offered in edit mode — a viewer that can rewrite a
+    /// file behind a read-only-looking UI is the exact surprise the Edit button exists to prevent.
+    fn ui_text_find(&mut self, ui: &mut egui::Ui) {
+        let hits = self.text_matches();
+        let editing = self.text_edit;
+        let (mut next, mut prev, mut close) = (false, false, false);
+        let (mut replace_one, mut replace_all) = (false, false);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Find");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.text_find)
+                    .desired_width(220.0)
+                    .hint_text("text to find"),
+            );
+            if r.changed() {
+                self.text_find_idx = 0;
+            }
+            // Enter walks matches from inside the field, the way every editor's search box does.
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if ui.input(|i| i.modifiers.shift) {
+                    prev = true;
+                } else {
+                    next = true;
+                }
+                r.request_focus();
+            }
+            ui.checkbox(&mut self.text_find_case, "Aa").on_hover_text("Match case");
+            if hits.is_empty() {
+                if self.text_find.is_empty() {
+                    ui.weak("—");
+                } else {
+                    ui.colored_label(ui.visuals().warn_fg_color, "no matches");
+                }
+            } else {
+                ui.weak(format!("{} of {}", self.text_find_idx + 1, hits.len()));
+            }
+            if ui.add_enabled(!hits.is_empty(), egui::Button::new("⬆")).clicked() {
+                prev = true;
+            }
+            if ui.add_enabled(!hits.is_empty(), egui::Button::new("⬇")).clicked() {
+                next = true;
+            }
+            if editing {
+                ui.separator();
+                ui.label("Replace");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.text_replace)
+                        .desired_width(180.0)
+                        .hint_text("replacement"),
+                );
+                if ui.add_enabled(!hits.is_empty(), egui::Button::new("Replace")).clicked() {
+                    replace_one = true;
+                }
+                if ui
+                    .add_enabled(!hits.is_empty(), egui::Button::new(format!("All ({})", hits.len())))
+                    .clicked()
+                {
+                    replace_all = true;
+                }
+            }
+            if ui.button("✕").clicked() {
+                close = true;
+            }
+        });
+        if next && !hits.is_empty() {
+            self.text_find_idx = (self.text_find_idx + 1) % hits.len();
+            self.text_find_seek = true;
+        }
+        if prev && !hits.is_empty() {
+            self.text_find_idx = (self.text_find_idx + hits.len() - 1) % hits.len();
+            self.text_find_seek = true;
+        }
+        if replace_one {
+            let (a, b) = hits[self.text_find_idx.min(hits.len() - 1)];
+            let rep = self.text_replace.clone();
+            if let Some((_, body)) = self.text_doc.as_mut() {
+                body.replace_range(a..b, &rep);
+            }
+            // Matches shift after an edit; staying on the same index would skip one.
+            self.text_find_idx = 0;
+            self.text_find_seek = true;
+        }
+        if replace_all {
+            // Right-to-left so each replacement cannot invalidate the ranges still to come.
+            let rep = self.text_replace.clone();
+            if let Some((_, body)) = self.text_doc.as_mut() {
+                for (a, b) in hits.iter().rev() {
+                    body.replace_range(*a..*b, &rep);
+                }
+            }
+            self.toast(ToastKind::Info, format!("Replaced {} occurrence(s)", hits.len()));
+            self.text_find_idx = 0;
+        }
+        if close {
+            self.text_find_open = false;
+        }
+    }
+
+    /// Drop every bit of editing state. Called whenever a different document is opened, so edit
+    /// mode, a stale search, and follow-mode never leak from one file onto the next.
+    fn reset_text_editor(&mut self) {
+        self.text_edit = false;
+        self.text_orig.clear();
+        self.text_crlf = false;
+        self.text_find_open = false;
+        self.text_find_idx = 0;
+        self.text_find_seek = false;
+        self.text_follow = false;
+        self.text_follow_len = 0;
+    }
+
+    /// Has the open document been changed since it was loaded or last saved?
+    fn text_is_dirty(&self) -> bool {
+        self.text_doc
+            .as_ref()
+            .is_some_and(|(_, body)| *body != self.text_orig)
+    }
+
+    /// Write the buffer to `path`, restoring the file's original line endings.
+    ///
+    /// Returns the error rather than toasting it here so the caller decides how loud to be — a
+    /// failed save must never be silent, and a caller that ignores it would be a bug worth seeing.
+    fn save_text_to(&mut self, path: &Path) -> Result<(), String> {
+        let Some((_, body)) = self.text_doc.clone() else {
+            return Err("nothing open".into());
+        };
+        let out = if self.text_crlf { body.replace('\n', "\r\n") } else { body.clone() };
+        std::fs::write(path, out).map_err(|e| e.to_string())?;
+        self.text_orig = body;
+        Ok(())
+    }
+
+    /// Save over the open file.
+    fn save_text(&mut self) {
+        let Some((path, _)) = self.text_doc.clone() else { return };
+        // A virtual path (inside an archive, or a downloaded 16colo/YouTube file) points at a
+        // temp copy that is thrown away — writing there looks like it worked and silently loses
+        // the edit, so refuse rather than lie.
+        let real = self.resolve_local(&path);
+        if real != path {
+            self.toast(
+                ToastKind::Error,
+                "This file lives inside an archive or a download cache — use Save as… to write it somewhere real.",
+            );
+            return;
+        }
+        match self.save_text_to(&real) {
+            Ok(()) => self.toast(ToastKind::Info, format!("Saved {}", short_name(&path))),
+            Err(e) => self.toast(ToastKind::Error, format!("Save failed: {e}")),
+        }
+    }
+
+    /// Save to a new file chosen by the user, and follow the document there.
+    fn save_text_as(&mut self) {
+        let Some((path, _)) = self.text_doc.clone() else { return };
+        let mut dlg = rfd::FileDialog::new().set_file_name(short_name(&path));
+        if let Some(dir) = self.resolve_local(&path).parent() {
+            dlg = dlg.set_directory(dir);
+        }
+        let Some(dest) = dlg.save_file() else { return };
+        match self.save_text_to(&dest) {
+            Ok(()) => {
+                // The editor now belongs to the new file: further saves must not go back to the
+                // original, which the user chose to leave alone.
+                if let Some((p, _)) = self.text_doc.as_mut() {
+                    *p = dest.clone();
+                }
+                self.toast(ToastKind::Info, format!("Saved {}", short_name(&dest)));
+            }
+            Err(e) => self.toast(ToastKind::Error, format!("Save failed: {e}")),
+        }
+    }
+
+    /// Ask before throwing away unsaved edits. `true` = go ahead.
+    ///
+    /// Native dialog rather than an in-app one: this is the last thing standing between a stray
+    /// click and lost work, so it should be modal in the way the OS understands.
+    fn confirm_discard_text(&mut self) -> bool {
+        if !self.text_is_dirty() {
+            return true;
+        }
+        let name = self
+            .text_doc
+            .as_ref()
+            .map(|(p, _)| short_name(p))
+            .unwrap_or_default();
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description(format!("{name} has unsaved changes. Discard them?"))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show() == rfd::MessageDialogResult::Ok
+    }
+
+    /// Byte ranges of every match of the find term, in order. Empty when the search is empty.
+    fn text_matches(&self) -> Vec<(usize, usize)> {
+        let needle = self.text_find.as_str();
+        let Some((_, body)) = self.text_doc.as_ref() else { return Vec::new() };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        find_ranges(body, needle, self.text_find_case)
+    }
+
+    /// Re-read a growing file and stay pinned to its end (`tail -f`).
+    ///
+    /// Polled on a timer rather than watched: a log is appended to constantly, and re-reading a
+    /// capped-size file a few times a second is far cheaper than the machinery to do better.
+    fn poll_text_follow(&mut self, ctx: &egui::Context) {
+        if !self.text_follow || self.text_edit {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        if now - self.text_follow_t < 0.5 {
+            return;
+        }
+        self.text_follow_t = now;
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let Some((path, _)) = self.text_doc.clone() else { return };
+        let real = self.resolve_local(&path);
+        let Ok(len) = std::fs::metadata(&real).map(|m| m.len()) else { return };
+        if len == self.text_follow_len {
+            return;
+        }
+        self.text_follow_len = len;
+        if let Ok(raw) = std::fs::read_to_string(&real) {
+            let body = if self.text_crlf { raw.replace("\r\n", "\n") } else { raw };
+            self.text_orig = body.clone();
+            if let Some((_, b)) = self.text_doc.as_mut() {
+                *b = body;
+            }
+            self.text_follow_jump = true;
+        }
+    }
+
     /// Draw the open text document: a read-only but selectable `TextEdit`, syntax-coloured via a
     /// `LayoutJob` from the same lexer the raster tile uses, with a line-number gutter.
     fn draw_text_ui(&mut self, ui: &mut egui::Ui, immersive: bool) {
@@ -28282,8 +28580,14 @@ impl PixelView {
             .and_then(|e| e.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let dirty = self.text_is_dirty();
+        let editing = self.text_edit;
+        // Deferred intents: the toolbar runs inside egui closures that cannot borrow `self` twice.
         let mut back = false;
+        let (mut want_edit, mut want_revert, mut want_save, mut want_save_as) = (false, false, false, false);
+        let mut want_follow: Option<bool> = None;
         let mut wrap = self.text_wrap;
+        let mut find_open = self.text_find_open;
         if !immersive {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("‹ Grid").clicked() {
@@ -28291,19 +28595,108 @@ impl PixelView {
                 }
                 ui.separator();
                 ui.strong(short_name(&path));
+                if dirty {
+                    // The one unmissable signal that this buffer differs from the file on disk.
+                    ui.colored_label(ui.visuals().warn_fg_color, "● modified");
+                }
                 ui.weak(format!("{} lines", body.lines().count()));
                 ui.separator();
+                if editing {
+                    let save = egui::Button::new("💾 Save").shortcut_text("Ctrl+S");
+                    if ui.add_enabled(dirty, save).clicked() {
+                        want_save = true;
+                    }
+                    if ui.button("Save as…").clicked() {
+                        want_save_as = true;
+                    }
+                    if ui
+                        .add_enabled(dirty, egui::Button::new("↶ Revert"))
+                        .on_hover_text("Throw away every change since the file was opened or last saved")
+                        .clicked()
+                    {
+                        want_revert = true;
+                    }
+                    if ui.button("✕ Done").on_hover_text("Leave edit mode").clicked() {
+                        want_edit = true;
+                    }
+                } else {
+                    if ui
+                        .button("✎ Edit")
+                        .on_hover_text("Make this document editable")
+                        .clicked()
+                    {
+                        want_edit = true;
+                    }
+                    let follow = self.text_follow;
+                    let btn = egui::Button::new("⬇ Follow").selected(follow);
+                    if ui
+                        .add(btn)
+                        .on_hover_text("tail -f: re-read the file as it grows and stay at the end")
+                        .clicked()
+                    {
+                        want_follow = Some(!follow);
+                    }
+                }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("🔍 Find").selected(find_open))
+                    .on_hover_text("Ctrl+F")
+                    .clicked()
+                {
+                    find_open = !find_open;
+                }
                 ui.checkbox(&mut wrap, "Wrap");
                 if ui.button("📋 Copy").clicked() {
                     ui.ctx().copy_text(body.clone());
                 }
             });
+            if find_open {
+                self.text_find_open = true;
+                self.ui_text_find(ui);
+            }
             ui.separator();
         }
         self.text_wrap = wrap;
+        self.text_find_open = find_open;
+        if want_edit {
+            if self.text_edit {
+                // Leaving edit mode discards nothing by itself, but walking away from unsaved work
+                // silently is how edits get lost.
+                if self.confirm_discard_text() {
+                    self.text_edit = false;
+                    if let Some((_, b)) = self.text_doc.as_mut() {
+                        *b = self.text_orig.clone();
+                    }
+                }
+            } else {
+                self.text_edit = true;
+                self.text_follow = false; // following a file you are editing makes no sense
+            }
+        }
+        if want_revert && self.confirm_discard_text() {
+            let orig = self.text_orig.clone();
+            if let Some((_, b)) = self.text_doc.as_mut() {
+                *b = orig;
+            }
+        }
+        if want_save {
+            self.save_text();
+        }
+        if want_save_as {
+            self.save_text_as();
+        }
+        if let Some(on) = want_follow {
+            self.text_follow = on;
+            self.text_follow_t = 0.0;
+            self.text_follow_jump = on;
+        }
         if back {
+            if !self.confirm_discard_text() {
+                return;
+            }
             self.set_mode(Mode::Grid);
             self.text_doc = None;
+            self.reset_text_editor();
             return;
         }
 
@@ -28329,49 +28722,149 @@ impl PixelView {
         let mono = egui::FontId::monospace(13.0);
         let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * 8.0 + 12.0;
         let wrap_at = if wrap { ui.available_width() - gutter_w } else { f32::INFINITY };
+        // Search hits are painted by the layouter, so highlighting is a property of the text rather
+        // than an overlay that would have to be kept in step with scrolling and wrapping.
+        let hits = self.text_matches();
+        let cur_hit = hits.get(self.text_find_idx).copied();
+        // A stable id so the cursor/selection survives the frame in which we jump to a match.
+        let text_id = ui.id().with("text_body");
+        let seek = std::mem::take(&mut self.text_find_seek);
+        let hit_range = cur_hit;
+        let hit_bg = ui.visuals().selection.bg_fill.gamma_multiply(0.55);
+        let cur_bg = ui.visuals().warn_fg_color.gamma_multiply(0.55);
         let mut layouter = move |ui: &egui::Ui, _text: &dyn egui::TextBuffer, _w: f32| -> std::sync::Arc<egui::Galley> {
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = wrap_at;
+            // Byte offset of the run being appended, tracked so a match can be located within it.
+            let mut off = 0usize;
+            let push = |job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32, at: usize| {
+                let bg = match hits.binary_search_by(|(a, b)| {
+                    if *b <= at { std::cmp::Ordering::Less } else if *a > at { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
+                }) {
+                    Ok(i) => Some(if Some(hits[i]) == cur_hit { cur_bg } else { hit_bg }),
+                    Err(_) => None,
+                };
+                job.append(
+                    text,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: mono.clone(),
+                        color,
+                        background: bg.unwrap_or(egui::Color32::TRANSPARENT),
+                        ..Default::default()
+                    },
+                );
+            };
             for (i, runs) in spans.iter().enumerate() {
                 for (text, tok) in runs {
                     let c = kind_rgb[kind_idx(*tok)];
-                    job.append(
-                        text,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: mono.clone(),
-                            color: egui::Color32::from_rgb(c[0], c[1], c[2]),
-                            ..Default::default()
-                        },
-                    );
+                    let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                    // A run may straddle a match boundary, so split it at every edge that falls
+                    // inside it — otherwise the highlight would snap to whole tokens.
+                    let mut cut: Vec<usize> = vec![0];
+                    for (a, b) in &hits {
+                        for e in [*a, *b] {
+                            if e > off && e < off + text.len() {
+                                cut.push(e - off);
+                            }
+                        }
+                    }
+                    cut.push(text.len());
+                    cut.sort_unstable();
+                    cut.dedup();
+                    for w in cut.windows(2) {
+                        if let Some(part) = text.get(w[0]..w[1]) {
+                            push(&mut job, part, color, off + w[0]);
+                        }
+                    }
+                    off += text.len();
                 }
                 if i + 1 < spans.len() {
-                    job.append("\n", 0.0, egui::TextFormat { font_id: mono.clone(), ..Default::default() });
+                    push(&mut job, "\n", egui::Color32::PLACEHOLDER, off);
+                    off += 1;
                 }
             }
             ui.painter().layout_job(job)
         };
 
-        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
+        // `stick_to_bottom` holds a view that is ALREADY at the bottom; it does not move one that
+        // isn't. Turning Follow on partway up a file therefore has to scroll there explicitly, and
+        // it must be a real target — an enormous `vertical_scroll_offset` is not clamped to the
+        // content and simply lands past the end, showing an empty pane.
+        let jump = std::mem::take(&mut self.text_follow_jump);
+        egui::ScrollArea::both()
+            .auto_shrink([false; 2])
+            // Following a growing file means staying at its end, which is the whole point of tail.
+            .stick_to_bottom(self.text_follow)
+            .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                // Line numbers as a separate, non-selectable column, so copying the body doesn't
-                // drag the numbers along with it.
-                ui.vertical(|ui| {
-                    ui.set_width(gutter_w);
-                    ui.style_mut().visuals.override_text_color = Some(ui.visuals().weak_text_color());
-                    for n in 1..=body.lines().count().max(1) {
-                        ui.label(egui::RichText::new(format!("{n:>5}")).font(egui::FontId::monospace(13.0)));
+                // The gutter is *painted* after the text, at the y of each galley row.
+                //
+                // Every attempt to lay it out as its own column of widgets drifts: the row pitch
+                // there is the label height plus item spacing, which is not the pitch the galley
+                // uses, so the numbers and the lines they label slide apart — imperceptibly at the
+                // top of the file and by whole lines further down. Reserving the space now and
+                // reading the real row positions back afterwards is exact by construction.
+                let gutter_x = ui.cursor().min.x;
+                ui.add_space(gutter_w);
+                // In view mode the buffer is still handed in as mutable and the edit thrown away:
+                // `interactive(false)` would also kill selection, and read-only text you cannot
+                // select or copy is worse than useless. In edit mode the real buffer goes in.
+                let mut scratch = body.clone();
+                let target: &mut String = if editing {
+                    match self.text_doc.as_mut() {
+                        Some((_, b)) => b,
+                        None => &mut scratch,
                     }
-                });
-                // `interactive(false)` would also disable selection, so the buffer is handed in
-                // as mutable and the edit discarded — read-only *and* selectable/copyable.
-                let mut shown = body.clone();
-                ui.add(
-                    egui::TextEdit::multiline(&mut shown)
-                        .font(egui::FontId::monospace(13.0))
-                        .desired_width(f32::INFINITY)
-                        .layouter(&mut layouter),
-                );
+                } else {
+                    &mut scratch
+                };
+                let out = egui::TextEdit::multiline(target)
+                    .id(text_id)
+                    .font(egui::FontId::monospace(13.0))
+                    .desired_width(f32::INFINITY)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                // Wrapping breaks the one-row-per-line assumption the numbering relies on, so the
+                // gutter is omitted there rather than shown wrong.
+                if !wrap {
+                    let color = ui.visuals().weak_text_color();
+                    let font = egui::FontId::monospace(13.0);
+                    let clip = ui.clip_rect();
+                    for (i, row) in out.galley.rows.iter().enumerate() {
+                        let y = out.galley_pos.y + row.pos.y;
+                        // Skip rows scrolled out of view — a 100k-line log would otherwise queue
+                        // one text shape per line, every frame.
+                        if y + 20.0 < clip.min.y || y > clip.max.y {
+                            continue;
+                        }
+                        ui.painter().text(
+                            egui::pos2(gutter_x + gutter_w - 6.0, y),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{}", i + 1),
+                            font.clone(),
+                            color,
+                        );
+                    }
+                }
+                // Jumping to a match means moving the cursor there: egui scrolls to keep the
+                // cursor visible, so selecting the range both reveals and marks the hit.
+                if jump {
+                    let end = egui::Rect::from_min_size(
+                        egui::pos2(ui.min_rect().min.x, ui.min_rect().max.y),
+                        egui::Vec2::ZERO,
+                    );
+                    ui.scroll_to_rect(end, Some(egui::Align::BOTTOM));
+                }
+                if seek {
+                    if let Some((a, b)) = hit_range {
+                        let ccur = |byte: usize| egui::text::CCursor::new(body[..byte.min(body.len())].chars().count());
+                        let mut st = out.state.clone();
+                        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(ccur(a), ccur(b))));
+                        st.store(ui.ctx(), out.response.id);
+                        ui.ctx().memory_mut(|m| m.request_focus(out.response.id));
+                    }
+                }
             });
         });
     }
@@ -31045,6 +31538,23 @@ impl eframe::App for PixelView {
             || self.fav_rename.is_some()
             || self.rebinding.is_some()
             || ctx.egui_wants_keyboard_input();
+        // Text-editor keys. Ctrl+S and Ctrl+F must work *while typing* — that is precisely when
+        // they are wanted — so they are handled ahead of the `typing` gate and consumed, which also
+        // stops Ctrl+F falling through to the grid's advanced search.
+        if self.text_doc.is_some() {
+            if self.text_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+                self.save_text();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                self.text_find_open = !self.text_find_open;
+            }
+            // Escape closes the search bar before it means "back to the grid".
+            if self.text_find_open
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.text_find_open = false;
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
@@ -31318,6 +31828,7 @@ impl eframe::App for PixelView {
         self.poll_colo_sauce();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
+        self.poll_text_follow(&ctx); // tail -f: re-read a growing file
         self.poll_video_load(ctx.input(|i| i.stable_dt)); // background video open → build player
         self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
                                                                // Screensaver: once a (random) pack has finished downloading + mounting, open its
@@ -31500,9 +32011,13 @@ impl eframe::App for PixelView {
             } else if let Some(stars) = rate {
                 self.apply_rating(stars);
             }
-            if esc && self.mode == Mode::Single {
+            if esc && self.mode == Mode::Single && self.confirm_discard_text() {
                 self.stop_video(); // don't leave a video's soundtrack playing in the grid
                 self.set_mode(Mode::Grid);
+                if self.text_doc.is_some() {
+                    self.text_doc = None;
+                    self.reset_text_editor();
+                }
             }
             if back {
                 // Parent in display space (see MenuAction::Up) so leaving an archive
@@ -44303,6 +44818,86 @@ mod tests {
 
 /// Headless GUI tests via `egui_kittest` — drive the real `eframe::App` widget
 /// tree (no window/compositor), the Rust-idiomatic alternative to screenshot QA.
+/// Byte ranges of every non-overlapping occurrence of `needle` in `hay`.
+///
+/// Case-insensitive matching lowercases both sides, which is only correct while the result is used
+/// as *byte* offsets — so it is restricted to the ASCII fast path, where lowercasing cannot change
+/// a string's length. A non-ASCII needle falls back to an exact match rather than returning offsets
+/// that would slice the buffer mid-character.
+fn find_ranges(hay: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let fold = !case_sensitive && hay.is_ascii() && needle.is_ascii();
+    let (h, n) = if fold {
+        (hay.to_ascii_lowercase(), needle.to_ascii_lowercase())
+    } else {
+        (hay.to_string(), needle.to_string())
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = h[from..].find(&n) {
+        let start = from + i;
+        out.push((start, start + n.len()));
+        from = start + n.len();
+    }
+    out
+}
+
+#[cfg(test)]
+mod text_editor_tests {
+    use super::*;
+
+    #[test]
+    fn find_ranges_are_ordered_non_overlapping_and_case_aware() {
+        let hay = "Foo foo FOO";
+        let ci = find_ranges(hay, "foo", false);
+        assert_eq!(ci, vec![(0, 3), (4, 7), (8, 11)]);
+        let cs = find_ranges(hay, "foo", true);
+        assert_eq!(cs, vec![(4, 7)]);
+        // Every range must slice the string — an offset landing mid-character would panic.
+        for (a, b) in &ci {
+            assert!(hay.get(*a..*b).is_some());
+        }
+        // Overlapping candidates advance past the whole match rather than re-matching inside it.
+        assert_eq!(find_ranges("aaaa", "aa", true), vec![(0, 2), (2, 4)]);
+        assert!(find_ranges("abc", "", true).is_empty());
+        assert!(find_ranges("abc", "zz", true).is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_search_never_returns_offsets_into_multibyte_text() {
+        // Lowercasing can change a string's byte length outside ASCII, which would make folded
+        // offsets refer to a different string than the one being sliced. The non-ASCII path is
+        // exact-match for that reason; this guards the invariant rather than the policy.
+        let hay = "İstanbul ıstanbul";
+        for (a, b) in find_ranges(hay, "stanbul", false) {
+            assert!(hay.get(a..b).is_some(), "offset {a}..{b} splits a character");
+        }
+    }
+
+    #[test]
+    fn crlf_round_trips_through_an_edit() {
+        // The buffer is normalised to LF so galley and cursor offsets agree; saving must put the
+        // file's own endings back, or opening a Windows file would silently rewrite every line.
+        let dir = std::env::temp_dir().join(format!("pv_text_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.bas");
+        std::fs::write(&f, "PRINT 1\r\nPRINT 2\r\n").unwrap();
+
+        let raw = std::fs::read_to_string(&f).unwrap();
+        let crlf = raw.contains("\r\n");
+        assert!(crlf);
+        let body = raw.replace("\r\n", "\n");
+        assert_eq!(body, "PRINT 1\nPRINT 2\n");
+        // ...edit in LF space, then write back in the file's own endings.
+        let edited = body.replace("PRINT 2", "PRINT 3");
+        let out = if crlf { edited.replace('\n', "\r\n") } else { edited };
+        assert_eq!(out, "PRINT 1\r\nPRINT 3\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod gui_tests {
     use super::*;
