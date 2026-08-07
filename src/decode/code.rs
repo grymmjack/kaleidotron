@@ -37,7 +37,7 @@ const PUNCT: [u8; 3] = [160, 160, 170];
 const GUTTER: [u8; 3] = [88, 88, 104];
 const TRUNC: [u8; 3] = [220, 170, 90];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tok {
     Default,
     Comment,
@@ -73,6 +73,13 @@ struct LangSpec {
     quotes: &'static [char],                     // single-line string quote chars
     preproc_hash: bool,                          // leading `#word` is a directive (C/C++)
     highlight: bool,                             // false = plain text (txt/log/md), no tokens
+    /// Language-specific keywords, matched case-insensitively, in addition to the shared union.
+    /// `None` = shared union only.
+    keywords: Option<&'static [&'static str]>,
+    /// Treat an uppercase-leading identifier as a type (Rust/Java/C# convention). Wrong for BASIC,
+    /// where the *keywords* are the uppercase words — leaving it on paints every `PRINT` and `DIM`
+    /// as a type instead of a keyword.
+    upper_is_type: bool,
 }
 
 const C_FAMILY: LangSpec = LangSpec {
@@ -82,6 +89,8 @@ const C_FAMILY: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: true,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const JS_FAMILY: LangSpec = LangSpec {
     line: &["//"],
@@ -90,6 +99,8 @@ const JS_FAMILY: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const RUST: LangSpec = LangSpec {
     line: &["//"],
@@ -98,6 +109,8 @@ const RUST: LangSpec = LangSpec {
     quotes: &['"'],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const HASH: LangSpec = LangSpec {
     line: &["#"],
@@ -106,6 +119,8 @@ const HASH: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const LUA: LangSpec = LangSpec {
     line: &["--"],
@@ -114,14 +129,19 @@ const LUA: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const BASIC: LangSpec = LangSpec {
     line: &["'", "REM ", "rem "],
     block: None,
     raw: &[],
     quotes: &['"'],
+    // QB64PE metacommands are `$IF` / `$END IF` style, not `#define`.
     preproc_hash: false,
     highlight: true,
+    keywords: Some(QB64PE_KEYWORDS),
+    upper_is_type: false,
 };
 const ASM: LangSpec = LangSpec {
     line: &[";"],
@@ -130,6 +150,8 @@ const ASM: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const CSS: LangSpec = LangSpec {
     line: &[],
@@ -138,6 +160,8 @@ const CSS: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const HTML: LangSpec = LangSpec {
     line: &[],
@@ -146,6 +170,8 @@ const HTML: LangSpec = LangSpec {
     quotes: &['"', '\''],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const JSONISH: LangSpec = LangSpec {
     line: &["//"],
@@ -154,6 +180,8 @@ const JSONISH: LangSpec = LangSpec {
     quotes: &['"'],
     preproc_hash: false,
     highlight: true,
+    keywords: None,
+    upper_is_type: true,
 };
 const PLAIN: LangSpec = LangSpec {
     line: &[],
@@ -162,6 +190,8 @@ const PLAIN: LangSpec = LangSpec {
     quotes: &[],
     preproc_hash: false,
     highlight: false,
+    keywords: None,
+    upper_is_type: true,
 };
 
 /// Shared keyword union — over-matching in the "wrong" language is only cosmetic.
@@ -315,12 +345,148 @@ enum Carry {
     Raw(&'static str),
 }
 
+/// QB64PE reserved words, extracted from the QB64PE VS Code extension's TextMate grammar (the
+/// language's own keyword list). Uppercase and matched case-insensitively — BASIC is not
+/// case-sensitive, and QB64PE source is conventionally written in caps.
+const QB64PE_KEYWORDS: &[&str] = &[
+    "ABS", "ABSOLUTE", "ACCEPTFILEDROP", "ACCESS", "ACOS", "ACOSH", "ADLER32", "ALIAS", "ALL",
+    "ALLOWFULLSCREEN", "ALPHA", "ALPHA32", "AND", "ANDALSO", "ANTICLOCKWISE", "ANY", "APPEND",
+    "ARCCOT", "ARCCSC", "ARCSEC", "AS", "ASC", "ASIN", "ASINH", "ASSERT", "ASSERTS", "ATAN2",
+    "ATANH", "ATN", "AUTODISPLAY", "AXIS", "BACKGROUNDCOLOR", "BASE", "BEEP", "BEHIND", "BIN",
+    "BINARY", "BIT", "BLEND", "BLINK", "BLOAD", "BLUE", "BLUE32", "BSAVE", "BUTTON",
+    "BUTTONCHANGE", "BYTE", "BYVAL", "CALL", "CALLS", "CAPSLOCK", "CASE", "CDBL", "CDECL",
+    "CEIL", "CHAIN", "CHDIR", "CHECKING", "CHR", "CINP", "CINT", "CIRCLE", "CLEAR",
+    "CLEARCOLOR", "CLIP", "CLIPBOARD", "CLIPBOARDIMAGE", "CLNG", "CLOCKWISE", "CLOSE", "CLS",
+    "COLOR", "COLORCHOOSERDIALOG", "COM", "COMMAND", "COMMANDCOUNT", "COMMON", "CONNECTED",
+    "CONNECTIONADDRESS", "CONSOLE", "CONSOLECURSOR", "CONSOLEFONT", "CONSOLEINPUT",
+    "CONSOLETITLE", "CONST", "CONTINUE", "CONTROLCHR", "COPYIMAGE", "COPYPALETTE", "COS",
+    "COSH", "COT", "COTH", "CRC32", "CSC", "CSCH", "CSNG", "CSRLIN", "CUSTOMTYPE", "CV", "CVD",
+    "CVDMBF", "CVI", "CVL", "CVS", "CVSMBF", "CWD", "D2G", "D2R", "DATA", "DATE", "DEBUG",
+    "DECLARE", "DEF", "DEFAULTCOLOR", "DEFDBL", "DEFINE", "DEFINT", "DEFLATE", "DEFLNG",
+    "DEFSNG", "DEFSTR", "DELAY", "DEPTHBUFFER", "DESKTOPHEIGHT", "DESKTOPWIDTH", "DEST",
+    "DEVICE", "DEVICEINPUT", "DEVICES", "DIM", "DIR", "DIREXISTS", "DISPLAY", "DISPLAYORDER",
+    "DO", "DONTBLEND", "DONTWAIT", "DOUBLE", "DRAW", "DROPPEDFILE", "DYNAMIC", "ECHO", "ELSE",
+    "ELSEIF", "EMBED", "EMBEDDED", "END", "ENVIRON", "ENVIRONCOUNT", "EOF", "EQV", "ERASE",
+    "ERDEV", "ERL", "ERR", "ERROR", "ERRORLINE", "ERRORMESSAGE", "EVERYCASE", "EXEICON", "EXIT",
+    "EXP", "EXPLICIT", "EXPLICITARRAY", "FIELD", "FILEATTR", "FILEEXISTS", "FILES",
+    "FILLBACKGROUND", "FINISHDROP", "FIX", "FLOAT", "FN", "FONT", "FONTHEIGHT", "FONTWIDTH",
+    "FOR", "FPS", "FRE", "FREE", "FREEFILE", "FREEFONT", "FREEIMAGE", "FREETIMER", "FULLPATH",
+    "FULLSCREEN", "FUNCTION", "G2D", "G2R", "GET", "GLACCUM", "GLALPHAFUNC",
+    "GLARETEXTURESRESIDENT", "GLARRAYELEMENT", "GLBEGIN", "GLBINDTEXTURE", "GLBITMAP",
+    "GLBLENDFUNC", "GLCALLLIST", "GLCALLLISTS", "GLCLEAR", "GLCLEARACCUM", "GLCLEARCOLOR",
+    "GLCLEARDEPTH", "GLCLEARINDEX", "GLCLEARSTENCIL", "GLCLIPPLANE", "GLCOLOR3B", "GLCOLOR3BV",
+    "GLCOLOR3D", "GLCOLOR3DV", "GLCOLOR3F", "GLCOLOR3FV", "GLCOLOR3I", "GLCOLOR3IV",
+    "GLCOLOR3S", "GLCOLOR3SV", "GLCOLOR3UB", "GLCOLOR3UBV", "GLCOLOR3UI", "GLCOLOR3UIV",
+    "GLCOLOR3US", "GLCOLOR3USV", "GLCOLOR4B", "GLCOLOR4BV", "GLCOLOR4D", "GLCOLOR4DV",
+    "GLCOLOR4F", "GLCOLOR4FV", "GLCOLOR4I", "GLCOLOR4IV", "GLCOLOR4S", "GLCOLOR4SV",
+    "GLCOLOR4UB", "GLCOLOR4UBV", "GLCOLOR4UI", "GLCOLOR4UIV", "GLCOLOR4US", "GLCOLOR4USV",
+    "GLCOLORMASK", "GLCOLORMATERIAL", "GLCOLORPOINTER", "GLCOPYPIXELS", "GLCOPYTEXIMAGE1D",
+    "GLCOPYTEXIMAGE2D", "GLCOPYTEXSUBIMAGE1D", "GLCOPYTEXSUBIMAGE2D", "GLCULLFACE",
+    "GLDELETELISTS", "GLDELETETEXTURES", "GLDEPTHFUNC", "GLDEPTHMASK", "GLDEPTHRANGE",
+    "GLDISABLE", "GLDISABLECLIENTSTATE", "GLDRAWARRAYS", "GLDRAWBUFFER", "GLDRAWELEMENTS",
+    "GLDRAWPIXELS", "GLEDGEFLAG", "GLEDGEFLAGPOINTER", "GLEDGEFLAGV", "GLENABLE",
+    "GLENABLECLIENTSTATE", "GLEND", "GLENDLIST", "GLEVALCOORD1D", "GLEVALCOORD1DV",
+    "GLEVALCOORD1F", "GLEVALCOORD1FV", "GLEVALCOORD2D", "GLEVALCOORD2DV", "GLEVALCOORD2F",
+    "GLEVALCOORD2FV", "GLEVALMESH1", "GLEVALMESH2", "GLEVALPOINT1", "GLEVALPOINT2",
+    "GLFEEDBACKBUFFER", "GLFINISH", "GLFLUSH", "GLFOGF", "GLFOGFV", "GLFOGI", "GLFOGIV",
+    "GLFRONTFACE", "GLFRUSTUM", "GLGENLISTS", "GLGENTEXTURES", "GLGETBOOLEANV",
+    "GLGETCLIPPLANE", "GLGETDOUBLEV", "GLGETERROR", "GLGETFLOATV", "GLGETINTEGERV",
+    "GLGETLIGHTFV", "GLGETLIGHTIV", "GLGETMAPDV", "GLGETMAPFV", "GLGETMAPIV", "GLGETMATERIALFV",
+    "GLGETMATERIALIV", "GLGETPIXELMAPFV", "GLGETPIXELMAPUIV", "GLGETPIXELMAPUSV",
+    "GLGETPOINTERV", "GLGETPOLYGONSTIPPLE", "GLGETSTRING", "GLGETTEXENVFV", "GLGETTEXENVIV",
+    "GLGETTEXGENDV", "GLGETTEXGENFV", "GLGETTEXGENIV", "GLGETTEXIMAGE", "GLGETTEXPARAMETERFV",
+    "GLGETTEXPARAMETERIV", "GLHINT", "GLINDEXD", "GLINDEXDV", "GLINDEXF", "GLINDEXFV",
+    "GLINDEXI", "GLINDEXIV", "GLINDEXMASK", "GLINDEXPOINTER", "GLINDEXS", "GLINDEXSV",
+    "GLINDEXUB", "GLINDEXUBV", "GLINITNAMES", "GLINTERLEAVEDARRAYS", "GLISENABLED", "GLISLIST",
+    "GLISTEXTURE", "GLLIGHTF", "GLLIGHTFV", "GLLIGHTI", "GLLIGHTIV", "GLLIGHTMODELF",
+    "GLLIGHTMODELFV", "GLLIGHTMODELI", "GLLIGHTMODELIV", "GLLINESTIPPLE", "GLLINEWIDTH",
+    "GLLISTBASE", "GLLOADIDENTITY", "GLLOADMATRIXD", "GLLOADMATRIXF", "GLLOADNAME", "GLLOGICOP",
+    "GLMAP1D", "GLMAP1F", "GLMAP2D", "GLMAP2F", "GLMAPGRID1D", "GLMAPGRID1F", "GLMAPGRID2D",
+    "GLMAPGRID2F", "GLMATERIALF", "GLMATERIALFV", "GLMATERIALI", "GLMATERIALIV", "GLMATRIXMODE",
+    "GLMULTMATRIXD", "GLMULTMATRIXF", "GLNEWLIST", "GLNORMAL3B", "GLNORMAL3BV", "GLNORMAL3D",
+    "GLNORMAL3DV", "GLNORMAL3F", "GLNORMAL3FV", "GLNORMAL3I", "GLNORMAL3IV", "GLNORMAL3S",
+    "GLNORMAL3SV", "GLNORMALPOINTER", "GLORTHO", "GLPASSTHROUGH", "GLPIXELMAPFV",
+    "GLPIXELMAPUIV", "GLPIXELMAPUSV", "GLPIXELSTOREF", "GLPIXELSTOREI", "GLPIXELTRANSFERF",
+    "GLPIXELTRANSFERI", "GLPIXELZOOM", "GLPOINTSIZE", "GLPOLYGONMODE", "GLPOLYGONOFFSET",
+    "GLPOLYGONSTIPPLE", "GLPOPATTRIB", "GLPOPCLIENTATTRIB", "GLPOPMATRIX", "GLPOPNAME",
+    "GLPRIORITIZETEXTURES", "GLPUSHATTRIB", "GLPUSHCLIENTATTRIB", "GLPUSHMATRIX", "GLPUSHNAME",
+    "GLRASTERPOS2D", "GLRASTERPOS2DV", "GLRASTERPOS2F", "GLRASTERPOS2FV", "GLRASTERPOS2I",
+    "GLRASTERPOS2IV", "GLRASTERPOS2S", "GLRASTERPOS2SV", "GLRASTERPOS3D", "GLRASTERPOS3DV",
+    "GLRASTERPOS3F", "GLRASTERPOS3FV", "GLRASTERPOS3I", "GLRASTERPOS3IV", "GLRASTERPOS3S",
+    "GLRASTERPOS3SV", "GLRASTERPOS4D", "GLRASTERPOS4DV", "GLRASTERPOS4F", "GLRASTERPOS4FV",
+    "GLRASTERPOS4I", "GLRASTERPOS4IV", "GLRASTERPOS4S", "GLRASTERPOS4SV", "GLREADBUFFER",
+    "GLREADPIXELS", "GLRECTD", "GLRECTDV", "GLRECTF", "GLRECTFV", "GLRECTI", "GLRECTIV",
+    "GLRECTS", "GLRECTSV", "GLRENDER", "GLRENDERMODE", "GLROTATED", "GLROTATEF", "GLSCALED",
+    "GLSCALEF", "GLSCISSOR", "GLSELECTBUFFER", "GLSHADEMODEL", "GLSTENCILFUNC", "GLSTENCILMASK",
+    "GLSTENCILOP", "GLTEXCOORD1D", "GLTEXCOORD1DV", "GLTEXCOORD1F", "GLTEXCOORD1FV",
+    "GLTEXCOORD1I", "GLTEXCOORD1IV", "GLTEXCOORD1S", "GLTEXCOORD1SV", "GLTEXCOORD2D",
+    "GLTEXCOORD2DV", "GLTEXCOORD2F", "GLTEXCOORD2FV", "GLTEXCOORD2I", "GLTEXCOORD2IV",
+    "GLTEXCOORD2S", "GLTEXCOORD2SV", "GLTEXCOORD3D", "GLTEXCOORD3DV", "GLTEXCOORD3F",
+    "GLTEXCOORD3FV", "GLTEXCOORD3I", "GLTEXCOORD3IV", "GLTEXCOORD3S", "GLTEXCOORD3SV",
+    "GLTEXCOORD4D", "GLTEXCOORD4DV", "GLTEXCOORD4F", "GLTEXCOORD4FV", "GLTEXCOORD4I",
+    "GLTEXCOORD4IV", "GLTEXCOORD4S", "GLTEXCOORD4SV", "GLTEXCOORDPOINTER", "GLTEXENVF",
+    "GLTEXENVFV", "GLTEXENVI", "GLTEXENVIV", "GLTEXGEND", "GLTEXGENDV", "GLTEXGENF",
+    "GLTEXGENFV", "GLTEXGENI", "GLTEXGENIV", "GLTEXIMAGE1D", "GLTEXIMAGE2D", "GLTEXPARAMETERF",
+    "GLTEXPARAMETERFV", "GLTEXPARAMETERI", "GLTEXPARAMETERIV", "GLTEXSUBIMAGE1D",
+    "GLTEXSUBIMAGE2D", "GLTRANSLATED", "GLTRANSLATEF", "GLUPERSPECTIVE", "GLVERTEX2D",
+    "GLVERTEX2DV", "GLVERTEX2F", "GLVERTEX2FV", "GLVERTEX2I", "GLVERTEX2IV", "GLVERTEX2S",
+    "GLVERTEX2SV", "GLVERTEX3D", "GLVERTEX3DV", "GLVERTEX3F", "GLVERTEX3FV", "GLVERTEX3I",
+    "GLVERTEX3IV", "GLVERTEX3S", "GLVERTEX3SV", "GLVERTEX4D", "GLVERTEX4DV", "GLVERTEX4F",
+    "GLVERTEX4FV", "GLVERTEX4I", "GLVERTEX4IV", "GLVERTEX4S", "GLVERTEX4SV", "GLVERTEXPOINTER",
+    "GLVIEWPORT", "GOSUB", "GOTO", "GREEN", "GREEN32", "HARDWARE", "HARDWARE1", "HEIGHT", "HEX",
+    "HIDE", "HYPOT", "ICON", "IF", "IMP", "INCLERRORFILE", "INCLERRORLINE", "INCLUDEONCE",
+    "INFLATE", "INKEY", "INP", "INPUT", "INPUTBOX", "INSTR", "INSTRREV", "INT", "INTEGER",
+    "INTEGER64", "INTERRUPT", "INTERRUPTX", "IOCTL", "IS", "KEEPBACKGROUND", "KEY", "KEYCLEAR",
+    "KEYDOWN", "KEYHIT", "KILL", "LASTAXIS", "LASTBUTTON", "LASTWHEEL", "LBOUND", "LCASE",
+    "LEFT", "LEN", "LET", "LIBRARY", "LIMIT", "LINE", "LIST", "LOADFONT", "LOADIMAGE", "LOC",
+    "LOCATE", "LOCK", "LOF", "LOG", "LONG", "LOOP", "LPOS", "LPRINT", "LSET", "LTRIM",
+    "MAPTRIANGLE", "MAPUNICODE", "MD5", "MEM", "MEMCOPY", "MEMELEMENT", "MEMEXISTS", "MEMFILL",
+    "MEMFREE", "MEMGET", "MEMIMAGE", "MEMNEW", "MEMPUT", "MEMSOUND", "MESSAGEBOX", "MID",
+    "MIDDLE", "MIDISOUNDFONT", "MK", "MKD", "MKDIR", "MKDMBF", "MKI", "MKL", "MKS", "MKSMBF",
+    "MOD", "MOUSEBUTTON", "MOUSEHIDE", "MOUSEINPUT", "MOUSEMOVE", "MOUSEMOVEMENTX",
+    "MOUSEMOVEMENTY", "MOUSEPIPEOPEN", "MOUSESHOW", "MOUSEWHEEL", "MOUSEX", "MOUSEY", "NAME",
+    "NEGATE", "NEWIMAGE", "NEXT", "NONE", "NOPREFIX", "NOT", "NOTIFYPOPUP", "NUMLOCK", "OCT",
+    "OFF", "OFFSET", "ON", "ONLY", "ONLYBACKGROUND", "ONTOP", "OPEN", "OPENCLIENT",
+    "OPENCONNECTION", "OPENFILEDIALOG", "OPENHOST", "OPTION", "OR", "ORELSE", "OS", "OUT",
+    "OUTPUT", "PAINT", "PALETTE", "PALETTECOLOR", "PCOPY", "PEEK", "PEN", "PI", "PIXELSIZE",
+    "PLAY", "PMAP", "POINT", "POKE", "POS", "PRESERVE", "PRESET", "PRINT", "PRINTIMAGE",
+    "PRINTMODE", "PRINTSTRING", "PRINTWIDTH", "PSET", "PUT", "PUTIMAGE", "R2D", "R2G", "RANDOM",
+    "RANDOMIZE", "READ", "READBIT", "READFILE", "RED", "RED32", "REDIM", "RESET", "RESETBIT",
+    "RESIZE", "RESIZEHEIGHT", "RESIZEWIDTH", "RESTORE", "RESUME", "RETURN", "RGB", "RGB32",
+    "RGBA", "RGBA32", "RIGHT", "RMDIR", "RND", "ROL", "ROR", "ROUND", "RSET", "RTRIM", "RUN",
+    "SADD", "SAVEFILEDIALOG", "SAVEIMAGE", "SCALEDHEIGHT", "SCALEDWIDTH", "SCREEN",
+    "SCREENCLICK", "SCREENEXISTS", "SCREENHIDE", "SCREENICON", "SCREENIMAGE", "SCREENMOVE",
+    "SCREENPRINT", "SCREENSHOW", "SCREENX", "SCREENY", "SCROLLLOCK", "SEAMLESS", "SEC", "SECH",
+    "SEEK", "SEG", "SELECT", "SELECTFOLDERDIALOG", "SETALPHA", "SETBIT", "SETMEM", "SGN",
+    "SHARED", "SHELL", "SHELLHIDE", "SHL", "SHR", "SIGNAL", "SIN", "SINGLE", "SINH", "SLEEP",
+    "SMOOTH", "SMOOTHSHRUNK", "SMOOTHSTRETCHED", "SNDBAL", "SNDCLOSE", "SNDCOPY", "SNDGETPOS",
+    "SNDLEN", "SNDLIMIT", "SNDLOOP", "SNDNEW", "SNDOPEN", "SNDOPENRAW", "SNDPAUSE", "SNDPAUSED",
+    "SNDPLAY", "SNDPLAYCOPY", "SNDPLAYFILE", "SNDPLAYING", "SNDRATE", "SNDRAW", "SNDRAWDONE",
+    "SNDRAWLEN", "SNDSETPOS", "SNDSTOP", "SNDVOL", "SOFTWARE", "SOUND", "SOURCE", "SPACE",
+    "SPC", "SQR", "SQUAREPIXELS", "STARTDIR", "STATIC", "STATUSCODE", "STEP", "STICK", "STOP",
+    "STR", "STRCMP", "STRETCH", "STRICMP", "STRIG", "STRING", "SUB", "SWAP", "SYSTEM", "TAB",
+    "TAN", "TANH", "THEN", "TIME", "TIMER", "TITLE", "TO", "TOGGLE", "TOGGLEBIT",
+    "TOTALDROPPEDFILES", "TRIM", "TROFF", "TRON", "TYPE", "UBOUND", "UCASE", "UCHARPOS",
+    "UEVENT", "UFONTHEIGHT", "ULINESPACING", "UNLOCK", "UNSIGNED", "UNSTABLE", "UNTIL",
+    "UPRINTSTRING", "UPRINTWIDTH", "USING", "VAL", "VARPTR", "VARSEG", "VERSIONINFO", "VIEW",
+    "VIRTUALKEYBOARD", "WAIT", "WEND", "WHEEL", "WHILE", "WIDTH", "WINDOW", "WINDOWHANDLE",
+    "WINDOWHASFOCUS", "WRITE", "WRITEFILE", "XOR",
+];
+
 /// A word is a keyword / type / neither.
-fn classify_word(w: &str) -> Tok {
+fn classify_word(w: &str, spec: &LangSpec) -> Tok {
     if KEYWORDS.contains(&w) {
-        Tok::Keyword
-    } else if TYPES.contains(&w) || (w.len() > 1 && w.starts_with(char::is_uppercase)) {
-        // Uppercase-leading identifiers read as types/constructors (Rust/Java/C#…).
+        return Tok::Keyword;
+    }
+    // A language's own keywords, case-insensitively (BASIC isn't case-sensitive).
+    if let Some(list) = spec.keywords {
+        let up = w.to_ascii_uppercase();
+        if list.binary_search(&up.as_str()).is_ok() {
+            return Tok::Keyword;
+        }
+    }
+    if TYPES.contains(&w) || (spec.upper_is_type && w.len() > 1 && w.starts_with(char::is_uppercase))
+    {
         Tok::Type
     } else {
         Tok::Default
@@ -468,7 +634,7 @@ fn lex_line(line: &[char], spec: &LangSpec, carry: &mut Carry) -> Vec<(char, Tok
                 i += 1;
             }
             let word: String = line[start..i].iter().collect();
-            let tok = classify_word(&word);
+            let tok = classify_word(&word, spec);
             for &ch in &line[start..i] {
                 out.push((ch, tok));
             }
@@ -855,6 +1021,37 @@ mod tests {
         assert!(img.width > 0 && img.height > 0);
         // Two lines → 2 rows × 16px tall.
         assert_eq!(img.height, 2 * CELL_H as u32);
+    }
+
+    #[test]
+    fn qb64pe_keywords_are_sorted() {
+        // `classify_word` binary-searches this list. An unsorted entry doesn't error — it just
+        // silently fails to match, so assert the invariant the search depends on.
+        let mut sorted = QB64PE_KEYWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(QB64PE_KEYWORDS, sorted.as_slice(), "QB64PE_KEYWORDS must be sorted");
+        assert!(QB64PE_KEYWORDS.len() > 500, "the full keyword set should be present");
+    }
+
+    #[test]
+    fn qb64pe_keywords_classify_as_keywords_not_types() {
+        // The shared classifier treats an uppercase-leading word as a type (a Rust/Java
+        // convention). In BASIC the keywords ARE the uppercase words, so that heuristic painted
+        // every PRINT and DIM as a type — this is the regression guard for that.
+        for w in ["PRINT", "DIM", "SUB", "FUNCTION", "SCREEN", "_PUTIMAGE"] {
+            let up = w.to_ascii_uppercase();
+            let found = QB64PE_KEYWORDS.binary_search(&up.as_str()).is_ok();
+            if found {
+                assert_eq!(classify_word(w, &BASIC), Tok::Keyword, "{w} should be a keyword");
+            }
+        }
+        // Case-insensitive: BASIC isn't case-sensitive.
+        assert_eq!(classify_word("print", &BASIC), Tok::Keyword);
+        assert_eq!(classify_word("Print", &BASIC), Tok::Keyword);
+        // A user identifier is still plain, not a type.
+        assert_eq!(classify_word("MyVariable", &BASIC), Tok::Default);
+        // …while a C-family language keeps the uppercase-is-type heuristic.
+        assert_eq!(classify_word("MyVariable", &C_FAMILY), Tok::Type);
     }
 
     #[test]
