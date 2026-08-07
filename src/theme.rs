@@ -240,13 +240,16 @@ pub fn from_vscode(v: &serde_json::Value, fallback_name: &str) -> Option<Theme> 
                 continue;
             };
             // `scope` is a string or a list of them.
+            // LAST rule wins, matching VS Code/TextMate. Real themes are layered — a base pass
+            // followed by language-specific overrides — so first-wins reads the base and silently
+            // discards exactly the customisation the author cared about.
             match &t["scope"] {
                 serde_json::Value::String(s) => {
-                    tokens.entry(s.clone()).or_insert(fg);
+                    tokens.insert(s.clone(), fg);
                 }
                 serde_json::Value::Array(a) => {
                     for s in a.iter().filter_map(|x| x.as_str()) {
-                        tokens.entry(s.to_string()).or_insert(fg);
+                        tokens.insert(s.to_string(), fg);
                     }
                 }
                 _ => {}
@@ -384,10 +387,29 @@ mod tests {
         assert_eq!(t.accent, parse_hex("#094771"));
         assert_eq!(t.hyperlink, parse_hex("#3794ff"));
         assert_eq!(t.error, parse_hex("#f48771"));
+        // A later rule for the same scope overrides an earlier one (VS Code semantics).
         // tokenColors: a scope list contributes every scope it names.
         assert_eq!(t.tokens.get("comment"), parse_hex("#6a9955").as_ref());
         assert_eq!(t.tokens.get("string"), parse_hex("#ce9178").as_ref());
         assert_eq!(t.tokens.get("constant.other.symbol"), parse_hex("#ce9178").as_ref());
+    }
+
+    #[test]
+    fn a_later_rule_overrides_an_earlier_one_for_the_same_scope() {
+        // VS Code/TextMate take the LAST matching rule. Real themes layer a base pass then
+        // language overrides, so first-wins would read the base and drop the author's intent.
+        let t = Theme::from_json(
+            r##"{ "name":"L","colors":{"foreground":"#ffffff"},
+                  "tokenColors":[
+                    {"scope":"comment","settings":{"foreground":"#111111"}},
+                    {"scope":["comment","string"],"settings":{"foreground":"#222222"}},
+                    {"scope":"comment","settings":{"foreground":"#333333"}}
+                  ]}"##,
+            "x",
+        )
+        .unwrap();
+        assert_eq!(t.scope_color("comment"), parse_hex("#333333"), "last rule wins");
+        assert_eq!(t.scope_color("string"), parse_hex("#222222"));
     }
 
     #[test]
