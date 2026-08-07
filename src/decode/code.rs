@@ -37,8 +37,8 @@ const PUNCT: [u8; 3] = [160, 160, 170];
 const GUTTER: [u8; 3] = [88, 88, 104];
 const TRUNC: [u8; 3] = [220, 170, 90];
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Tok {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Tok {
     Default,
     Comment,
     Keyword,
@@ -472,6 +472,39 @@ const QB64PE_KEYWORDS: &[&str] = &[
     "VIRTUALKEYBOARD", "WAIT", "WEND", "WHEEL", "WHILE", "WIDTH", "WINDOW", "WINDOWHANDLE",
     "WINDOWHASFOCUS", "WRITE", "WRITEFILE", "XOR",
 ];
+
+/// Highlight `src` as `ext`, returning one `Vec` of `(text, kind)` runs per line.
+///
+/// This is the same lexer the raster tile uses — the *output* differs, not the classification, so
+/// the bitmap tile and the interactive text viewer can never disagree about what a token is.
+/// Adjacent characters sharing a kind are merged into runs, which is what a text layout wants.
+pub fn highlight_lines(src: &str, ext: &str) -> Vec<Vec<(String, Tok)>> {
+    let spec = lang_for(ext);
+    let mut carry = Carry::None;
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        let toks = if spec.highlight {
+            lex_line(&chars, spec, &mut carry)
+        } else {
+            chars.iter().map(|&c| (c, Tok::Default)).collect()
+        };
+        let mut runs: Vec<(String, Tok)> = Vec::new();
+        for (c, t) in toks {
+            match runs.last_mut() {
+                Some((s, lt)) if *lt == t => s.push(c),
+                _ => runs.push((c.to_string(), t)),
+            }
+        }
+        out.push(runs);
+    }
+    out
+}
+
+/// The colour for a token kind, so the interactive viewer matches the tile exactly.
+pub fn tok_rgb(t: Tok) -> [u8; 3] {
+    t.color()
+}
 
 /// A word is a keyword / type / neither.
 fn classify_word(w: &str, spec: &LangSpec) -> Tok {
@@ -1109,5 +1142,30 @@ mod tests {
         let img = ext_render(&long, "txt");
         // Width capped near MAX_COLS (+ gutter), not 1000 cells wide.
         assert!(img.width <= ((MAX_COLS + 8) * CELL_W) as u32);
+    }
+}
+
+#[cfg(test)]
+mod qb64pe_viewer {
+    use super::*;
+
+    #[test]
+    fn qb64pe_source_yields_distinct_token_kinds() {
+        let src = "' a comment\nDIM SHARED count AS INTEGER\nFOR i = 1 TO 10\n    PRINT \"hello\"; i\nNEXT i\n";
+        let lines = highlight_lines(src, "bas");
+        assert_eq!(lines.len(), 5);
+        let kinds: std::collections::HashSet<Tok> =
+            lines.iter().flatten().map(|(_, t)| *t).collect();
+        // The whole point: a comment, keywords, a string and a number must be *different* kinds,
+        // or the viewer renders one flat colour.
+        for want in [Tok::Comment, Tok::Keyword, Tok::Str, Tok::Number] {
+            assert!(kinds.contains(&want), "missing {want:?} in {kinds:?}");
+        }
+        // Line 1 is entirely a comment (BASIC's `'`).
+        assert!(lines[0].iter().all(|(_, t)| *t == Tok::Comment));
+        // DIM / SHARED / AS are keywords, `count` is not.
+        let l2: Vec<_> = lines[1].iter().filter(|(s, _)| !s.trim().is_empty()).collect();
+        assert!(l2.iter().any(|(s, t)| s.contains("DIM") && *t == Tok::Keyword));
+        assert!(l2.iter().any(|(s, t)| s.contains("count") && *t == Tok::Default));
     }
 }
