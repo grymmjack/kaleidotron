@@ -116,7 +116,16 @@ const DEFAULT_PALETTE_FAVS: &[&str] = &[
     "ANSI32 (32).GPL",
 ];
 
-#[derive(PartialEq)]
+/// Which docks are open. Remembered per [`Mode`]: the layout you want while browsing is rarely
+/// the layout you want while viewing, and a single set of global toggles makes those two fight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PanelLayout {
+    explorer: bool,
+    details: bool,
+    recolor: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Grid,
     Single,
@@ -2014,6 +2023,9 @@ pub struct PixelView {
     themes_dir: PathBuf,       // <data>/themes/*.json
     theme_name: String,        // selected theme; empty = egui's built-in dark/light
     themes: Vec<crate::theme::Theme>,
+    /// Dock layout per mode, keyed by the mode's stable id. Saved when leaving a mode and restored
+    /// when entering one.
+    panel_layouts: HashMap<u8, PanelLayout>,
     // Web-source plugins: each shows/hides one Places tab. Like the *format* plugins these default
     // OFF, so a fresh install opens with a clean Places bar and you switch on only the sources you
     // actually browse (Preferences → "Web sources"). A persisted value always wins over the
@@ -2123,6 +2135,7 @@ impl PixelView {
     const RAIL_SECTION_KEY: &'static str = "rail_section";
     const RECENTS_KEY: &'static str = "recent_dirs";
     const RAIL_EXPANDED_KEY: &'static str = "rail_expanded";
+    const PANEL_LAYOUTS_KEY: &'static str = "panel_layouts";
     const PLUGIN_GIFS_KEY: &'static str = "plugin_gifs";
     const PLUGIN_WEB_KEY: &'static str = "plugin_web";
     const PLUGIN_ICONS_KEY: &'static str = "plugin_icons";
@@ -3636,6 +3649,17 @@ impl PixelView {
             themes_dir,
             theme_name: String::new(),
             themes,
+            panel_layouts: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<(u8, [bool; 3])>>(s, Self::PANEL_LAYOUTS_KEY))
+                .map(|v| {
+                    v.into_iter()
+                        .map(|(m, a)| {
+                            (m, PanelLayout { explorer: a[0], details: a[1], recolor: a[2] })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             plugin_gifs: load_bool(Self::PLUGIN_GIFS_KEY, false),
             plugin_web: load_bool(Self::PLUGIN_WEB_KEY, false),
             plugin_icons: load_bool(Self::PLUGIN_ICONS_KEY, false),
@@ -4268,7 +4292,7 @@ impl PixelView {
         self.selection.clear();
         self.anchor = None;
         self.path_edit = None;
-        self.mode = Mode::Grid;
+        self.set_mode(Mode::Grid);
         self.rebuild_view();
         self.start_git_status(); // compute this folder's git status off-thread
     }
@@ -12100,7 +12124,7 @@ impl PixelView {
         self.video_loading = None;
         self.video_tex = None;
         self.kit_editor = true;
-        self.mode = Mode::Single;
+        self.set_mode(Mode::Single);
         self.pad_list_focus = true; // arrows drive the Pads list right away
         self.sample_focus = false;
         self.ensure_kit_editor();
@@ -16337,7 +16361,7 @@ impl PixelView {
             self.search_results = Some(results);
             self.search_running = false;
             self.status = format!("{n} match(es) in this listing");
-            self.mode = Mode::Grid;
+            self.set_mode(Mode::Grid);
             self.selection.clear();
             self.rebuild_view();
             return;
@@ -16358,7 +16382,7 @@ impl PixelView {
         self.search_results = Some(Vec::new());
         self.search_running = true;
         self.status = "Searching…".into();
-        self.mode = Mode::Grid;
+        self.set_mode(Mode::Grid);
         self.selection.clear();
         self.rebuild_view();
     }
@@ -16936,7 +16960,7 @@ impl PixelView {
                                            // (that clobbered ThreeD), so stepping between a model and an image switches modes
                                            // correctly on its own. Set before the `already` early-return so re-opening an
                                            // already-decoded image from the grid still enters the viewer.
-        self.mode = Mode::Single;
+        self.set_mode(Mode::Single);
         let already = self
             .full_tex
             .as_ref()
@@ -17079,7 +17103,7 @@ impl PixelView {
                     sig: u64::MAX, // force a first render
                     fps: false,
                 });
-                self.mode = Mode::ThreeD;
+                self.set_mode(Mode::ThreeD);
                 return;
             }
         }
@@ -25035,7 +25059,7 @@ impl PixelView {
                         ui.heading(title);
                         if ui.button("‹ Grid").clicked() {
                             self.kit_editor = false;
-                            self.mode = Mode::Grid;
+                            self.set_mode(Mode::Grid);
                         }
                     });
                     ui.add_space(6.0);
@@ -25511,7 +25535,7 @@ impl PixelView {
         self.compare.zoom_r = 0.0;
         self.compare.off_l = egui::Vec2::ZERO;
         self.compare.off_r = egui::Vec2::ZERO;
-        self.mode = Mode::Compare;
+        self.set_mode(Mode::Compare);
         self.status = "Comparing — drag to pan, wheel to zoom, Esc for the grid".into();
     }
 
@@ -26028,7 +26052,7 @@ impl PixelView {
 
         // Apply deferred navigation (out of the `three_d` borrow).
         if want_back {
-            self.mode = Mode::Grid;
+            self.set_mode(Mode::Grid);
             self.three_d = None;
         } else if want_prev {
             self.step_image(ctx, false);
@@ -26398,7 +26422,7 @@ impl PixelView {
 
         // --- Apply deferred actions -------------------------------------------
         if want_back {
-            self.mode = Mode::Grid;
+            self.set_mode(Mode::Grid);
         }
         if want_swap {
             self.compare_swapped = !self.compare_swapped;
@@ -28132,6 +28156,34 @@ impl PixelView {
         }
     }
 
+    fn current_layout(&self) -> PanelLayout {
+        PanelLayout {
+            explorer: self.show_explorer,
+            details: self.show_details,
+            recolor: self.show_recolor,
+        }
+    }
+
+    /// Switch view mode, remembering the docks you had open in the old one and restoring whatever
+    /// you last used in the new one.
+    ///
+    /// Every `self.mode = …` goes through here — there are a dozen assignment sites, and one that
+    /// bypassed this would silently drop a layout.
+    fn set_mode(&mut self, new: Mode) {
+        if self.mode == new {
+            return;
+        }
+        self.panel_layouts.insert(mode_id(self.mode), self.current_layout());
+        self.mode = new;
+        // A mode seen for the first time keeps whatever is currently open, so this never yanks
+        // panels away on first use — it only restores a layout you actually chose before.
+        if let Some(l) = self.panel_layouts.get(&mode_id(new)).copied() {
+            self.show_explorer = l.explorer;
+            self.show_details = l.details;
+            self.show_recolor = l.recolor;
+        }
+    }
+
     /// Install the selected theme's `Visuals`. An empty or unknown name falls back to the plain
     /// dark/light base, so deleting a theme file can't leave the UI unstyled.
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -28678,7 +28730,7 @@ impl PixelView {
                     match self.mode {
                         Mode::Single => {
                             if ui.button("⬅ Grid").clicked() {
-                                self.mode = Mode::Grid;
+                                self.set_mode(Mode::Grid);
                             }
                             if ui.button("1:1").clicked() {
                                 self.zoom = 1.0;
@@ -29170,7 +29222,7 @@ impl PixelView {
         if audio_show_playing {
             // Jump to the viewer showing the currently-playing file (it may be in another folder).
             if let Some(path) = self.audio_player.as_ref().map(|ap| ap.path.clone()) {
-                self.mode = Mode::Single;
+                self.set_mode(Mode::Single);
                 self.load_full(ctx, path);
             }
         }
@@ -31256,7 +31308,7 @@ impl eframe::App for PixelView {
             }
             if esc && self.mode == Mode::Single {
                 self.stop_video(); // don't leave a video's soundtrack playing in the grid
-                self.mode = Mode::Grid;
+                self.set_mode(Mode::Grid);
             }
             if back {
                 // Parent in display space (see MenuAction::Up) so leaving an archive
@@ -31365,7 +31417,7 @@ impl eframe::App for PixelView {
             match self.mode {
                 Mode::Grid => self.go_history(true),
                 Mode::Single | Mode::ThreeD => self.step_image(&ctx, false),
-                Mode::Compare => self.mode = Mode::Grid,
+                Mode::Compare => self.set_mode(Mode::Grid),
             }
         }
         if mouse_fwd {
@@ -32541,6 +32593,14 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
         eframe::set_value(storage, Self::RAIL_EXPANDED_KEY, &self.rail_expanded);
+        // Capture the mode we're currently in, so quitting from it doesn't lose its layout.
+        let mut layouts = self.panel_layouts.clone();
+        layouts.insert(mode_id(self.mode), self.current_layout());
+        let flat: Vec<(u8, [bool; 3])> = layouts
+            .iter()
+            .map(|(m, l)| (*m, [l.explorer, l.details, l.recolor]))
+            .collect();
+        eframe::set_value(storage, Self::PANEL_LAYOUTS_KEY, &flat);
         eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
         eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
@@ -38045,6 +38105,17 @@ fn is_fon_ext(p: &Path) -> bool {
 
 /// Any virtual/remote source (16colo OR YouTube) — used by guards that must not do disk ops
 /// (favorites split, etc.) on a non-local path.
+/// Stable per-mode id for persistence. Explicit rather than `as u8` so reordering the `Mode`
+/// variants can't silently repoint everyone's saved layouts.
+fn mode_id(m: Mode) -> u8 {
+    match m {
+        Mode::Grid => 0,
+        Mode::Single => 1,
+        Mode::Compare => 2,
+        Mode::ThreeD => 3,
+    }
+}
+
 fn any_remote(p: &Path) -> bool {
     crate::sixteen::is_remote(p)
         || crate::imgsearch::is_gif_remote(p)
