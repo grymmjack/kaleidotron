@@ -995,6 +995,15 @@ impl RailSection {
     }
 }
 
+/// What a command-palette row does: run a menu action, or switch to a browsing source (which is a
+/// rail/tab change rather than a MenuAction).
+#[derive(Clone)]
+enum PaletteAct {
+    Menu(MenuAction),
+    Source(u8),
+}
+
+#[derive(Clone)]
 enum MenuAction {
     Open,
     SelectMask,
@@ -1413,6 +1422,12 @@ pub struct PixelView {
     rail_expanded: bool, // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
     prefs_section: u8,        // which Preferences section is showing
+    /// The shared command overlay. `Some(true)` = command palette, `Some(false)` = quick-open.
+    /// One widget serves both (and later the Preferences search) so the interaction — focus, arrow
+    /// keys, Enter, Esc — is written once.
+    palette: Option<bool>,
+    palette_query: String,
+    palette_sel: usize,
     toasts: Vec<Toast>,       // transient "that finished" notifications
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
@@ -3103,6 +3118,9 @@ impl PixelView {
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             rail_settings_menu: false,
             prefs_section: 0,
+            palette: None,
+            palette_query: String::new(),
+            palette_sel: 0,
             toasts: Vec::new(),
             recent_dirs: cc
                 .storage
@@ -27916,6 +27934,183 @@ impl PixelView {
         }
     }
 
+    /// Subsequence match with a light score: earlier and more contiguous matches rank higher.
+    /// Deliberately not a full fuzzy library — this only has to order a few hundred short strings.
+    fn palette_score(hay: &str, needle: &str) -> Option<i32> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        let h: Vec<char> = hay.to_lowercase().chars().collect();
+        let n: Vec<char> = needle.to_lowercase().chars().collect();
+        let (mut hi, mut score, mut last) = (0usize, 0i32, usize::MAX);
+        for c in n {
+            let found = h[hi..].iter().position(|&x| x == c)? + hi;
+            score -= found as i32; // earlier is better
+            if last != usize::MAX && found == last + 1 {
+                score += 12; // contiguous run
+            }
+            last = found;
+            hi = found + 1;
+        }
+        Some(score)
+    }
+
+    /// Everything the command palette can run.
+    fn palette_commands(&self) -> Vec<(String, String, PaletteAct)> {
+        use PaletteAct::Menu;
+        let mut v: Vec<(String, String, PaletteAct)> = vec![
+            ("Open folder…".into(), "File".into(), Menu(MenuAction::Open)),
+            ("Preferences…".into(), "File".into(), Menu(MenuAction::Prefs)),
+            ("Hotkeys…".into(), "Help".into(), Menu(MenuAction::Hotkeys)),
+            ("Associations…".into(), "View".into(), Menu(MenuAction::Associations)),
+            ("Select by pattern…".into(), "Edit  Ctrl+D".into(), Menu(MenuAction::SelectMask)),
+            ("Find…".into(), "Edit  Ctrl+F".into(), Menu(MenuAction::Search)),
+            ("Undo".into(), "Edit  Ctrl+Z".into(), Menu(MenuAction::Undo)),
+            ("Refresh".into(), "View  F5".into(), Menu(MenuAction::Refresh)),
+            ("Force refresh".into(), "View  Shift+F5".into(), Menu(MenuAction::HardRefresh)),
+            ("Toggle Explorer pane".into(), "View".into(), Menu(MenuAction::ToggleExplorer)),
+            ("Toggle Details pane".into(), "View".into(), Menu(MenuAction::ToggleDetails)),
+            ("Toggle Recolor pane".into(), "View".into(), Menu(MenuAction::ToggleRecolor)),
+            ("Toggle grid / table view".into(), "View  T".into(), Menu(MenuAction::ToggleTable)),
+            ("Toggle hidden files".into(), "View".into(), Menu(MenuAction::ToggleHidden)),
+            ("Reset thumbnail size".into(), "View".into(), Menu(MenuAction::ResetThumb)),
+            ("Go to parent folder".into(), "Go  Backspace".into(), Menu(MenuAction::Up)),
+            ("Go home".into(), "Go".into(), Menu(MenuAction::Home)),
+        ];
+        // Navigating to a source is the commonest thing you'd want a palette for, and these come
+        // straight from the rail's own table so the two can't drift.
+        for (idx, _glyph, label, tip) in RailSection::source_buttons() {
+            if self.places_tab_enabled(*idx) {
+                v.push((format!("Go to: {label}"), (*tip).into(), PaletteAct::Source(*idx)));
+            }
+        }
+        v
+    }
+
+    /// The shared command overlay: a centred, dimmed modal with a filter box and a keyboard-driven
+    /// list. Serves the command palette (Ctrl+Shift+P) and quick-open (Ctrl+P).
+    fn ui_palette(&mut self, ctx: &egui::Context) {
+        let Some(is_cmd) = self.palette else { return };
+        // Build the candidate list.
+        let cmds = if is_cmd { self.palette_commands() } else { Vec::new() };
+        // Score every candidate, then take the best. Commands and entries share the
+        // same shape so the list rendering below doesn't care which mode it's in.
+        // Quick-open: the current view's entries, which are already in memory.
+        let mut scored: Vec<(i32, String, String, usize)> = Vec::new();
+        if is_cmd {
+            for (i, (l, h, _)) in cmds.iter().enumerate() {
+                if let Some(s) = Self::palette_score(l, &self.palette_query) {
+                    scored.push((s, l.clone(), h.clone(), i));
+                }
+            }
+        } else {
+            for (i, e) in self.entries.iter().enumerate() {
+                let name = e.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if let Some(s) = Self::palette_score(&name, &self.palette_query) {
+                    let hint = if e.is_dir { "folder".to_string() } else { String::new() };
+                    scored.push((s, name, hint, i));
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.truncate(60);
+        let rows: Vec<(String, String, usize)> =
+            scored.iter().map(|(_, l, h, i)| (l.clone(), h.clone(), *i)).collect();
+        self.palette_sel = self.palette_sel.min(rows.len().saturating_sub(1));
+
+        // Keys: arrows move, Enter runs, Esc closes.
+        let (up, down, enter, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+        if up {
+            self.palette_sel = self.palette_sel.saturating_sub(1);
+        }
+        if down && self.palette_sel + 1 < rows.len() {
+            self.palette_sel += 1;
+        }
+        if esc {
+            self.palette = None;
+            return;
+        }
+
+        let mut run: Option<usize> = None;
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("palette_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+            });
+        egui::Area::new(egui::Id::new("palette"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(screen.center().x, screen.min.y + 90.0))
+            .pivot(egui::Align2::CENTER_TOP)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(10.0).show(ui, |ui| {
+                    ui.set_width(560.0);
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.palette_query)
+                            .hint_text(if is_cmd { "Run a command…" } else { "Go to file…" })
+                            .desired_width(f32::INFINITY),
+                    );
+                    te.request_focus();
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                        for (n, (label, hint, _)) in rows.iter().enumerate() {
+                            let on = n == self.palette_sel;
+                            let r = ui.add_sized(
+                                [ui.available_width(), 24.0],
+                                egui::Button::selectable(on, label.as_str()),
+                            );
+                            if !hint.is_empty() {
+                                let p = r.rect.right_center() - egui::vec2(8.0, 0.0);
+                                ui.painter().text(
+                                    p,
+                                    egui::Align2::RIGHT_CENTER,
+                                    hint,
+                                    egui::FontId::proportional(11.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            }
+                            if r.clicked() {
+                                run = Some(n);
+                            }
+                        }
+                        if rows.is_empty() {
+                            ui.weak("No matches");
+                        }
+                    });
+                });
+            });
+        if enter && !rows.is_empty() {
+            run = Some(self.palette_sel);
+        }
+        if let Some(n) = run {
+            let idx = rows[n].2;
+            self.palette = None;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+            if is_cmd {
+                match cmds.get(idx).map(|(_, _, a)| a.clone()) {
+                    Some(PaletteAct::Menu(a)) => self.do_menu(ctx, a),
+                    Some(PaletteAct::Source(tab)) => {
+                        self.rail_section = RailSection::Sources;
+                        self.places_tab = tab;
+                        self.show_explorer = true;
+                    }
+                    None => {}
+                }
+            } else {
+                self.activate(ctx, idx);
+            }
+        }
+    }
+
     /// How long a toast holds at full opacity before fading.
     const TOAST_SECS: f64 = 4.5;
 
@@ -31082,6 +31277,24 @@ impl eframe::App for PixelView {
             self.show_search = true;
             self.focus_adv_search = true;
         }
+        // Ctrl+Shift+P = command palette, Ctrl+P = quick-open. Consumed so neither leaks to a
+        // grid/viewer binding, and skipped while another text field has focus.
+        if self.path_edit.is_none() && self.rebinding.is_none() && !ctx.egui_wants_keyboard_input() {
+            let (cmd, quick) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::P,
+                    ),
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
+                )
+            });
+            if cmd || quick {
+                self.palette = Some(cmd);
+                self.palette_query.clear();
+                self.palette_sel = 0;
+            }
+        }
         // Ctrl+D — select by wildcard mask (Total Commander's select-by-mask).
         if self.path_edit.is_none()
             && self.rebinding.is_none()
@@ -31278,6 +31491,7 @@ impl eframe::App for PixelView {
         self.paint_audio_loading_overlay(&ctx);
         self.paint_video_loading_overlay(&ctx);
         self.ui_bulk_progress(&ctx);
+        self.ui_palette(&ctx);
         self.ui_toasts(&ctx);
         self.ui_web_download_dialog(&ctx);
         self.ui_select_mask_dialog(&ctx);
