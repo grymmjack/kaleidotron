@@ -31803,11 +31803,21 @@ impl eframe::App for PixelView {
             let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
             let mut font_preview_changed = false; // font-tile sample text edited → refresh tiles
             let mut theme_apply = false; // theme picked → re-install Visuals after the closure
+            let mut open_config: Option<PathBuf> = None; // Config-files tab → open this path
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([720.0, 560.0])
+                // Fixed width, height follows the selected tab (see the ScrollArea's
+                // `auto_shrink` below) so the dialog is never too small for its content — the
+                // sections are short enough now that scrolling should be the exception.
+                .default_width(760.0)
+                .max_height(ctx.content_rect().height() - 80.0)
+                // Real breathing room: content was running into the frame edge on every side.
+                .frame(
+                    egui::Frame::window(&ctx.global_style())
+                        .inner_margin(egui::Margin::symmetric(18, 14)),
+                )
                 .show(&ctx, |ui| {
                     // Responsive layout: the sections flow into two columns when the (resizable)
                     // window is wide enough, collapsing to a single stacked column when narrow.
@@ -31822,7 +31832,7 @@ impl eframe::App for PixelView {
                     // groups (YouTube, the Steam key, the SoundFont, format colours) live inside
                     // `if plugin_… {}` conditionals, so they ride along with the section that
                     // encloses them, and the names reflect where things actually landed.
-                    const PREF_SECTIONS: [&str; 7] = [
+                    const PREF_SECTIONS: [&str; 8] = [
                         "Appearance",
                         "Viewer",
                         "Keyboard",
@@ -31830,6 +31840,7 @@ impl eframe::App for PixelView {
                         "Plugins",
                         "Audio & Colors",
                         "Advanced",
+                        "Config files",
                     ];
                     let sec = self.prefs_section;
                     // Section selector: padded, evenly sized tabs so the row reads as a strip
@@ -31861,11 +31872,16 @@ impl eframe::App for PixelView {
                     ui.spacing_mut().slider_width = 180.0;
                     let ncols = 1;
                     egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
+                        // Horizontal: fill. Vertical: shrink to content, which is what lets the
+                        // window height follow the tab instead of being a fixed box.
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.columns(ncols, |cols| {
                                 let ui = &mut cols[0];
                                 ui.add_space(2.0);
+                                // Keep full-width widgets (text fields, sliders) off the right
+                                // edge — they were running flush into the frame.
+                                ui.set_max_width(ui.available_width() - 10.0);
                                 let mut theme = self.theme;
                                 let mut gap = self.grid_gap;
                                 if sec == 0 {
@@ -32514,11 +32530,96 @@ impl eframe::App for PixelView {
                                     }
                                 });
                                 }
+                                if sec == 7 {
+                                ui.label("Configuration files");
+                                ui.weak(
+                                    "Plain text, hand-editable, and safe to keep in a dotfile \
+                                     manager — except secrets.json. Changes apply on the next \
+                                     launch.",
+                                );
+                                ui.add_space(10.0);
+                                let themes_dir = self.themes_dir.clone();
+                                let entries: [(&str, PathBuf, &str); 4] = [
+                                    (
+                                        "settings.json",
+                                        self.settings_file.clone(),
+                                        "Everything in this dialog, grouped by section. Delete a \
+                                         line to restore its default; delete the file to reset all.",
+                                    ),
+                                    (
+                                        "keybindings.json",
+                                        self.keybindings_file.clone(),
+                                        "Key bindings, one per action. Actions are named, so \
+                                         reordering them can't rebind your keys.",
+                                    ),
+                                    (
+                                        "themes/",
+                                        themes_dir.clone(),
+                                        "UI + syntax themes. Drop a VS Code theme .json in here \
+                                         and it's imported directly.",
+                                    ),
+                                    (
+                                        "secrets.json",
+                                        self.secrets_file.clone(),
+                                        "API keys, owner-readable only. Keep this one OUT of \
+                                         dotfile sync — it's why they live apart from settings.",
+                                    ),
+                                ];
+                                for (name, path, blurb) in entries {
+                                    let exists = path.exists();
+                                    // Modified time, so it's obvious which file a change landed in.
+                                    let when = std::fs::metadata(&path)
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| date_ymd_unix(d.as_secs() as i64));
+                                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                                        ui.set_width(ui.available_width() - 8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.strong(name);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add_enabled(
+                                                            exists,
+                                                            egui::Button::new("Open"),
+                                                        )
+                                                        .on_hover_text(path.to_string_lossy())
+                                                        .clicked()
+                                                    {
+                                                        open_config = Some(path.clone());
+                                                    }
+                                                    match (&when, exists) {
+                                                        (Some(w), _) => {
+                                                            ui.weak(format!("updated {w}"));
+                                                        }
+                                                        (None, false) => {
+                                                            ui.weak("not created yet");
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.weak(blurb);
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("📁 Open config folder").clicked() {
+                                    open_config =
+                                        self.settings_file.parent().map(|d| d.to_path_buf());
+                                }
+                                }
                             });
                         });
                 });
             if theme_apply {
                 self.apply_theme(&ctx);
+            }
+            if let Some(p) = open_config {
+                self.open_url(&p.to_string_lossy());
             }
             self.show_prefs = open;
             if prefs_refresh {
