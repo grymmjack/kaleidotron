@@ -28230,6 +28230,7 @@ impl PixelView {
     /// Install the selected theme's `Visuals`. An empty or unknown name falls back to the plain
     /// dark/light base, so deleting a theme file can't leave the UI unstyled.
     fn apply_theme(&mut self, ctx: &egui::Context) {
+        self.sync_syntax_theme();
         if let Some(t) = self
             .themes
             .iter()
@@ -28243,6 +28244,32 @@ impl PixelView {
             } else {
                 egui::Visuals::dark()
             });
+        }
+    }
+
+    /// Push the active syntax theme to the code rasteriser and drop any tile it already painted.
+    ///
+    /// The grid tile for a source file is a bitmap the worker threads rendered with whatever
+    /// palette was live at the time, so changing theme has to invalidate them — otherwise the
+    /// viewer restyles and the thumbnails beside it keep the old colours, which looks like a bug
+    /// rather than a cache.
+    fn sync_syntax_theme(&mut self) {
+        crate::decode::set_syntax_theme(self.syntax_theme().cloned().map(std::sync::Arc::new));
+        let code: Vec<PathBuf> = self
+            .all_entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+            .filter(|p| {
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+                crate::decode::CODE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
+            })
+            .collect();
+        for p in &code {
+            self.thumb_tex.remove(p);
+            self.thumb_rgba.remove(p);
+            self.grid_recolor.remove(p);
+            self.thumbs.forget(p);
         }
     }
 
@@ -28288,29 +28315,16 @@ impl PixelView {
         // says anything about that scope, else the built-in palette. Doing it here rather than
         // inside the layouter keeps the per-run work to an array index.
         let active = self.syntax_theme();
-        let kind_rgb: Vec<[u8; 3]> = [
-            crate::decode::Tok::Default,
-            crate::decode::Tok::Comment,
-            crate::decode::Tok::Keyword,
-            crate::decode::Tok::Type,
-            crate::decode::Tok::Str,
-            crate::decode::Tok::Number,
-            crate::decode::Tok::Preproc,
-            crate::decode::Tok::Punct,
-        ]
-        .iter()
-        .map(|k| {
-            active
-                .and_then(|t| t.kind_color(*k))
-                .unwrap_or_else(|| crate::decode::tok_rgb(*k))
-        })
-        .collect();
+        let kind_rgb: Vec<[u8; 3]> = crate::decode::ALL_TOKS
+            .iter()
+            .map(|k| {
+                active
+                    .and_then(|t| t.kind_color_in(*k, crate::decode::lang_scopes(&ext, *k)))
+                    .unwrap_or_else(|| crate::decode::tok_rgb(*k))
+            })
+            .collect();
         let kind_idx = |k: crate::decode::Tok| -> usize {
-            use crate::decode::Tok::*;
-            match k {
-                Default => 0, Comment => 1, Keyword => 2, Type => 3,
-                Str => 4, Number => 5, Preproc => 6, Punct => 7,
-            }
+            crate::decode::ALL_TOKS.iter().position(|t| *t == k).unwrap_or(0)
         };
         let mono = egui::FontId::monospace(13.0);
         let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * 8.0 + 12.0;

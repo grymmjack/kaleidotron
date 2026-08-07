@@ -180,7 +180,17 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     bin.rs           .bin — raw char/attr pairs (SAUCE width); idf/adf reuse render_textmode
     code.rs          source code / text (~90 exts) → CP437 8x16 raster + a lean hand-rolled
                      highlighter (per-language comment/string rules, shared keyword union,
-                     line-number gutter, tab expand, UTF-8→CP437, line+cell budget). `CODE_EXTS`
+                     line-number gutter, tab expand, UTF-8→CP437, line+cell budget). Tokens split
+                     Keyword/Control/Func/Preproc/Type/Str/Number/Comment/Punct/Default (`ALL_TOKS`);
+                     `lang_scopes(ext, tok)` names a language's OWN TextMate scopes so an imported
+                     VS Code theme resolves what its author meant (QB64PE colours `keyword.all.QB64PE`,
+                     NOT `keyword` — asking for the generic name finds an inherited base rule almost
+                     identical to the identifier colour, so a .bas file renders near-monochrome and
+                     the theme looks unloaded). BOTH surfaces theme: the text viewer via
+                     `Theme::kind_color_in`, and the RASTER TILE via `set_syntax_theme` — a
+                     process-global (like `set_font_9px`) because the thumbnailer has no `PixelView`;
+                     `Palette::resolve(ext)` folds it in per-field (bg = `editor.background`), and
+                     `sync_syntax_theme` drops cached code thumbs so tiles re-decode. `CODE_EXTS`
                      re-exported; registry routes code exts to `decode_ext(bytes, ext)`. ipynb
                      flattens to highlighted Python. Zero heavy deps (no syntect).
     pdf.rs           .pdf — the tile is the REAL first page via `render_page`. Tries in-process

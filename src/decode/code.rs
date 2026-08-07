@@ -34,6 +34,8 @@ const STRING: [u8; 3] = [206, 145, 120];
 const NUMBER: [u8; 3] = [181, 206, 168];
 const PREPROC: [u8; 3] = [197, 134, 192];
 const PUNCT: [u8; 3] = [160, 160, 170];
+const CONTROL: [u8; 3] = [197, 134, 192];
+const FUNC: [u8; 3] = [220, 220, 170];
 const GUTTER: [u8; 3] = [88, 88, 104];
 const TRUNC: [u8; 3] = [220, 170, 90];
 
@@ -47,6 +49,11 @@ pub enum Tok {
     Number,
     Preproc,
     Punct,
+    /// Control flow, split out from `Keyword` because editor themes almost always colour it
+    /// separately (`keyword.control`) — collapsing the two throws that distinction away.
+    Control,
+    /// A declared routine's name (`support.function` / `entity.name.function`).
+    Func,
 }
 
 impl Tok {
@@ -60,6 +67,8 @@ impl Tok {
             Tok::Number => NUMBER,
             Tok::Preproc => PREPROC,
             Tok::Punct => PUNCT,
+            Tok::Control => CONTROL,
+            Tok::Func => FUNC,
         }
     }
 }
@@ -76,6 +85,16 @@ struct LangSpec {
     /// Language-specific keywords, matched case-insensitively, in addition to the shared union.
     /// `None` = shared union only.
     keywords: Option<&'static [&'static str]>,
+    /// Control-flow keywords, matched case-insensitively and checked *before* `keywords`, so a
+    /// word in both lists lands on the more specific kind. `None` = no split; everything in
+    /// `keywords` reads as a plain keyword.
+    control: Option<&'static [&'static str]>,
+    /// A `$WORD` is a compiler metacommand (QB64PE's `$INCLUDE`, `$NOPREFIX`), i.e. a directive
+    /// rather than an identifier. C-family languages use `preproc_hash` for the same idea.
+    preproc_dollar: bool,
+    /// A line beginning `SUB name` / `FUNCTION name` declares a routine, so the rest of the line
+    /// is its signature — coloured as a definition the way an editor grammar does.
+    decl_words: &'static [&'static str],
     /// Treat an uppercase-leading identifier as a type (Rust/Java/C# convention). Wrong for BASIC,
     /// where the *keywords* are the uppercase words — leaving it on paints every `PRINT` and `DIM`
     /// as a type instead of a keyword.
@@ -90,6 +109,9 @@ const C_FAMILY: LangSpec = LangSpec {
     preproc_hash: true,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const JS_FAMILY: LangSpec = LangSpec {
@@ -100,6 +122,9 @@ const JS_FAMILY: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const RUST: LangSpec = LangSpec {
@@ -110,6 +135,9 @@ const RUST: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const HASH: LangSpec = LangSpec {
@@ -120,6 +148,9 @@ const HASH: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const LUA: LangSpec = LangSpec {
@@ -130,6 +161,9 @@ const LUA: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const BASIC: LangSpec = LangSpec {
@@ -141,6 +175,9 @@ const BASIC: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: Some(QB64PE_KEYWORDS),
+    control: Some(QB64PE_CONTROL),
+    preproc_dollar: true,
+    decl_words: &["SUB", "FUNCTION"],
     upper_is_type: false,
 };
 const ASM: LangSpec = LangSpec {
@@ -151,6 +188,9 @@ const ASM: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const CSS: LangSpec = LangSpec {
@@ -161,6 +201,9 @@ const CSS: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const HTML: LangSpec = LangSpec {
@@ -171,6 +214,9 @@ const HTML: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const JSONISH: LangSpec = LangSpec {
@@ -181,6 +227,9 @@ const JSONISH: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: true,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 const PLAIN: LangSpec = LangSpec {
@@ -191,6 +240,9 @@ const PLAIN: LangSpec = LangSpec {
     preproc_hash: false,
     highlight: false,
     keywords: None,
+    control: None,
+    preproc_dollar: false,
+    decl_words: &[],
     upper_is_type: true,
 };
 
@@ -348,6 +400,17 @@ enum Carry {
 /// QB64PE reserved words, extracted from the QB64PE VS Code extension's TextMate grammar (the
 /// language's own keyword list). Uppercase and matched case-insensitively — BASIC is not
 /// case-sensitive, and QB64PE source is conventionally written in caps.
+/// QB64PE control-flow words, taken from the `keyword.control.QB64PE` rule of the official
+/// TextMate grammar so the split matches what the editor extension does. The grammar spells the
+/// compound forms (`End If`, `Exit Do`) as phrases; a word-at-a-time lexer can't match those, so
+/// `END` and `EXIT` are listed on their own — they are overwhelmingly used as part of one.
+const QB64PE_CONTROL: &[&str] = &[
+    "_ANDALSO", "_CONTINUE", "_DELAY", "_LIMIT", "_NEGATE", "_ORELSE", "AND", "CASE", "CONTINUE",
+    "DELAY", "DO", "EACH", "ELSE", "ELSEIF", "END", "EXIT", "FOR", "IF", "IIF", "KEY", "LIMIT",
+    "LOOP", "MOD", "NEXT", "NOT", "OFF", "OR", "RETURN", "SELECT", "SLEEP", "STEP", "THEN", "TO",
+    "UNTIL", "WEND", "WHILE", "WITH", "XOR",
+];
+
 const QB64PE_KEYWORDS: &[&str] = &[
     "ABS", "ABSOLUTE", "ACCEPTFILEDROP", "ACCESS", "ACOS", "ACOSH", "ADLER32", "ALIAS", "ALL",
     "ALLOWFULLSCREEN", "ALPHA", "ALPHA32", "AND", "ANDALSO", "ANTICLOCKWISE", "ANY", "APPEND",
@@ -501,6 +564,118 @@ pub fn highlight_lines(src: &str, ext: &str) -> Vec<Vec<(String, Tok)>> {
     out
 }
 
+/// The syntax theme the raster tiles paint with, if any.
+///
+/// The thumbnailer runs on worker threads with no access to `PixelView`, so — exactly like
+/// `set_font_9px` — the choice reaches it as a process-global rather than a threaded parameter.
+static SYNTAX_THEME: std::sync::RwLock<Option<std::sync::Arc<crate::theme::Theme>>> =
+    std::sync::RwLock::new(None);
+
+/// Point the code rasteriser at a theme (or `None` for the built-in palette). Cheap to call; the
+/// caller is responsible for dropping cached thumbnails so they re-decode with the new colours.
+pub fn set_syntax_theme(theme: Option<std::sync::Arc<crate::theme::Theme>>) {
+    if let Ok(mut g) = SYNTAX_THEME.write() {
+        *g = theme;
+    }
+}
+
+/// The colours one rendered tile uses, resolved once per render rather than per glyph.
+struct Palette {
+    bg: [u8; 3],
+    gutter: [u8; 3],
+    trunc: [u8; 3],
+    toks: [[u8; 3]; ALL_TOKS.len()],
+}
+
+impl Palette {
+    /// Resolve for `ext`: the active theme where it has an opinion, the built-in palette otherwise.
+    /// Falling back per *field* rather than per theme means a sparse theme still contributes what
+    /// it does define instead of being discarded wholesale.
+    fn resolve(ext: &str) -> Palette {
+        let mut p = Palette {
+            bg: BG,
+            gutter: GUTTER,
+            trunc: TRUNC,
+            toks: ALL_TOKS.map(|t| t.color()),
+        };
+        let guard = SYNTAX_THEME.read().ok();
+        let Some(theme) = guard.as_ref().and_then(|g| g.as_ref()) else {
+            return p;
+        };
+        let rgb = |c: Option<[u8; 4]>| c.map(|c| [c[0], c[1], c[2]]);
+        if let Some(c) = rgb(theme.extreme_bg.or(theme.window_bg)) {
+            p.bg = c;
+        }
+        if let Some(c) = rgb(theme.weak_text) {
+            p.gutter = c;
+        }
+        if let Some(c) = rgb(theme.warn) {
+            p.trunc = c;
+        }
+        for (i, k) in ALL_TOKS.iter().enumerate() {
+            if let Some(c) = theme.kind_color_in(*k, lang_scopes(ext, *k)) {
+                p.toks[i] = c;
+            }
+        }
+        p
+    }
+
+    fn of(&self, t: Tok) -> [u8; 3] {
+        ALL_TOKS
+            .iter()
+            .position(|k| *k == t)
+            .map(|i| self.toks[i])
+            .unwrap_or(DEFAULT)
+    }
+}
+
+/// The TextMate scopes a language's own grammar uses for `kind`, most specific first.
+///
+/// Themes are written against a grammar's scope names, so a theme built for QB64PE says
+/// `keyword.all.QB64PE` where a generic lookup would ask for `keyword`. Without this the theme
+/// resolves through whatever base rule it inherited — for the QB64PE theme that is a cyan almost
+/// identical to its identifier colour, so a `.bas` file renders very nearly monochrome and the
+/// theme looks like it never loaded. Empty for languages with no dedicated scope vocabulary.
+pub fn lang_scopes(ext: &str, kind: Tok) -> &'static [&'static str] {
+    let basic = matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "bas" | "bm" | "bi" | "qb"
+    );
+    if !basic {
+        return &[];
+    }
+    match kind {
+        Tok::Keyword => &["keyword.all.QB64PE", "keywords.all.QB64PE", "keyword.QB64PE"],
+        Tok::Control => &["keyword.control.QB64PE"],
+        Tok::Preproc => &["metacommand.QB64PE", "meta.preprocessor.QB64PE"],
+        Tok::Func => &[
+            "userfunctions.QB64PE",
+            "support.function.QB64PE",
+            "entity.name.function.QB64PE",
+        ],
+        Tok::Type => &["support.type.QB64PE"],
+        Tok::Str => &["string.quoted.double.QB64PE"],
+        Tok::Number => &["constant.numeric.QB64PE"],
+        Tok::Comment => &["comment.line.apostrophe.QB64PE"],
+        Tok::Default => &["variable.other.QB64PE", "variable.QB64PE"],
+        Tok::Punct => &["punctuation.separator.QB64PE"],
+    }
+}
+
+/// Every token kind, in one place, so a consumer building a palette can't quietly miss one.
+pub const ALL_TOKS: [Tok; 10] = [
+    Tok::Default,
+    Tok::Comment,
+    Tok::Keyword,
+    Tok::Type,
+    Tok::Str,
+    Tok::Number,
+    Tok::Preproc,
+    Tok::Punct,
+    Tok::Control,
+    Tok::Func,
+];
+
 /// The colour for a token kind, so the interactive viewer matches the tile exactly.
 pub fn tok_rgb(t: Tok) -> [u8; 3] {
     t.color()
@@ -508,12 +683,23 @@ pub fn tok_rgb(t: Tok) -> [u8; 3] {
 
 /// A word is a keyword / type / neither.
 fn classify_word(w: &str, spec: &LangSpec) -> Tok {
+    // A metacommand is a directive, not an identifier — and it must be checked before the keyword
+    // lists, which hold the bare word (`$IF` vs `IF`).
+    if spec.preproc_dollar && w.starts_with('$') && w.len() > 1 {
+        return Tok::Preproc;
+    }
     if KEYWORDS.contains(&w) {
         return Tok::Keyword;
     }
-    // A language's own keywords, case-insensitively (BASIC isn't case-sensitive).
+    // A language's own keywords, case-insensitively (BASIC isn't case-sensitive). Control flow is
+    // tested first so a word in both lists takes the more specific kind.
+    let up = w.to_ascii_uppercase();
+    if let Some(list) = spec.control {
+        if list.binary_search(&up.as_str()).is_ok() {
+            return Tok::Control;
+        }
+    }
     if let Some(list) = spec.keywords {
-        let up = w.to_ascii_uppercase();
         if list.binary_search(&up.as_str()).is_ok() {
             return Tok::Keyword;
         }
@@ -531,6 +717,8 @@ fn lex_line(line: &[char], spec: &LangSpec, carry: &mut Carry) -> Vec<(char, Tok
     let mut out: Vec<(char, Tok)> = Vec::with_capacity(line.len());
     let n = line.len();
     let mut i = 0;
+    // Set once a `SUB`/`FUNCTION` opens the line; see the identifier branch below.
+    let mut decl_seen = false;
 
     // Continue a carried block comment / raw string first.
     match std::mem::replace(carry, Carry::None) {
@@ -667,7 +855,20 @@ fn lex_line(line: &[char], spec: &LangSpec, carry: &mut Carry) -> Vec<(char, Tok
                 i += 1;
             }
             let word: String = line[start..i].iter().collect();
-            let tok = classify_word(&word, spec);
+            let mut tok = classify_word(&word, spec);
+            // `SUB name (args)` — the grammar treats the whole rest of the line as the routine's
+            // signature, so once the declaring word is seen every later identifier on the line is
+            // part of the definition rather than a use of something.
+            if !spec.decl_words.is_empty() {
+                let up = word.to_ascii_uppercase();
+                if decl_seen {
+                    if tok == Tok::Default || tok == Tok::Type {
+                        tok = Tok::Func;
+                    }
+                } else if first_non_ws == Some(start) && spec.decl_words.contains(&up.as_str()) {
+                    decl_seen = true;
+                }
+            }
             for &ch in &line[start..i] {
                 out.push((ch, tok));
             }
@@ -782,7 +983,8 @@ fn ipynb_to_text(bytes: &[u8]) -> Option<String> {
 }
 
 /// Render `text` (already the display text) into a highlighted `PixImage`.
-fn render_text(text: &str, spec: &LangSpec) -> PixImage {
+fn render_text(text: &str, spec: &LangSpec, ext: &str) -> PixImage {
+    let pal = Palette::resolve(ext);
     // Collect raw lines up to the caps (line + total-cell budget), tab-expanded.
     let raw_lines: Vec<&str> = text.lines().collect();
     let total_lines = raw_lines.len();
@@ -819,7 +1021,7 @@ fn render_text(text: &str, spec: &LangSpec) -> PixImage {
 
     let w = cols * CELL_W;
     let h = n_rows * CELL_H;
-    let mut pixels = vec![[BG[0], BG[1], BG[2], 255]; w * h];
+    let mut pixels = vec![[pal.bg[0], pal.bg[1], pal.bg[2], 255]; w * h];
 
     // Gutter line numbers + content.
     for (ri, row) in rows.iter().enumerate() {
@@ -830,14 +1032,14 @@ fn render_text(text: &str, spec: &LangSpec) -> PixImage {
             ri,
             0,
             &format!("{lineno:>width$}", width = gutter_w - 1),
-            GUTTER,
+            pal.gutter,
         );
         for (ci, &(ch, tok)) in row.iter().enumerate() {
-            blit_glyph(&mut pixels, w, ri, gutter_w + ci, to_cp437(ch), tok.color());
+            blit_glyph(&mut pixels, w, ri, gutter_w + ci, to_cp437(ch), pal.of(tok));
         }
     }
     if let Some(msg) = notice {
-        blit_str(&mut pixels, w, rows.len(), gutter_w, &msg, TRUNC);
+        blit_str(&mut pixels, w, rows.len(), gutter_w, &msg, pal.trunc);
     }
 
     PixImage::from_rgba(w as u32, h as u32, pixels)
@@ -1022,7 +1224,7 @@ impl Decoder for CodeDecoder {
         // Without the path we can't pick the exact LangSpec here; the registry calls
         // `decode_with_ext` when it knows the extension (see mod.rs). This bare path
         // renders plain (still correct, just uncolored).
-        Ok(render_text(&text, &PLAIN))
+        Ok(render_text(&text, &PLAIN, ""))
     }
 }
 
@@ -1033,10 +1235,10 @@ impl CodeDecoder {
         if ext == "ipynb" {
             let text =
                 ipynb_to_text(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            return Ok(render_text(&text, &HASH));
+            return Ok(render_text(&text, &HASH, "py"));
         }
         let text = String::from_utf8_lossy(bytes).into_owned();
-        Ok(render_text(&text, lang_for(ext)))
+        Ok(render_text(&text, lang_for(ext), ext))
     }
 }
 
@@ -1054,6 +1256,83 @@ mod tests {
         assert!(img.width > 0 && img.height > 0);
         // Two lines → 2 rows × 16px tall.
         assert_eq!(img.height, 2 * CELL_H as u32);
+    }
+
+    #[test]
+    fn qb64_splits_control_metacommands_and_declarations() {
+        let kind = |src: &str, needle: &str| -> Tok {
+            let lines = highlight_lines(src, "bas");
+            lines
+                .iter()
+                .flatten()
+                .find(|(t, _)| t.trim() == needle)
+                .map(|(_, k)| *k)
+                .unwrap_or_else(|| panic!("{needle:?} not lexed as its own run in {src:?}"))
+        };
+        // Control flow is its own kind: themes colour `keyword.control` separately, and folding it
+        // into Keyword is what made a whole file read as one colour.
+        assert_eq!(kind("IF x THEN", "IF"), Tok::Control);
+        assert_eq!(kind("FOR i = 1 TO 9", "FOR"), Tok::Control);
+        // ...but an ordinary statement stays a plain keyword.
+        assert_eq!(kind("PRINT x", "PRINT"), Tok::Keyword);
+        assert_eq!(kind("DIM SHARED n", "DIM"), Tok::Keyword);
+        // A metacommand is a directive, and must not be confused with the bare keyword.
+        assert_eq!(kind("$NOPREFIX", "$NOPREFIX"), Tok::Preproc);
+        assert_eq!(kind("$IF WIN THEN", "$IF"), Tok::Preproc);
+        assert_eq!(kind("IF a THEN", "IF"), Tok::Control);
+        // A declaration names a routine; the name is a definition, not an ordinary identifier.
+        assert_eq!(kind("SUB DrawBar (v)", "DrawBar"), Tok::Func);
+        assert_eq!(kind("FUNCTION Clamp# (v)", "Clamp"), Tok::Func);
+        // Calling it later is not a declaration — only a line that *opens* with SUB/FUNCTION is.
+        assert_ne!(kind("x = Clamp(3)", "Clamp"), Tok::Func);
+    }
+
+    #[test]
+    fn qb64_scopes_resolve_through_a_real_theme() {
+        // The bug this guards: asking a QB64PE theme for the generic `keyword` scope finds a base
+        // rule that is all but identical to its identifier colour, so a .bas file renders nearly
+        // monochrome and the theme looks like it was never loaded. The language's own scope names
+        // are what carry the author's intent.
+        let json = r##"{
+            "name": "T", "type": "dark",
+            "colors": { "editor.background": "#0000aa" },
+            "tokenColors": [
+                { "scope": "keyword", "settings": { "foreground": "#5ED8F0" } },
+                { "scope": "keyword.all.QB64PE", "settings": { "foreground": "#E2FFFF" } },
+                { "scope": "keyword.control.QB64PE", "settings": { "foreground": "#95EBF1" } }
+            ]
+        }"##;
+        let t = crate::theme::Theme::from_json(json, "t").expect("parses");
+        let of = |k: Tok, ext: &str| t.kind_color_in(k, lang_scopes(ext, k));
+        assert_eq!(of(Tok::Keyword, "bas"), Some([0xE2, 0xFF, 0xFF]));
+        assert_eq!(of(Tok::Control, "bas"), Some([0x95, 0xEB, 0xF1]));
+        // A language with no scope vocabulary of its own still gets the generic rule.
+        assert_eq!(of(Tok::Keyword, "rs"), Some([0x5E, 0xD8, 0xF0]));
+        // And a scope the theme never mentions walks the dotted prefix down to one it does.
+        assert_eq!(
+            t.kind_color_in(Tok::Control, &["keyword.control.rust"]),
+            Some([0x5E, 0xD8, 0xF0])
+        );
+    }
+
+    #[test]
+    fn the_raster_palette_follows_the_active_theme() {
+        // The grid tile is a bitmap painted on a worker thread, so the theme reaches it as a
+        // process-global. Without this the viewer restyles and the thumbnails beside it don't.
+        let plain = Palette::resolve("bas");
+        assert_eq!(plain.bg, BG, "no theme set -> built-in palette");
+
+        let json = r##"{ "name": "T", "type": "dark",
+            "colors": { "editor.background": "#0000aa" },
+            "tokenColors": [{ "scope": "comment", "settings": { "foreground": "#8681C9" } }] }"##;
+        let t = std::sync::Arc::new(crate::theme::Theme::from_json(json, "t").unwrap());
+        set_syntax_theme(Some(t));
+        let themed = Palette::resolve("bas");
+        assert_eq!(themed.bg, [0x00, 0x00, 0xAA], "tile uses editor.background");
+        assert_eq!(themed.of(Tok::Comment), [0x86, 0x81, 0xC9]);
+        // A theme silent on a kind contributes nothing there rather than blanking it.
+        assert_eq!(themed.of(Tok::Str), STRING);
+        set_syntax_theme(None);
     }
 
     #[test]

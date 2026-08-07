@@ -203,9 +203,17 @@ impl Theme {
     /// produces kinds, VS Code themes colour scopes, and these are the standard scope names for
     /// each kind. Falls back to `None` so the built-in palette still applies when a theme is
     /// absent or says nothing about that scope.
-    pub fn kind_color(&self, kind: crate::decode::Tok) -> Option<[u8; 3]> {
+    /// As [`Self::kind_color`], but consulting `extra` scopes first.
+    ///
+    /// A theme written for one language names its scopes for that language — QB64PE's colours a
+    /// statement `keyword.all.QB64PE`, not `keyword`. Looking only at the generic name finds
+    /// whatever base rule the theme inherited and misses the author's actual intent, which reads
+    /// on screen as "the theme isn't applied". `extra` carries the language's own scope names, and
+    /// costs nothing when a theme doesn't define them: [`Self::scope_color`] walks the dotted
+    /// prefix down, so `keyword.all.QB64PE` still resolves via `keyword`.
+    pub fn kind_color_in(&self, kind: crate::decode::Tok, extra: &[&str]) -> Option<[u8; 3]> {
         use crate::decode::Tok;
-        let scopes: &[&str] = match kind {
+        let generic: &[&str] = match kind {
             Tok::Comment => &["comment"],
             Tok::Keyword => &["keyword", "keyword.control"],
             Tok::Type => &["storage.type", "entity.name.type", "support.type"],
@@ -214,9 +222,12 @@ impl Theme {
             Tok::Preproc => &["keyword.control.directive", "meta.preprocessor", "keyword"],
             Tok::Punct => &["punctuation"],
             Tok::Default => &["source", "variable"],
+            Tok::Control => &["keyword.control", "keyword"],
+            Tok::Func => &["entity.name.function", "support.function"],
         };
-        scopes
+        extra
             .iter()
+            .chain(generic.iter())
             .find_map(|s| self.scope_color(s))
             .map(|c| [c[0], c[1], c[2]])
     }
@@ -463,11 +474,11 @@ mod tests {
             "x",
         )
         .unwrap();
-        assert_eq!(t.kind_color(Tok::Comment), Some([0x11, 0x88, 0x11]));
-        assert_eq!(t.kind_color(Tok::Keyword), Some([0x22, 0x22, 0xee]));
-        assert_eq!(t.kind_color(Tok::Str), Some([0xcc, 0x44, 0x44]));
+        assert_eq!(t.kind_color_in(Tok::Comment, &[]), Some([0x11, 0x88, 0x11]));
+        assert_eq!(t.kind_color_in(Tok::Keyword, &[]), Some([0x22, 0x22, 0xee]));
+        assert_eq!(t.kind_color_in(Tok::Str, &[]), Some([0xcc, 0x44, 0x44]));
         // A kind the theme says nothing about returns None so the caller keeps its default.
-        assert_eq!(t.kind_color(Tok::Number), None);
+        assert_eq!(t.kind_color_in(Tok::Number, &[]), None);
     }
 
     #[test]
@@ -540,7 +551,7 @@ mod real_theme_binding {
         for (name, k) in [("Comment", Comment), ("Keyword", Keyword), ("Type", Type),
                           ("Str", Str), ("Number", Number), ("Preproc", Preproc),
                           ("Punct", Punct), ("Default", Default)] {
-            match t.kind_color(k) {
+            match t.kind_color_in(k, &[]) {
                 Some(c) => { bound += 1; eprintln!("  {name:8} -> #{:02x}{:02x}{:02x}", c[0], c[1], c[2]); }
                 None => eprintln!("  {name:8} -> (unset, keeps built-in)"),
             }
