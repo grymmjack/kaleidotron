@@ -28274,6 +28274,37 @@ impl PixelView {
         // so the work is proportional to the document, not to what's on screen — hence the size
         // cap in `load_full` rather than trying to lay out a 50 MB log.
         let spans = crate::decode::highlight_lines(&body, &ext);
+        // Resolve each token kind's colour ONCE per frame: an active theme's tokenColors if it
+        // says anything about that scope, else the built-in palette. Doing it here rather than
+        // inside the layouter keeps the per-run work to an array index.
+        let active = self
+            .themes
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()));
+        let kind_rgb: Vec<[u8; 3]> = [
+            crate::decode::Tok::Default,
+            crate::decode::Tok::Comment,
+            crate::decode::Tok::Keyword,
+            crate::decode::Tok::Type,
+            crate::decode::Tok::Str,
+            crate::decode::Tok::Number,
+            crate::decode::Tok::Preproc,
+            crate::decode::Tok::Punct,
+        ]
+        .iter()
+        .map(|k| {
+            active
+                .and_then(|t| t.kind_color(*k))
+                .unwrap_or_else(|| crate::decode::tok_rgb(*k))
+        })
+        .collect();
+        let kind_idx = |k: crate::decode::Tok| -> usize {
+            use crate::decode::Tok::*;
+            match k {
+                Default => 0, Comment => 1, Keyword => 2, Type => 3,
+                Str => 4, Number => 5, Preproc => 6, Punct => 7,
+            }
+        };
         let mono = egui::FontId::monospace(13.0);
         let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * 8.0 + 12.0;
         let wrap_at = if wrap { ui.available_width() - gutter_w } else { f32::INFINITY };
@@ -28282,7 +28313,7 @@ impl PixelView {
             job.wrap.max_width = wrap_at;
             for (i, runs) in spans.iter().enumerate() {
                 for (text, tok) in runs {
-                    let c = crate::decode::tok_rgb(*tok);
+                    let c = kind_rgb[kind_idx(*tok)];
                     job.append(
                         text,
                         0.0,

@@ -180,6 +180,48 @@ impl Theme {
     }
 }
 
+impl Theme {
+    /// The colour a theme gives a TextMate `scope`, following TextMate's **most-specific-wins**
+    /// rule: a theme that only defines `comment` still colours `comment.line.double-slash`, so the
+    /// lookup drops trailing segments until something matches.
+    pub fn scope_color(&self, scope: &str) -> Option<[u8; 4]> {
+        let mut s = scope;
+        loop {
+            if let Some(c) = self.tokens.get(s) {
+                return Some(*c);
+            }
+            match s.rfind('.') {
+                Some(i) => s = &s[..i],
+                None => return None,
+            }
+        }
+    }
+
+    /// The colour for one of our lexer's token kinds, via the TextMate scope it corresponds to.
+    ///
+    /// This is the bridge that lets an imported VS Code theme colour source text: our highlighter
+    /// produces kinds, VS Code themes colour scopes, and these are the standard scope names for
+    /// each kind. Falls back to `None` so the built-in palette still applies when a theme is
+    /// absent or says nothing about that scope.
+    pub fn kind_color(&self, kind: crate::decode::Tok) -> Option<[u8; 3]> {
+        use crate::decode::Tok;
+        let scopes: &[&str] = match kind {
+            Tok::Comment => &["comment"],
+            Tok::Keyword => &["keyword", "keyword.control"],
+            Tok::Type => &["storage.type", "entity.name.type", "support.type"],
+            Tok::Str => &["string", "string.quoted"],
+            Tok::Number => &["constant.numeric", "constant"],
+            Tok::Preproc => &["keyword.control.directive", "meta.preprocessor", "keyword"],
+            Tok::Punct => &["punctuation"],
+            Tok::Default => &["source", "variable"],
+        };
+        scopes
+            .iter()
+            .find_map(|s| self.scope_color(s))
+            .map(|c| [c[0], c[1], c[2]])
+    }
+}
+
 /// Map a VS Code theme onto ours. Curated, not mechanical: the two vocabularies don't correspond
 /// one-to-one, so each field takes the most apt key with fallbacks.
 pub fn from_vscode(v: &serde_json::Value, fallback_name: &str) -> Option<Theme> {
@@ -366,6 +408,47 @@ mod tests {
     }
 
     #[test]
+    fn scope_lookup_falls_back_to_less_specific() {
+        // TextMate's most-specific-wins rule: a theme defining only `comment` must still colour
+        // `comment.line.double-slash`, or most real themes would leave our tokens uncoloured.
+        let t = Theme::from_json(
+            r##"{ "name":"T","colors":{"foreground":"#ffffff"},
+                  "tokenColors":[
+                    {"scope":"comment","settings":{"foreground":"#118811"}},
+                    {"scope":"string.quoted.double","settings":{"foreground":"#cc4444"}}
+                  ]}"##,
+            "x",
+        )
+        .unwrap();
+        assert_eq!(t.scope_color("comment"), parse_hex("#118811"));
+        assert_eq!(t.scope_color("comment.line.double-slash"), parse_hex("#118811"));
+        // A more specific rule is found by its own exact name.
+        assert_eq!(t.scope_color("string.quoted.double"), parse_hex("#cc4444"));
+        // …but a sibling the theme never mentions stays unset, so the built-in palette applies.
+        assert_eq!(t.scope_color("entity.name.function"), None);
+    }
+
+    #[test]
+    fn token_kinds_bind_to_theme_colours() {
+        use crate::decode::Tok;
+        let t = Theme::from_json(
+            r##"{ "name":"T","colors":{"foreground":"#ffffff"},
+                  "tokenColors":[
+                    {"scope":"comment","settings":{"foreground":"#118811"}},
+                    {"scope":"keyword","settings":{"foreground":"#2222ee"}},
+                    {"scope":"string","settings":{"foreground":"#cc4444"}}
+                  ]}"##,
+            "x",
+        )
+        .unwrap();
+        assert_eq!(t.kind_color(Tok::Comment), Some([0x11, 0x88, 0x11]));
+        assert_eq!(t.kind_color(Tok::Keyword), Some([0x22, 0x22, 0xee]));
+        assert_eq!(t.kind_color(Tok::Str), Some([0xcc, 0x44, 0x44]));
+        // A kind the theme says nothing about returns None so the caller keeps its default.
+        assert_eq!(t.kind_color(Tok::Number), None);
+    }
+
+    #[test]
     fn bad_input_is_never_fatal() {
         assert!(Theme::from_json("{ not json", "x").is_none());
         assert!(Theme::from_json("", "x").is_none());
@@ -414,5 +497,33 @@ mod real_vscode {
         }
         assert!(got >= 10, "most fields should map from a real theme");
         let _ = t.to_visuals();
+    }
+}
+
+#[cfg(test)]
+mod real_theme_binding {
+    use super::*;
+    /// Bind our token kinds against a real published theme, to prove the scope names we chose
+    /// actually exist in themes people ship — not just in the fixtures above.
+    #[test]
+    #[ignore = "reads a file fetched into /tmp"]
+    fn binds_kinds_against_a_real_theme() {
+        let Ok(text) = std::fs::read_to_string("/tmp/vsdark.json") else {
+            eprintln!("skipped: /tmp/vsdark.json not present");
+            return;
+        };
+        let t = Theme::from_json(&text, "x").expect("parsed");
+        use crate::decode::Tok::*;
+        let mut bound = 0;
+        for (name, k) in [("Comment", Comment), ("Keyword", Keyword), ("Type", Type),
+                          ("Str", Str), ("Number", Number), ("Preproc", Preproc),
+                          ("Punct", Punct), ("Default", Default)] {
+            match t.kind_color(k) {
+                Some(c) => { bound += 1; eprintln!("  {name:8} -> #{:02x}{:02x}{:02x}", c[0], c[1], c[2]); }
+                None => eprintln!("  {name:8} -> (unset, keeps built-in)"),
+            }
+        }
+        eprintln!("{} / 8 kinds bound from '{}'", bound, t.name);
+        assert!(bound >= 4, "a real theme should colour most of our kinds");
     }
 }
