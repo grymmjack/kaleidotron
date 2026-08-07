@@ -7,11 +7,19 @@
 //! ```jsonc
 //! {
 //!   // ── Appearance ──
-//!   // 0 = dark, 1 = light
-//!   "theme": 0,
-//!   "grid_gap": 8.0
+//!   "appearance": {
+//!     // 0 = dark, 1 = light
+//!     "theme": 0,
+//!     "grid_gap": 8.0
+//!   },
+//!   "plugins": { "plugin_audio": true }
 //! }
 //! ```
+//!
+//! Settings are grouped into a nested object per section rather than one flat blob — 45 keys in a
+//! single object is unreadable. [`parse`] flattens one level, and also accepts a **flat** file, so
+//! a config written by an earlier build still loads and is simply rewritten nested on the next
+//! save. Keys are unique across sections, so flattening is unambiguous.
 //!
 //! **This file is a curated subset, not a dump of everything persisted.** Three categories are
 //! deliberately excluded:
@@ -34,6 +42,11 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
 }
 
+/// The JSON object name for a section heading ("Web sources" -> "web_sources").
+pub fn section_key(section: &str) -> String {
+    section.to_lowercase().replace(' ', "_")
+}
+
 /// One setting as it appears in the file: which section it's grouped under, its key, its current
 /// value, and a one-line explanation emitted as a `//` comment above it.
 pub struct Entry {
@@ -49,10 +62,22 @@ pub struct Entry {
 /// fails to parse yields nothing rather than panicking — the caller keeps its defaults.
 pub fn parse(text: &str) -> HashMap<String, serde_json::Value> {
     let cleaned = crate::keybindings::strip_comments(text);
-    match serde_json::from_str::<serde_json::Value>(&cleaned) {
-        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-        _ => HashMap::new(),
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&cleaned)
+    else {
+        return HashMap::new();
+    };
+    // Flatten one level: a section object contributes its members, anything else is a flat key
+    // (which is how a file written by an earlier, un-sectioned build still loads).
+    let mut out = HashMap::new();
+    for (k, v) in map {
+        match v {
+            serde_json::Value::Object(inner) => out.extend(inner),
+            other => {
+                out.insert(k, other);
+            }
+        }
     }
+    out
 }
 
 /// Render entries as a documented JSON object, grouped by section in the order given.
@@ -64,21 +89,30 @@ pub fn to_json(entries: &[Entry]) -> String {
          // API keys live in secrets.json — keep THAT file out of dotfile sync.\n\
          {\n",
     );
-    let mut section = "";
-    for (i, e) in entries.iter().enumerate() {
-        if e.section != section {
-            if !section.is_empty() {
-                s.push('\n');
+    // Group into one nested object per section, preserving the order entries arrive in.
+    let mut groups: Vec<(&'static str, Vec<&Entry>)> = Vec::new();
+    for e in entries {
+        match groups.last_mut() {
+            Some((sec, list)) if *sec == e.section => list.push(e),
+            _ => groups.push((e.section, vec![e])),
+        }
+    }
+    for (gi, (section, list)) in groups.iter().enumerate() {
+        if gi > 0 {
+            s.push('\n');
+        }
+        s.push_str(&format!("  // ── {section} ──\n"));
+        s.push_str(&format!("  \"{}\": {{\n", section_key(section)));
+        for (i, e) in list.iter().enumerate() {
+            if !e.doc.is_empty() {
+                s.push_str(&format!("    // {}\n", e.doc));
             }
-            s.push_str(&format!("  // ── {} ──\n", e.section));
-            section = e.section;
+            let comma = if i + 1 == list.len() { "" } else { "," };
+            let v = serde_json::to_string(&e.value).unwrap_or_else(|_| "null".into());
+            s.push_str(&format!("    \"{}\": {v}{comma}\n", e.key));
         }
-        if !e.doc.is_empty() {
-            s.push_str(&format!("  // {}\n", e.doc));
-        }
-        let comma = if i + 1 == entries.len() { "" } else { "," };
-        let v = serde_json::to_string(&e.value).unwrap_or_else(|_| "null".into());
-        s.push_str(&format!("  \"{}\": {v}{comma}\n", e.key));
+        let comma = if gi + 1 == groups.len() { "" } else { "," };
+        s.push_str(&format!("  }}{comma}\n"));
     }
     s.push_str("}\n");
     s
@@ -157,19 +191,41 @@ mod tests {
     }
 
     #[test]
-    fn emits_grouped_documented_json_that_reparses() {
+    fn emits_nested_documented_json_that_reparses() {
         let text = to_json(&sample());
         assert!(text.contains("// ── Appearance ──"));
         assert!(text.contains("// ── Viewer ──"));
         assert!(text.contains("// 0 = dark, 1 = light"));
-        // The last entry must not carry a trailing comma — serde_json would reject it.
-        assert!(!text.trim_end().trim_end_matches('}').trim_end().ends_with(','));
+        // Each section is its own object, not a flat blob.
+        assert!(text.contains("\"appearance\": {"), "sections are nested objects");
+        assert!(text.contains("\"viewer\": {"));
+        // Must still be valid JSON — a stray trailing comma anywhere would break serde_json.
+        let cleaned = crate::keybindings::strip_comments(&text);
+        serde_json::from_str::<serde_json::Value>(&cleaned).expect("emitted file is valid JSON");
 
         let m = parse(&text);
         assert_eq!(get_u64(&m, "theme"), Some(0));
         assert_eq!(get_f32(&m, "grid_gap"), Some(8.0));
         assert_eq!(get_bool(&m, "black_bg"), Some(true));
         assert_eq!(get_rgb(&m, "transp_color"), Some([255, 0, 255]));
+    }
+
+    #[test]
+    fn a_flat_file_from_an_older_build_still_loads() {
+        // Backward compatibility: settings.json used to be one flat object. Such a file must keep
+        // working (and is simply rewritten nested on the next save) rather than resetting someone
+        // to defaults.
+        let flat = r#"{ "theme": 1, "grid_gap": 4.0, "black_bg": true }"#;
+        let m = parse(flat);
+        assert_eq!(get_u64(&m, "theme"), Some(1));
+        assert_eq!(get_f32(&m, "grid_gap"), Some(4.0));
+        assert_eq!(get_bool(&m, "black_bg"), Some(true));
+    }
+
+    #[test]
+    fn section_names_become_object_keys() {
+        assert_eq!(section_key("Appearance"), "appearance");
+        assert_eq!(section_key("Web sources"), "web_sources");
     }
 
     #[test]
