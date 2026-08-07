@@ -2026,6 +2026,10 @@ pub struct PixelView {
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
     themes_dir: PathBuf,       // <data>/themes/*.json
     theme_name: String,        // selected theme; empty = egui's built-in dark/light
+    /// Which half of a theme to apply: 0 = all, 1 = syntax only, 2 = chrome only. A VS Code theme
+    /// carries both a `colors` block and `tokenColors`; some people want a loud editor with
+    /// restrained chrome (or the reverse), so the two halves are independently switchable.
+    theme_scope: u8,
     themes: Vec<crate::theme::Theme>,
     /// Dock layout per mode, keyed by the mode's stable id. Saved when leaving a mode and restored
     /// when entering one.
@@ -3654,6 +3658,7 @@ impl PixelView {
             secrets_file,
             themes_dir,
             theme_name: String::new(),
+            theme_scope: 0,
             themes,
             panel_layouts: cc
                 .storage
@@ -3776,6 +3781,7 @@ impl PixelView {
             e(A, "grid_gap", self.grid_gap, "horizontal gap between grid tiles"),
             e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
             e(A, "theme_name", self.theme_name.clone(), "themes/<name>.json (blank = built-in dark/light)"),
+            e(A, "theme_scope", self.theme_scope, "what the theme styles: 0 = all, 1 = syntax only, 2 = chrome only"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
@@ -3858,6 +3864,9 @@ impl PixelView {
         }
         if let Some(v) = st::get_string(&m, "theme_name") {
             self.theme_name = v;
+        }
+        if let Some(v) = st::get_u64(&m, "theme_scope") {
+            self.theme_scope = (v as u8).min(2);
         }
         if let Some(v) = st::get_f32(&m, "rail_icon_size") {
             self.rail_icon_size = v.clamp(12.0, 48.0);
@@ -28224,6 +28233,7 @@ impl PixelView {
         if let Some(t) = self
             .themes
             .iter()
+            .filter(|_| self.theme_chrome())
             .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
         {
             ctx.set_visuals(t.to_visuals());
@@ -28277,10 +28287,7 @@ impl PixelView {
         // Resolve each token kind's colour ONCE per frame: an active theme's tokenColors if it
         // says anything about that scope, else the built-in palette. Doing it here rather than
         // inside the layouter keeps the per-run work to an array index.
-        let active = self
-            .themes
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()));
+        let active = self.syntax_theme();
         let kind_rgb: Vec<[u8; 3]> = [
             crate::decode::Tok::Default,
             crate::decode::Tok::Comment,
@@ -28353,6 +28360,26 @@ impl PixelView {
                 );
             });
         });
+    }
+
+    /// Does the selected theme style the app chrome? (scope 0 = all, 2 = chrome only)
+    fn theme_chrome(&self) -> bool {
+        matches!(self.theme_scope, 0 | 2)
+    }
+
+    /// …and the syntax colours? (scope 0 = all, 1 = syntax only)
+    fn theme_syntax(&self) -> bool {
+        matches!(self.theme_scope, 0 | 1)
+    }
+
+    /// The active theme, when it applies to syntax. `None` keeps the built-in code palette.
+    fn syntax_theme(&self) -> Option<&crate::theme::Theme> {
+        if !self.theme_syntax() {
+            return None;
+        }
+        self.themes
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
     }
 
     /// How long a toast holds at full opacity before fading.
@@ -31883,6 +31910,25 @@ impl eframe::App for PixelView {
                                     }
                                 });
                                 ui.weak("Drop a VS Code theme .json in that folder — it's imported directly.");
+                                // A VS Code theme carries both halves (`colors` + `tokenColors`);
+                                // this picks which of them we honour.
+                                ui.horizontal(|ui| {
+                                    ui.label("Styles");
+                                    for (v, label, hover) in [
+                                        (0u8, "Everything", "App chrome and code syntax"),
+                                        (1, "Code only", "Syntax colours; app keeps the built-in look"),
+                                        (2, "App only", "Chrome; code keeps the built-in palette"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(self.theme_scope == v, label)
+                                            .on_hover_text(hover)
+                                            .clicked()
+                                        {
+                                            self.theme_scope = v;
+                                            theme_apply = true;
+                                        }
+                                    }
+                                });
                                 if let Some(name) = pick {
                                     self.theme_name = name;
                                     theme_apply = true;
