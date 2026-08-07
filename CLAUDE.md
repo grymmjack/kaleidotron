@@ -86,7 +86,7 @@ src/
   app.rs             Kaleidotron: the whole UI — panels, grid/single views, model,
                      settings persistence, sort/filter, ratings, CLI parsing
   image_types.rs     PixImage (RGBA + optional indexed/palette)
-  cache.rs           persistent HTTP cache for 16colo (JSON/thumbnails/files/zips):
+  cache.rs           persistent HTTP cache for 16colors (JSON/thumbnails/files/zips):
                      blob files under <data>/cache/ + a SQLite index (cache.db) for
                      TTL freshness, LRU eviction (2 GiB cap) + size stats; thread-safe
                      via a global Mutex<Connection>. `init`/`get_bytes`/`get_file`/
@@ -99,7 +99,7 @@ src/
                      `-ss t`. VideoPlayer / VideoLoading (async open); see "Video playback".
   colo_thumb.rs      RemoteThumbs: HTTP worker pool fetching 16colo.rs `tn` PNGs
                      (mirrors ThumbBuilder; results uploaded to thumb_tex + thumb_rgba
-                     by path, so 16colo tiles recolor). Holds an Arc<Registry>: a PDF
+                     by path, so 16colors tiles recolor). Holds an Arc<Registry>: a PDF
                      piece (no server render) fetches its RAW file + renders page 1
                      locally (pdftoppm) instead of the missing `tn` PNG.
                      Busy feedback: `net_busy()` (any *_rx in flight + colo_sauce_pending)
@@ -372,10 +372,10 @@ and apply it *after* the closure returns.
 (filename / extension list / W·H min-max / **size KB min-max** / **modified-date
 range** / **min ★** / SAUCE text; all optional, plus a **`recursive` bool** — the `[x]
 Recursive` checkbox, default ON) drives `search_walk`, which BFS-walks
-the current folder's subtree on a **background thread** (mirrors the 16colo `mpsc`
+the current folder's subtree on a **background thread** (mirrors the 16colors `mpsc`
 pattern: `search_rx` + an `AtomicBool` cancel, `Send`ing a `SearchMsg::Hit(Entry)` per
 match then `Done(n)`). Filters run cheapest-first: name/type (path strings) → size/date
-(one `metadata` read) → rating (xattr; sidecar-only ratings on archive/16colo art are
+(one `metadata` read) → rating (xattr; sidecar-only ratings on archive/16colors art are
 invisible to the thread) → SAUCE (`read_file_tail` + parse) → dimensions (`quick_dims`:
 a header-only `image::image_dimensions`, full-decode fallback) — each only when its
 field is set, and a cheap reject skips the costly ones. Dates use `date_ymd` (mtime →
@@ -407,7 +407,7 @@ deferred → `favorites.push`). File tiles get a **🔍 Smart filter on…** sub
 (`smart_filter_from`): Type=its ext, File name=first ≥3-char word of the stem, File
 size=±20% KB, Date=its mtime day, Rating=its stars+ (shown only when rated), SAUCE
 group/artist=its SAUCE field (shown only for `is_textmode_ext`). Both are deferred
-`pin_dir`/`smart_on` locals applied after the tile closure. **In a 16colo flat listing
+`pin_dir`/`smart_on` locals applied after the tile closure. **In a 16colors flat listing
 (`colo_flat`) the rows are *pieces*, not dirs**, so `entry_context_menu` also takes a
 `colo_pin: Option<(&str, bool)>` and offers **📌 Pin “<artist/group/search>” to Places**
 (`TilePick::PinFolder` → `pin_current` → `pin_current_folder` pins `self.folder`). Since
@@ -420,8 +420,8 @@ for that extension (+ "Other program…" → an rfd one-off). An `Opener` is `{n
 env, icon, exts}` (`exts` comma/space-separated; `ext_list()` normalizes), persisted as a
 flat `Vec<Vec<String>>` (`record`/`from_record`, no serde-derive — like `SearchSpec`).
 `launch_external` spawns `Command::new(exec)` with `args` (a `{}` token → the **`resolve_local`d
-real** file path, else appended — so virtual 16colo/archive art opens from its on-disk copy)
-and `env` (`KEY=VALUE` lines). `open_external_for` routes both paths: a 16colo flat-listing
+real** file path, else appended — so virtual 16colors/archive art opens from its on-disk copy)
+and `env` (`KEY=VALUE` lines). `open_external_for` routes both paths: a 16colors flat-listing
 piece **not yet downloaded** kicks off `start_piece_open` and stashes `(exec,args,env)` in
 `pending_external`, which `poll_colo_open` consumes to launch the program once the real file
 lands (instead of opening the viewer); everything else launches immediately. `entry_context_menu` is a free fn so it can't borrow `self`; it
@@ -467,7 +467,7 @@ the columns (a vertical drop indicator follows the pointer; the new order persis
 unknown/new kinds appended). Thumbnail stays first, the scene Download menu last; click vs
 drag vs border-drag disambiguate by sense (the cell is `click_and_drag`, the border its own
 `drag` widget). Archive rows (.zip/…) render the folder glyph + a format badge like the grid. In the scene layout the **Pack / Year /
-Group** cells are clickable links into the 16colo browser (`colo_link` deferred →
+Group** cells are clickable links into the 16colors browser (`colo_link` deferred →
 `open_folder` of the pack / year / `groups/<group>` path; the link click takes priority
 over the row's open-the-art click).
 
@@ -484,7 +484,7 @@ on the Artists tab it builds `SEARCH/artist/<q>` → `ColoSource::SearchArtists`
 names only), on Groups `SEARCH/group/<q>` → `SearchGroups`, otherwise `SEARCH/<q>` →
 `Search` (both) — so "tainted" under Artists no longer drags in the *group* "tainted".
 `do_artists`/`do_groups` closures in `colo_walk` are shared by all three. Thumbnails are
-16colo's pre-rendered render PNGs fetched by the `RemoteThumbs` HTTP pool (`colo_thumb.rs`)
+16colors's pre-rendered render PNGs fetched by the `RemoteThumbs` HTTP pool (`colo_thumb.rs`)
 and uploaded to `thumb_tex` by virtual path (LINEAR — they're rendered previews, not
 pixel-art); we fetch the **larger `/x1/`** render (≈768px, derived from the `tn` path via
 `sixteen::x1_url`), not the tiny `/tn/`, so big grid tiles aren't a blurry upscale. **The
@@ -649,7 +649,7 @@ rematch**, and the *order* of all of it is user-controlled.
 - **PixelFX presets (`FxPreset`, `pixelfx: Vec<FxPreset>`, `PIXELFX_KEY`)** — a snapshot
   of the WHOLE recolor stack (adjustments + order, post-FX, dither, balance, resize,
   reduce, active palette), saved/recalled from the **Places → PixelFX** sub-tab (`places_tab
-  == 4`, inserted between Local and 16colo without renumbering — display order ≠ index).
+  == 4`, inserted between Local and 16colors without renumbering — display order ≠ index).
   `capture_fx_preset`/`apply_fx_preset`; portable fields (`order` as `Vec<u8>`, `postfx`
   as a record) + `#[serde(default)]` so a preset survives new ops/params. Each preset has
   a background `color` + text `fg` tag (auto-contrasts when `fg` is None); `ansi32_swatch_grid`
@@ -680,7 +680,7 @@ rematch**, and the *order* of all of it is user-controlled.
   duplicate. Fork one by applying it and Save-ing a copy (lands top-level / your folder).
 - **Applies to 16colo.rs browsing too.** The remote-thumb upload (`colo_thumbs.drain`) now
   stores the rendered PNG's CPU pixels in `thumb_rgba` (previously only `thumb_tex`), so
-  `grid_recolored_tex` can recolor 16colo tiles (LINEAR — they're rendered previews);
+  `grid_recolored_tex` can recolor 16colors tiles (LINEAR — they're rendered previews);
   `make_preview` falls back to that thumbnail when the raw art isn't downloaded, so a
   hovered piece recolors in the details pane.
 - **Swatches + Export/Save** sit directly under the preview image (prioritized for
@@ -727,11 +727,11 @@ rematch**, and the *order* of all of it is user-controlled.
   take their **base aspect from the open image's `full_tex`** (via `preview_aspect`), not
   the downscaled thumbnail's own dims — otherwise a thumbnail decoded at a different width
   (e.g. cached at 8px before a 9px-cell toggle re-decoded the full view) renders squished.
-  **But a 16colo flat-listing piece (`colo_pieces`) keeps its thumbnail's own dims** — its
-  thumb is 16colo's pre-rendered PNG, a different renderer than our (often very tall) full
+  **But a 16colors flat-listing piece (`colo_pieces`) keeps its thumbnail's own dims** — its
+  thumb is 16colors's pre-rendered PNG, a different renderer than our (often very tall) full
   decode, so forcing it to `full_tex`'s aspect squashed the preview into a thin sliver
   (looked "gone"). `make_preview` likewise decodes `resolve_local(path)` so the colorizer
-  can recolor an opened 16colo piece (its bytes live at the cache file, not the virtual path).
+  can recolor an opened 16colors piece (its bytes live at the cache file, not the virtual path).
 - **9px VGA cell** (`font_9px`, `FONT_9PX_KEY`, **off by default**) is a separate
   status-bar toggle (next to CRT, text-mode art only) that renders the 8-pixel CP437
   glyph in a **9-dot-wide cell**, the way real VGA text mode did: the 9th column is
@@ -742,8 +742,8 @@ rematch**, and the *order* of all of it is user-controlled.
   storage on startup; toggling it calls `redecode_full` to rebuild the viewer texture
   in place (keeping zoom/pan). `redecode_full` decodes `resolve_local(path)` (the **real**
   cache file) while keeping the virtual `path` as the stored identity — same split as
-  `load_full`; without it, re-decoding a 16colo piece read the *virtual* path off disk,
-  failed silently, and the toggle was a no-op. This is why ansilove/16colo (9-dot) render
+  `load_full`; without it, re-decoding a 16colors piece read the *virtual* path off disk,
+  failed silently, and the toggle was a no-op. This is why ansilove/16colors (9-dot) render
   wider than a naive 8px blit. Thumbnails aren't re-rendered on toggle (sub-pixel at thumb
   scale).
 - **Baud-rate playback** (ANSImation / "watch RIP draw"). The whole engine is "render
@@ -806,7 +806,7 @@ rematch**, and the *order* of all of it is user-controlled.
   link** (flows `a · b · c`) — then the **SAUCE comment / description** (the COMNT block on
   local scene files — `sauce::parse`,
   which `cached_sauce` reads a ~16 KB tail for since COMNT precedes the 128-byte record; the API
-  `Comments` string on 16colo pieces), then an **attributes** row flowing `label value · …`
+  `Comments` string on 16colors pieces), then an **attributes** row flowing `label value · …`
   (type / columns / lines / font / group / pack / year, or local type / size / dimensions /
   colors / created) — ending in a ★ rating. A one-field row reads as its own line; a
   multi-field row wraps only on overflow. **Placement** (`osd_position` 0..=7, a spatial 3×3
@@ -814,7 +814,7 @@ rematch**, and the *order* of all of it is user-controlled.
   (left/center/right) and vertical third (top/middle/bottom) resolved independently, so any
   corner or edge-center — top-left, top-right, bottom-left, bottom-right, etc. — is a single
   choice. **Interactive:** `paint_osd` returns `(rect, link rects, close rect)` —
-  links (`osd_links`) each carry an `open_folder` target (a local directory or a 16colo
+  links (`osd_links`) each carry an `open_folder` target (a local directory or a 16colors
   artist/group/pack/year virtual path), and the top-right **`×`** (`osd_close`) **dismisses the
   OSD for this view** (`osd_dismissed`, reset on the next `load_full` so it returns on the next
   image). `draw_image_view` hit-tests last frame's rects (using `hover_pos().or(interact_pos())`
@@ -910,7 +910,7 @@ keyboard + pan/zoom semantics differ from browse/single (adding the variant made
 compiler flag every `match self.mode` site to decide Compare's behaviour). The chosen paths
 live on `Kaleidotron` (`compare_source`/`compare_diff`); the transient runtime — decoded
 `PixImage`s, two `TiledTexture`s, the overlay texture, per-pane zoom/offset — is a
-`Compare` struct. `enter_compare` decodes both via `resolve_local` (so archive / 16colo
+`Compare` struct. `enter_compare` decodes both via `resolve_local` (so archive / 16colors
 virtual paths work) and builds the textures with `view_tex_opts`.
 
 **Two panes, `source | diff`**, split from `available_rect_before_wrap` with a 2px gutter +
@@ -991,7 +991,7 @@ The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF
   → `mesh3d::decode_thumb(path, 512)`. `.blend`/`.blend1` are likewise path-routed →
   `mesh3d::decode_blend(path)`. Gated by `plugin_disabled` (mesh_on) for `MESH_EXTS` + `AUX_EXTS`.
 - **`Mode::ThreeD` (`ui_three_d`) + cameras.** `load_full`'s `is_mesh_path` branch decodes via
-  `resolve_local` (archive/16colo virtual paths work) into a `ThreeDView { mesh, orbit, fly,
+  `resolve_local` (archive/16colors virtual paths work) into a `ThreeDView { mesh, orbit, fly,
   pre_fly, tex, sig, fps }`. **`load_full` OWNS the view mode** (defaults to Single at the top,
   the mesh branch overrides to ThreeD) — callers must NOT set `self.mode = Single` *after*
   `load_full` (that clobbered ThreeD → "Nothing loaded"; the old `activate`/`poll_colo_open`
@@ -1127,7 +1127,7 @@ audio toggle doesn't gate it.
   the **YouTube browser** (Phase 3 — `yt-dlp` as the "API" mirroring `sixteen.rs`, reusing `cache.rs` +
   `RemoteThumbs` + this same ffmpeg frame pipe, since `ffmpeg -i <stream-url>` reads URLs like files).
 
-## YouTube browser (`src/youtube.rs` + `app.rs` — mirrors the 16colo source model)
+## YouTube browser (`src/youtube.rs` + `app.rs` — mirrors the 16colors source model)
 
 A **Places → YouTube tab** (search box) that browses YouTube like 16colo.rs: search → a grid of
 result tiles with thumbnails → open a video by **downloading it in place** then playing the local
@@ -1180,7 +1180,7 @@ reusing the whole YouTube source. Reads the local Steam config directly — no S
   `SteamGame{appid,name,last_played,size}` (`installed_games`, sorted, de-duped, runtimes filtered by
   `is_nongame`). URL helpers: `header_url` (CDN thumbnail), `store_url`, `run_url`
   (`steam://rungameid/<appid>`), `hub_url`, `discussions_url`. `ROOT = "<steam>"` + `is_remote` +
-  `rel_parts` mirror the youtube/16colo virtual-path scheme. A `#[ignore]` `lists_real_library` test
+  `rel_parts` mirror the youtube/16colors virtual-path scheme. A `#[ignore]` `lists_real_library` test
   dumps the machine's actual games.
 - **`app.rs`**: `steam_games` (virtual path → `SteamGame`); `open_folder` routes `steam::is_remote`
   → **`open_steam`** (scans `installed_games`, builds `<steam>/<Name>` entries with a rating read
@@ -1189,7 +1189,7 @@ reusing the whole YouTube source. Reads the local Steam config directly — no S
   submenu (`TilePick::Steam(SteamAct)`): Find videos / **Launch game** (`open_url(run_url)` → xdg-open
   → the Steam client) / Store page / Community hub / Discussions. The Places tab also has **🔀 Random
   game → videos** (`steam_random_videos`, wall-clock pick). Games are **ratable** (virtual entries →
-  the `ratings.json` sidecar, like 16colo/YouTube) and **pinnable** (favorites). `any_remote` now =
+  the `ratings.json` sidecar, like 16colors/YouTube) and **pinnable** (favorites). `any_remote` now =
   `sixteen || youtube || steam`.
 - **Deferred**: deeper in-app game browsing (news/achievements/screens), and the broader idea of an
   **HTTP/FTP "virtual filesystem" browser** (pass a URL → introspect + crawl it, Total-Commander
@@ -1259,7 +1259,7 @@ attribute bytes*, where index 1=blue and 4=red, so they must use `ansi::VGA_PALE
 handed by the raw `attr & 0x0f`, so the **caller** picks the right order: `bin.rs` and
 `xbin.rs` (no embedded palette) pass `VGA_PALETTE`; XBIN/IDF/ADF *embedded* palettes are
 already VGA-ordered (raw RGB by attribute index) and are indexed directly. Bug symptom:
-a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
+a piece whose 16colors/ansilove thumbnail is red renders blue in the viewer
 (`MULTI-13.BIN`); guarded by `bin::tests::vga_attribute_indices_are_not_ansi_order`.
 
 ## Settings & ratings
@@ -1277,10 +1277,10 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
   bitmask), `KEYMAP_KEY`).
   `persist_egui_memory()` returns `false` — we persist only our keys, in `save()`.
 - **Last folder** (`FOLDER_KEY`) is reopened on launch (CLI `--folder` wins). `save()`
-  stores the **display** path, not `self.folder` — inside an archive / downloaded 16colo
+  stores the **display** path, not `self.folder` — inside an archive / downloaded 16colors
   pack the latter is a temp dir that's gone next run, whereas the display path
   (`pack.zip/…`, `<16colo.rs>/year/pack`) is stable. `new()` restores it when it's a real
-  dir, a 16colo path (re-fetched), or an archive file (re-extracted) — `open_folder`
+  dir, a 16colors path (re-fetched), or an archive file (re-extracted) — `open_folder`
   routes each. (A subpath *inside* a local archive isn't restored — `is_archive` only
   matches the archive file itself.)
 - **Two independent zoom axes:** Ctrl +/- = whole-GUI scale (egui `zoom_factor`);
@@ -1292,10 +1292,10 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
   (removes the attr); single view rates the current image. In the grid/table the **tile
   under the cursor wins** when it isn't part of the selection (`apply_rating`) — so "point
   at a piece and press 3" rates *that* one even with an earlier-opened piece still selected
-  (the 16colo flat-listing gotcha); hovering one of the selected tiles still rates the whole
+  (the 16colors flat-listing gotcha); hovering one of the selected tiles still rates the whole
   selection. The shared `entry_context_menu` also has a **★ Rating** submenu (Unrated/1–5
   with the 0–5 hotkeys shown via `Button::shortcut_text`, current marked selected →
-  `TilePick::Rate` → `rate_entry`), a reliable rating path for 16colo pieces.
+  `TilePick::Rate` → `rate_entry`), a reliable rating path for 16colors pieces.
 - **Cross-platform sidecar** (`ratings.rs`, `RatingStore`): xattrs only exist for a
   real on-disk file on Linux, but **virtual art has no such file** — archive contents
   are extracted to a *disposable* temp dir and 16colo.rs pieces are downloaded on
@@ -1367,7 +1367,7 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   Then `💾 Save` (Ctrl+S) / `Save as…` / `↶ Revert` / `✕ Done`, a `● modified` marker
   (`text_is_dirty` = buffer ≠ `text_orig`), and a native confirm before ANY exit that would discard
   (‹ Grid, Escape, and `load_full` — the choke point every other file-open goes through). **Save
-  refuses a virtual path** (archive / 16colo / YouTube cache): writing there hits a temp copy that's
+  refuses a virtual path** (archive / 16colors / YouTube cache): writing there hits a temp copy that's
   thrown away, so it looks like it worked and silently loses the edit — Save as… instead. The buffer
   is **normalised to LF on load** (`text_crlf`) so galley/cursor/find offsets all agree, and saving
   converts back — a CRLF file round-trips byte-identical. **🔍 Find** (Ctrl+F) highlights every match
@@ -1704,9 +1704,9 @@ base/octave + global velocity + every pad's record** + `pad_NN.wav`s; `save_kit`
 `zip` crate). **New** (`new_kit`) clears all 16 pads + removes their persisted WAVs + resets
 name/base/global-velocity to defaults (confirms first via native OK/Cancel when the kit has content,
 since the working set can't be undone; keeps the MIDI connection). Saved
-kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · PixelFX · 16colo · Kits · Samples`**
-(PixelFX is `places_tab == 4`, ordered between Local and 16colo by the button array, *not* by index,
-so 16colo/Kits/Samples keep their indices; Kits/Samples audio-plugin-only): the **PixelFX** tab is the
+kits live in `<data>/kits/`. **Places dock sub-tabs are `Local · PixelFX · 16colors · Kits · Samples`**
+(PixelFX is `places_tab == 4`, ordered between Local and 16colors by the button array, *not* by index,
+so 16colors/Kits/Samples keep their indices; Kits/Samples audio-plugin-only): the **PixelFX** tab is the
 recolor-preset library (see the Recolor section — save current stack, apply, rename, bg/fg colorize,
 remove; deferred `fx_*` locals applied after the closure); the **Kits** tab lists saved `.pvkit`s
 (click → `load_kit` into the current pads, no navigation) and **opens the standalone pad editor**
@@ -2001,7 +2001,7 @@ than assuming a logic bug. Already hit and migrated for 0.34.3:
 - `Context::wants_keyboard_input()` → **`egui_wants_keyboard_input()`**. Used in the
   global key handler's `typing` guard so hotkeys (ratings, Backspace→ParentDir, R→random
   pack) are suppressed while a text field is focused — the explicit `path_edit`/`search`
-  flags don't cover the 16colo search box / advanced-search fields, only this does.
+  flags don't cover the 16colors search box / advanced-search fields, only this does.
 - **`ui.put(rect, widget)` advances the layout cursor** — it isn't a pure "draw at this
   rect" overlay. `put` runs `scope_builder` → `advance_cursor_after_rect(child.min_rect())`,
   and for a widget that **doesn't stretch to fill** its `max_rect` (a *vertical* `Slider`,

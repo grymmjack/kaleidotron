@@ -1,7 +1,12 @@
 # kaleidotron
 
-A fast, **pixel-art-first** image **browser** for Linux/macOS/Windows, written in
-Rust with [egui/eframe](https://github.com/emilk/egui). 
+A fast, **pixel-art-first** media **browser** for Linux/macOS/Windows, written in
+Rust with [egui/eframe](https://github.com/emilk/egui).
+
+It started as an image viewer. It now also renders 3D models, plays and trims
+video, edits samples and MIDI drum kits, browses eight web sources, and edits
+text — hence the name.
+
 
 > I wrote this to accompany my https://github.com/grymmjack/pixelmon so I could easily see my generated AI art and rate it fast.
 > Needless to say, things got a little...
@@ -19,6 +24,14 @@ Think *Gwenview for pixel art and the BBS scene*: crisp nearest-neighbor zoom, p
 a virtualized thumbnail grid, and first-class support for ANSI / PETSCII / RIPscript
 and the rest of the demoscene / textmode art world — right down to baud-rate
 "watch it type" playback and CRT effects.
+
+### A few screens
+
+| | |
+|---|---|
+| ![grid](docs/screenshots/grid.png) **Thumbnail grid** — virtualized, independently zoomable, with a live details dock | ![table](docs/screenshots/table.png) **Table view** — sortable, resizable, reorderable columns |
+| ![viewer](docs/screenshots/viewer.png) **Viewer** — pixel-perfect scene art, metadata OSD, baud-rate playback | ![3d](docs/screenshots/three-d.png) **3D viewer** — CPU-rasterized, orbit or FPS free-fly |
+| ![audio](docs/screenshots/audio-sampler.png) **Sampler** — waveform editor, 16 pads, MIDI in | ![text](docs/screenshots/text-theme.png) **Text viewer** — real syntax highlighting, VS Code themes |
 
 ---
 
@@ -43,6 +56,20 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   - [Archives & 16colo.rs](#archives--16colors)
   - [Scene art, ANSImation & retro effects](#scene-art-ansimation--retro-effects)
   - [Animated GIFs](#animated-gifs)
+  - [Text viewing & editing](#text-viewing--editing)
+  - [3D models](#3d-models)
+  - [Video](#video)
+  - [Image compare](#image-compare)
+  - [Mind maps (XMind)](#mind-maps-xmind)
+  - [Fonts & type](#fonts--type)
+  - [AI generation](#ai-generation-plugin)
+  - [Git status](#git-status)
+- [The interface](#the-interface)
+  - [Activity rail & docks](#activity-rail--docks)
+  - [Command palette & quick open](#command-palette--quick-open)
+  - [Themes (and VS Code theme import)](#themes-and-vs-code-theme-import)
+  - [Configuration files](#configuration-files)
+- [Web sources](#web-sources)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Command-line options](#command-line-options)
   - [Rendering text art to files](#rendering-text-art-to-files---render)
@@ -81,6 +108,26 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   playback with a per-sample explorer/export, and **sample banks — SoundFont / SFZ / DLS —
   browsed as a folder** of their samples). Each is a **toggleable plugin** you can switch off in
   Preferences.
+- **3D models** (`obj/stl/ply/gltf/glb/dae`) with real thumbnails and an interactive
+  viewer — orbit or FPS free-fly, textured/wireframe, light presets, PNG export. Rendered
+  on the **CPU**, so the same renderer draws the tile and the viewport.
+- **Video** (`mp4/mkv/webm/mov/…` via ffmpeg) — real frame thumbnails, hover-scrub, an
+  in-app player with A/V sync, audio-scrubbing seek, **lossless trim and join**, frame
+  export, and **chapter markers in a `.md` sidecar** that paste straight into a YouTube
+  description.
+- **Text editing, opt-in** — source files open in a real, selectable, syntax-highlighted
+  text view; an `✎ Edit` button turns on saving, find/replace and `tail -f` follow. Until
+  you press it, nothing can overwrite a file.
+- **Nine web sources**, all keyless — 16colo.rs, Poly Haven, Google Fonts, Lospec, The Mod
+  Archive, Openverse, Iconify, Wikimedia, plus an **HTTP browser** that turns any URL into
+  a browsable tree with wildcard batch download. Also YouTube (via yt-dlp) and your local
+  Steam library.
+- **A VS Code-shaped interface** — activity rail, command palette (`Ctrl+Shift+P`), quick
+  open (`Ctrl+P`), per-mode panel layouts, toasts, recents, and four editable config files.
+  **Drop a VS Code theme in and it just works**, for the app chrome, the syntax
+  highlighting, or both.
+- **Side-by-side image compare** with a tolerance/opacity diff overlay and **layered PSD
+  export**, so the diff stays editable in Photoshop or GIMP.
 - **Star ratings** stored as KDE Baloo xattrs (interoperate with Gwenview), with a
   cross-platform sidecar so even art inside a zip or on 16colo.rs is ratable.
 - **A fading metadata OSD** in the viewer — title, artist(s), SAUCE comment and
@@ -159,6 +206,22 @@ down to the extensions a decoder claims.
 |---|---|---|
 | **Sample banks** | **SoundFont** (`.sf2`), **SFZ** (`.sfz`), **DLS** (`.dls`) | Browsed as a folder of their samples; presets/instruments/sample counts |
 | **Instruments** | **FastTracker II** (`.xi`), **Renoise** (`.xrns` song / `.xrni` instrument) | Browse + play + export the samples inside |
+
+### 🧊 3D models *(plugin)*
+
+`.obj` `.stl` `.ply` `.gltf` `.glb` `.dae` — geometry, one diffuse map and a flat base
+colour; `.mtl` renders as a swatch grid of its materials; `.blend` shows a cached
+headless-Blender render (no Rust crate can parse modern `.blend` files).
+
+### 🎬 Video *(plugin — needs ffmpeg)*
+
+`.mp4` `.m4v` `.mkv` `.webm` `.mov` `.avi` `.wmv` `.flv` `.mpg` `.mpeg` `.mts` `.m2ts`
+`.ts` `.ogv` `.3gp`
+
+### 🧠 Mind maps
+
+`.xmind` — rendered from the file's own theme, with markers, notes, images, boundaries,
+relationships and multiple sheets.
 
 ### 🗜 Archives & online
 
@@ -599,7 +662,7 @@ The textmode/BBS side is the heart of kaleidotron:
   `38;2`/`48;2`) renders pixel-identical to ansilove, not snapped to the 16-color palette.
 - **9-dot VGA cell** (toggle) — renders the 8-pixel glyph in a 9-wide cell the way
   real VGA text mode did (the 9th column repeats for line-draw chars so box rules
-  join). This is why output matches ansilove / 16colo widths.
+  join). This is why output matches ansilove / 16colors widths.
 - **Baud-rate playback** — watch ANSI art and RIPscript *draw themselves* at an
   authentic modem speed (300 baud crawl → 115.2k). Pick a rate in the status bar; the
   view auto-scrolls BBS-style to follow the cursor. ANSI and RIP remember independent
@@ -623,6 +686,278 @@ The textmode/BBS side is the heart of kaleidotron:
 
 Animated GIFs play in the viewer (autoplay + frame seek) and **play on hover** in the
 thumbnail grid.
+
+---
+
+### Text viewing & editing
+
+Source and text files (~90 extensions) open in a **real text view** — selectable,
+copyable, searchable — not a picture of text. Syntax highlighting comes from a
+hand-rolled lexer with per-language comment/string rules, so there's no heavyweight
+grammar engine in the dependency tree.
+
+![text editing](docs/screenshots/text-editing.png)
+
+**Editing is opt-in.** The `✎ Edit` button enables it, GitHub-style. Until you press
+it, nothing you type can change a file — a browser that silently overwrites your
+source is a different kind of program, and *falling into* that by pressing keys in a
+viewer would be the worst version of it.
+
+| | |
+|---|---|
+| `✎ Edit` | make the document editable |
+| `💾 Save` / `Ctrl+S` | write it back |
+| `Save as…` | write elsewhere, and follow the document there |
+| `↶ Revert` | discard everything since open/last save |
+| `● modified` | shown whenever the buffer differs from disk |
+
+A native confirm guards **every** exit that would discard unsaved work — the back
+button, `Esc`, and opening any other file.
+
+Saving is refused for a file inside an **archive** or a **16colors/YouTube download**:
+those paths point at a temp copy that gets thrown away, so the save would appear to
+work and quietly lose your edit. Use *Save as…* to write somewhere real.
+
+**Line endings round-trip.** The buffer is normalised to LF internally so the layout,
+the cursor and search offsets all agree; saving restores the file's own endings, so a
+CRLF file comes back byte-identical apart from your edit.
+
+**Find & replace** (`Ctrl+F`) highlights every match inline — as part of the text
+layout, so highlighting survives scrolling and wrapping — with the current match
+tinted differently, and `Enter` / `Shift+Enter` to walk them. Replace appears only in
+edit mode.
+
+**Follow (`tail -f`)** re-reads the file as it grows and stays pinned to the end.
+
+![follow](docs/screenshots/text-follow.png)
+
+---
+
+### 3D models
+
+*Plugin — off by default.* `.obj` `.stl` `.ply` `.gltf` `.glb` `.dae`, plus `.mtl`
+material swatches and `.blend` previews.
+
+![3D viewer](docs/screenshots/three-d.png)
+
+Grid thumbnails are real renders, and opening a model enters an interactive viewer.
+
+The renderer is a **z-buffered CPU rasterizer**, not the GPU. That isn't a compromise
+— the thumbnailer runs on worker threads with no GPU context, and using one renderer
+for both the tile and the viewport means they can never disagree.
+
+- **Orbit** (default) — drag to rotate, wheel to zoom, `Space`+drag to pan, `W`/`S` dolly
+- **Right-click** toggles **FPS free-fly** (Blender walk-mode) — mouse looks, `WASD`
+  moves, `Q`/`E` down/up. Entering seeds the camera from the orbit view so nothing
+  jumps; leaving carries the pose back
+- `Textured` and `Wireframe` are independent — wireframe is a depth-tested overlay, so
+  it composes with either shading mode
+- **Scene…** menu with named light presets (Studio / Product / Top / Rim / Dramatic…)
+- **⬇ PNG** exports the current view at viewport size with a transparent background
+
+`.blend` files can't be parsed — no Rust crate reads modern Blender 4.x — so
+right-click → **🎬 Render with Blender** shells out to `blender -b` and *caches the
+result as that file's thumbnail*, across restarts.
+
+---
+
+### Video
+
+*Plugin — off by default. Needs `ffmpeg` / `ffprobe` on PATH.*
+
+`.mp4` `.mkv` `.webm` `.mov` `.avi` `.wmv` `.flv` `.mpg` `.ts` `.ogv` `.3gp` and more.
+Thumbnails are a real frame (grabbed 10% in, to skip black intros); opening one enters
+a player with proper A/V sync — frames chase the audio clock, so it stays in sync on a
+slow machine rather than drifting.
+
+- **Transport** — play/pause (`Space`), a seek bar, speed 0.25×–4×, frame counter, and
+  a `m:ss` "go to" field
+- **Scrubbing plays audio** while you drag the playhead, DAW-style, even when paused
+- **Hover-scrub thumbnails** — hovering a video tile in the grid extracts a strip of
+  frames and maps pointer-x to a frame, YouTube-storyboard style
+- **Lossless trim** — `i` / `o` set in/out, then *Export clip…* stream-copies the range
+- **Lossless join** — select several clips → right-click → *Join N videos*
+- **Chapter markers in a `.md` sidecar** — `clip.mp4` → `clip.md`. Timecode lines
+  (`0:00 Intro`) become markers with notes beneath them; press `m` to drop one at the
+  playhead. The file is YouTube-chapter-compatible, so logging footage and writing the
+  description are the same action
+- **Extract audio** to a file, or straight into the built-in sampler
+
+---
+
+### Image compare
+
+Right-click any file → **Compare ▸ Set as source / Set as diff**. Setting both opens a
+two-pane comparison that overlays per-pixel differences in a colour you pick.
+
+- Independent **or synced** pan/zoom
+- **Tolerance** and overlay **opacity** sliders, a differing-pixel readout, side swap
+- **Layered PSD export** — the base image plus an opaque diff-colour layer whose *layer
+  opacity* is the slider, so the blend stays editable in Photoshop or GIMP rather than
+  being baked into pixels
+- **Save/recall named comparisons**
+
+---
+
+### Mind maps (XMind)
+
+`.xmind` files render as real mind maps — the archive is unzipped, `content.json`
+parsed, laid out with a tidy-tree algorithm, emitted as SVG and rasterized.
+
+It reads **the file's own theme**, so a map looks like it does in XMind: branch
+palettes, filled or outlined topics, tapered ribbon connectors. Markers (priority,
+task, flag, star), notes, labels, embedded images, boundaries, relationship arrows and
+detached/floating topics all render. Multi-sheet files get a sheet selector, and
+`←`/`→` turn sheets.
+
+Because it's vector, zooming **re-renders from source** rather than magnifying a
+bitmap — the same treatment PDF pages get.
+
+---
+
+### Fonts & type
+
+`.ttf` `.otf` `.ttc` `.otc` and TheDraw `.tdf` files are first-class: a font's tile is a
+rendered sample, and opening one gives a **type specimen** view with a glyph browser and
+an editable sample string.
+
+- **Colour fonts** (COLR/CPAL — emoji fonts and layered colour typefaces) render in
+  their real colours, not as flat outlines
+- **TheDraw `.tdf`** — the ANSI scene's block-letter fonts, all three flavours (outline,
+  single-colour, multi-colour), rendered with the authentic CP437 cell
+- **A logo maker** turns any TTF into art: ink / background / stroke colours, and a **3D
+  extrusion** mode that builds a real mesh (caps, walls, bevel) and renders it through
+  the same 3D pipeline as a model — exportable as PNG or as **vector SVG**
+
+### AI generation *(plugin)*
+
+An optional tab that shells out to a local generator, with results landing straight in
+the grid where the ratings, palette tools and recolor pipeline already are. Off by
+default; it's the one source that expects something set up on your machine.
+
+### Git status
+
+In a git repository, files are annotated with their status — a grid corner badge, a
+table column, a Details line, and a filename tint (new = green, modified = orange,
+conflict = red, ignored = grey).
+
+It shells out to `git status --porcelain` once per folder, off the UI thread, so a
+large monorepo can't stall navigation. Outside a repo — or with no `git` — it's
+completely inert. Toggleable in Preferences.
+
+---
+
+## The interface
+
+### Activity rail & docks
+
+![grid](docs/screenshots/grid.png)
+
+A VS Code-style **activity rail** down the left edge: sections (Files, Sources, Audio,
+FX, AI) plus one button per enabled web source, and ⚙ Settings pinned at the bottom.
+`»` expands it to show labels beside the icons; the icon size is configurable.
+
+- **Docks** — an explorer (folder tree + filter), a live details pane, and the recolor
+  pane, each toggleable
+- **Layouts are remembered per view mode** — the panels you want while browsing a grid
+  aren't the ones you want in the viewer, so each mode keeps its own arrangement
+- **Recents** in the Places dock, storing the *display* path so an entry inside an
+  archive or a downloaded pack survives a restart
+- **Toast notifications** for background work (downloads, saves, renders)
+- Left-clicking ⚙ opens a menu straight to the config files
+
+### Command palette & quick open
+
+| | |
+|---|---|
+| `Ctrl+Shift+P` | **command palette** — every menu action, searchable |
+| `Ctrl+P` | **quick open** — jump to a file in the current folder by name |
+
+![command palette](docs/screenshots/command-palette.png)
+
+### Themes (and VS Code theme import)
+
+Themes are `~/.local/share/kaleidotron/themes/*.json`. **Drop a VS Code theme in that
+folder and it's imported directly** — `colors` become the app chrome, `tokenColors`
+become syntax highlighting.
+
+![text theme](docs/screenshots/text-theme.png)
+
+A **scope** switch decides how far a theme reaches: *Everything*, *Code only* (syntax,
+app keeps its built-in look), or *App only*.
+
+Syntax theming resolves a theme's **own language scopes**, not just generic ones. This
+matters more than it sounds: a theme written for QB64PE colours a statement
+`keyword.all.QB64PE`, and asking only for the generic `keyword` finds whatever base
+rule the theme inherited — often nearly identical to its identifier colour, so the file
+renders almost monochrome and the theme looks like it never loaded.
+
+The **grid thumbnail is themed too**, so a source file's tile matches the viewer.
+
+### Configuration files
+
+Four text files, all tolerant of `//` comments, seeded on first run, and never fatal if
+you break one.
+
+![config files](docs/screenshots/config-files.png)
+
+| file | holds |
+|---|---|
+| `settings.json` | ~45 curated settings, one object per section |
+| `keybindings.json` | actions keyed by name |
+| `themes/*.json` | app + syntax themes, including imported VS Code ones |
+| `secrets.json` | API keys — `0600`, and deliberately **not** in `settings.json` so that file stays safe to sync |
+
+Preferences has a **Config files** tab listing each with its last-modified time and a
+button to open it.
+
+`settings.json` is written **atomically**, and a file that exists but can't be read is
+copied aside rather than replaced — losing hand-written settings to a half-written file
+is not an acceptable failure mode.
+
+![preferences](docs/screenshots/preferences.png)
+
+---
+
+## Web sources
+
+Each is a **plugin, off by default** (Preferences → Format plugins / Web sources), and
+each appears as a browsable place in the rail. All are **keyless** except where noted —
+no account, no API token.
+
+| source | what you get |
+|---|---|
+| **[16colo.rs](https://16colo.rs)** | the ANSI archive as a virtual folder — years, packs, groups, artists, search; bulk-download an artist or pack for offline use |
+| **[Poly Haven](https://polyhaven.com)** | CC0 3D models, textures and HDRIs. Models arrive as bundles (glTF + `.bin` + textures) and are materialised so they just open |
+| **[Google Fonts](https://fonts.google.com)** | browse and preview the whole library |
+| **[Lospec](https://lospec.com)** | palette browser, with a detail view — author, colours, downloads |
+| **[The Mod Archive](https://modarchive.org)** | tracker modules, playable in place |
+| **[Openverse](https://openverse.org)** | CC-licensed images, audio and animated GIFs |
+| **[Iconify](https://iconify.design)** | icon search across many sets |
+| **Wikimedia** | vector/SVG art search |
+| **HTTP browser** | point it at *any* URL and browse it like a folder tree |
+
+![web browser](docs/screenshots/web-browser.png)
+
+The **HTTP browser** doesn't need an Apache/nginx autoindex — it introspects the
+rendered page, extracts links with their names, and lets you **select by wildcard** and
+**batch download**, including recursively. Total Commander's FS plugins, roughly.
+
+**YouTube** (needs `yt-dlp`) searches and plays videos by downloading them in place;
+once downloaded a video is an ordinary local file, so markers, trim, join and frame
+export all apply. Downloads go to a configurable folder kept **out** of the HTTP cache.
+
+**Steam** reads your local Steam library — no API key, no login — lists installed games
+as tiles, and routes a click to a YouTube search for that game. Right-click to launch
+the game, or open its store page, hub or discussions.
+
+### Being a good citizen
+
+Every web source goes through one HTTP choke point that honours **robots.txt**
+(RFC 9309, including `Crawl-delay`), rate-limits per host, backs off on `Retry-After`,
+sends an honest User-Agent, and caches aggressively — a 2 GiB on-disk cache with LRU
+eviction, so re-browsing costs nothing. The bulk downloader is **cache-first**: anything
+you've already viewed is copied locally without a request.
 
 ---
 
@@ -650,7 +985,10 @@ The rest are fixed (this is the same list shown in **Help → Keyboard shortcuts
 | `Home` / `End` | Grid: first / last · Viewer: scroll to top / bottom |
 | `PageUp` / `PageDown` | Viewer: scroll 25 lines (a screen of scene art) |
 | `/` | Grid: filter by filename |
-| `Ctrl + F` | Open advanced recursive search |
+| `Ctrl + F` | Advanced recursive search · **in the text view: find/replace** |
+| `Ctrl + P` | Quick open — jump to a file by name |
+| `Ctrl + Shift + P` | Command palette — every action, searchable |
+| `Ctrl + S` | Save (text view, while editing) |
 | `Drag` | Pan the image (viewer) |
 | `F` | Fit to window + auto-fit new images (viewer) |
 | `T` | Grid/Table toggle (browse) · Tile preview — fill window (viewer) |
@@ -659,7 +997,11 @@ The rest are fixed (this is the same list shown in **Help → Keyboard shortcuts
 | `0` | Clear rating |
 | `R` | Jump to a random 16colo.rs pack |
 | `Enter` | Open the current file in its OS default app |
-| `Space` | Play / pause the audio preview |
+| `Space` | Play / pause audio · video playback |
+| `i` / `o` | Video: set trim in / out |
+| `m` | Video: drop a chapter marker at the playhead |
+| `Shift + Esc` | PANIC — stop all sound immediately |
+| Right-click | 3D viewer: toggle FPS free-fly |
 | `Click` | Open image / enter folder |
 | `Ctrl + Click` | Toggle selection |
 | `Shift + Click` | Range-select |
@@ -680,7 +1022,7 @@ zoom ladder. (Holding `Z` suppresses the `1`–`5` rating keys.)
 ## Command-line options
 
 ```
-kaleidotron — a pixel-art-first image viewer
+kaleidotron — a pixel-art-first media browser
 
 USAGE:
     kaleidotron [OPTIONS]
@@ -701,7 +1043,7 @@ RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files
         --outdir <DIR>            Output folder for batch conversion (created if needed).
                                   Default: each file is written beside its input.
         --font-9px                Render the 9-dot VGA text cell (line-draw chars join),
-                                  the way real VGA / ansilove / 16colo do. Default: 8-dot.
+                                  the way real VGA / ansilove / 16colors do. Default: 8-dot.
         --scale <N>               Nearest-neighbor upscale the output N× (default 1).
         --format <FMT>            Force the output encoder (png, bmp, tga, …) instead of
                                   inferring it from the output filename's extension.
@@ -725,7 +1067,7 @@ kaleidotron --render ART.ANS
 # ANSI → an explicit output path
 kaleidotron --render ART.ANS -o ~/renders/art.png
 
-# XBin, using the authentic 9-dot VGA cell (matches ansilove / 16colo widths)
+# XBin, using the authentic 9-dot VGA cell (matches ansilove / 16colors widths)
 kaleidotron --render SCENE.XB --font-9px -o scene.png
 
 # RIPscript (EGA vector) → PNG
@@ -783,17 +1125,36 @@ the **Format plugins** toggles (source code / PDF / audio), the palette director
 
 ## Settings & where things are stored
 
-- **Settings** persist via eframe's storage at `~/.local/share/kaleidotron/` (Linux).
-  Each setting (zoom, thumbnail size, favorites, last folder, sort/filter, dock
-  visibility, grid spacing, captions, keymap, CRT/baud/look toggles, …) is its own
-  key.
+Everything lives under `~/.local/share/kaleidotron/` on Linux.
+
+- **Settings** persist via eframe's storage — every setting (zoom, thumbnail size,
+  favorites, last folder, sort/filter, dock visibility, grid spacing, captions, keymap,
+  CRT/baud/look toggles, …) is its own key. The ~45 most useful of them are also exposed
+  as editable text in **`settings.json`**, alongside **`keybindings.json`**,
+  **`themes/*.json`** and **`secrets.json`** — see [Configuration files](#configuration-files).
+- **Kits and pads** — the sample-pad working set is `pads/*.wav`, and saved kits are
+  `kits/*.pvkit` (a zip of the samples plus a manifest).
 - **Ratings** live in two places: the `user.baloo.rating` xattr on real files (for
   Gwenview interop) and a portable `ratings.json` sidecar in the data dir (for
   virtual art and non-Linux platforms).
 - **View history** is a small SQLite database (`views.db`) in the data dir — visited
   state, view count, and first/last-viewed, keyed by the same stable display path.
-- **The 16colo.rs cache** lives under `<data>/cache/` (blob files + a `cache.db` index);
-  clear it from Preferences.
+- **The HTTP cache** (16colo.rs and every other web source) lives under `<data>/cache/`
+  — blob files plus a `cache.db` index, capped at 2 GiB with LRU eviction. Clear it from
+  Preferences.
+- **YouTube downloads** go to `<data>/youtube` by default, deliberately *outside* the
+  capped cache since videos are large. Point it elsewhere in Preferences.
+
+### Upgrading from pixelview
+
+kaleidotron was called **pixelview** until August 2026. On first run it copies an old
+`~/.local/share/pixelview` across automatically — ratings, view history, kits, pads,
+themes and settings — and **leaves the original completely untouched** as a backup you
+can delete once you're happy.
+
+The `cache/` and `youtube/` directories are *linked* rather than copied: they're the only
+large things there (gigabytes), and duplicating data that is either regenerable or already
+on disk once would just stall startup.
 - **Palettes** are embedded in the binary; an optional user palette directory adds
   more `.GPL` files on top.
 
@@ -855,12 +1216,32 @@ src/
   ratings.rs         cross-platform ratings.json sidecar
   viewdb.rs          SQLite view-history store (visited / count / last-viewed)
   anim.rs            animated-GIF frame decode
-  sixteen.rs         16colo.rs JSON API client (years/packs/artists/groups/search)
-  cache.rs           persistent SQLite-indexed HTTP cache for 16colo
-  colo_thumb.rs      worker pool fetching 16colo's pre-rendered thumbnails
+  git.rs             per-folder git status (shells out to git status --porcelain)
+  video.rs           interactive video player: ffmpeg frame pipe + rodio audio + A/V clock
+  scale.rs           pixel-art upscalers (Scale2x/3x, Eagle, xBR, HQx, 2xSaI…)
   sauce.rs           SAUCE record + COMNT-comment parsing
   decode/            Decoder trait + every format decoder
   palettes_builtin.rs  the embedded .GPL library
+
+  # configuration
+  settings.rs        settings.json — curated, sectioned, atomically written
+  keybindings.rs     keybindings.json (+ the shared JSONC comment/trailing-comma cleaner)
+  theme.rs           themes/*.json, including VS Code theme import
+  secrets.rs         secrets.json — API keys, 0600, kept out of the shared settings
+
+  # web sources (each keyless; all share cache.rs + netpolicy.rs)
+  netpolicy.rs       robots.txt, per-host rate limiting, backoff — the single choke point
+  cache.rs           persistent SQLite-indexed HTTP cache (2 GiB, LRU)
+  sixteen.rs         16colo.rs JSON API (years/packs/artists/groups/search)
+  colo_thumb.rs      worker pool fetching remote thumbnails
+  polyhaven.rs       Poly Haven CC0 models / textures / HDRIs
+  gfonts.rs          Google Fonts
+  lospec.rs          Lospec palettes
+  modarchive.rs      The Mod Archive (tracker modules)
+  audiosearch.rs     Openverse audio / images / GIFs
+  httpfs.rs          browse any URL as a folder tree (page introspection)
+  youtube.rs         yt-dlp search + download
+  steam.rs           local Steam library → YouTube bridge
 ```
 
 For the deep internals — the recolor pipeline, the pixel-perfect blit math, the RIP

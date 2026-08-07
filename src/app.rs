@@ -965,7 +965,7 @@ impl RailSection {
         match self {
             RailSection::Files => &[(0, "Local")],
             RailSection::Sources => &[
-                (1, "16colo"),
+                (1, "16colors"),
                 (5, "YouTube"),
                 (8, "Images"),
                 (16, "GIFs"),
@@ -42329,7 +42329,7 @@ pub struct CliArgs {
 }
 
 const USAGE: &str = "\
-kaleidotron — a pixel-art-first image viewer
+kaleidotron — a pixel-art-first media browser
 
 USAGE:
     kaleidotron [OPTIONS]
@@ -42350,7 +42350,7 @@ RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files
         --outdir <DIR>            Output folder for batch conversion (created if needed).
                                   Default: each file is written beside its input.
         --font-9px                Render the 9-dot VGA text cell (line-draw chars join),
-                                  the way real VGA / ansilove / 16colo do. Default: 8-dot.
+                                  the way real VGA / ansilove / 16colors do. Default: 8-dot.
         --scale <N>               Nearest-neighbor upscale the output N× (default 1).
         --format <FMT>            Force the output encoder (png, bmp, tga, …) instead of
                                   inferring it from the output filename's extension.
