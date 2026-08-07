@@ -1392,6 +1392,7 @@ pub struct PixelView {
     rail_icon_size: f32, // activity-rail glyph size in points
     rail_expanded: bool, // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
+    prefs_section: u8,        // which Preferences section is showing
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -3080,6 +3081,7 @@ impl PixelView {
             rail_icon_size: 22.0,
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             rail_settings_menu: false,
+            prefs_section: 0,
             recent_dirs: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
@@ -31187,7 +31189,34 @@ impl eframe::App for PixelView {
                     // The scroll area fills the window, so a scrollbar appears exactly when the
                     // content is taller than the current window — drag the window bigger to see
                     // more at once, or drag it wider to spread the controls across two columns.
-                    let ncols = if ui.available_width() >= 640.0 { 2 } else { 1 };
+                    // GIMP/Inkscape-style section list, mirroring settings.json's objects so the
+                    // file and the dialog stay in step. One column now: a single section is short
+                    // enough that the old two-column flow (a full-screen wall) isn't needed.
+                    //
+                    // Section boundaries can only sit at the top level of the block — several
+                    // groups (YouTube, the Steam key, the SoundFont, format colours) live inside
+                    // `if plugin_… {}` conditionals, so they ride along with the section that
+                    // encloses them, and the names reflect where things actually landed.
+                    const PREF_SECTIONS: [&str; 7] = [
+                        "Appearance",
+                        "Viewer",
+                        "Keyboard",
+                        "Sources",
+                        "Plugins",
+                        "Audio & Colors",
+                        "Advanced",
+                    ];
+                    let sec = self.prefs_section;
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, name) in PREF_SECTIONS.iter().enumerate() {
+                            let i = i as u8;
+                            if ui.selectable_label(sec == i, *name).clicked() {
+                                self.prefs_section = i;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    let ncols = 1;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -31195,6 +31224,7 @@ impl eframe::App for PixelView {
                                 let ui = &mut cols[0];
                                 let mut theme = self.theme;
                                 let mut gap = self.grid_gap;
+                                if sec == 0 {
                                 ui.label("Theme");
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut theme, 0, "Dark");
@@ -31225,6 +31255,8 @@ impl eframe::App for PixelView {
                                     );
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 0 {
                                 ui.label("Font preview sample");
                                 let resp = ui.add(
                                     egui::TextEdit::multiline(&mut self.font_preview_text)
@@ -31249,6 +31281,8 @@ impl eframe::App for PixelView {
                                 }
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 1 {
                                 ui.label("Window title bar");
                                 ui.checkbox(&mut self.title_show_path, "Show open path / file")
                                     .on_hover_text(
@@ -31261,6 +31295,8 @@ impl eframe::App for PixelView {
                                 // it opens at this zoom instead of an unreadable 1:1. Measured in
                                 // *device* pixels per source pixel (N×) — the pixel-perfect unit the
                                 // viewer shows; applied to every ANSI/scene file as it loads.
+                                }
+                                if sec == 1 {
                                 ui.label("Text-mode (ANSI/scene) zoom");
                                 let mut tz = self.textmode_zoom.round() as i32;
                                 egui::ComboBox::from_id_salt("textmode_zoom")
@@ -31279,6 +31315,8 @@ impl eframe::App for PixelView {
                                 }
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 0 {
                                 ui.label("Show under thumbnails");
                                 let mut fields = self.caption_fields;
                                 ui.horizontal_wrapped(|ui| {
@@ -31301,6 +31339,8 @@ impl eframe::App for PixelView {
                                         "Draw subtle row + column divider lines in the table view \
                                          (in addition to the zebra striping)",
                                     );
+                                }
+                                if sec == 0 {
                                 ui.label("Table columns (file view)");
                                 let mut tcols = self.table_columns;
                                 ui.horizontal_wrapped(|ui| {
@@ -31318,6 +31358,8 @@ impl eframe::App for PixelView {
                                 self.table_columns = tcols;
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 2 {
                                 ui.label("Hotkeys");
                                 let mut new_rebind: Option<Option<Action>> = None;
                                 egui::Grid::new("prefs_keys")
@@ -31349,6 +31391,8 @@ impl eframe::App for PixelView {
                                 }
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 1 {
                                 ui.label("Viewer info OSD");
                                 ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
                                     .on_hover_text("A fading panel with the piece's details");
@@ -31382,7 +31426,8 @@ impl eframe::App for PixelView {
 
                                 ui.add_space(10.0);
                                 // ── right column (same column as the left when collapsed to 1) ──
-                                let ui = &mut cols[ncols - 1];
+                                }
+                                if sec == 3 {
                                 ui.label("Web sources");
                                 ui.weak("Off by default — switch on the sources you browse.");
                                 for (on, label, hover) in [
@@ -31398,6 +31443,8 @@ impl eframe::App for PixelView {
                                     ui.checkbox(on, label).on_hover_text(hover);
                                 }
                                 ui.add_space(10.0);
+                                }
+                                if sec == 4 {
                                 ui.label("Format plugins");
                                 ui.weak("Turn off a file type you don't want the viewer to handle.");
                                 let mut plug_changed = false;
@@ -31549,6 +31596,8 @@ impl eframe::App for PixelView {
                                 // one (the public search page is parsed); a key just upgrades to
                                 // the XML API's richer metadata (artist / genre / size).
                                 ui.add_space(8.0);
+                                }
+                                if sec == 5 {
                                 ui.label("ModArchive API key (optional)");
                                 ui.horizontal(|ui| {
                                     ui.add(
@@ -31662,6 +31711,8 @@ impl eframe::App for PixelView {
                                 });
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 1 {
                                 ui.label("Transparency");
                                 ui.weak("What shows through an image's transparent pixels in the viewer.");
                                 // Checkerboard row: radio + size dropdown + two colour chips.
@@ -31693,6 +31744,8 @@ impl eframe::App for PixelView {
                                 });
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 6 {
                                 ui.label("Git status");
                                 if ui
                                     .checkbox(
@@ -31712,6 +31765,8 @@ impl eframe::App for PixelView {
                                 ui.weak("Add a \"Git\" column via the table header's right-click menu.");
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 6 {
                                 ui.label("16colo.rs cache");
                                 let (bytes, count) = crate::cache::stats();
                                 ui.horizontal(|ui| {
@@ -31733,6 +31788,8 @@ impl eframe::App for PixelView {
                                 });
 
                                 ui.add_space(10.0);
+                                }
+                                if sec == 6 {
                                 ui.label("3D render cache");
                                 let (bbytes, bcount) = crate::decode::mesh3d::blend_cache_stats();
                                 ui.horizontal(|ui| {
@@ -31748,6 +31805,7 @@ impl eframe::App for PixelView {
                                         clear_blend_renders = true;
                                     }
                                 });
+                                }
                             });
                         });
                 });
@@ -43477,9 +43535,12 @@ mod gui_tests {
         harness.run();
         harness.get_by_label("Preferences…").click();
         harness.run();
-        // A control inside the Preferences window is visible.
+        // Preferences opens on the Appearance section, so its controls are the visible ones.
         harness.get_by_label("Grid spacing (horizontal)");
-        // The rebindable-hotkeys section lists the nav actions.
+        // Settings now live behind section tabs rather than all being shown at once, so the
+        // hotkeys are reachable only after selecting Keyboard — which is exactly what this asserts.
+        harness.get_by_label("Keyboard").click();
+        harness.run();
         harness.get_by_label("Previous image");
     }
 
