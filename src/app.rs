@@ -1431,6 +1431,10 @@ pub struct PixelView {
     rail_expanded: bool, // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
     prefs_section: u8,        // which Preferences section is showing
+    /// The open text/code file: (path, contents). Kept separate from `full_tex` — the grid tile
+    /// stays a raster, the viewer works on the real text.
+    text_doc: Option<(PathBuf, String)>,
+    text_wrap: bool,
     /// The shared command overlay. `Some(true)` = command palette, `Some(false)` = quick-open.
     /// One widget serves both (and later the Preferences search) so the interaction — focus, arrow
     /// keys, Enter, Esc — is written once.
@@ -3145,6 +3149,8 @@ impl PixelView {
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             rail_settings_menu: false,
             prefs_section: 0,
+            text_doc: None,
+            text_wrap: false,
             palette: None,
             palette_query: String::new(),
             palette_sel: 0,
@@ -16951,6 +16957,27 @@ impl PixelView {
     }
 
     fn load_full(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.text_doc = None; // leaving whatever text document was open
+        // Source/text opens in the REAL text viewer (selectable, copyable, searchable) rather than
+        // the rasterised tile. Capped: the layouter colours the whole document, so a huge log would
+        // stall a frame — beyond the cap it falls through to the raster path, which is bounded.
+        if crate::decode::CODE_EXTS
+            .contains(&path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase().as_str())
+            && self.plugin_code
+        {
+            let real = self.resolve_local(&path);
+            const MAX_TEXT: u64 = 4 * 1024 * 1024;
+            let small = std::fs::metadata(&real).map(|m| m.len() <= MAX_TEXT).unwrap_or(false);
+            if small {
+                if let Ok(body) = std::fs::read_to_string(&real) {
+                    self.text_doc = Some((path.clone(), body));
+                    self.set_mode(Mode::Single);
+                    self.full_tex = None;
+                    self.mark_viewed(&path);
+                    return;
+                }
+            }
+        }
         self.kit_editor = false; // opening any file leaves the standalone pad editor
         self.editor_source = None;
         self.edit_focus = EditFocus::Song; // a freshly-opened file isn't a pad drill-in
@@ -24659,6 +24686,13 @@ impl PixelView {
         // In immersive (F11) mode the controls row is hidden too, for a fully black screen.
         let immersive = self.immersive;
 
+        // Real text viewer for source/text: selectable, copyable, searchable — a rasterised
+        // bitmap can be none of those. The grid tile still uses the raster path.
+        if self.text_doc.is_some() {
+            self.draw_text_ui(ui, immersive);
+            return;
+        }
+
         // Font viewer (.ttf/.otf/.ttc): metadata + type-to-sample + glyph grid + copy.
         if let Some(p) = self.full_tex.as_ref().map(|(p, _)| p.clone()) {
             if is_font_ext(&p) {
@@ -28200,6 +28234,94 @@ impl PixelView {
                 egui::Visuals::dark()
             });
         }
+    }
+
+    /// Draw the open text document: a read-only but selectable `TextEdit`, syntax-coloured via a
+    /// `LayoutJob` from the same lexer the raster tile uses, with a line-number gutter.
+    fn draw_text_ui(&mut self, ui: &mut egui::Ui, immersive: bool) {
+        let Some((path, body)) = self.text_doc.clone() else { return };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut back = false;
+        let mut wrap = self.text_wrap;
+        if !immersive {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("‹ Grid").clicked() {
+                    back = true;
+                }
+                ui.separator();
+                ui.strong(short_name(&path));
+                ui.weak(format!("{} lines", body.lines().count()));
+                ui.separator();
+                ui.checkbox(&mut wrap, "Wrap");
+                if ui.button("📋 Copy").clicked() {
+                    ui.ctx().copy_text(body.clone());
+                }
+            });
+            ui.separator();
+        }
+        self.text_wrap = wrap;
+        if back {
+            self.set_mode(Mode::Grid);
+            self.text_doc = None;
+            return;
+        }
+
+        // Colour every line once per frame. The layouter is called by egui with the *whole* text,
+        // so the work is proportional to the document, not to what's on screen — hence the size
+        // cap in `load_full` rather than trying to lay out a 50 MB log.
+        let spans = crate::decode::highlight_lines(&body, &ext);
+        let mono = egui::FontId::monospace(13.0);
+        let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * 8.0 + 12.0;
+        let wrap_at = if wrap { ui.available_width() - gutter_w } else { f32::INFINITY };
+        let mut layouter = move |ui: &egui::Ui, _text: &dyn egui::TextBuffer, _w: f32| -> std::sync::Arc<egui::Galley> {
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = wrap_at;
+            for (i, runs) in spans.iter().enumerate() {
+                for (text, tok) in runs {
+                    let c = crate::decode::tok_rgb(*tok);
+                    job.append(
+                        text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: mono.clone(),
+                            color: egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            ..Default::default()
+                        },
+                    );
+                }
+                if i + 1 < spans.len() {
+                    job.append("\n", 0.0, egui::TextFormat { font_id: mono.clone(), ..Default::default() });
+                }
+            }
+            ui.painter().layout_job(job)
+        };
+
+        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                // Line numbers as a separate, non-selectable column, so copying the body doesn't
+                // drag the numbers along with it.
+                ui.vertical(|ui| {
+                    ui.set_width(gutter_w);
+                    ui.style_mut().visuals.override_text_color = Some(ui.visuals().weak_text_color());
+                    for n in 1..=body.lines().count().max(1) {
+                        ui.label(egui::RichText::new(format!("{n:>5}")).font(egui::FontId::monospace(13.0)));
+                    }
+                });
+                // `interactive(false)` would also disable selection, so the buffer is handed in
+                // as mutable and the edit discarded — read-only *and* selectable/copyable.
+                let mut shown = body.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut shown)
+                        .font(egui::FontId::monospace(13.0))
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter),
+                );
+            });
+        });
     }
 
     /// How long a toast holds at full opacity before fading.
