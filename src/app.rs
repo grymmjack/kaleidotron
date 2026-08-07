@@ -897,6 +897,63 @@ impl SortKey {
 
 /// A deferred menu-bar action, applied after the menu closure returns (so the
 /// nested menu closures never need to borrow `self` mutably).
+/// Which group the Places panel is showing. VSCode's model: a handful of activity-rail icons, each
+/// swapping the whole side panel, instead of one horizontal strip of every tab. A vertical list
+/// inside a panel scales to any number of sources; a tab strip stops working past about eight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RailSection {
+    Files,
+    Sources,
+    Audio,
+    Fx,
+    Ai,
+}
+
+impl RailSection {
+    /// The `places_tab` ids belonging to this section, with their labels, in display order.
+    fn tabs(self) -> &'static [(u8, &'static str)] {
+        match self {
+            RailSection::Files => &[(0, "Local")],
+            RailSection::Sources => &[
+                (1, "16colo"),
+                (5, "YouTube"),
+                (8, "Images"),
+                (16, "GIFs"),
+                (17, "Web"),
+                (9, "Icons"),
+                (10, "Vectors"),
+                (11, "Palettes"),
+                (12, "3D / CC0"),
+                (13, "Fonts"),
+                (14, "Audio"),
+                (15, "Modules"),
+                (6, "Steam"),
+            ],
+            RailSection::Audio => &[(2, "Kits"), (3, "Samples")],
+            RailSection::Fx => &[(4, "PixelFX")],
+            RailSection::Ai => &[(7, "AI")],
+        }
+    }
+    fn to_u8(self) -> u8 {
+        match self {
+            RailSection::Files => 0,
+            RailSection::Sources => 1,
+            RailSection::Audio => 2,
+            RailSection::Fx => 3,
+            RailSection::Ai => 4,
+        }
+    }
+    fn from_u8(v: u8) -> RailSection {
+        match v {
+            1 => RailSection::Sources,
+            2 => RailSection::Audio,
+            3 => RailSection::Fx,
+            4 => RailSection::Ai,
+            _ => RailSection::Files,
+        }
+    }
+}
+
 enum MenuAction {
     Open,
     SelectMask,
@@ -1306,6 +1363,7 @@ pub struct PixelView {
     explorer_filter: String,         // folder-tree search box (runtime only)
     colo_search: String,             // 16colo.rs nav-bar search box (runtime only)
     explorer_tab: u8,                // 0 = Places, 1 = Folders
+    rail_section: RailSection, // which group the Places panel is showing
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -1994,6 +2052,7 @@ impl PixelView {
     const SHOW_FPS_KEY: &'static str = "show_fps";
     const STEAM_KEY_KEY: &'static str = "steam_api_key";
     const MA_KEY_KEY: &'static str = "modarchive_api_key";
+    const RAIL_SECTION_KEY: &'static str = "rail_section";
     const PLUGIN_GIFS_KEY: &'static str = "plugin_gifs";
     const PLUGIN_WEB_KEY: &'static str = "plugin_web";
     const PLUGIN_ICONS_KEY: &'static str = "plugin_icons";
@@ -2988,6 +3047,11 @@ impl PixelView {
             explorer_filter: String::new(),
             colo_search: String::new(),
             explorer_tab: 0,
+            rail_section: RailSection::from_u8(
+                cc.storage
+                    .and_then(|s| eframe::get_value::<u8>(s, Self::RAIL_SECTION_KEY))
+                    .unwrap_or(0),
+            ),
             places_tab: 0,
             sample_places: cc
                 .storage
@@ -27549,7 +27613,62 @@ impl PixelView {
             if icon(ui, "🎨", self.show_recolor, "Recolor pane") {
                 self.show_recolor = !self.show_recolor;
             }
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            // Places sections. Clicking one swaps what the Explorer pane shows (and opens it if
+            // it's hidden — otherwise the click would appear to do nothing).
+            for (sec, glyph, tip) in [
+                (RailSection::Files, "📁", "Files — folders, favorites, filters"),
+                (RailSection::Sources, "🌐", "Sources — online browsing"),
+                (RailSection::Audio, "🎹", "Audio — kits and samples"),
+                (RailSection::Fx, "✨", "PixelFX presets"),
+                (RailSection::Ai, "🤖", "AI generation"),
+            ] {
+                // Hide a section with nothing in it: Audio/AI depend on their plugin, and Sources
+                // is empty when every web source is switched off.
+                let available = match sec {
+                    RailSection::Audio => self.plugin_audio,
+                    RailSection::Ai => self.plugin_ai,
+                    RailSection::Sources => sec.tabs().iter().any(|(i, _)| self.places_tab_enabled(*i)),
+                    _ => true,
+                };
+                if !available {
+                    continue;
+                }
+                if icon(ui, glyph, self.rail_section == sec, tip) {
+                    self.rail_section = sec;
+                    self.show_explorer = true;
+                    self.explorer_tab = 0;
+                    // Land on the first enabled tab of the new section.
+                    if let Some((i, _)) = sec.tabs().iter().find(|(i, _)| self.places_tab_enabled(*i)) {
+                        self.places_tab = *i;
+                        if *i == 2 {
+                            self.kit_editor = true;
+                        }
+                    }
+                }
+                ui.add_space(2.0);
+            }
         });
+    }
+
+    /// Is this Places tab available, given the plugin toggles? Shared by the rail, the section
+    /// list, and the stranded-tab guard so all three agree.
+    fn places_tab_enabled(&self, idx: u8) -> bool {
+        match idx {
+            2 | 3 => self.plugin_audio,
+            7 => self.plugin_ai,
+            9 => self.plugin_icons,
+            10 => self.plugin_vectors,
+            11 => self.plugin_lospec,
+            12 => self.plugin_ph,
+            13 => self.plugin_gfonts,
+            15 => self.plugin_ma,
+            16 => self.plugin_gifs,
+            17 => self.plugin_web,
+            _ => true,
+        }
     }
 
     /// Screensaver controls (status bar): a random-pack launcher + the endless Shuffle
@@ -28526,55 +28645,42 @@ impl PixelView {
                 if self.explorer_tab == 0 {
                     // Sub-tabs: Local · PixelFX · 16colo.rs · Kits · Samples (Kits/Samples
                     // audio-plugin only). PixelFX (idx 4) sits between Local and 16colo.
-                    ui.horizontal_wrapped(|ui| {
-                        for (idx, label) in [
-                            (0u8, "Local"),
-                            (4, "PixelFX"),
-                            (1, "16colo"),
-                            (5, "YouTube"),
-                            (8, "Images"),
-                            (16, "GIFs"),
-                            (17, "Web"),
-                            (9, "Icons"),
-                            (10, "Vectors"),
-                            (11, "Palettes"),
-                            (12, "3D/CC0"),
-                            (13, "Fonts"),
-                            (14, "Audio"),
-                            (15, "Modules"),
-                            (6, "Steam"),
-                            (7, "AI"),
-                            (2, "Kits"),
-                            (3, "Samples"),
-                        ] {
-                            if (idx == 2 || idx == 3) && !self.plugin_audio {
-                                continue;
-                            }
-                            if idx == 7 && !self.plugin_ai {
-                                continue;
-                            }
-                            // Web-source plugins — each hides its own Places tab.
-                            if !match idx {
-                                9 => self.plugin_icons,
-                                10 => self.plugin_vectors,
-                                11 => self.plugin_lospec,
-                                12 => self.plugin_ph,
-                                13 => self.plugin_gfonts,
-                                15 => self.plugin_ma,
-                                16 => self.plugin_gifs,
-                                17 => self.plugin_web,
-                                _ => true,
-                            } {
-                                continue;
-                            }
-                            if ui.selectable_label(self.places_tab == idx, label).clicked() {
-                                self.places_tab = idx;
-                                if idx == 2 {
-                                    open_editor = true; // Kits tab → show the pad editor
+                    // Section selector. `Sources` is a vertical list — it holds a dozen entries
+                    // and a horizontal strip stops being usable past about eight. The other
+                    // sections have one or two tabs, so they read better inline.
+                    let sec = self.rail_section;
+                    let tabs = sec.tabs();
+                    let enabled: Vec<(u8, &str)> = tabs
+                        .iter()
+                        .copied()
+                        .filter(|(i, _)| self.places_tab_enabled(*i))
+                        .collect();
+                    if enabled.len() > 1 {
+                        let vertical = sec == RailSection::Sources;
+                        let mut render = |ui: &mut egui::Ui| {
+                            for (idx, label) in &enabled {
+                                if ui.selectable_label(self.places_tab == *idx, *label).clicked() {
+                                    self.places_tab = *idx;
+                                    if *idx == 2 {
+                                        open_editor = true; // Kits → show the pad editor
+                                    }
                                 }
                             }
+                        };
+                        if vertical {
+                            ui.vertical(|ui| render(ui));
+                        } else {
+                            ui.horizontal_wrapped(|ui| render(ui));
                         }
-                    });
+                        ui.separator();
+                    }
+                    // Keep `places_tab` inside the selected section, so switching sections can't
+                    // leave the panel showing a body from the previous one.
+                    if !enabled.iter().any(|(i, _)| *i == self.places_tab) {
+                        if let Some((i, _)) = enabled.first() {
+                            self.places_tab = *i;
+                        }
+                    }
                     // A disabled source's tab button is gone, but `places_tab` may still point at
                     // it (it was selected when the user unchecked it) — that would render a blank
                     // panel with no way back, so fall back to Local.
@@ -31584,6 +31690,7 @@ impl eframe::App for PixelView {
         eframe::set_value(storage, Self::PLUGIN_PH_KEY, &self.plugin_ph);
         eframe::set_value(storage, Self::PLUGIN_GFONTS_KEY, &self.plugin_gfonts);
         eframe::set_value(storage, Self::PLUGIN_MA_KEY, &self.plugin_ma);
+        eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::GIF_RECOLOR_KEY, &self.gif_recolor);
         eframe::set_value(storage, Self::GIF_SPEED_KEY, &self.gif_speed);
         eframe::set_value(storage, Self::AUDIO_AUTOPLAY_KEY, &self.audio_autoplay);
