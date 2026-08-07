@@ -2615,6 +2615,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaleidotron"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "arboard",
+ "asefile",
+ "cc",
+ "eframe",
+ "egui_kittest",
+ "gltf",
+ "hqx",
+ "icy_parser_core",
+ "image 0.25.10",
+ "lopdf",
+ "lyon_tessellation",
+ "mesh-loader",
+ "midir",
+ "pdfium-render",
+ "psd",
+ "resvg",
+ "retrofont",
+ "rfd",
+ "rodio",
+ "ron",
+ "rusqlite",
+ "rustysynth",
+ "serde",
+ "serde_json",
+ "symphonia 0.6.0",
+ "trash",
+ "ttf-parser",
+ "unarc-rs",
+ "ureq",
+ "xattr",
+ "xcf",
+ "xmrs",
+ "xmrsplayer",
+ "zip",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3696,47 +3737,6 @@ name = "piston-float"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad78bf43dcf80e8f950c92b84f938a0fc7590b7f6866fbcbeca781609c115590"
-
-[[package]]
-name = "pixelview"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "arboard",
- "asefile",
- "cc",
- "eframe",
- "egui_kittest",
- "gltf",
- "hqx",
- "icy_parser_core",
- "image 0.25.10",
- "lopdf",
- "lyon_tessellation",
- "mesh-loader",
- "midir",
- "pdfium-render",
- "psd",
- "resvg",
- "retrofont",
- "rfd",
- "rodio",
- "ron",
- "rusqlite",
- "rustysynth",
- "serde",
- "serde_json",
- "symphonia 0.6.0",
- "trash",
- "ttf-parser",
- "unarc-rs",
- "ureq",
- "xattr",
- "xcf",
- "xmrs",
- "xmrsplayer",
- "zip",
-]
 
 [[package]]
 name = "pkg-config"

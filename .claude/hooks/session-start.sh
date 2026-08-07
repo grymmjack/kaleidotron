@@ -1,7 +1,7 @@
 #!/bin/bash
 # SessionStart hook for Claude Code on the web.
 #
-# Why this exists: pixelview has one git dependency (icy_parser_core, from
+# Why this exists: kaleidotron has one git dependency (icy_parser_core, from
 # github.com/mkrueger/icy_tools). In the web sandbox, outbound github *git* access
 # is routed through a repo-scoped proxy that only permits THIS repo, so a fresh
 # `cargo build`/`cargo test` can't fetch that dependency (the proxy 403s). This

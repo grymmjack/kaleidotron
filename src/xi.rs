@@ -151,7 +151,7 @@ fn cache_dir(xi: &Path) -> io::Result<PathBuf> {
         .unwrap_or(0);
     let key = format!("{}|{}|{}", xi.display(), meta.len(), mtime);
     let stem = xi.file_name().and_then(|s| s.to_str()).unwrap_or("xi");
-    Ok(std::env::temp_dir().join("pixelview-xi").join(format!(
+    Ok(std::env::temp_dir().join("kaleidotron-xi").join(format!(
         "{}-{:016x}",
         sanitize(stem),
         hash_str(&key)

@@ -566,7 +566,7 @@ pub fn highlight_lines(src: &str, ext: &str) -> Vec<Vec<(String, Tok)>> {
 
 /// The syntax theme the raster tiles paint with, if any.
 ///
-/// The thumbnailer runs on worker threads with no access to `PixelView`, so — exactly like
+/// The thumbnailer runs on worker threads with no access to `Kaleidotron`, so — exactly like
 /// `set_font_9px` — the choice reaches it as a process-global rather than a threaded parameter.
 static SYNTAX_THEME: std::sync::RwLock<Option<std::sync::Arc<crate::theme::Theme>>> =
     std::sync::RwLock::new(None);

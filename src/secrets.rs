@@ -50,7 +50,7 @@ pub fn save(file: &Path, entries: &[(&str, &str, &str)]) -> Result<(), String> {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
     let mut s = String::from(
-        "// pixelview secrets — API keys.\n\
+        "// kaleidotron secrets — API keys.\n\
          // Kept out of settings.json so that file stays safe to sync or share.\n\
          // EXCLUDE THIS FILE from dotfile managers and version control.\n{\n",
     );

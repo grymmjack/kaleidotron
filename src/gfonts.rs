@@ -1,5 +1,5 @@
 //! [Google Fonts](https://fonts.google.com) as a keyless virtual source — the missing half of
-//! pixelview's font story. The viewer already renders TTF/OTF (metadata, glyph grid, logo maker, 3D
+//! kaleidotron's font story. The viewer already renders TTF/OTF (metadata, glyph grid, logo maker, 3D
 //! extrusion, COLR colour fonts); this is how you *find* a font in the first place.
 //!
 //! Two undocumented-but-stable keyless endpoints, both verified against the live service:
@@ -9,7 +9,7 @@
 //!   [`crate::polyhaven`].
 //! * **`fonts.googleapis.com/css2?family=…`** — returns a CSS `@font-face` whose `src: url(…)`
 //!   is the real font binary. Google content-negotiates the format on **User-Agent**: a modern
-//!   browser UA gets `woff2` (which pixelview can't parse), while pixelview's own UA gets a plain
+//!   browser UA gets `woff2` (which kaleidotron can't parse), while kaleidotron's own UA gets a plain
 //!   **`.ttf`**. That's why [`crate::cache`]'s User-Agent must not be spoofed to a browser here.
 //!
 //! Pure + unit-tested; the egui/threading wiring lives in `app.rs` (the `gf_*` machinery).
@@ -189,7 +189,7 @@ pub fn font_url(family: &str, weight: &str) -> Result<String, String> {
     let css = String::from_utf8_lossy(&body);
     let url = parse_font_url(&css).ok_or_else(|| format!("no font URL in css2 for {family}"))?;
     if !url.ends_with(".ttf") && !url.ends_with(".otf") {
-        // Only happens if the User-Agent is spoofed to a browser (→ woff2), which pixelview
+        // Only happens if the User-Agent is spoofed to a browser (→ woff2), which kaleidotron
         // doesn't do — surface it clearly rather than downloading an unparseable file.
         return Err(format!("css2 returned a non-TTF font ({url}) — check the User-Agent"));
     }

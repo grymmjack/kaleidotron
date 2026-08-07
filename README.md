@@ -1,4 +1,4 @@
-# pixel-viewer
+# kaleidotron
 
 A fast, **pixel-art-first** image **browser** for Linux/macOS/Windows, written in
 Rust with [egui/eframe](https://github.com/emilk/egui). 
@@ -180,7 +180,7 @@ You need a [Rust toolchain](https://rustup.rs) (stable).
 
 ```sh
 git clone <this-repo>
-cd pixelview
+cd kaleidotron
 cargo run --release      # build + launch (release is recommended: nearest-neighbor
                          # rendering wants the GPU/wgpu path)
 ```
@@ -189,7 +189,7 @@ Or build the binary and run it directly:
 
 ```sh
 cargo build --release
-./target/release/pixelview --folder ~/Pictures
+./target/release/kaleidotron --folder ~/Pictures
 ```
 
 ### Dependencies — the easy way
@@ -247,14 +247,14 @@ proper task-switcher icon), run:
 ./install-icon.sh
 ```
 
-It installs `pixelview.desktop` + the app icon into `~/.local/share`. The entry's
-`StartupWMClass=pixelview` matches the window's app-id so the icon maps correctly.
+It installs `kaleidotron.desktop` + the app icon into `~/.local/share`. The entry's
+`StartupWMClass=kaleidotron` matches the window's app-id so the icon maps correctly.
 
 ---
 
 ## Quick start
 
-1. Launch `pixelview` (optionally with `--folder PATH`).
+1. Launch `kaleidotron` (optionally with `--folder PATH`).
 2. The **thumbnail grid** shows the current folder. Click a folder tile to descend,
    or use the breadcrumbs / **Go** menu / `Backspace` to go up.
 3. **Click an image** to open the single-image viewer. `←` / `→` step through the
@@ -347,7 +347,7 @@ order, CRT toggles, baud rates — is **remembered between runs**.
 
 ### Pixel-perfect rendering
 
-pixelview goes out of its way to keep pixel art *exact*:
+kaleidotron goes out of its way to keep pixel art *exact*:
 
 - Source-resolution thumbnails and the viewer upload `NEAREST` textures so upscaling
   never smears.
@@ -467,7 +467,7 @@ Register your own editors and open files in them by type:
 
 ### Source code, PDF & audio (plugins)
 
-pixelview isn't only for pixels. Three extra viewers let you browse a folder that mixes
+kaleidotron isn't only for pixels. Three extra viewers let you browse a folder that mixes
 art with **source code, PDFs and audio** — each shows a real thumbnail in the grid and
 opens in a purpose-built viewer:
 
@@ -589,7 +589,7 @@ you can keep the viewer lean.
 
 ### Scene art, ANSImation & retro effects
 
-The textmode/BBS side is the heart of pixelview:
+The textmode/BBS side is the heart of kaleidotron:
 
 - **Authentic fonts** — the real IBM VGA CP437 ROM (8×16 and an 8×8 VGA50 variant)
   and a C64 character ROM, so block/shade/line-draw glyphs are exact.
@@ -680,11 +680,11 @@ zoom ladder. (Holding `Z` suppresses the `1`–`5` rating keys.)
 ## Command-line options
 
 ```
-pixelview — a pixel-art-first image viewer
+kaleidotron — a pixel-art-first image viewer
 
 USAGE:
-    pixelview [OPTIONS]
-    pixelview --render <PATH>... [RENDER OPTIONS]   (headless; no window)
+    kaleidotron [OPTIONS]
+    kaleidotron --render <PATH>... [RENDER OPTIONS]   (headless; no window)
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
@@ -712,7 +712,7 @@ the command line override the persisted ones and are remembered afterward.**
 
 ### Rendering text art to files (`--render`)
 
-`--render` turns any format pixelview can decode — **ANSI, XBin, RIPscript, raw BIN,
+`--render` turns any format kaleidotron can decode — **ANSI, XBin, RIPscript, raw BIN,
 iCE Draw, Artworx, TundraDraw, PETSCII, …** and ordinary images — straight into a PNG
 (or BMP/TGA/…) **with no window**, so it works over SSH and in batch scripts. The output
 is pixel-identical to what the viewer shows: text-mode art is rasterized with the real
@@ -720,32 +720,32 @@ IBM VGA / C64 fonts, SAUCE-aware, in true 24-bit color.
 
 ```sh
 # One ANSI file → PNG written beside it (ART.png)
-pixelview --render ART.ANS
+kaleidotron --render ART.ANS
 
 # ANSI → an explicit output path
-pixelview --render ART.ANS -o ~/renders/art.png
+kaleidotron --render ART.ANS -o ~/renders/art.png
 
 # XBin, using the authentic 9-dot VGA cell (matches ansilove / 16colo widths)
-pixelview --render SCENE.XB --font-9px -o scene.png
+kaleidotron --render SCENE.XB --font-9px -o scene.png
 
 # RIPscript (EGA vector) → PNG
-pixelview --render LOGO.RIP -o logo.png
+kaleidotron --render LOGO.RIP -o logo.png
 
 # The other binary scene formats, one per line:
-pixelview --render ART.BIN -o art.png     # raw BIN (SAUCE width)
-pixelview --render ART.IDF -o art.png     # iCE Draw
-pixelview --render ART.ADF -o art.png     # Artworx
-pixelview --render ART.TND -o art.png     # TundraDraw (24-bit truecolor)
-pixelview --render ART.SEQ -o art.png     # Commodore PETSCII (.seq / .pet)
+kaleidotron --render ART.BIN -o art.png     # raw BIN (SAUCE width)
+kaleidotron --render ART.IDF -o art.png     # iCE Draw
+kaleidotron --render ART.ADF -o art.png     # Artworx
+kaleidotron --render ART.TND -o art.png     # TundraDraw (24-bit truecolor)
+kaleidotron --render ART.SEQ -o art.png     # Commodore PETSCII (.seq / .pet)
 
 # 2× nearest-neighbor upscale, encoded as BMP
-pixelview --render ART.ANS --scale 2 --format bmp -o art.bmp
+kaleidotron --render ART.ANS --scale 2 --format bmp -o art.bmp
 
 # Batch — convert a whole pack folder into an output folder
-pixelview --render ~/packs/blocktronics/ --outdir ~/renders/
+kaleidotron --render ~/packs/blocktronics/ --outdir ~/renders/
 
 # Batch — several named files at once, all 9-dot, into one folder
-pixelview --render a.ans b.xb c.rip --outdir out/ --font-9px
+kaleidotron --render a.ans b.xb c.rip --outdir out/ --font-9px
 ```
 
 **Behavior & rules**
@@ -783,7 +783,7 @@ the **Format plugins** toggles (source code / PDF / audio), the palette director
 
 ## Settings & where things are stored
 
-- **Settings** persist via eframe's storage at `~/.local/share/pixelview/` (Linux).
+- **Settings** persist via eframe's storage at `~/.local/share/kaleidotron/` (Linux).
   Each setting (zoom, thumbnail size, favorites, last folder, sort/filter, dock
   visibility, grid spacing, captions, keymap, CRT/baud/look toggles, …) is its own
   key.
@@ -826,13 +826,13 @@ DAWNBRINGERS-8-COLOR (8)
 ```
 
 Drop a `.GPL` into `assets/palettes/` (and add one `include_str!` line) to bundle a
-new one, or point pixelview at a palette directory to load yours at runtime.
+new one, or point kaleidotron at a palette directory to load yours at runtime.
 
 ---
 
 ## Architecture
 
-A single binary crate (`pixelview`). Three subsystems wired together at startup:
+A single binary crate (`kaleidotron`). Three subsystems wired together at startup:
 
 1. **Decoder registry** (`src/decode/`) — a `Vec<Box<dyn Decoder>>` with two-tier
    dispatch: every decoder's `sniff()` (magic bytes) is tried first, then file
@@ -841,14 +841,14 @@ A single binary crate (`pixelview`). Three subsystems wired together at startup:
 2. **Threaded thumbnailer** (`src/thumb.rs`) — a worker pool (one thread per core)
    sharing a LIFO job stack so just-scrolled tiles decode first. Only CPU RGBA
    buffers cross back to the UI thread; texture upload happens there.
-3. **The UI** (`src/app.rs`) — `PixelView`, an `eframe::App`: a stack of panels
+3. **The UI** (`src/app.rs`) — `Kaleidotron`, an `eframe::App`: a stack of panels
    (menubar, rail, favorites, breadcrumbs, search, docks, status/sort bars) around a
    central grid-or-viewer.
 
 ```
 src/
   main.rs            eframe entry / window setup
-  app.rs             PixelView: the whole UI, model, settings, sort/filter, ratings, CLI
+  app.rs             Kaleidotron: the whole UI, model, settings, sort/filter, ratings, CLI
   image_types.rs     PixImage (RGBA + optional indexed/palette)
   thumb.rs           worker pool: thumbnails + metadata
   rating.rs          star ratings via the user.baloo.rating xattr
@@ -896,7 +896,7 @@ it almost certainly just moved; check the egui CHANGELOG for that version.
 - [`image`](https://github.com/image-rs/image) — the raster decoders.
 - [resvg](https://github.com/RazrFalcon/resvg) — SVG rasterization.
 - Mike Krüger's **icy ecosystem** ([`icy_tools`](https://github.com/mkrueger/icy_tools)) —
-  `icy_parser_core` powers the PETSCII and RIPscript parsers (driven into pixelview's
+  `icy_parser_core` powers the PETSCII and RIPscript parsers (driven into kaleidotron's
   own renderers), and `unarc-rs` handles archive extraction. The RIP BGI primitives
   are ported pixel-for-pixel from `icy_engine`'s reference renderer.
 - The bundled **CP437 VGA font** derives from the IBM ROM (the canonical block/shade
@@ -912,4 +912,4 @@ Released under the **MIT License**.
 
 > Note: the bundled fonts carry their own licenses — the C64 font is from the MEGA65
 > open-roms project (LGPL) and the CP437 VGA font derives from an IBM ROM. The MIT
-> license covers pixelview's own source, not those embedded assets.
+> license covers kaleidotron's own source, not those embedded assets.

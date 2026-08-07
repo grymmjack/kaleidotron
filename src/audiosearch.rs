@@ -1,6 +1,6 @@
 //! Free **audio** search via [Openverse](https://api.openverse.org) — the same keyless CC API that
 //! backs [`crate::imgsearch`], but its `/v1/audio/` half. Most results proxy Freesound, so a query
-//! like "drum loop" returns CC0 one-shots and loops that drop straight onto pixelview's sample pads.
+//! like "drum loop" returns CC0 one-shots and loops that drop straight onto kaleidotron's sample pads.
 //!
 //! The point of this source is the **sampler pipeline**: a result downloads to a real local file, so
 //! it opens in the waveform editor, gets trimmed/looped/enveloped, lands on a pad, and exports to

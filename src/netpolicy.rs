@@ -1,6 +1,6 @@
 //! **Good-net-citizen policy** for every outbound HTTP request.
 //!
-//! pixelview browses other people's servers — arbitrary sites via the HTTP browser, plus a dozen
+//! kaleidotron browses other people's servers — arbitrary sites via the HTTP browser, plus a dozen
 //! free APIs and archives. This module is the etiquette layer, applied at the single choke point
 //! ([`crate::cache::http_get`]) so no source can bypass it.
 //!
@@ -35,7 +35,7 @@ pub const MIN_HOST_INTERVAL: Duration = Duration::from_millis(500);
 /// wedge the UI for minutes. Beyond this we simply give up on the request instead of sleeping.
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 /// The product token we match `robots.txt` groups against.
-pub const UA_TOKEN: &str = "pixelview";
+pub const UA_TOKEN: &str = "kaleidotron";
 
 /// What a host's `robots.txt` tells us.
 #[derive(Clone, Debug, Default)]
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn our_own_token_is_matched() {
-        let r = parse_robots("User-agent: pixelview\nDisallow: /nope\n");
+        let r = parse_robots("User-agent: kaleidotron\nDisallow: /nope\n");
         assert!(!r.allows("/nope"));
     }
 

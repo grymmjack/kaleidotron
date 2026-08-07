@@ -1,7 +1,7 @@
 //! [Poly Haven](https://polyhaven.com) — **CC0** 3D models, textures and HDRIs, as a keyless virtual
 //! source (mirrors [`crate::sixteen`] / [`crate::lospec`]). Three facets in one API:
 //!
-//! * **models** → a `.gltf` bundle that opens in pixelview's existing `Mode::ThreeD` viewer
+//! * **models** → a `.gltf` bundle that opens in kaleidotron's existing `Mode::ThreeD` viewer
 //! * **textures** → the diffuse map as a normal image tile
 //! * **HDRIs** → the `tonemapped` JPG preview as the tile (the real `.hdr` is a download)
 //!

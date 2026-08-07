@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# install-deps.sh — install pixelview's build + runtime dependencies.
+# install-deps.sh — install kaleidotron's build + runtime dependencies.
 #
-# pixelview itself is a single Rust binary, but several *plugins* shell out to external
+# kaleidotron itself is a single Rust binary, but several *plugins* shell out to external
 # tools at runtime (the same lean approach as the rest of the app — no bundled libraries):
 #
 #   ffmpeg / ffprobe   Video plugin  — thumbnails, the in-app player, PNG/audio export,
@@ -100,4 +100,4 @@ for t in ffmpeg ffprobe yt-dlp pdftoppm blender; do
       "$([ "$t" = blender ] && echo ', optional')"
   fi
 done
-say "Done. Build pixelview with:  cargo run --release"
+say "Done. Build kaleidotron with:  cargo run --release"

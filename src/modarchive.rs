@@ -1,6 +1,6 @@
 //! [The Mod Archive](https://modarchive.org) — ~170,000 tracker modules as a virtual source.
 //!
-//! This one is almost pure upside for pixelview, because the *playback* half already exists:
+//! This one is almost pure upside for kaleidotron, because the *playback* half already exists:
 //! `xmrs` handles MOD/XM/S3M/IT, bundled libxmp covers 669/FAR/OKT/MED/AMF/ULT/MTM/STM, and the
 //! sample explorer rips a module's instrument bank to individual WAVs that drop onto the sample
 //! pads. So a downloaded module isn't just something to listen to — it's a **sample source**.

@@ -260,7 +260,7 @@ fn cache_dir(sfz: &Path) -> io::Result<PathBuf> {
         .unwrap_or(0);
     let key = format!("{}|{}|{}", sfz.display(), meta.len(), mtime);
     let stem = sfz.file_name().and_then(|s| s.to_str()).unwrap_or("sfz");
-    Ok(std::env::temp_dir().join("pixelview-sfz").join(format!(
+    Ok(std::env::temp_dir().join("kaleidotron-sfz").join(format!(
         "{}-{:016x}",
         sanitize(stem),
         hash_str(&key)

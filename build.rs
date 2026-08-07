@@ -1,4 +1,4 @@
-//! Build the vendored **libxmp** (MIT) into a static library, so pixelview can play the extra
+//! Build the vendored **libxmp** (MIT) into a static library, so kaleidotron can play the extra
 //! tracker formats `xmrs` doesn't (669/FAR/OKT/MED/AMF/ULT/MTM/STM). libxmp is self-contained
 //! (its own depackers; only links libm) and needs no generated config header — `common.h`
 //! self-detects the platform and the version lives in `include/xmp.h`, so a plain `cc` compile

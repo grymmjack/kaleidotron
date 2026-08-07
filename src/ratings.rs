@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_a_file() {
-        let dir = std::env::temp_dir().join(format!("pixelview_ratings_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kaleidotron_ratings_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn stars_are_clamped() {
         let dir =
-            std::env::temp_dir().join(format!("pixelview_ratings_clamp_{}", std::process::id()));
+            std::env::temp_dir().join(format!("kaleidotron_ratings_clamp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = RatingStore::load(&dir);

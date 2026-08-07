@@ -1,4 +1,4 @@
-pixelview .mtl material demos
+kaleidotron .mtl material demos
 ============================================================
 Our .mtl preview renders ONE lit "material ball" per `newmtl`, using only:
   • Kd       diffuse COLOR        → the ball's colour

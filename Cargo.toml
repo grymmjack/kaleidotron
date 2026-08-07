@@ -1,5 +1,5 @@
 [package]
-name = "pixelview"
+name = "kaleidotron"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, pixel-art-first image viewer"

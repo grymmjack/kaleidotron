@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pixelview` — a pixel-art-first image **browser** in Rust + eframe/egui, grown
-from a scaffold into a Gwenview-like tool. Single binary crate named `pixelview`.
+`kaleidotron` — a pixel-art-first image **browser** in Rust + eframe/egui, grown
+from a scaffold into a Gwenview-like tool. Single binary crate named `kaleidotron`.
 Features: folder navigation (breadcrumbs, drag-reorderable favorites, a left
 activity rail, an explorer dock with an expandable folder tree + filter, and a
 live details dock with a fit thumbnail + palette swatches + `.GPL` export), a
@@ -83,7 +83,7 @@ Standard Cargo binary-crate layout (`Cargo.toml` has no `path` override):
 ```
 src/
   main.rs            eframe entry / window setup
-  app.rs             PixelView: the whole UI — panels, grid/single views, model,
+  app.rs             Kaleidotron: the whole UI — panels, grid/single views, model,
                      settings persistence, sort/filter, ratings, CLI parsing
   image_types.rs     PixImage (RGBA + optional indexed/palette)
   cache.rs           persistent HTTP cache for 16colo (JSON/thumbnails/files/zips):
@@ -188,7 +188,7 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
                      identical to the identifier colour, so a .bas file renders near-monochrome and
                      the theme looks unloaded). BOTH surfaces theme: the text viewer via
                      `Theme::kind_color_in`, and the RASTER TILE via `set_syntax_theme` — a
-                     process-global (like `set_font_9px`) because the thumbnailer has no `PixelView`;
+                     process-global (like `set_font_9px`) because the thumbnailer has no `Kaleidotron`;
                      `Palette::resolve(ext)` folds it in per-field (bg = `editor.background`), and
                      `sync_syntax_theme` drops cached code thumbs so tiles re-decode. `CODE_EXTS`
                      re-exported; registry routes code exts to `decode_ext(bytes, ext)`. ipynb
@@ -228,12 +228,12 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     cp437_font.rs    embedded CP437 8x16 VGA font (generated from a system PSF)
     cp437_font_8x8.rs  embedded CP437 8x8 VGA50 font (IBM ROM, for 80×50 ANSI)
   palettes_builtin.rs  the bundled .GPL palette library, embedded via include_str!
-assets/pixelview.png   generated app icon (4×4 thumbnail grid)
+assets/kaleidotron.png   generated app icon (4×4 thumbnail grid)
 assets/palettes/       55 bundled .GPL palettes (embedded into the binary)
 assets/pixelfx_builtin.ron  bundled PixelFX recolor presets (embedded; see PixelFX presets)
 assets/DejaVuSans.ttf  embedded UI fallback font (fills egui's tofu gaps; see Font gotcha)
 assets/SymbolsNerdFont-Regular.ttf  embedded icon font (the `icons::*` designed glyphs)
-pixelview.desktop      desktop entry (StartupWMClass=pixelview) for the task icon
+kaleidotron.desktop      desktop entry (StartupWMClass=kaleidotron) for the task icon
 install-icon.sh        installs the .desktop + icon into ~/.local/share
 ```
 
@@ -266,7 +266,7 @@ First-time eframe/winit system deps on Debian/KDE:
 sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 ```
 
-**Headless render-to-file (`--render`).** `pixelview --render <PATH>... [-o FILE | --outdir DIR]
+**Headless render-to-file (`--render`).** `kaleidotron --render <PATH>... [-o FILE | --outdir DIR]
 [--font-9px] [--scale N] [--format FMT]` decodes any viewable format (ANS/XB/XBIN/RIP/BIN/… + raster)
 to an image file and **exits without opening a window** (works over SSH / in a batch pack-conversion
 script). `CliArgs::is_render()` short-circuits `main` into `app::run_render` *before* `eframe::run_native`.
@@ -290,7 +290,7 @@ hardlink util) shadows MSVC's real `link.exe` and fails linking with LNK1181.
 
 ## Architecture: the big picture
 
-Three subsystems wired together in `PixelView::new` (`app.rs`):
+Three subsystems wired together in `Kaleidotron::new` (`app.rs`):
 
 **1. Decoder registry (`decode/mod.rs`)** — the entire extension story. `Registry`
 holds `Vec<Box<dyn Decoder>>`. Dispatch in `decode_bytes` is **two-tier**: every
@@ -551,7 +551,7 @@ rematch**, and the *order* of all of it is user-controlled.
   `Vignette` / `Phosphor`. New ops are **appended** to `OpKind::ALL` so persisted order
   indices stay valid. `OpKind::is_marker` is the slider-vs-marker test the row UI keys
   off. (Pixelate's *value* still lives in `Adjust.pixelate` (width); its height/lock are
-  separate `PixelView` fields — see below.)
+  separate `Kaleidotron` fields — see below.)
 - **`apply_pipeline(rgba, w, h, &adjust, &PipeAux)`** is the one true pipeline: it
   walks `adjust.order` and runs each value op (point ops via 256-LUT, color ops via
   HSL, sharpen spatial); at each *marker* op it does that step inline — `Pixelate` via
@@ -570,7 +570,7 @@ rematch**, and the *order* of all of it is user-controlled.
   the WHOLE pipeline there, then **nearest-upscales back** to `w×h` — so the output keeps
   native size (unchanged zoom/screen size) but shows the low-res degradation and dither
   runs at the reduced resolution. Factor-based (`resize_on`/`resize_fx`/`resize_fy`/
-  `resize_lock`, all `PixelView` fields); `resize_target(w,h)` computes `(tw,th)`. Every
+  `resize_lock`, all `Kaleidotron` fields); `resize_target(w,h)` computes `(tw,th)`. Every
   recolor path calls this instead of `apply_pipeline` directly.
 - **Pixel-art upscalers (`scale.rs`, `scale_algo: Scaler`, `SCALE_ALGO_KEY`).** The
   Resize section's **Upscale** dropdown runs an integer pixel-art scaler (Scale2x/3x,
@@ -591,13 +591,13 @@ rematch**, and the *order* of all of it is user-controlled.
   `thumb::dither_pass` dispatches both; `DITHER_NAMES`/`DITHER_CUSTOM` index the methods.
   The ordered methods take a **per-axis cell size** `scale_x`/`scale_y` (each Bayer cell
   spans `scale_x`×`scale_y` px) so the crosshatch reads on hi-res art; stored as
-  `dither_scale_x`/`dither_scale_y` (+`dither_scale_lock`) `PixelView` fields, UI = Cell
+  `dither_scale_x`/`dither_scale_y` (+`dither_scale_lock`) `Kaleidotron` fields, UI = Cell
   W/H sliders + Lock. **Auto** (`detect_dither_scale` → `thumb::detect_pixel_scale`)
   detects the art's integer upscale factor per axis (edge positions cluster onto a
   period-S grid) and matches the cell to it, else scales to the resolution. `eff_dither_scale`
   shrinks the authored scale by `buf/native` on a small preview so it predicts the full view.
 - **Pixelate is a marker op** with per-axis Width×Height: width = `Adjust.pixelate`,
-  height = `pixelate_h` (a `PixelView` field, threaded via `PipeAux`), `pixelate_lock`
+  height = `pixelate_h` (a `Kaleidotron` field, threaded via `PipeAux`), `pixelate_lock`
   keeps it square. `apply_pipeline` reads both (height <2 ⇒ square fallback). A width-off/
   height-on vertical mosaic still renders because `pipeline_active` also checks `pixelate_h`.
 - **CRT post-FX (`PostFx` value, threaded as `aux.fx`)** — four marker ops baked into the
@@ -833,7 +833,7 @@ rematch**, and the *order* of all of it is user-controlled.
   triggers the next random pack → endless. Shuffle auto-enables `auto_next`; pair with F11
   for a screensaver of real scene art. **R** jumps to a new random pack (skip a dud).
 - **Look defaults** lean to the late-night-BBS aesthetic (`crt_aspect`, `black_bg`,
-  `zoom_lock`/Snap, ANSI 4800 / RIP 9600 baud — all `unwrap_or(...)` in `PixelView::new`). The
+  `zoom_lock`/Snap, ANSI 4800 / RIP 9600 baud — all `unwrap_or(...)` in `Kaleidotron::new`). The
   **CRT post-FX + slideshow default OFF** though: `crt_scanline_dark` 0, `crt_scanline_scale` false,
   `glow` false, `auto_next` false — a fresh install is clean + doesn't auto-advance; opt into the
   CRT look / slideshow in the status bar. `font_9px` is also default-off: its setter flips a
@@ -908,7 +908,7 @@ pick pattern as the other tile actions in *both* `ui_grid` and `ui_table`
 (`ui_compare`) — a distinct view mode, **not** a `table_view`-style bool, because its
 keyboard + pan/zoom semantics differ from browse/single (adding the variant made the
 compiler flag every `match self.mode` site to decide Compare's behaviour). The chosen paths
-live on `PixelView` (`compare_source`/`compare_diff`); the transient runtime — decoded
+live on `Kaleidotron` (`compare_source`/`compare_diff`); the transient runtime — decoded
 `PixImage`s, two `TiledTexture`s, the overlay texture, per-pane zoom/offset — is a
 `Compare` struct. `enter_compare` decodes both via `resolve_local` (so archive / 16colo
 virtual paths work) and builds the textures with `view_tex_opts`.
@@ -1083,7 +1083,7 @@ audio toggle doesn't gate it.
   **m** = drop a marker. The digit + Home keys are **`consume_key`'d** so they don't also set a star
   rating / scroll the frame (the rating handler reads `key_pressed` *after*, so a consumed key is gone).
 - **Audio extract (`extract_video_audio_to`, shared).** **"Extract & edit in sampler"** →
-  `extract_video_audio_for_edit` decodes to a temp WAV and `load_full`s it into pixelview's **own**
+  `extract_video_audio_for_edit` decodes to a temp WAV and `load_full`s it into kaleidotron's **own**
   built-in sampler/waveform editor (enabling the audio plugin first if off — that editor *is* the
   audio plugin). **"Extract audio to file…"** → a save dialog (`.wav`→PCM, else lossless `-c:a copy`
   with a re-encode fallback). **Both honor the current playback speed**: at any speed ≠ 1× it
@@ -1106,7 +1106,7 @@ audio toggle doesn't gate it.
   <dur> -c copy` — a **lossless** stream copy (cut snaps to the nearest keyframe at/before In), with a
   re-encode fallback if the container can't hold the source codecs. rfd save dialog, default
   `<stem>_clip.<ext>`.
-- **Player state fields** (`PixelView`): `video_player` / `video_loading` / `video_tex` /
+- **Player state fields** (`Kaleidotron`): `video_player` / `video_loading` / `video_tex` /
   `video_markers` / `video_md_header` / `video_marker_sel` / `video_marker_focus` / `video_speed` /
   `video_scrub` / `video_scrub_t` / `video_seek_input` / `video_trim_in` / `video_trim_out`, all reset
   in `load_full`'s teardown. Master volume/mute pushed each frame via `set_volume`.
@@ -1216,7 +1216,7 @@ Parsing is unit-tested (`git::tests`); the CLI is trusted for the rest.
 
 egui's *bundled* fonts (Ubuntu-Light + a small NotoEmoji subset) omit whole Unicode blocks,
 so glyphs used to render as tofu (`□`). **`install_fallback_font` (`app.rs`, called first
-thing in `PixelView::new`) appends TWO embedded fallbacks** to the Proportional + Monospace
+thing in `Kaleidotron::new`) appends TWO embedded fallbacks** to the Proportional + Monospace
 families: **Symbols Nerd Font** (`assets/SymbolsNerdFont-Regular.ttf`) for designed UI icons,
 then **DejaVu Sans** (`assets/DejaVuSans.ttf`) to back every remaining standard-Unicode symbol
 (Arrows, Geometric Shapes, Misc Symbols, Box Drawing, …). Both are appended *last*, so they
@@ -1271,7 +1271,7 @@ a piece whose 16colo/ansilove thumbnail is red renders blue in the viewer
   `exists_but_unreadable` distinguishes a *missing* file (normal first run → seed it) from a broken
   one (someone's hand-written settings → copy to `.bak` and leave it alone).
 - **Persistence** uses eframe's `persistence` feature (storage at
-  `~/.local/share/pixelview/`). Each setting is its own key (consts on `PixelView`:
+  `~/.local/share/kaleidotron/`). Each setting is its own key (consts on `Kaleidotron`:
   `ZOOM_KEY`, `THUMB_KEY`, `FAV_KEY`, `FOLDER_KEY`, sort/filter keys, `EXPLORER_KEY`,
   `DETAILS_KEY`, `GAP_KEY`/`GAP_Y_KEY` (h/v grid spacing), `CAPTION_KEY` (caption
   bitmask), `KEYMAP_KEY`).
@@ -1465,7 +1465,7 @@ inside `caught(||…)` (the same panic guard as `decode_caught`). Both always re
   into `decode/opl3.rs` (the "Opal" OPL3 chip emulator — `write_reg` + `sample()` with an internal
   49716→44100 resampler), pulling `sr/hz` samples per tick. Both are faithful ports (tables verbatim,
   wrapping arithmetic, bounds-guarded so a malformed file returns `None`/never panics). Ported (not
-  the GPL `opl-emu` crate) so pixelview stays MIT.
+  the GPL `opl-emu` crate) so kaleidotron stays MIT.
 
 Both player surfaces also have an **onscreen piano keyboard** (`piano_keyboard(ui, octave, h,
 highlights, pad_keys) -> (picked, hovered)` — `h` sizes it big vs compact) + Oct −/+ to audition
@@ -1837,7 +1837,7 @@ Samples tab), the ↻ reloads it fresh from disk (`want_reload_source` → `load
 first frame the monitor size is known, clamped on-screen) — except in `DEBUG_MODE`, where the
 bottom-right dev dock wins.
 
-**Window title** (`update_window_title` → `title_location`): `pixelview — <path> (<ui%>)`. In the
+**Window title** (`update_window_title` → `title_location`): `kaleidotron — <path> (<ui%>)`. In the
 standalone kit editor (`kit_editor`) there's no open file, so `title_location` must special-case it —
 it shows **`Sample Pads — <kit_name>`** (+ `· Pad N: <sample>` while drilled into a pad), NOT the
 generic Single-view fallback (`full_tex` → the selected grid entry), which left a **stale file** (e.g.
@@ -2022,7 +2022,7 @@ or write a sample `.psd` to `/tmp`):
   `Registry` dispatch (incl. a real PNG via the `image` crate), `make_thumb` /
   `count_colors`, `PixImage` palette expansion, `rating.rs` parse/encode + a
   guarded xattr round-trip, `sorted_filtered_view` (the sort/filter logic,
-  extracted from `rebuild_view` so it's testable without a `PixelView`), `sauce`
+  extracted from `rebuild_view` so it's testable without a `Kaleidotron`), `sauce`
   (record + COMNT parsing), `sixteen` (JSON → pieces + URL `#`-encoding), the RIP
   rasterizer (golden-scene guards), `viewdb` round-trips, the `blend_toward` tile-bg
   mix, and the sample-pad grid (`Pad::record`/`from_record` round-trip incl.
@@ -2032,7 +2032,7 @@ or write a sample `.psd` to `/tmp`):
   overlap-at-top-left + count, and `build_compare_psd_roundtrips` — the hand-written layered
   PSD re-parsed through the `psd` crate with the right layers/names/opacity).
 - **GUI tests** (`gui_tests` in `app.rs`, via the `egui_kittest` dev-dep with its
-  `eframe` feature): `Harness::builder().build_eframe(|cc| PixelView::new(cc,
+  `eframe` feature): `Harness::builder().build_eframe(|cc| Kaleidotron::new(cc,
   CliArgs::default()))` boots the real app with no window and drives menus through
   AccessKit. Custom-*painted* grid tiles have no a11y label, so kittest covers the
   chrome (menus/dialogs/Preferences), not the tiles.
@@ -2040,8 +2040,8 @@ or write a sample `.psd` to `/tmp`):
 For a **visual** check on KDE Wayland (KWin has no wlroots screencopy, so `grim`
 fails): run under XWayland so `xdotool` can target the window, capture with KDE's
 `spectacle`:
-`env -u WAYLAND_DISPLAY DISPLAY=:1 ./target/release/pixelview --folder DIR &`,
-then `WID=$(DISPLAY=:1 xdotool search --name pixelview)`, drive with
+`env -u WAYLAND_DISPLAY DISPLAY=:1 ./target/release/kaleidotron --folder DIR &`,
+then `WID=$(DISPLAY=:1 xdotool search --name kaleidotron)`, drive with
 `xdotool`/`ydotool` (you're in the `input` group), `spectacle -b -n -f -o shot.png`.
 
 Note: egui's bundled font lacks some glyphs (e.g. `→` U+2192 → tofu); the emoji

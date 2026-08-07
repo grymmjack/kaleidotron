@@ -1,6 +1,6 @@
 # 3D demos
 
-Sample assets for exploring pixelview's **3D models** plugin
+Sample assets for exploring kaleidotron's **3D models** plugin
 (Preferences → Format plugins → ☑ 3D models).
 
 - **`materials/`** — diverse Wavefront `.mtl` files (+ procedural textures in
@@ -13,6 +13,6 @@ Sample assets for exploring pixelview's **3D models** plugin
   `models/README.txt`. `.blend` / `.fbx` are **not** loadable as geometry
   (right-click a `.blend` → *Render with Blender* instead).
 
-Open this folder in pixelview to see `.mtl` material previews in the grid and
+Open this folder in kaleidotron to see `.mtl` material previews in the grid and
 open any model in the interactive viewer (drag = orbit, wheel = zoom,
 right-click = FPS fly).

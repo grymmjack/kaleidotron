@@ -167,7 +167,7 @@ const SCENE_PRESETS: &[(&str, f32, f32, [u8; 3])] = &[
 ];
 
 /// Runtime (transient) state for the side-by-side image compare view. The chosen
-/// files + overlay settings live on `PixelView` (so they persist); this holds only
+/// files + overlay settings live on `Kaleidotron` (so they persist); this holds only
 /// the decoded pixels, GPU textures, per-pane view transforms and the diff overlay,
 /// all rebuilt when a comparison is (re)entered.
 #[derive(Default)]
@@ -331,7 +331,7 @@ struct YtInfo {
 }
 
 /// What a 16colo.rs flat-piece listing is built from (see
-/// [`PixelView::start_colo_pieces`]): an artist, a group, or a server-side search.
+/// [`Kaleidotron::start_colo_pieces`]): an artist, a group, or a server-side search.
 #[derive(Clone)]
 enum ColoSource {
     Artist(String),
@@ -435,7 +435,7 @@ struct ImgMeta {
 
 /// Per-piece 16colo.rs metadata, keyed by the piece's virtual display path
 /// (`<16colo.rs>/<year>/<pack>/<FILE>`). Populated when an artist/group/search view
-/// is flattened into individual pieces (see [`PixelView::start_colo_pieces`]); it
+/// is flattened into individual pieces (see [`Kaleidotron::start_colo_pieces`]); it
 /// drives the table's scene columns, the scene sort keys, and the per-row download
 /// actions. The thumbnail comes from `tn_url` (16colo's pre-rendered PNG), and
 /// opening a piece downloads `raw_url` (the single file) rather than its whole pack.
@@ -1274,7 +1274,7 @@ enum FileAction {
     NewFolder,
 }
 
-pub struct PixelView {
+pub struct Kaleidotron {
     registry: Arc<Registry>,
     thumbs: ThumbBuilder,
 
@@ -1807,7 +1807,7 @@ pub struct PixelView {
     // to reapply on the first frame (None in DEBUG_MODE — the dock wins there).
     win_geom: Option<[f32; 4]>,
     restore_geom: Option<[f32; 4]>,
-    // Window title bar: when on, the open folder/file's display path is shown after "pixelview";
+    // Window title bar: when on, the open folder/file's display path is shown after "kaleidotron";
     // the GUI zoom % (Ctrl +/-) is always appended in parens when it isn't 100%. `title_last`
     // dedupes so we only push a `ViewportCommand::Title` when the string actually changes.
     title_show_path: bool,
@@ -2133,7 +2133,7 @@ pub struct PixelView {
     colo_sauce_pending: usize, // in-flight pack-SAUCE fetches (for the busy spinner)
 }
 
-impl PixelView {
+impl Kaleidotron {
     /// Storage key for the persisted UI zoom factor.
     const ZOOM_KEY: &'static str = "ui_zoom_factor";
     /// Storage key for the persisted thumbnail tile size.
@@ -2667,7 +2667,7 @@ impl PixelView {
         // baud (RIP at 9600), auto-advance on. Any persisted value still overrides.
         let crt_aspect = get_bool(Self::CRT_ASPECT_KEY).unwrap_or(true);
         // NB: left default-off. Its setter flips a process-global flag the decoder reads,
-        // which would leak into (parallel) decode tests via PixelView::new; the user's
+        // which would leak into (parallel) decode tests via Kaleidotron::new; the user's
         // persisted choice still applies. The other look defaults are per-instance + safe.
         let font_9px = get_bool(Self::FONT_9PX_KEY).unwrap_or(false);
         let baud_ansi = get_u8(Self::BAUD_ANSI_KEY)
@@ -2722,8 +2722,8 @@ impl PixelView {
         // persisted cell width.
         crate::decode::set_font_9px(font_9px);
         // Ratings sidecar lives alongside eframe's own storage (e.g.
-        // ~/.local/share/pixelview/ratings.json); temp dir is a harmless fallback.
-        let data_dir = eframe::storage_dir("pixelview").unwrap_or_else(std::env::temp_dir);
+        // ~/.local/share/kaleidotron/ratings.json); temp dir is a harmless fallback.
+        let data_dir = eframe::storage_dir("kaleidotron").unwrap_or_else(std::env::temp_dir);
         let ratings = crate::ratings::RatingStore::load(&data_dir);
         // View history lives alongside the ratings sidecar + eframe storage.
         let viewdb = crate::viewdb::ViewDb::open(&data_dir);
@@ -6263,7 +6263,7 @@ impl PixelView {
     }
 
     // --- HTTP filesystem browser. A directory is fetched + parsed on a worker; a file is
-    // downloaded on click and then opened by the normal decoder path, so any format pixelview
+    // downloaded on click and then opened by the normal decoder path, so any format kaleidotron
     // already understands works over HTTP with no extra handling.
 
     /// The "Download folder…" dialog for a remote directory: a Total-Commander-style wildcard mask
@@ -9341,7 +9341,7 @@ impl PixelView {
         };
         let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
         let slug = if slug.is_empty() { "font".into() } else { slug };
-        let out = std::env::temp_dir().join(format!("pixelview_{slug}.svg"));
+        let out = std::env::temp_dir().join(format!("kaleidotron_{slug}.svg"));
         if let Err(e) = std::fs::write(&out, svg) {
             self.status = format!("Couldn't write temp SVG: {e}");
             return;
@@ -9359,7 +9359,7 @@ impl PixelView {
         };
         let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
         let slug = if slug.is_empty() { "font".into() } else { slug };
-        let out = std::env::temp_dir().join(format!("pixelview_{slug}.png"));
+        let out = std::env::temp_dir().join(format!("kaleidotron_{slug}.png"));
         if let Err(e) = image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
             self.status = format!("Couldn't write temp PNG: {e}");
             return;
@@ -10818,7 +10818,7 @@ impl PixelView {
     }
 
     /// Export the rendered TDF text as ANSI art (`.ans`) via a save dialog.
-    /// SAUCE metadata for an ANSI export: `(title, comment, date CCYYMMDD)`. Credits pixel-viewer +
+    /// SAUCE metadata for an ANSI export: `(title, comment, date CCYYMMDD)`. Credits kaleidotron +
     /// names the source TheDraw font.
     fn tdf_ansi_sauce(&self, sample: &str) -> (String, String, String) {
         let title: String = sample.lines().next().unwrap_or("").chars().take(35).collect();
@@ -10830,7 +10830,7 @@ impl PixelView {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let comment = format!(
-            "Created by pixel-viewer https://github.com/grymmjack/pixel-viewer — TheDraw font '{font}' ({fname})"
+            "Created by kaleidotron https://github.com/grymmjack/kaleidotron — TheDraw font '{font}' ({fname})"
         );
         let date = date_ymd_unix(unix_now()).replace('-', ""); // YYYY-MM-DD → CCYYMMDD
         (title, comment, date)
@@ -10841,7 +10841,7 @@ impl PixelView {
         let sauce = crate::decode::tdf::AnsiSauce {
             title: &title,
             author: "",
-            group: "pixel-viewer",
+            group: "kaleidotron",
             comment: &comment,
             date: &date,
         };
@@ -10874,7 +10874,7 @@ impl PixelView {
         let sauce = crate::decode::tdf::AnsiSauce {
             title: &title,
             author: "",
-            group: "pixel-viewer",
+            group: "kaleidotron",
             comment: &comment,
             date: &date,
         };
@@ -10895,7 +10895,7 @@ impl PixelView {
             .take(24)
             .collect();
         let slug = if slug.is_empty() { "tdf".into() } else { slug };
-        let out = std::env::temp_dir().join(format!("pixelview_{slug}.ans"));
+        let out = std::env::temp_dir().join(format!("kaleidotron_{slug}.ans"));
         if let Err(e) = std::fs::write(&out, &bytes) {
             self.status = format!("Couldn't write temp ANSI: {e}");
             return;
@@ -10927,7 +10927,7 @@ impl PixelView {
     /// Copy a rendered `PixImage` to the system clipboard **as a bitmap** (Character-Map style —
     /// paste the styled sample straight into another program). egui's `copy_text` is text-only, so
     /// this goes through `arboard`. Sets `self.status` with the result. (On X11 the image lives on
-    /// the clipboard only while pixelview runs — an inherent X11 clipboard limitation.)
+    /// the clipboard only while kaleidotron runs — an inherent X11 clipboard limitation.)
     fn copy_image_to_clipboard(&mut self, img: &crate::image_types::PixImage) {
         let rgba = img.rgba_bytes();
         let data = arboard::ImageData {
@@ -11433,7 +11433,7 @@ impl PixelView {
                     ui.menu_button("Audio ▾", |ui| {
                         if ui
                             .button("Extract & edit in sampler")
-                            .on_hover_text("Extract the audio and open it in pixelview's built-in sampler/waveform editor")
+                            .on_hover_text("Extract the audio and open it in kaleidotron's built-in sampler/waveform editor")
                             .clicked()
                         {
                             want_extract = Some(true);
@@ -11737,7 +11737,7 @@ impl PixelView {
         }
         match want_extract {
             Some(true) => {
-                // Extract → open in pixelview's OWN sampler/waveform editor. This leaves the
+                // Extract → open in kaleidotron's OWN sampler/waveform editor. This leaves the
                 // video (load_full tears the player down) and needs the audio plugin on.
                 if let Some(wav) = self.extract_video_audio_for_edit() {
                     if !self.plugin_audio {
@@ -11987,12 +11987,12 @@ impl PixelView {
     }
 
     /// "Extract & edit in sampler" — decode the audio to a temp WAV (frictionless, no dialog) so
-    /// the caller can open it in pixelview's built-in sampler/waveform editor via `load_full`.
+    /// the caller can open it in kaleidotron's built-in sampler/waveform editor via `load_full`.
     /// Returns the temp WAV path, or `None` on failure (status set).
     fn extract_video_audio_for_edit(&mut self) -> Option<PathBuf> {
         let src = self.video_player.as_ref().map(|vp| vp.path.clone())?;
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
-        let dest = std::env::temp_dir().join(format!("pixelview_{}.wav", sanitize_filename(stem)));
+        let dest = std::env::temp_dir().join(format!("kaleidotron_{}.wav", sanitize_filename(stem)));
         let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
         if self.extract_video_audio_to(&src, &dest, speed) {
             self.status = format!("Editing audio from {}", short_name(&src));
@@ -12142,7 +12142,7 @@ impl PixelView {
             return;
         };
         // The concat demuxer reads a list file of `file '<path>'` lines (single quotes escaped).
-        let list_path = std::env::temp_dir().join("pixelview_concat.txt");
+        let list_path = std::env::temp_dir().join("kaleidotron_concat.txt");
         let mut list = String::new();
         for p in &paths {
             let esc = p.to_string_lossy().replace('\'', "'\\''");
@@ -19084,10 +19084,10 @@ impl PixelView {
         p.map(|p| self.to_display(&p).display().to_string())
     }
 
-    /// Rebuild the OS window title ("pixelview" + optional path + zoom %) and push it only
+    /// Rebuild the OS window title ("kaleidotron" + optional path + zoom %) and push it only
     /// when it changed, so we don't spam the compositor with a viewport command every frame.
     fn update_window_title(&mut self, ctx: &egui::Context) {
-        let mut title = String::from("pixelview");
+        let mut title = String::from("kaleidotron");
         if self.title_show_path {
             if let Some(loc) = self.title_location() {
                 title.push_str("  —  ");
@@ -19355,7 +19355,7 @@ impl PixelView {
         let description = meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
         let info = self.yt_info.get(path).cloned();
         let info_pending = self.yt_info_pending.as_deref() == Some(path);
-        // The channel id (for "Go to channel" — browse the channel inside pixelview).
+        // The channel id (for "Go to channel" — browse the channel inside kaleidotron).
         let channel_id = meta
             .as_ref()
             .map(|m| crate::youtube::channel_id_from_url(&m.channel_url))
@@ -19385,7 +19385,7 @@ impl PixelView {
                         if !channel_id.is_empty()
                             && ui
                                 .button("▸ Browse channel")
-                                .on_hover_text("Browse this channel's videos + playlists in pixelview")
+                                .on_hover_text("Browse this channel's videos + playlists in kaleidotron")
                                 .clicked()
                         {
                             want_channel = Some(channel_id.clone());
@@ -19557,7 +19557,7 @@ impl PixelView {
 
     /// Fresh output dir for an AI run (`run` diffs before/after, so reuse is fine).
     fn ai_out_dir(&self) -> PathBuf {
-        std::env::temp_dir().join("pixelview_ai_out")
+        std::env::temp_dir().join("kaleidotron_ai_out")
     }
 
     /// Build the final prompt from the dialog (style prefix + prompt + suffix).
@@ -31473,7 +31473,7 @@ impl PixelView {
     }
 }
 
-impl eframe::App for PixelView {
+impl eframe::App for Kaleidotron {
     // eframe 0.34.3 made `ui` the required method (`update` is now deprecated).
     // We're handed a root `Ui` instead of a `Context`, so panels mount via
     // `show_inside(ui, ..)` and we clone the context off the `Ui` for the rest.
@@ -35794,7 +35794,7 @@ fn dedup_path(dir: &Path, name: &OsStr) -> PathBuf {
 }
 
 /// Pure filter + sort behind `rebuild_view` — extracted so it can be unit-tested
-/// without constructing a full `PixelView` (which spawns worker threads).
+/// without constructing a full `Kaleidotron` (which spawns worker threads).
 #[allow(clippy::too_many_arguments)]
 fn sorted_filtered_view(
     all: &[Entry],
@@ -36854,7 +36854,7 @@ fn build_sfz_text(
     bpm: f32,
 ) -> String {
     let mut sfz = format!(
-        "// {name} — exported from pixelview\n// {} pads\n\n",
+        "// {name} — exported from kaleidotron\n// {} pads\n\n",
         entries.len()
     );
     for (note, fname, pad, dur, rate) in entries {
@@ -38030,7 +38030,7 @@ fn pan_knob(ui: &mut egui::Ui, pan: &mut f32, diameter: f32) -> egui::Response {
 }
 
 /// Solo/mute fold for a pad grid: a muted pad is silent; if ANY pad is soloed only soloed pads
-/// sound; otherwise every pad sounds. Free fn so it's testable without a `PixelView`.
+/// sound; otherwise every pad sounds. Free fn so it's testable without a `Kaleidotron`.
 fn pad_is_audible(pads: &[Pad], i: usize) -> bool {
     let Some(p) = pads.get(i) else {
         return false;
@@ -39693,7 +39693,7 @@ type MidiNoteEvent = (u8, u8, bool);
 /// Enumerate the names of the connected MIDI **input** devices (for the picker). A fresh
 /// `MidiInput` per enumeration, since `connect` consumes one — cheap, and always current.
 fn midi_input_port_names() -> Vec<String> {
-    let Ok(inp) = midir::MidiInput::new("pixelview-midi-enum") else {
+    let Ok(inp) = midir::MidiInput::new("kaleidotron-midi-enum") else {
         return Vec::new();
     };
     inp.ports()
@@ -39710,7 +39710,7 @@ fn open_midi_port(
     tx: std::sync::mpsc::Sender<MidiNoteEvent>,
     ctx: egui::Context,
 ) -> Option<midir::MidiInputConnection<std::sync::mpsc::Sender<MidiNoteEvent>>> {
-    let mut inp = midir::MidiInput::new("pixelview-midi-in").ok()?;
+    let mut inp = midir::MidiInput::new("kaleidotron-midi-in").ok()?;
     inp.ignore(midir::Ignore::None);
     let ports = inp.ports();
     let port = ports
@@ -40727,7 +40727,7 @@ fn empty_area_context_menu(
 /// The shared editor body for a list of external programs — used for both the file "Open in…"
 /// associations (`show_exts` = true) and the "Open folder in…" folder actions (`show_exts` =
 /// false, so the Extensions field is hidden). A free fn taking the pieces as disjoint borrows
-/// (`openers` mut, `selected` mut, `icons` shared) so one `PixelView` can host both tabs.
+/// (`openers` mut, `selected` mut, `icons` shared) so one `Kaleidotron` can host both tabs.
 /// Renders the Add / preset row, a left list + right field editor, and applies add/remove.
 #[allow(clippy::too_many_arguments)]
 fn openers_editor(
@@ -41420,7 +41420,7 @@ fn emit_artist(
 }
 
 /// Background worker for a flat 16colo.rs piece listing (see
-/// [`PixelView::start_colo_pieces`]). Streams a `ColoMsg::Hit` per piece, then
+/// [`Kaleidotron::start_colo_pieces`]). Streams a `ColoMsg::Hit` per piece, then
 /// `Done(total)`. An artist is one API call; a group fetches each of its packs; a
 /// search aggregates matched artists + groups (capped, so a broad query stays bounded).
 /// Checks `cancel` between pieces / network calls so navigation stops it promptly.
@@ -42329,11 +42329,11 @@ pub struct CliArgs {
 }
 
 const USAGE: &str = "\
-pixelview — a pixel-art-first image viewer
+kaleidotron — a pixel-art-first image viewer
 
 USAGE:
-    pixelview [OPTIONS]
-    pixelview --render <PATH>... [RENDER OPTIONS]   (headless; no window)
+    kaleidotron [OPTIONS]
+    kaleidotron --render <PATH>... [RENDER OPTIONS]   (headless; no window)
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
@@ -42436,7 +42436,7 @@ impl CliArgs {
 }
 
 fn cli_fail(msg: &str) -> ! {
-    eprintln!("pixelview: {msg}");
+    eprintln!("kaleidotron: {msg}");
     std::process::exit(2);
 }
 
@@ -42565,7 +42565,7 @@ pub fn run_render(cli: &CliArgs) -> i32 {
     // Fail fast on a bad --format before doing any work.
     if let Some(fmt) = &cli.render_format {
         if image::ImageFormat::from_extension(fmt).is_none() {
-            eprintln!("pixelview: unsupported --format '{fmt}' (try png, bmp, tga, …)");
+            eprintln!("kaleidotron: unsupported --format '{fmt}' (try png, bmp, tga, …)");
             return 2;
         }
     }
@@ -42574,14 +42574,14 @@ pub fn run_render(cli: &CliArgs) -> i32 {
     let single_input_file = cli.render_inputs.len() == 1 && cli.render_inputs[0].is_file();
     if cli.render_out.is_some() && !single_input_file {
         eprintln!(
-            "pixelview: -o/--out only works with a single input file; use --outdir for batches"
+            "kaleidotron: -o/--out only works with a single input file; use --outdir for batches"
         );
         return 2;
     }
 
     if let Some(d) = &cli.render_outdir {
         if let Err(e) = std::fs::create_dir_all(d) {
-            eprintln!("pixelview: cannot create output dir {}: {e}", d.display());
+            eprintln!("kaleidotron: cannot create output dir {}: {e}", d.display());
             return 2;
         }
     }
@@ -42592,17 +42592,17 @@ pub fn run_render(cli: &CliArgs) -> i32 {
         if inp.is_dir() {
             let files = scan_render_dir(inp);
             if files.is_empty() {
-                eprintln!("pixelview: no viewable art files in {}", inp.display());
+                eprintln!("kaleidotron: no viewable art files in {}", inp.display());
             }
             jobs.extend(files);
         } else if inp.is_file() {
             jobs.push(inp.clone());
         } else {
-            eprintln!("pixelview: not found: {}", inp.display());
+            eprintln!("kaleidotron: not found: {}", inp.display());
         }
     }
     if jobs.is_empty() {
-        eprintln!("pixelview: nothing to render");
+        eprintln!("kaleidotron: nothing to render");
         return 1;
     }
 
@@ -42615,7 +42615,7 @@ pub fn run_render(cli: &CliArgs) -> i32 {
                 ok += 1;
             }
             Err(e) => {
-                eprintln!("pixelview: {}: {e}", job.display());
+                eprintln!("kaleidotron: {}: {e}", job.display());
                 fail += 1;
             }
         }
@@ -44909,7 +44909,7 @@ mod gui_tests {
         // No folder open → menu bar, toolbar, favorites, status all render the
         // empty state. Several frames must complete without panicking.
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run_steps(3);
         // The menu bar's top-level items exist in the accessibility tree.
         harness.get_by_label("File");
@@ -44919,7 +44919,7 @@ mod gui_tests {
     #[test]
     fn file_menu_opens_and_shows_quit() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run();
         harness.get_by_label("File").click();
         harness.run();
@@ -44930,7 +44930,7 @@ mod gui_tests {
     #[test]
     fn help_opens_keyboard_shortcuts_window() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run();
         harness.get_by_label("Help").click();
         harness.run();
@@ -44943,7 +44943,7 @@ mod gui_tests {
     #[test]
     fn explorer_and_details_toggles_present() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run();
         // The dock toggles moved from the toolbar to the View menu (and the rail).
         harness.get_by_label("View").click();
@@ -44955,7 +44955,7 @@ mod gui_tests {
     #[test]
     fn table_view_toggle_present_and_switches_without_panic() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run();
         harness.get_by_label("View").click();
         harness.run();
@@ -44969,7 +44969,7 @@ mod gui_tests {
     #[test]
     fn view_menu_opens_preferences() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.run();
         harness.get_by_label("View").click();
         harness.run();
@@ -44991,7 +44991,7 @@ mod gui_tests {
         let dir = std::env::temp_dir().join(format!("pv_fav_click_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         harness.state_mut().favorites.push(dir.clone());
         harness.run();
         // The toolbar favorite renders as "📁 <name>" (Places dock is hidden by
@@ -45145,7 +45145,7 @@ mod gui_tests {
     #[test]
     fn leaving_an_archive_mount_clears_it() {
         let mut harness =
-            Harness::builder().build_eframe(|cc| PixelView::new(cc, CliArgs::default()));
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         let pid = std::process::id();
         let mount = std::env::temp_dir().join(format!("pv_mount_{pid}"));
         let inside = mount.join("sub");
@@ -45178,7 +45178,7 @@ mod gui_tests {
 
 /// Renders real GUI screenshots to `target/gui-screenshots/` for CI artifacts /
 /// visual review. Each *scenario* drives the actual app headlessly (egui_kittest
-/// boots `PixelView`, opens art, clicks controls) and captures the frame; the only
+/// boots `Kaleidotron`, opens art, clicks controls) and captures the frame; the only
 /// thing painted onto the image is the spatial click marker (a ring) — kittest
 /// already paints the mouse cursor at the pointer. The *textual* annotations
 /// (action / keys / mouse / which change a shot demonstrates) are written as
@@ -45200,7 +45200,7 @@ mod gui_screenshots {
 
     // A small text-mode piece so the viewer shows the text-mode-only controls
     // (CRT aspect, 9-dot cell) and a baud player: colored blocks, a title, dither.
-    const SAMPLE_ANS: &[u8] = b"\x1b[0;1;31m\xdb\xdb\x1b[33m\xdb\xdb\x1b[32m\xdb\xdb\x1b[36m\xdb\xdb\x1b[34m\xdb\xdb\x1b[35m\xdb\xdb\x1b[37m\xdb\xdb\x1b[0m\r\n\x1b[1;36m  pixelview \x1b[0;37mUI cleanup demo\x1b[0m\r\n\x1b[1;30m\xb0\xb1\xb2\x1b[0;36m\xb2\xb1\xb0 \x1b[1;33mtext-mode art\x1b[0m\r\n";
+    const SAMPLE_ANS: &[u8] = b"\x1b[0;1;31m\xdb\xdb\x1b[33m\xdb\xdb\x1b[32m\xdb\xdb\x1b[36m\xdb\xdb\x1b[34m\xdb\xdb\x1b[35m\xdb\xdb\x1b[37m\xdb\xdb\x1b[0m\r\n\x1b[1;36m  kaleidotron \x1b[0;37mUI cleanup demo\x1b[0m\r\n\x1b[1;30m\xb0\xb1\xb2\x1b[0;36m\xb2\xb1\xb0 \x1b[1;33mtext-mode art\x1b[0m\r\n";
 
     /// One screenshot scenario. `drive` puts the app in a state and returns the
     /// click point (image px) to ring, if any. `action`/`shows` become captions.
@@ -45209,10 +45209,10 @@ mod gui_screenshots {
         tags: &'static [&'static str],
         action: &'static str,
         shows: &'static str,
-        drive: fn(&mut Harness<'_, PixelView>, &Path) -> Option<(i32, i32)>,
+        drive: fn(&mut Harness<'_, Kaleidotron>, &Path) -> Option<(i32, i32)>,
     }
 
-    fn build(folder: &Path) -> Harness<'static, PixelView> {
+    fn build(folder: &Path) -> Harness<'static, Kaleidotron> {
         let args = CliArgs {
             folder: Some(folder.to_path_buf()),
             ..Default::default()
@@ -45220,14 +45220,14 @@ mod gui_screenshots {
         Harness::builder()
             .with_size([1280.0, 860.0])
             .wgpu()
-            .build_eframe(move |cc| PixelView::new(cc, args))
+            .build_eframe(move |cc| Kaleidotron::new(cc, args))
     }
 
     // Let async work (folder scan, thumbnail decode on the worker pool) catch up.
-    // Use `step` (one frame), not `run`: pixelview keeps requesting repaints
+    // Use `step` (one frame), not `run`: kaleidotron keeps requesting repaints
     // (spinners / pending thumbnails / the player), so `run` never "settles" and
     // would hit its max-steps assertion.
-    fn settle(h: &mut Harness<'_, PixelView>, frames: usize) {
+    fn settle(h: &mut Harness<'_, Kaleidotron>, frames: usize) {
         for _ in 0..frames {
             h.step();
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -45236,7 +45236,7 @@ mod gui_screenshots {
 
     // Open `sample` in the single/viewer view, exactly as a grid click would
     // (load_full decodes synchronously, then flip the mode).
-    fn enter_viewer(h: &mut Harness<'_, PixelView>, sample: &Path) {
+    fn enter_viewer(h: &mut Harness<'_, Kaleidotron>, sample: &Path) {
         let ctx = h.ctx.clone();
         {
             let st = h.state_mut();
@@ -45247,7 +45247,7 @@ mod gui_screenshots {
     }
 
     // Click a labelled widget; return its center in image pixels (for the ring).
-    fn click(h: &mut Harness<'_, PixelView>, label: &str) -> (i32, i32) {
+    fn click(h: &mut Harness<'_, Kaleidotron>, label: &str) -> (i32, i32) {
         let ppp = h.ctx.pixels_per_point();
         let center = {
             let n = h.get_by_label(label);
@@ -45481,7 +45481,7 @@ mod hold_test {
     #[test]
     fn write_wav_16_produces_a_valid_header() {
         let dir = std::env::temp_dir();
-        let path = dir.join("pixelview_test_export.wav");
+        let path = dir.join("kaleidotron_test_export.wav");
         // A tiny mono ramp: 4 frames at 8000 Hz.
         let samples = [0.0f32, 0.5, -0.5, 1.0];
         super::write_wav_16(&path, &samples, 1, 8000).unwrap();
