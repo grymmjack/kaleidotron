@@ -126,11 +126,32 @@ pub fn load(file: &Path) -> Option<HashMap<String, serde_json::Value>> {
 }
 
 /// Write the file, creating the directory as needed.
+/// Write the file **atomically**: a full temp file, then a rename.
+///
+/// `fs::write` truncates and then fills, so anything reading during that window sees a partial —
+/// or empty — file. This is not hypothetical: launching a second instance while the first is
+/// flushing produced exactly that, and since an unreadable file parses to nothing, the reader then
+/// wrote its *defaults* back over the user's settings. A rename is atomic on both Unix and Windows,
+/// so a reader sees either the old file or the new one, never a half-written one.
 pub fn save(file: &Path, entries: &[Entry]) -> Result<(), String> {
     if let Some(d) = file.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
-    std::fs::write(file, to_json(entries)).map_err(|e| e.to_string())
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, to_json(entries)).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Does a settings file exist but yield nothing usable?
+///
+/// The distinction matters: a *missing* file is the normal first run and should be seeded with
+/// defaults, whereas a file that exists but won't parse holds settings somebody wrote by hand.
+/// Overwriting that with defaults is silent data loss, so the caller preserves it instead.
+pub fn exists_but_unreadable(file: &Path) -> bool {
+    file.exists() && load(file).is_none()
 }
 
 // --- Typed readers. Each returns `None` when the key is absent or the wrong type, so a mangled
@@ -245,6 +266,41 @@ mod tests {
         let m = parse(r#"{ "c": [255, 300, -5], "short": [1, 2] }"#);
         assert_eq!(get_rgb(&m, "c"), Some([255, 255, 0]));
         assert_eq!(get_rgb(&m, "short"), None, "wrong length is rejected");
+    }
+
+    #[test]
+    fn an_unreadable_file_is_detected_rather_than_replaced() {
+        // The bug this guards: a partial or unparseable settings file yields nothing, and a caller
+        // that then writes its defaults back has silently destroyed hand-written settings.
+        let dir = std::env::temp_dir().join(format!("pv_set_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("settings.json");
+        // Missing is NOT unreadable — that's an ordinary first run, which should be seeded.
+        assert!(!exists_but_unreadable(&f));
+        std::fs::write(&f, "").unwrap();
+        assert!(exists_but_unreadable(&f), "an empty file is not usable settings");
+        std::fs::write(&f, "{ this is not json").unwrap();
+        assert!(exists_but_unreadable(&f));
+        std::fs::write(&f, r#"{ "Appearance": { "theme_name": "X" } }"#).unwrap();
+        assert!(!exists_but_unreadable(&f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_leaves_no_partial_file_behind() {
+        let dir = std::env::temp_dir().join(format!("pv_set_atomic_{}", std::process::id()));
+        let f = dir.join("settings.json");
+        let entries = [Entry {
+            section: "Appearance",
+            key: "theme_name",
+            value: serde_json::Value::String("X".into()),
+            doc: "",
+        }];
+        save(&f, &entries).unwrap();
+        assert_eq!(load(&f).unwrap()["theme_name"], serde_json::json!("X"));
+        // The temp file must not survive a successful write.
+        assert!(!f.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
