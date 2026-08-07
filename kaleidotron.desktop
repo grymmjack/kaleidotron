@@ -1,13 +1,13 @@
 [Desktop Entry]
 Type=Application
-Name=pixelview
+Name=kaleidotron
 GenericName=Pixel-art Image Viewer
 Comment=A fast, pixel-art-first image browser
-Exec=pixelview %F
-Icon=pixelview
+Exec=kaleidotron %F
+Icon=kaleidotron
 Terminal=false
 Categories=Graphics;Viewer;RasterGraphics;
 MimeType=image/png;image/gif;image/bmp;image/jpeg;image/webp;image/x-tga;image/tiff;image/x-portable-anymap;image/x-pcx;image/vnd.adobe.photoshop;
-# Must match ViewportBuilder::with_app_id("pixelview") so KWin maps the window
+# Must match ViewportBuilder::with_app_id("kaleidotron") so KWin maps the window
 # to this entry (and therefore this Icon) in the task switcher.
-StartupWMClass=pixelview
+StartupWMClass=kaleidotron

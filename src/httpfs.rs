@@ -1,4 +1,4 @@
-//! **HTTP filesystem browser** — point pixelview at any URL and browse it like a folder tree, the
+//! **HTTP filesystem browser** — point kaleidotron at any URL and browse it like a folder tree, the
 //! way Total Commander's FS plugins do.
 //!
 //! HTTP has no standard directory listing, so the practical target is the **auto-index page** that

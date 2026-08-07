@@ -2,7 +2,7 @@
 //! `palette-list/load` endpoint returns palettes **with their colours inline**, so we render the
 //! swatch thumbnail ourselves (Lospec's own `.png` endpoint is currently broken) and can apply a
 //! palette to the Recolor pane instantly; opening/clicking one also downloads its `.gpl` into the
-//! palette library (pixelview already parses `.gpl`), so it persists in the Recolor palette list.
+//! palette library (kaleidotron already parses `.gpl`), so it persists in the Recolor palette list.
 //!
 //! Pure + unit-tested here; the egui/threading wiring is in `app.rs` (the `lospec_*` machinery).
 
@@ -42,7 +42,7 @@ pub struct LospecPalette {
 }
 
 impl LospecPalette {
-    /// The `.gpl` (GIMP palette) download URL — pixelview parses this directly.
+    /// The `.gpl` (GIMP palette) download URL — kaleidotron parses this directly.
     pub fn gpl_url(&self) -> String {
         format!("{DL}/{}.gpl", self.slug)
     }

@@ -1,7 +1,7 @@
 //! Persistent "view history" for browsed items — visited state, view counts, and
 //! first/last-viewed timestamps — backed by a small SQLite database alongside eframe's
-//! storage (e.g. `~/.local/share/pixelview/views.db`). Keyed by the *stable display
-//! path* (the same identity ratings use; see [`crate::app::PixelView::to_display`]), so a
+//! storage (e.g. `~/.local/share/kaleidotron/views.db`). Keyed by the *stable display
+//! path* (the same identity ratings use; see [`crate::app::Kaleidotron::to_display`]), so a
 //! piece inside a zip or on 16colo.rs is tracked across re-extraction / re-download.
 //!
 //! All rows are mirrored into an in-memory map on open, so the grid/table can ask "is
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir =
-            std::env::temp_dir().join(format!("pixelview_viewdb_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("kaleidotron_viewdb_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         {
             let mut db = ViewDb::open(&dir).expect("open");

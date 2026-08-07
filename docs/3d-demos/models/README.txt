@@ -1,7 +1,7 @@
-pixelview 3D format samples
+kaleidotron 3D format samples
 ============================================================
 The same model (Blender's "Suzanne" monkey) exported to every 3D format
-pixelview can VIEW as geometry, plus a hand-written COLLADA cube. Enable
+kaleidotron can VIEW as geometry, plus a hand-written COLLADA cube. Enable
 Preferences → Format plugins → "3D models", then open any of these — each
 opens the interactive viewer (drag = orbit, wheel = zoom, right-click = FPS fly).
 

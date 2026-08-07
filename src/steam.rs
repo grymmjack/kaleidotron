@@ -1,4 +1,4 @@
-//! "SteamTube": introspect the local Steam library (installed games) so pixelview can list them,
+//! "SteamTube": introspect the local Steam library (installed games) so kaleidotron can list them,
 //! search them, and — clicking a game — find related YouTube videos (routes to the YouTube source).
 //!
 //! Pure (no egui): reads Steam's VDF/ACF KeyValues config files off disk + a tiny field parser.

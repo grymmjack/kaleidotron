@@ -95,7 +95,7 @@ mod tests {
         // Best-effort: some temp filesystems don't support user xattrs, so we
         // only assert when the write actually succeeds.
         let path =
-            std::env::temp_dir().join(format!("pixelview_rating_{}.bin", std::process::id()));
+            std::env::temp_dir().join(format!("kaleidotron_rating_{}.bin", std::process::id()));
         std::fs::write(&path, b"x").unwrap();
         if write(&path, 4).is_ok() {
             assert_eq!(read(&path), 4);

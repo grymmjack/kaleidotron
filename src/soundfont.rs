@@ -87,7 +87,7 @@ pub fn extract_to_cache(sf2: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
-/// The deterministic cache directory for `sf2`: `<temp>/pixelview-soundfonts/<stem>-<hash>`,
+/// The deterministic cache directory for `sf2`: `<temp>/kaleidotron-soundfonts/<stem>-<hash>`,
 /// the hash folding in size + mtime so an edited file re-extracts.
 fn cache_dir(sf2: &Path) -> io::Result<PathBuf> {
     let meta = std::fs::metadata(sf2)?;
@@ -101,7 +101,7 @@ fn cache_dir(sf2: &Path) -> io::Result<PathBuf> {
     let stem = sf2.file_name().and_then(|s| s.to_str()).unwrap_or("sf2");
     let safe = sanitize(stem);
     Ok(std::env::temp_dir()
-        .join("pixelview-soundfonts")
+        .join("kaleidotron-soundfonts")
         .join(format!("{safe}-{:016x}", hash_str(&key))))
 }
 

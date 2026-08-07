@@ -1,4 +1,4 @@
-# Autonomous build log — pixelview backlog
+# Autonomous build log — kaleidotron backlog
 
 Started by grymmjack with full approval to build the backlog unattended, PR-per-feature,
 merge each so the next builds on clean main. Order: quick-ish → medium → large.
@@ -29,7 +29,7 @@ merge each so the next builds on clean main. Order: quick-ish → medium → lar
   playlist videos / a channel's playlists. `start_yt_list` generalizes `start_yt_search`.
 - ✅ `open_yt` routes `<youtube>/channel/<id>` (videos), `.../channel/<id>/playlists`,
   `<youtube>/playlist/<Title [plid]>` (folder-like tile → its videos), + pinned-video leaves.
-- ✅ Details pane: **▸ Browse channel** (opens the channel in pixelview) next to Web + the channel
+- ✅ Details pane: **▸ Browse channel** (opens the channel in kaleidotron) next to Web + the channel
   name; `go_to_channel`. Pin a channel via the ★ toolbar once there.
 - ✅ Breadcrumb shows the channel NAME (yt_channel_names, learned from results) + friendly
   Channel/Playlists/Playlist segment labels.
@@ -115,7 +115,7 @@ fonts; one file holds several named fonts (outline / block / colour sub-types). 
 hand-parse the fiddly binary (my prototype kept misaligning the header), I depend on Mike Krüger's
 **`retrofont`** crate (same icy ecosystem as `icy_parser_core`, MIT/Apache) which fully resolves
 every glyph into a uniform `Vec<GlyphPart>` cell stream; `decode/tdf.rs` rasterises those with
-pixelview's own CP437 8×16 font + VGA palette (crisp pixel-perfect zoom, matches the other
+kaleidotron's own CP437 8×16 font + VGA palette (crisp pixel-perfect zoom, matches the other
 text-mode decoders).
 - `decode/tdf.rs`: `TdfDecoder` (sniff `0x13`+"TheDraw FONTS file"), `font_list`/`render_tdf`;
   `render_string` walks GlyphPart (NewLine/Skip/HardBlank/FillMarker/OutlinePlaceholder→
@@ -168,7 +168,7 @@ User feedback on the font browser (+ new asks). Batch:
 - **Copy sample as image (Character-Map style)** — egui's clipboard is text-only, so added `arboard`
   (already transitive via egui-winit) + `copy_image_to_clipboard`; a **📋 image** button in all three
   font viewers copies the rendered sample as a bitmap to paste into any program. (X11: lives on the
-  clipboard while pixelview runs.)
+  clipboard while kaleidotron runs.)
 - 286 tests pass.
 - **DRAW font-format survey** (user asked for "every format DRAW supports"): DRAW has ttf/otf ✅,
   .FON ✅ (now), plus **.psf** (Linux console) + **.F16/.F08** (raw 8×16/8×8 bitmap dumps) — both

@@ -3,7 +3,7 @@
 //! box-drawing letters), **block** (solid CP437 letters, one colour) and **colour** (per-cell
 //! fg/bg attributes). Parsing is delegated to Mike Krüger's **`retrofont`** crate (same icy
 //! ecosystem as `icy_parser_core`), which fully resolves every glyph into a uniform stream of
-//! [`GlyphPart`] cells; we rasterise those with pixelview's own CP437 8×16 font + VGA palette —
+//! [`GlyphPart`] cells; we rasterise those with kaleidotron's own CP437 8×16 font + VGA palette —
 //! keeping the pixel-perfect zoom + thumbnail quality the other text-mode decoders enjoy.
 //!
 //! The grid tile shows the first font spelling a short sample; opening a `.tdf` enters a viewer
@@ -108,7 +108,7 @@ pub fn render_tdf(bytes: &[u8], index: usize, text: &str, opts: &TdfOpts) -> Opt
 }
 
 /// SAUCE metadata for the ANSI export (so editors like Moebius/PabloDraw open the canvas at the
-/// right width instead of wrapping at 80, and the piece is credited to pixelview).
+/// right width instead of wrapping at 80, and the piece is credited to kaleidotron).
 #[derive(Default)]
 pub struct AnsiSauce<'a> {
     pub title: &'a str,
@@ -647,8 +647,8 @@ mod sauce_multiline {
         eprintln!("height 1-line={h1} 2-line={h2}");
         assert!(h2 > h1 + 5);
         // SAUCE on the ANS
-        let sauce = AnsiSauce { title: "bbs main menu", author: "", group: "pixel-viewer",
-            comment: "Created by pixel-viewer https://github.com/grymmjack/pixel-viewer", date: "20260804" };
+        let sauce = AnsiSauce { title: "bbs main menu", author: "", group: "kaleidotron",
+            comment: "Created by kaleidotron https://github.com/grymmjack/kaleidotron", date: "20260804" };
         let ans = tdf_to_ansi(&bytes, 0, "WW", &TdfOpts { spacing: 0, line_gap: 0, ..Default::default() }, &sauce).unwrap();
         // last 128 bytes = SAUCE record
         let rec = &ans[ans.len()-128..];

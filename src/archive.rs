@@ -45,7 +45,7 @@ pub fn extract_to_cache(archive: &Path) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
-/// The deterministic cache directory for `archive`: `<temp>/pixelview-archives/
+/// The deterministic cache directory for `archive`: `<temp>/kaleidotron-archives/
 /// <stem>-<hash>` where the hash folds in size + mtime so edits invalidate it.
 fn cache_dir(archive: &Path) -> io::Result<PathBuf> {
     let meta = std::fs::metadata(archive)?;
@@ -71,7 +71,7 @@ fn cache_dir(archive: &Path) -> io::Result<PathBuf> {
         })
         .collect();
     Ok(std::env::temp_dir()
-        .join("pixelview-archives")
+        .join("kaleidotron-archives")
         .join(format!("{safe}-{:016x}", hash_str(&key))))
 }
 

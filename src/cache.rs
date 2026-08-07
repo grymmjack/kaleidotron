@@ -79,7 +79,7 @@ fn key(url: &str) -> String {
 
 /// A descriptive User-Agent — Wikimedia (and good API etiquette generally) require one; a
 /// missing/blank UA gets 403'd. Kept generic + contactable per the Wikimedia UA policy.
-pub const USER_AGENT: &str = "pixelview/0.1 (https://github.com/grymmjack/pixel-viewer)";
+pub const USER_AGENT: &str = "kaleidotron/0.1 (https://github.com/grymmjack/kaleidotron)";
 
 /// HTTP GET `url` into memory (capped). Errors on a network/HTTP failure (so failures
 /// are never cached).
@@ -153,7 +153,7 @@ pub fn get_file(url: &str, filename: &str) -> Result<PathBuf, String> {
         return Ok(path);
     }
     // Cache disabled → still hand back a (temp) file so callers keep working.
-    let dir = std::env::temp_dir().join("pixelview-16colo").join(key(url));
+    let dir = std::env::temp_dir().join("kaleidotron-16colo").join(key(url));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(filename);
     if !path.exists() {

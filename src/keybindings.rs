@@ -139,7 +139,7 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
 /// emitted as a `//` comment above its entry so the file explains itself.
 pub fn to_json(entries: &[(String, String)], labels: &dyn Fn(&str) -> Option<String>) -> String {
     let mut s = String::from(
-        "// pixelview key bindings.\n\
+        "// kaleidotron key bindings.\n\
          // Edit and save — changes apply without restarting.\n\
          // \"key\" uses egui key names: ArrowLeft, PageDown, F5, A, Num1, …\n\
          // Delete this file to restore the defaults.\n[\n",

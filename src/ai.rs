@@ -1,9 +1,9 @@
 //! AI generation plugin — shell out to a user-configured external generator (pixelmon / soundmon /
 //! ansimon / a test echo), the same model as grymmjack's DRAW editor.
 //!
-//! pixelview never talks to a model directly. A **tool** is an external command whose argument
+//! kaleidotron never talks to a model directly. A **tool** is an external command whose argument
 //! string is a **template** of `{macros}` (`{prompt}` `{seed}` `{outdir}` `{sw}` …) expanded per
-//! run; the tool writes its output into a fresh `{outdir}`, and pixelview imports whatever new
+//! run; the tool writes its output into a fresh `{outdir}`, and kaleidotron imports whatever new
 //! files land there. A **style** wraps the prompt (prefix/suffix) + adds CLI flags + can lock a
 //! seed; a **prompt** is a saved text preset. Everything is pure here (no egui) so it's testable.
 
@@ -16,7 +16,7 @@ use std::process::Command;
 pub struct AiTool {
     pub name: String, // display name, e.g. "pixelmon"
     pub exe: String,  // executable (absolute or on PATH)
-    pub dir: String,  // working directory ("" = pixelview's own)
+    pub dir: String,  // working directory ("" = kaleidotron's own)
     pub args: String, // argument template, expanded by `expand`
     pub audio: bool,  // true = a sound generator (soundmon) — offered on audio pads
 }
@@ -256,7 +256,7 @@ pub fn run(
             format!("Generator error: {tail}")
         });
     }
-    // New files, skipping pixelview's own `_`-prefixed / hidden ones. Newest first.
+    // New files, skipping kaleidotron's own `_`-prefixed / hidden ones. Newest first.
     let mut fresh: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&ctx.outdir)
         .map_err(|e| format!("Can't read output: {e}"))?
         .flatten()
@@ -283,7 +283,7 @@ pub fn run(
 }
 
 /// Starter tools seeded on first enable: a test echo + pixelmon (images) + soundmon (audio) +
-/// ansimon (ANSI), pointed at the sibling repos grymmjack keeps next to pixel-viewer. Paths that
+/// ansimon (ANSI), pointed at the sibling repos grymmjack keeps next to kaleidotron. Paths that
 /// don't exist are harmless — the user edits them in the AI tab.
 pub fn starter_tools(home: &Path) -> Vec<AiTool> {
     // Each generator has its OWN CLI. pixelmon takes a pixel --size; soundmon has NO --size;

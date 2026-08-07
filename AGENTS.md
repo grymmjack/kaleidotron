@@ -1,17 +1,17 @@
 # AGENTS.md
 
-Guidance for AI agents / LLMs driving **pixelview**. For human docs see
+Guidance for AI agents / LLMs driving **kaleidotron**. For human docs see
 [`README.md`](README.md); for deep implementation internals see [`CLAUDE.md`](CLAUDE.md).
 
 ---
 
-## Tool: `pixelview --render` — headless text-art → image converter
+## Tool: `kaleidotron --render` — headless text-art → image converter
 
-`pixelview` converts BBS/scene text art and images to image files with **no window**
+`kaleidotron` converts BBS/scene text art and images to image files with **no window**
 (works over SSH and in batch scripts). Command shape:
 
 ```
-pixelview --render <INPUT>... [-o FILE | --outdir DIR] [--font-9px] [--scale N] [--format FMT]
+kaleidotron --render <INPUT>... [-o FILE | --outdir DIR] [--font-9px] [--scale N] [--format FMT]
 ```
 
 ### Rules
@@ -35,14 +35,14 @@ pixelview --render <INPUT>... [-o FILE | --outdir DIR] [--font-9px] [--scale N] 
 ### Per-format examples (all text-mode types)
 
 ```sh
-pixelview --render art.ans -o art.png     # ANSI/ASCII (.ans .asc .nfo .diz .ice .cia)
-pixelview --render art.xb  -o art.png     # XBin (.xb / .xbin)
-pixelview --render art.bin -o art.png     # raw BIN (SAUCE width)
-pixelview --render art.tnd -o art.png     # TundraDraw (24-bit truecolor)
-pixelview --render art.idf -o art.png     # iCE Draw
-pixelview --render art.adf -o art.png     # Artworx
-pixelview --render art.seq -o art.png     # Commodore PETSCII (.seq / .pet)
-pixelview --render art.rip -o art.png     # RIPscript (EGA vector)
+kaleidotron --render art.ans -o art.png     # ANSI/ASCII (.ans .asc .nfo .diz .ice .cia)
+kaleidotron --render art.xb  -o art.png     # XBin (.xb / .xbin)
+kaleidotron --render art.bin -o art.png     # raw BIN (SAUCE width)
+kaleidotron --render art.tnd -o art.png     # TundraDraw (24-bit truecolor)
+kaleidotron --render art.idf -o art.png     # iCE Draw
+kaleidotron --render art.adf -o art.png     # Artworx
+kaleidotron --render art.seq -o art.png     # Commodore PETSCII (.seq / .pet)
+kaleidotron --render art.rip -o art.png     # RIPscript (EGA vector)
 ```
 
 Ordinary images (`png`, `gif`, `bmp`, `jpg`, `pcx`, `svg`, …) render too — an explicitly
@@ -51,18 +51,18 @@ named input file is always tried regardless of type.
 ### Common recipes
 
 ```sh
-pixelview --render art.ans --font-9px -o art.png        # ansilove-accurate width
-pixelview --render art.ans --scale 2 -o art@2x.png      # 2× upscale
-pixelview --render pack/ --outdir out/ --font-9px       # convert a whole pack folder
-pixelview --render a.ans b.xb c.rip --outdir out/       # several files at once
-pixelview --render art.ans --format tga -o art          # force TGA output
+kaleidotron --render art.ans --font-9px -o art.png        # ansilove-accurate width
+kaleidotron --render art.ans --scale 2 -o art@2x.png      # 2× upscale
+kaleidotron --render pack/ --outdir out/ --font-9px       # convert a whole pack folder
+kaleidotron --render a.ans b.xb c.rip --outdir out/       # several files at once
+kaleidotron --render art.ans --format tga -o art          # force TGA output
 ```
 
 ---
 
 ## Repo conventions for code changes
 
-- Rust + eframe/egui, single binary crate (`pixelview`). Pinned `eframe = "0.34"` /
+- Rust + eframe/egui, single binary crate (`kaleidotron`). Pinned `eframe = "0.34"` /
   `image = "0.25"`; `Cargo.lock` is committed.
 - Before finishing a change: `cargo fmt` **only your own edits** (the tree has some
   pre-existing rustfmt drift — do not sweep it into an unrelated diff), then

@@ -49,23 +49,110 @@ fn main() -> Result<(), eframe::Error> {
         std::process::exit(app::run_render(&cli));
     }
 
+    // Carry a pixelview install's data over before eframe reads its storage.
+    migrate_from_pixelview();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 420.0])
-            .with_title("pixelview")
+            .with_title("kaleidotron")
             // Wayland compositors key the task-switcher icon off the app_id (matched
-            // against a pixelview.desktop). `with_icon` covers X11 / other backends.
-            .with_app_id("pixelview")
+            // against a kaleidotron.desktop). `with_icon` covers X11 / other backends.
+            .with_app_id("kaleidotron")
             .with_icon(app_icon()),
         ..Default::default()
     };
 
     eframe::run_native(
-        "pixelview",
+        "kaleidotron",
         options,
-        Box::new(move |cc| Ok(Box::new(app::PixelView::new(cc, cli)))),
+        Box::new(move |cc| Ok(Box::new(app::Kaleidotron::new(cc, cli)))),
     )
+}
+
+/// Bring a previous `pixelview` install's data across, once, on first run under the new name.
+///
+/// Ratings, view history, kits, pads, themes and settings all live in the app's data dir, which is
+/// derived from the application name — so renaming the app would otherwise look exactly like a
+/// fresh install with everything lost.
+///
+/// Deliberately **copies** rather than moves: the old directory is left completely untouched, so if
+/// anything here is wrong the original is still sitting there. Nothing is ever overwritten either —
+/// the migration only runs when the new directory does not yet exist.
+///
+/// Two directories are **linked instead of copied**: `cache/` (the evictable HTTP cache) and
+/// `youtube/` (downloaded videos) are the only large things here — gigabytes each — and duplicating
+/// them would stall startup and double the disk cost for data that is either regenerable or already
+/// on disk once. A symlink gives both installs the same store. Where symlinks aren't available the
+/// new install simply starts with an empty cache, which costs nothing but re-downloading.
+fn migrate_from_pixelview() {
+    let (Some(old), Some(new)) = (
+        eframe::storage_dir("pixelview"),
+        eframe::storage_dir("kaleidotron"),
+    ) else {
+        return;
+    };
+    if new.exists() || !old.exists() {
+        return; // already migrated, or nothing to migrate
+    }
+    // Big, regenerable, or already-once-on-disk: shared rather than duplicated.
+    const LINK: [&str; 2] = ["cache", "youtube"];
+    if let Err(e) = std::fs::create_dir_all(&new) {
+        eprintln!("could not create {}: {e}", new.display());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&old) else { return };
+    let mut copied = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let src = entry.path();
+        let dst = new.join(&name);
+        if LINK.contains(&name.to_string_lossy().as_ref()) {
+            link_dir(&src, &dst);
+            continue;
+        }
+        let ok = match entry.file_type() {
+            Ok(t) if t.is_dir() => copy_tree(&src, &dst).is_ok(),
+            Ok(_) => std::fs::copy(&src, &dst).is_ok(),
+            Err(_) => false,
+        };
+        copied += usize::from(ok);
+    }
+    eprintln!(
+        "migrated {copied} item(s) from {} to {} — the old directory was left untouched",
+        old.display(),
+        new.display()
+    );
+}
+
+#[cfg(unix)]
+fn link_dir(src: &std::path::Path, dst: &std::path::Path) {
+    let _ = std::os::unix::fs::symlink(src, dst);
+}
+#[cfg(not(unix))]
+fn link_dir(src: &std::path::Path, dst: &std::path::Path) {
+    let _ = std::os::windows::fs::symlink_dir(src, dst);
+}
+
+/// Recursively copy `src` into `dst`. Best-effort per entry: one unreadable file must not abort a
+/// migration that has already moved everything else across.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                let _ = copy_tree(&from, &to);
+            }
+            Ok(_) => {
+                let _ = std::fs::copy(&from, &to);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// A generated window icon: a 4×4 grid of bright "thumbnails" on a dark field —

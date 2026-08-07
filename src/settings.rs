@@ -31,7 +31,7 @@
 //! * **Caches and transient state** — nothing a person would ever hand-edit.
 //!
 //! Like `keybindings.rs` this module is deliberately egui-free and knows nothing about
-//! `PixelView`: it moves `(key, json value)` pairs, so the file format is unit-testable without a
+//! `Kaleidotron`: it moves `(key, json value)` pairs, so the file format is unit-testable without a
 //! UI. `app.rs` owns the table that maps keys onto fields.
 
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ pub fn parse(text: &str) -> HashMap<String, serde_json::Value> {
 /// Render entries as a documented JSON object, grouped by section in the order given.
 pub fn to_json(entries: &[Entry]) -> String {
     let mut s = String::from(
-        "// pixelview settings.\n\
+        "// kaleidotron settings.\n\
          // Edit and save. Delete a line to restore its default; delete the file to reset all.\n\
          // Machine-local state (window size, last folder) is deliberately NOT here.\n\
          // API keys live in secrets.json — keep THAT file out of dotfile sync.\n\
