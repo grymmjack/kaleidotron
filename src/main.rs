@@ -93,7 +93,12 @@ fn migrate_from_pixelview() {
     ) else {
         return;
     };
-    if new.exists() || !old.exists() {
+    // Gate on an explicit marker, not on the new directory's existence. Anything at all can
+    // create that directory first — a build that predates this function did exactly that here —
+    // and then the migration silently never runs and the install looks empty. The marker says
+    // "this has been done", which is the actual question.
+    let marker = new.join(".migrated-from-pixelview");
+    if marker.exists() || !old.exists() {
         return; // already migrated, or nothing to migrate
     }
     // Big, regenerable, or already-once-on-disk: shared rather than duplicated.
@@ -108,6 +113,11 @@ fn migrate_from_pixelview() {
         let name = entry.file_name();
         let src = entry.path();
         let dst = new.join(&name);
+        // Never overwrite. Whatever is already on the new side was put there by the new install
+        // and is by definition more current than the copy being migrated from.
+        if dst.exists() {
+            continue;
+        }
         if LINK.contains(&name.to_string_lossy().as_ref()) {
             link_dir(&src, &dst);
             continue;
@@ -119,6 +129,7 @@ fn migrate_from_pixelview() {
         };
         copied += usize::from(ok);
     }
+    let _ = std::fs::write(&marker, "");
     eprintln!(
         "migrated {copied} item(s) from {} to {} — the old directory was left untouched",
         old.display(),
