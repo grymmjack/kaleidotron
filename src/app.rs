@@ -1391,6 +1391,7 @@ pub struct PixelView {
     recent_dirs: Vec<PathBuf>,
     rail_icon_size: f32, // activity-rail glyph size in points
     rail_expanded: bool, // rail shows icon + label instead of icon only
+    rail_settings_menu: bool, // the gear's settings menu is open
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -3078,6 +3079,7 @@ impl PixelView {
             explorer_tab: 0,
             rail_icon_size: 22.0,
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
+            rail_settings_menu: false,
             recent_dirs: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
@@ -4159,6 +4161,7 @@ impl PixelView {
     /// virtual 16colo.rs views.
     fn show_folder(&mut self, dir: PathBuf, entries: Vec<Entry>) {
         self.note_recent(&dir);
+        self.focus_rail_for(&dir);
         // Folder counts are rendered live in the status bar; clear any transient
         // file-op message carried over from the folder we're leaving (file ops set
         // their message *after* calling refresh(), so theirs survives this).
@@ -27633,43 +27636,53 @@ impl PixelView {
         let btn_h = sz + 12.0;
         let expanded = self.rail_expanded;
 
-        // One row: the glyph at icon size, plus a normal-size label when expanded. A LayoutJob is
-        // needed because the two halves want different font sizes within one button.
-        let row = |ui: &mut egui::Ui, glyph: &str, label: &str, on: bool, tip: &str| -> bool {
-            let col = if on {
-                ui.visuals().strong_text_color()
+        // One row, custom-painted rather than a `Button`. Three things need control a Button
+        // can't give: the glyph must sit in a FIXED-WIDTH cell so every label starts at the same
+        // x (otherwise wider glyphs push their text right and the left edge goes ragged), the
+        // glyph must be centred in that cell (so the collapsed rail is a straight column), and the
+        // highlight must be a flat filled box rather than a bordered button, VSCode-style.
+        let icon_cell = sz + 16.0;
+        let row = |ui: &mut egui::Ui, glyph: &str, label: &str, on: bool, tip: &str| -> egui::Response {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::click());
+            let vis = ui.visuals();
+            // Flat fill: selected wins, else a subtle hover wash. No stroke, no rounding.
+            let fill = if on {
+                Some(vis.selection.bg_fill)
+            } else if resp.hovered() {
+                Some(vis.widgets.hovered.weak_bg_fill)
             } else {
-                ui.visuals().text_color()
+                None
             };
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
+            if let Some(f) = fill {
+                ui.painter().rect_filled(rect, 0.0, f);
+            }
+            let col = if on {
+                vis.selection.stroke.color
+            } else if resp.hovered() {
+                vis.strong_text_color()
+            } else {
+                vis.text_color()
+            };
+            // Glyph centred inside its fixed cell — this is what squares up both layouts.
+            let cell = egui::Rect::from_min_size(rect.min, egui::vec2(icon_cell, btn_h));
+            ui.painter().text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
                 glyph,
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::proportional(sz),
-                    color: col,
-                    ..Default::default()
-                },
+                egui::FontId::proportional(sz),
+                col,
             );
             if expanded {
-                job.append(
-                    &format!("  {label}"),
-                    0.0,
-                    egui::TextFormat {
-                        font_id: egui::FontId::proportional(14.0),
-                        color: col,
-                        valign: egui::Align::Center,
-                        ..Default::default()
-                    },
+                ui.painter().text(
+                    egui::pos2(rect.left() + icon_cell, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(14.0),
+                    col,
                 );
             }
-            ui.add(
-                egui::Button::selectable(on, job)
-                    .min_size(egui::vec2(btn_w, btn_h))
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            )
-            .on_hover_text(tip)
-            .clicked()
+            resp.on_hover_text(tip)
         };
 
         // The gear is pinned to the bottom (where VSCode keeps settings), so the scrolling list is
@@ -27688,26 +27701,26 @@ impl PixelView {
                     "Collapse",
                     false,
                     if expanded { "Collapse the rail" } else { "Expand the rail (show labels)" },
-                ) {
+                ).clicked() {
                     self.rail_expanded = !self.rail_expanded;
                 }
                 ui.add_space(6.0);
 
-                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, "Open folder\u{2026}") {
+                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, "Open folder\u{2026}").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.open_folder(dir);
                     }
                 }
                 ui.add_space(8.0);
-                if row(ui, "\u{2630}", "Explorer", self.show_explorer, "Explorer pane") {
+                if row(ui, "\u{2630}", "Explorer", self.show_explorer, "Explorer pane").clicked() {
                     self.show_explorer = !self.show_explorer;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{2139}", "Details", self.show_details, "Details pane") {
+                if row(ui, "\u{2139}", "Details", self.show_details, "Details pane").clicked() {
                     self.show_details = !self.show_details;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, "Recolor pane") {
+                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, "Recolor pane").clicked() {
                     self.show_recolor = !self.show_recolor;
                 }
                 ui.add_space(12.0);
@@ -27729,7 +27742,7 @@ impl PixelView {
                     if !available {
                         continue;
                     }
-                    if row(ui, glyph, label, self.rail_section == sec, tip) {
+                    if row(ui, glyph, label, self.rail_section == sec, tip).clicked() {
                         self.rail_section = sec;
                         self.show_explorer = true;
                         self.explorer_tab = 0;
@@ -27758,7 +27771,7 @@ impl PixelView {
                         first_source = false;
                     }
                     let on = self.rail_section == RailSection::Sources && self.places_tab == *idx;
-                    if row(ui, glyph, label, on, tip) {
+                    if row(ui, glyph, label, on, tip).clicked() {
                         self.rail_section = RailSection::Sources;
                         self.places_tab = *idx;
                         self.show_explorer = true;
@@ -27769,45 +27782,91 @@ impl PixelView {
             });
 
         // Settings, pinned to the bottom.
+        let mut gear_rect: Option<egui::Rect> = None;
         // Align::Min so the gear lines up with the buttons above it rather than sitting
         // centred and visibly indented when the rail is expanded.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(6.0);
-            let clicked = row(ui, "\u{2699}", "Settings", self.show_prefs, "Settings \u{2014} click for Preferences, right-click for the config files");
-            if clicked {
+            let gear = row(
+                ui,
+                "\u{2699}",
+                "Settings",
+                self.rail_settings_menu,
+                "Settings \u{2014} click for the settings menu",
+            );
+            if gear.clicked() {
+                self.rail_settings_menu = !self.rail_settings_menu;
+            }
+            gear_rect = Some(gear.rect);
+        });
+
+        // Settings menu, opened by LEFT-clicking the gear (VSCode opens its gear menu on left
+        // click too). Drawn as a borderless Area anchored to the gear rather than a context menu,
+        // so it works with the custom-painted row — the earlier `ui.response().context_menu(...)`
+        // attached to the panel's own response, not the gear's, which is why right-click did
+        // nothing.
+        if self.rail_settings_menu {
+            let anchor = gear_rect.map(|r| r.right_top()).unwrap_or(ui.max_rect().left_bottom());
+            let mut close = false;
+            let mut open_path: Option<PathBuf> = None;
+            let mut prefs = false;
+            let area = egui::Area::new(ui.id().with("rail_settings_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(anchor + egui::vec2(4.0, -8.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(210.0);
+                        if ui.button("\u{2699}  Preferences\u{2026}").clicked() {
+                            prefs = true;
+                            close = true;
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Edit config files").weak().small());
+                        for (label, path) in [
+                            ("settings.json", Some(self.settings_file.clone())),
+                            ("keybindings.json", Some(self.keybindings_file.clone())),
+                            // themes/ doesn't exist yet — the theme system is still to come, so
+                            // this deliberately isn't offered rather than opening a dead path.
+                        ] {
+                            if let Some(p) = path {
+                                let exists = p.exists();
+                                if ui
+                                    .add_enabled(exists, egui::Button::new(format!("\u{1F4C4}  {label}")))
+                                    .on_hover_text(p.to_string_lossy())
+                                    .clicked()
+                                {
+                                    open_path = Some(p);
+                                    close = true;
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("\u{1F4C1}  Reveal config folder").clicked() {
+                            open_path = self.settings_file.parent().map(|d| d.to_path_buf());
+                            close = true;
+                        }
+                    });
+                });
+            // Click anywhere else dismisses it.
+            if ui.ctx().input(|i| i.pointer.any_click())
+                && !area.response.rect.contains(
+                    ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or_default(),
+                )
+                && !gear_rect.is_some_and(|r| {
+                    r.contains(ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or_default())
+                })
+            {
+                close = true;
+            }
+            if prefs {
                 self.show_prefs = true;
             }
-        });
-        // The JSON files are the other half of the settings story, so make them reachable without
-        // hunting through the data dir. Attached to the last widget drawn (the gear).
-        let (sf, kf) = (self.settings_file.clone(), self.keybindings_file.clone());
-        let mut act: Option<PathBuf> = None;
-        let mut prefs = false;
-        ui.response().context_menu(|ui| {
-            ui.label(egui::RichText::new(sf.to_string_lossy()).weak().small());
-            ui.separator();
-            if ui.button("Preferences\u{2026}").clicked() {
-                prefs = true;
-                ui.close();
+            if let Some(p) = open_path {
+                self.open_url(&p.to_string_lossy());
             }
-            if ui.button("Open settings.json").clicked() {
-                act = Some(sf.clone());
-                ui.close();
+            if close {
+                self.rail_settings_menu = false;
             }
-            if ui.button("Open keybindings.json").clicked() {
-                act = Some(kf.clone());
-                ui.close();
-            }
-            if ui.button("Reveal config folder").clicked() {
-                act = sf.parent().map(|d| d.to_path_buf());
-                ui.close();
-            }
-        });
-        if prefs {
-            self.show_prefs = true;
-        }
-        if let Some(p) = act {
-            self.open_url(&p.to_string_lossy());
         }
     }
 
@@ -27828,6 +27887,52 @@ impl PixelView {
         self.recent_dirs.retain(|p| p != &key);
         self.recent_dirs.insert(0, key);
         self.recent_dirs.truncate(Self::MAX_RECENTS);
+    }
+
+    /// Point the rail at whichever source `dir` belongs to, so navigating somewhere — a pinned
+    /// 16colo place, a Recent entry, a link inside the app — highlights the matching rail button
+    /// instead of leaving the rail showing where you *were*.
+    ///
+    /// Deliberately does not touch `show_explorer`: navigation shouldn't force a pane open.
+    fn focus_rail_for(&mut self, dir: &Path) {
+        let tab = if crate::sixteen::is_remote(dir) {
+            1
+        } else if crate::youtube::is_remote(dir) {
+            5
+        } else if crate::steam::is_remote(dir) {
+            6
+        } else if crate::imgsearch::is_gif_remote(dir) {
+            16
+        } else if crate::imgsearch::is_remote(dir) {
+            8
+        } else if crate::httpfs::is_remote(dir) {
+            17
+        } else if crate::lospec::is_remote(dir) {
+            11
+        } else if crate::polyhaven::is_remote(dir) {
+            12
+        } else if crate::gfonts::is_remote(dir) {
+            13
+        } else if crate::audiosearch::is_remote(dir) {
+            14
+        } else if crate::modarchive::is_remote(dir) {
+            15
+        } else if crate::assetsearch::is_remote(dir) {
+            // Icons and vectors share a virtual root; `source_of` tells them apart.
+            match crate::assetsearch::source_of(dir) {
+                Some(crate::assetsearch::Source::Vectors) => 10,
+                _ => 9,
+            }
+        } else {
+            // A local folder (or an archive mounted from one) belongs to Files.
+            self.rail_section = RailSection::Files;
+            self.places_tab = 0;
+            return;
+        };
+        if self.places_tab_enabled(tab) {
+            self.rail_section = RailSection::Sources;
+            self.places_tab = tab;
+        }
     }
 
     fn places_tab_enabled(&self, idx: u8) -> bool {
