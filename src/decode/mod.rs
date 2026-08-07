@@ -51,7 +51,7 @@ pub use rip::RipStream;
 
 /// Every source-code / text extension the [`code::CodeDecoder`] handles — re-exported so
 /// `app.rs`'s viewer predicates (`is_image_ext`) can share the one list, not duplicate it.
-pub use code::{highlight_lines, tok_rgb, Tok, CODE_EXTS};
+pub use code::{highlight_lines, lang_scopes, set_syntax_theme, tok_rgb, Tok, ALL_TOKS, CODE_EXTS};
 
 /// PDF metadata (page count / size / title / author) for the Details pane, and a
 /// single-page renderer for the in-app multi-page viewer.
