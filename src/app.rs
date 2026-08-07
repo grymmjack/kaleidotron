@@ -911,6 +911,27 @@ enum RailSection {
 
 impl RailSection {
     /// The `places_tab` ids belonging to this section, with their labels, in display order.
+    /// A rail glyph + tooltip for each source tab. Sources live directly in the activity rail
+    /// rather than in a list inside the panel: with the source plugins defaulting off, you get one
+    /// button per source you actually enabled, so the rail stays short.
+    fn source_buttons() -> &'static [(u8, &'static str, &'static str)] {
+        &[
+            (1, icons::BOLT, "16colo.rs — ANSI art archive"),
+            (5, icons::PLAY, "YouTube"),
+            (8, icons::SEARCH, "Image search"),
+            (16, "🎞", "Animated GIF search"),
+            (17, icons::GLOBE, "Web — browse any URL"),
+            (9, "✦", "Icon search"),
+            (10, "✎", "Vector art search"),
+            (11, "🎨", "Lospec palettes"),
+            (12, icons::CUBE, "Poly Haven — 3D / textures / HDRIs"),
+            (13, "🅰", "Google Fonts"),
+            (14, "🔊", "Free audio search"),
+            (15, icons::MUSIC, "The Mod Archive — tracker modules"),
+            (6, "🎮", "Steam library"),
+        ]
+    }
+
     fn tabs(self) -> &'static [(u8, &'static str)] {
         match self {
             RailSection::Files => &[(0, "Local")],
@@ -1368,6 +1389,7 @@ pub struct PixelView {
     /// one: inside an archive or a downloaded pack the real path is a temp dir that's gone next
     /// run, which is the same reason `save()` persists the display path for the last folder.
     recent_dirs: Vec<PathBuf>,
+    rail_icon_size: f32, // activity-rail glyph size in points
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -3052,6 +3074,7 @@ impl PixelView {
             explorer_filter: String::new(),
             colo_search: String::new(),
             explorer_tab: 0,
+            rail_icon_size: 22.0,
             recent_dirs: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<PathBuf>>(s, Self::RECENTS_KEY))
@@ -3657,6 +3680,7 @@ impl PixelView {
             e(A, "thumb_size", self.thumb_size, "grid tile size in points"),
             e(A, "grid_gap", self.grid_gap, "horizontal gap between grid tiles"),
             e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
+            e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
             e(A, "table_grid", self.table_grid, "dividing lines in the table view"),
@@ -3735,6 +3759,9 @@ impl PixelView {
         }
         if let Some(v) = st::get_f32(&m, "grid_gap_y") {
             self.grid_gap_y = v.clamp(0.0, 200.0);
+        }
+        if let Some(v) = st::get_f32(&m, "rail_icon_size") {
+            self.rail_icon_size = v.clamp(12.0, 48.0);
         }
         if let Some(v) = st::get_bool(&m, "grid_tile_border") {
             self.grid_tile_border = v;
@@ -27595,9 +27622,15 @@ impl PixelView {
     /// VSCode-style activity rail on the far left: icon toggles for the side docks
     /// plus quick actions. Deliberately narrow with room reserved for more buttons.
     fn ui_rail(&mut self, ui: &mut egui::Ui) {
+        // Scrollable: with every source plugin enabled the rail runs to ~21 icons, which overflows
+        // a short window and would leave the last few unreachable. The bar is hidden so it still
+        // reads as a solid strip.
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(6.0);
-            let big = egui::FontId::proportional(19.0);
+            let big = egui::FontId::proportional(self.rail_icon_size);
             let icon = |ui: &mut egui::Ui, glyph: &str, on: bool, tip: &str| -> bool {
                 let txt = egui::RichText::new(glyph).font(big.clone());
                 ui.add(egui::Button::selectable(on, txt))
@@ -27630,17 +27663,14 @@ impl PixelView {
             // it's hidden — otherwise the click would appear to do nothing).
             for (sec, glyph, tip) in [
                 (RailSection::Files, "📁", "Files — folders, favorites, filters"),
-                (RailSection::Sources, "🌐", "Sources — online browsing"),
                 (RailSection::Audio, "🎹", "Audio — kits and samples"),
                 (RailSection::Fx, "✨", "PixelFX presets"),
-                (RailSection::Ai, "🤖", "AI generation"),
+                (RailSection::Ai, icons::ROBOT, "AI generation"),
             ] {
-                // Hide a section with nothing in it: Audio/AI depend on their plugin, and Sources
-                // is empty when every web source is switched off.
+                // Hide a section with nothing in it — Audio/AI depend on their plugin.
                 let available = match sec {
                     RailSection::Audio => self.plugin_audio,
                     RailSection::Ai => self.plugin_ai,
-                    RailSection::Sources => sec.tabs().iter().any(|(i, _)| self.places_tab_enabled(*i)),
                     _ => true,
                 };
                 if !available {
@@ -27650,7 +27680,6 @@ impl PixelView {
                     self.rail_section = sec;
                     self.show_explorer = true;
                     self.explorer_tab = 0;
-                    // Land on the first enabled tab of the new section.
                     if let Some((i, _)) = sec.tabs().iter().find(|(i, _)| self.places_tab_enabled(*i)) {
                         self.places_tab = *i;
                         if *i == 2 {
@@ -27660,7 +27689,30 @@ impl PixelView {
                 }
                 ui.add_space(2.0);
             }
+            // Online sources, one button each. Only the enabled ones appear, so the rail length
+            // tracks what you actually switched on in Preferences.
+            let mut first_source = true;
+            for (idx, glyph, tip) in RailSection::source_buttons() {
+                if !self.places_tab_enabled(*idx) {
+                    continue;
+                }
+                if first_source {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    first_source = false;
+                }
+                let on = self.rail_section == RailSection::Sources && self.places_tab == *idx;
+                if icon(ui, glyph, on, tip) {
+                    self.rail_section = RailSection::Sources;
+                    self.places_tab = *idx;
+                    self.show_explorer = true;
+                    self.explorer_tab = 0;
+                }
+                ui.add_space(2.0);
+            }
         });
+            });
     }
 
     /// Is this Places tab available, given the plugin toggles? Shared by the rail, the section
@@ -28684,7 +28736,8 @@ impl PixelView {
                         .copied()
                         .filter(|(i, _)| self.places_tab_enabled(*i))
                         .collect();
-                    if enabled.len() > 1 {
+                    // Sources are selected from the rail, so the panel shows just the chosen one.
+                    if enabled.len() > 1 && sec != RailSection::Sources {
                         let vertical = sec == RailSection::Sources;
                         let mut render = |ui: &mut egui::Ui| {
                             for (idx, label) in &enabled {
@@ -32352,6 +32405,8 @@ mod icons {
     pub const GLOBE: &str = "\u{f01e7}"; // nf-md-earth
     pub const MUSIC: &str = "\u{f0389}"; // nf-md-music_note
     pub const PIANO: &str = "\u{f067d}"; // nf-md-piano
+    pub const CUBE: &str = "\u{f01a6}"; // nf-md-cube_outline (3D / Poly Haven)
+    pub const ROBOT: &str = "\u{f06a9}"; // nf-md-robot (AI)
     pub const LOCK: &str = "\u{f033e}"; // nf-md-lock (pad key-lock, engaged)
     pub const LOCK_OPEN: &str = "\u{f033f}"; // nf-md-lock_open (pad key-lock, free)
 }
