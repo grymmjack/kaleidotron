@@ -29,36 +29,88 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("keybindings.json")
 }
 
-/// Strip `//` line comments so `serde_json` can parse a commented file.
+/// Make a **JSONC** document parseable by `serde_json`: strip `//` line comments and `/* … */`
+/// block comments, and remove trailing commas.
 ///
-/// Quote-aware: a `//` inside a string (a URL, a Windows path) must survive. Escapes are tracked so
-/// `"a\"//b"` isn't mistaken for the end of a string.
+/// All three matter for real files. VS Code ships its own themes with `//` comments *and* trailing
+/// commas — `dark_modern.json` fails `serde_json` (and Python's `json`) on a trailing comma alone —
+/// so a cleaner that only handled comments would reject the very files this is meant to import.
+///
+/// Quote-aware throughout: a `//`, a `/*` or a `,` inside a string literal must survive, and
+/// escapes are tracked so `"a\"//b"` isn't mistaken for the end of a string.
 pub(crate) fn strip_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let (mut in_str, mut esc) = (false, false);
-        let mut cut = line.len();
-        let b: Vec<char> = line.chars().collect();
-        for i in 0..b.len() {
-            let c = b[i];
+    let b: Vec<char> = text.chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(b.len());
+    let (mut instr, mut esc) = (false, false);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if instr {
+            out.push(c);
             if esc {
                 esc = false;
-                continue;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                instr = false;
             }
-            match c {
-                '\\' if in_str => esc = true,
-                '"' => in_str = !in_str,
-                '/' if !in_str && i + 1 < b.len() && b[i + 1] == '/' => {
-                    cut = i;
-                    break;
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                instr = true;
+                out.push(c);
+                i += 1;
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '/' => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
                 }
-                _ => {}
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            _ => {
+                out.push(c);
+                i += 1;
             }
         }
-        out.push_str(&b[..cut].iter().collect::<String>());
-        out.push('\n');
     }
-    out
+    // Trailing commas: drop any `,` whose next non-whitespace character closes the object/array.
+    let mut s: Vec<char> = Vec::with_capacity(out.len());
+    let (mut instr, mut esc) = (false, false);
+    for (i, &c) in out.iter().enumerate() {
+        if instr {
+            s.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                instr = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            instr = true;
+            s.push(c);
+            continue;
+        }
+        if c == ',' {
+            if let Some(&nxt) = out[i + 1..].iter().find(|ch| !ch.is_whitespace()) {
+                if nxt == '}' || nxt == ']' {
+                    continue; // trailing comma — drop it
+                }
+            }
+        }
+        s.push(c);
+    }
+    s.into_iter().collect()
 }
 
 /// Parse a `keybindings.json` body into `(action_id, key_name)` pairs.
