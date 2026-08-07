@@ -382,3 +382,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod real_vscode {
+    use super::*;
+    /// Import a genuine published VS Code theme, to prove the mapping works on real files (which
+    /// are JSONC — VS Code ships them with comments) and not just on hand-written fixtures.
+    #[test]
+    #[ignore = "reads a file fetched into /tmp"]
+    fn imports_a_real_theme() {
+        // Fetch with:
+        //   curl -o /tmp/vsdark.json https://raw.githubusercontent.com/microsoft/vscode/main/\
+        //     extensions/theme-defaults/themes/dark_modern.json
+        let Ok(text) = std::fs::read_to_string("/tmp/vsdark.json") else {
+            eprintln!("skipped: /tmp/vsdark.json not present");
+            return;
+        };
+        let t = Theme::from_json(&text, "fallback").expect("parsed");
+        let fields = [
+            ("window_bg", t.window_bg), ("panel_bg", t.panel_bg), ("faint_bg", t.faint_bg),
+            ("extreme_bg", t.extreme_bg), ("text", t.text), ("weak_text", t.weak_text),
+            ("strong_text", t.strong_text), ("accent", t.accent), ("accent_text", t.accent_text),
+            ("hover_bg", t.hover_bg), ("active_bg", t.active_bg), ("widget_bg", t.widget_bg),
+            ("border", t.border), ("hyperlink", t.hyperlink), ("warn", t.warn), ("error", t.error),
+        ];
+        let got = fields.iter().filter(|(_, v)| v.is_some()).count();
+        eprintln!("theme: {} | dark={} | mapped {}/{} fields | {} token scopes",
+                  t.name, t.dark, got, fields.len(), t.tokens.len());
+        for (n, v) in fields.iter() {
+            if v.is_none() { eprintln!("   unmapped: {n}"); }
+        }
+        assert!(got >= 10, "most fields should map from a real theme");
+        let _ = t.to_visuals();
+    }
+}
