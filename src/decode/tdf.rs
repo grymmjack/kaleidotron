@@ -39,7 +39,7 @@ impl Cell {
 
 /// Reverse of retrofont's `CP437_TO_UNICODE`: Unicode char → CP437 byte (best effort; unknown
 /// chars fall back to a filled block so they're at least visible). Built once.
-fn unicode_to_cp437(ch: char) -> u8 {
+pub fn unicode_to_cp437(ch: char) -> u8 {
     static MAP: OnceLock<HashMap<char, u8>> = OnceLock::new();
     let map = MAP.get_or_init(|| {
         let mut m = HashMap::with_capacity(256);

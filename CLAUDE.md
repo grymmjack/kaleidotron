@@ -108,6 +108,9 @@ src/
                      and the SAUCE panel ("fetching…") show one too.
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
+  tasks.rs           `.vscode/tasks.json` runner (pure): JSONC strip, platform blocks, `${…}`
+                     substitution incl. `${config:}` + URL-opening `${input:}`, sequential
+                     `dependsOn`, shell/process exec, project+global merge
   git.rs             per-folder git status (shells out to `git status --porcelain -z`);
                      parses to an abs-path→GitStatus map; surfaced as grid badge / table
                      column / Details line / filename tint. Inert outside a repo. See below.
@@ -257,7 +260,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 266 tests (256 unit + 10 headless egui_kittest GUI tests; +13 ignored network/real-trash/PSD-dump)
+cargo test               # 390 tests (380 unit + 10 headless egui_kittest GUI tests; +40 ignored network / real-trash / PSD-dump / real-tasks.json)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -1211,6 +1214,133 @@ a **filename tint** (grid caption + table Name cell) — new=green, modified=ora
 ignored=grey. Everything degrades to inert (no `git` / not a repo / error ⇒ `None`), never an
 error. Shelling out (not libgit2) is deliberate — one stable porcelain read, no heavy dep.
 Parsing is unit-tested (`git::tests`); the CLI is trusted for the rest.
+
+## Project tasks — running `.vscode/tasks.json` (`tasks.rs`)
+
+A folder's own build/run/tool commands, read from **VS Code's `tasks.json`** rather than a
+kaleidotron-specific file — most source folders already have one, and a `.bas` next to a tasks.json
+that knows how to compile it should just be compilable. `tasks.rs` is **pure** (parse / substitute /
+order; no egui, no spawning) so all the string handling is unit-tested; `app.rs` holds only the
+process spawning and the panel.
+
+- **Parsing.** `strip_jsonc` first — comments **and trailing commas** (a real hand-edited file has
+  both; `serde_json` rejects both), string- and escape-aware so a `//` inside `"https://…"` survives.
+  `parse` → `Vec<Task>` with the **platform block folded in per field** (`linux`/`osx`/`windows`
+  override `command`/`args`/`options`, so a task may set `command` at the top and only `args` per
+  platform). `group` parses in both forms (`"test"` / `{kind, isDefault}`), `dependsOn` in both
+  (string / list). A labelless **`npm`** task is named `npm: <script>` (VS Code's own name — dropping
+  it silently lost whole files) and becomes `npm run <script>`.
+- **Variables (`substitute`).** `${file}` `${fileDirname}` `${fileBasename}`
+  `${fileBasenameNoExtension}` `${fileExtname}` `${relativeFile}` `${workspaceFolder}` `${cwd}`
+  `${pathSeparator}` `${userHome}` `${env:X}` and **`${config:X}`** from `.vscode/settings.json` —
+  the last is load-bearing, not optional (a QB64PE `BUILD: Compile` is entirely
+  `${config:qb64pe.compilerPath}`). An **unknown** variable is left **verbatim**: a task that
+  silently becomes `qb64pe -x  -o ` is a mystery, one that still reads `${config:…}` in the output
+  panel names the missing key.
+- **`${input:…}`: the resolvable half works.** `parse_inputs` reads the file's `inputs` array and
+  resolves a **`type: "command"`** input naming `simpleBrowser.show` / `simpleBrowser.api.open` /
+  `vscode.open` to its URL — that has a perfectly good meaning outside VS Code. `exec_for` then sees
+  a command that is **nothing but a URL** (`bare_url`) and runs the platform opener
+  (`xdg-open`/`open`/`cmd /C start ""`) instead of handing a URL to a shell. A line that merely
+  *contains* a URL (`setsid xdg-open https://…`) stays an ordinary shell task — it opens the link
+  itself, and hijacking it would double up. The genuinely interactive kinds (`promptString`,
+  `pickString`) stay unresolved: `Task::needs_input(&inputs)` flags **only** those, and they render
+  **disabled** with a hover explaining why, rather than running a literal `${input:x}`.
+- **`exec_for`.** A `shell` task's `command` is a command *line*, not a word (`setsid xdg-open URL`
+  is three words) — passed through unquoted, with only the **args** `sh_quote`d; `process` spawns
+  directly. `sh -c` / `cmd /C`.
+- **`plan` runs `dependsOn` SEQUENTIALLY, always.** VS Code's documented default is *parallel*
+  unless `dependsOrder: "sequence"`, but the near-universal shape — `BUILD: Compile` depending on
+  `BUILD: Remove` — is a chain, and running those concurrently races to delete the binary just
+  built. Following the spec's letter would make correct-looking files fail intermittently. Cycles
+  are broken (each label runs once).
+- **Where the file lives — two places, merged.** Nothing is stored or copied by kaleidotron; the
+  files are read in place, fresh on every navigation (so an edit in another window lands on the next
+  nav). (1) The **project's** `.vscode/tasks.json`: `find_workspace` walks **up** from the current
+  folder, so a file at the repo root still applies deep inside it. (2) A **global**
+  `<data>/tasks/tasks.json` (+ optional `settings.json`), folded in by `merge_global` — a general
+  tool ("open this in GIMP", "view in PabloDraw") is not project-specific, and confining it to the
+  one repo that declared it was the obvious gap. **The project wins on a label collision** (a repo
+  defining its own `BUILD: Compile` means *that* one; a global default silently shadowing it would be
+  the worst outcome); config and input maps merge the same way. A commented, deliberately **inert**
+  starter (`GLOBAL_TASKS_TEMPLATE`, `"tasks": []`) is seeded on first run and never overwritten — the
+  themes/PixelFX rule. `task_ws` (= `${workspaceFolder}`) falls back to the **current folder** when
+  there is no project. `refresh_tasks` runs on every `show_folder`; skipped for remote /
+  archive-mount / virtual folders, and when `tasks_enabled` is off (Preferences → Advanced, which
+  also has "Open global tasks folder"). No tasks ⇒ every Run surface simply doesn't render.
+- **Running.** `run_task(label, file)` → a worker thread walking the plan; `run_one_exec` spawns and
+  reads **stdout and stderr on separate threads** into one channel (reading them in sequence is the
+  classic pipe deadlock — a compiler filling stderr while we block on stdout hangs the build), each
+  line `request_repaint`ing so output appears on an idle UI. A non-zero exit abandons the rest of the
+  chain. `stdin` is null so a task that prompts can't wedge. `poll_tasks` drains into `TaskRun`
+  (capped at `TASK_LINE_CAP` = 5000 lines, dropping from the **front** — a failure is at the tail).
+  Stop kills the live child through `task_child: Arc<Mutex<Option<Child>>>` (holding the `Child` is
+  the only portable kill) and flags `task_cancel` so no later step starts; the lock is **released
+  before `wait`**, or Stop would block for exactly as long as the task runs.
+- **Surfaces.** A **`▶ Run`** menu in the code viewer's toolbar (grouped Build / Test / Other, the
+  `isDefault` one starred); a **`▶ Tasks`** submenu at the top of the grid/table right-click menu
+  (`TilePick::Task(label)`, deferred via `run_task_on` like every other tile action) so `${file}`
+  tasks — "Open in GIMP", "View in PabloDraw" — work on any file, not just source; **Ctrl+Shift+B**
+  runs the default build task (VS Code's binding, `consume_key`'d so the B can't also reach a focused
+  text field); View → **Task output** / **Reload tasks**. The bottom **output panel**
+  (`ui_tasks_panel`, mounted after the sortbar so it sits above it) streams the run with the code
+  font, echoed command lines tinted, ok/failed **as a word plus a colour**, elapsed time, and
+  Re-run / Clear / Stop. `presentation.reveal: never` populates the panel but doesn't force it open.
+- **Not implemented:** `problemMatcher` (compiler errors are text, not clickable), interactive
+  `${input:…}` kinds, `isBackground`, task-level `dependsOrder`.
+
+## Code viewer font + current-line highlight
+
+Preferences → Appearance → "Code viewer": `code_font_size` (6–32 pt), `code_font_path` (any
+`.ttf`/`.otf`), `code_line_highlight` — all persisted in `settings.json`. The font registers as the
+**named family `CODE_FAMILY = "code"`**, *not* by replacing `Monospace`, which the rest of the app
+(paths, hex fields, audio readouts) uses. `apply_fonts(ctx, code)` builds the whole stack —
+`set_fonts` **replaces** it, so the Nerd Font + DejaVu fallbacks are re-added on every rebuild and
+chained behind the code font. `ensure_code_font` reloads only when the *choice* changes
+(`code_font_loaded`), and a path that no longer resolves clears the preference and falls back rather
+than leaving a blank viewer. The gutter width is **measured** (`layout_no_wrap("0")`), not
+`digits * 8.0` — that constant was one digit at 13pt in the built-in mono and broke the moment either
+changed. The current-line tint comes off `visuals().selection.bg_fill` and is painted through a
+**pre-reserved `Shape::Noop`** slot so it lands *under* the glyphs (the zebra-stripe idiom); it keys
+off the **galley cursor row**, so it stays right under Wrap where one logical line owns several rows.
+
+**Text encodings + the three-way open.** A source file has two useful readings and both are wanted,
+so the grid/table right-click offers **Preview (image)** (the rasterised page — pan/zoom/navigator)
+· **View (text)** · **Edit (text)** (`OpenAs`, `TilePick::Open`, consumed by `load_full` through the
+one-shot `force_open`). Plain click keeps the old default.
+
+`decode/code.rs` owns the encodings: `Encoding` (Utf8 / Cp437 / Latin1), `decode_text` (auto: UTF-8
+if it validates, else CP437), `decode_with` (explicit override; only UTF-8 can fail and it falls back
+to Latin-1, so a wrong pick shows undoable mojibake rather than an empty pane), and `encode_text`.
+The viewer keeps `text_enc` + the raw `text_raw` bytes, so the toolbar's code-page combo re-decodes
+from memory (works inside an archive; an edited buffer's original bytes are never lost) and **saving
+re-encodes to the file's own encoding** — a CP437 source is not silently rewritten as UTF-8.
+`text_crlf` does the same job for line endings.
+
+**Why this matters (three bugs, one cause).** DOS-era source is **CP437 bytes, not UTF-8** — a QB64
+`.bas` with a box-drawing comment banner. (1) `load_full` used `read_to_string`, which fails on those
+files, so they silently fell through to the *image* viewer with no explanation. (2) `decode_ext` used
+`String::from_utf8_lossy`, turning every such byte into U+FFFD. (3) `to_cp437` had no entry for
+box-drawing, so U+FFFD became `?` — the tile rendered `REM ????`. All three now route through the
+CP437 fallback; `to_cp437` consults the real reverse table, with a round-trip check so a character
+genuinely absent from CP437 still degrades to an honest `?` rather than a solid block.
+
+**Custom code font — the frame-delay trap.** `Context::set_fonts` does not take effect until the
+**next** frame. Naming `FontFamily::Name("code")` in the same frame that installed it panics inside
+epaint (`is not bound to any fonts`) and killed the app the instant a source file was opened with a
+custom font chosen. `code_font(ctx)` therefore *verifies* the family is bound (`Fonts::families()`)
+before naming it, falling back to `Monospace` for that one frame; `ensure_code_font` requests a
+repaint so the real font lands immediately. Guarded by `opening_code_with_a_custom_font_does_not_panic`.
+
+**Theme scope gotcha:** a theme says three things about code — token colours, `editor.background`,
+and the gutter tint — and `decode::code::Palette::resolve` (the raster tile) reads all three while
+`draw_text_ui` originally read only the tokens. With the theme scoped to **"Code only"**,
+`theme_chrome()` is false so `apply_theme` installs the plain dark `Visuals`, and the viewer pane
+kept the default backdrop and grey line numbers while its own thumbnail went fully themed. Both
+surfaces now resolve the same fields. `Palette::resolve_with(ext, Option<&Theme>)` is split out of
+`resolve` so the test can pass a theme explicitly — asserting on the `SYNTAX_THEME` process-global
+raced the GUI tests (which boot a real `Kaleidotron` and install their own) and failed about one run
+in four.
 
 ## Font glyph gotcha (solved — two embedded fallbacks + an icon set)
 
