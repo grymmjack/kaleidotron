@@ -3846,18 +3846,6 @@ impl Kaleidotron {
         // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
         crate::decode::font::set_thumb_sample(if app.font_preview_on { &app.font_preview_text } else { "" });
 
-        // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
-        // visible on launch instead of an empty window. `open_folder` itself routes the
-        // virtual cases, so allow a real dir, a 16colo.rs path (re-fetched), or an
-        // archive file (re-extracted) — not only an on-disk directory.
-        if let Some(dir) = open_target {
-            if dir.is_dir()
-                || crate::sixteen::is_remote(&dir)
-                || (dir.is_file() && (crate::archive::is_archive(&dir) || is_sample_bank(&dir)))
-            {
-                app.open_folder(dir);
-            }
-        }
         // `settings.json` overrides the persisted defaults, then is (re)written so a fresh install
         // finds a documented file immediately rather than after a clean exit.
         // API keys come from `secrets.json` when present. They're still read from the legacy
@@ -3870,8 +3858,36 @@ impl Kaleidotron {
         if let Some(v) = sec.get("ma_key") {
             app.ma_key = v.clone();
         }
+        // BEFORE the first folder is opened, not after. Both of these change what that scan
+        // produces, and doing them afterwards meant the launch listing ignored them:
+        //
+        //   * `apply_settings_file` pushes the format-plugin flags to the `Registry`, and
+        //     `known_extension` is what filters a folder listing. Enabling the source-code plugin
+        //     in settings.json left every `.bas` missing from the grid until the user pressed F5 or
+        //     navigated somewhere — the setting looked broken. Same for `git_enabled`, which is
+        //     read when `show_folder` kicks off the status job.
+        //   * `apply_theme` calls `sync_syntax_theme`, which hands the code rasteriser its palette
+        //     through a process-global. Scanning first meant the thumbnailer could start decoding
+        //     source tiles with no theme installed, so a themed install painted its first few code
+        //     thumbnails in the built-in colours.
+        //
+        // Nothing here depends on a folder being open: `apply_settings_file` only assigns fields
+        // and sets registry flags, and `sync_syntax_theme`'s cache-drop is a no-op on an empty
+        // listing — which is precisely the point of doing it while the listing is still empty.
         app.apply_settings_file();
         app.apply_theme(&cc.egui_ctx);
+        // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
+        // visible on launch instead of an empty window. `open_folder` itself routes the
+        // virtual cases, so allow a real dir, a 16colo.rs path (re-fetched), or an
+        // archive file (re-extracted) — not only an on-disk directory.
+        if let Some(dir) = open_target {
+            if dir.is_dir()
+                || crate::sixteen::is_remote(&dir)
+                || (dir.is_file() && (crate::archive::is_archive(&dir) || is_sample_bank(&dir)))
+            {
+                app.open_folder(dir);
+            }
+        }
         // Re-emit the file so a new setting appears in it — but NOT when it exists and could not be
         // read. That file holds settings somebody typed; replacing it with defaults would destroy
         // them silently. Keep a copy and leave the original alone instead.

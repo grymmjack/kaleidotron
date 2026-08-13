@@ -1392,6 +1392,25 @@ already VGA-ordered (raw RGB by attribute index) and are indexed directly. Bug s
 a piece whose 16colors/ansilove thumbnail is red renders blue in the viewer
 (`MULTI-13.BIN`); guarded by `bin::tests::vga_attribute_indices_are_not_ansi_order`.
 
+## Startup order (settings before the first scan)
+
+`Kaleidotron::new` applies **`settings.json` and the theme BEFORE opening the launch folder**, and
+the order is load-bearing in both directions:
+
+- `apply_settings_file` pushes the **format-plugin flags to the `Registry`**, and `known_extension`
+  is what filters a folder listing. With the old order (scan, then settings) enabling the
+  source-code plugin in `settings.json` left every `.bas` missing from the grid until the user
+  pressed F5 or navigated — the setting simply looked broken. `git_enabled` had the same problem,
+  since `show_folder` reads it when it starts the status job.
+- `apply_theme` calls `sync_syntax_theme`, which hands the code rasteriser its palette through a
+  process-global. Scanning first let the thumbnailer start decoding source tiles before any theme
+  was installed, so a themed install painted its first few code thumbnails in the built-in colours.
+
+Nothing in either call depends on a folder being open (`apply_settings_file` only assigns fields and
+sets registry flags; `sync_syntax_theme`'s cache-drop is a no-op on an empty listing — which is the
+point of doing it while the listing is still empty). Found by the QA suite, which had to press F5
+before every test that touched a plugin-gated format; `qa-harness`'s `formats.sh` now pins it.
+
 ## Settings & ratings
 
 - **`settings.json` is written atomically** (temp + rename) and **never overwritten when it exists
