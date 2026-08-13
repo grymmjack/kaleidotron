@@ -1038,7 +1038,7 @@ enum MenuAction {
     Search,
     ToggleTasksPanel, // show/hide the task output panel
     ReloadTasks,      // re-read this project's .vscode/tasks.json
-    AmigaFonts,  // open (fetching first time) the Amiga ColorFonts collection
+    AmigaFonts,  // open the bundled Amiga ColorFonts collection
     Refresh,     // re-scan the current folder (F5)
     HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
@@ -1694,6 +1694,11 @@ pub struct Kaleidotron {
     amiga_line_gap: i32, // extra pixels between rows of multi-line sample text
     amiga_zoom: f32,     // preview zoom multiplier (persisted)
     amiga_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "path|sample|spacing|recolor"
+    amiga_snap: bool, // snap the preview zoom to an integer scale (crisp pixels), persisted
+    amiga_crt: bool,  // ~1.2x vertical CRT-aspect stretch in the preview, persisted
+    amiga_cell: u32,  // glyph-grid cell size in px, persisted
+    #[allow(clippy::type_complexity)]
+    amiga_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<u8>)>, // key, tex, cols, codes
     tdf_bytes: Vec<u8>,
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
@@ -2093,10 +2098,6 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
-    amiga_fonts_dir: PathBuf, // <data>/amiga_fonts — the Stone Oakvalley ColorFonts collection
-    // A background fetch+unpack of the 46 MB ColorFonts archive: the folder to open once it lands,
-    // or an error. `None` when no fetch is in flight.
-    amiga_fetch_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
@@ -2418,6 +2419,9 @@ impl Kaleidotron {
     const AMIGA_SPACING_KEY: &'static str = "amiga_spacing";
     const AMIGA_LINE_GAP_KEY: &'static str = "amiga_line_gap";
     const AMIGA_ZOOM_KEY: &'static str = "amiga_zoom";
+    const AMIGA_SNAP_KEY: &'static str = "amiga_snap";
+    const AMIGA_CRT_KEY: &'static str = "amiga_crt";
+    const AMIGA_CELL_KEY: &'static str = "amiga_cell";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
@@ -2967,7 +2971,6 @@ impl Kaleidotron {
         let gf_dir = data_dir.join("gfonts");
         let web_dir = data_dir.join("web");
         let ma_dir = data_dir.join("modules");
-        let amiga_fonts_dir = data_dir.join("amiga_fonts");
         let mut palette_files = all_palettes(&palette_dir);
         for p in all_palettes(&lospec_dir) {
             if !palette_files.contains(&p) {
@@ -3488,6 +3491,10 @@ impl Kaleidotron {
             amiga_font: None,
             amiga_path: None,
             amiga_sample_tex: None,
+            amiga_grid_tex: None,
+            amiga_snap: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_SNAP_KEY)).unwrap_or(true),
+            amiga_crt: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_CRT_KEY)).unwrap_or(false),
+            amiga_cell: cc.storage.and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY)).unwrap_or(64).clamp(24, 160),
             amiga_spacing: cc
                 .storage
                 .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_SPACING_KEY))
@@ -3803,8 +3810,6 @@ impl Kaleidotron {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
-            amiga_fonts_dir,
-            amiga_fetch_rx: None,
             keybindings_file: kb_file,
             settings_file,
             secrets_file,
@@ -6862,42 +6867,13 @@ impl Kaleidotron {
         }
     }
 
-    /// Open the Amiga ColorFonts collection, downloading + unpacking the 46 MB archive on a worker
-    /// thread the first time. Already present ⇒ just open the folder. Mirrors the modarchive fetch:
-    /// an `mpsc` result drained by `poll_amiga_fetch`, with the status bar carrying the progress.
+    /// Open the bundled Amiga ColorFonts collection — seed the embedded zip to `<data>/bundled/`
+    /// (first run only) and browse it as an archive, exactly like the TheDraw font library. The
+    /// bundle is FLAT (one file per font in one folder), so Left/Right steps between fonts.
     fn open_amiga_fonts(&mut self) {
-        let dir = self.amiga_fonts_dir.clone();
-        if crate::amiga_fonts::is_present(&dir) {
-            self.open_folder(dir);
-            return;
-        }
-        if self.amiga_fetch_rx.is_some() {
-            self.status = "Already downloading the Amiga fonts…".into();
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.amiga_fetch_rx = Some(rx);
-        self.status = "Downloading Amiga ColorFonts (46 MB, first time only)…".into();
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::amiga_fonts::fetch_into(&dir).map(|_| dir));
-        });
-    }
-
-    /// Drain the ColorFonts fetch: open the folder when it lands, report an error otherwise.
-    fn poll_amiga_fetch(&mut self) {
-        let Some(rx) = &self.amiga_fetch_rx else { return };
-        match rx.try_recv() {
-            Ok(Ok(dir)) => {
-                self.amiga_fetch_rx = None;
-                self.status = "Amiga ColorFonts ready.".into();
-                self.open_folder(dir);
-            }
-            Ok(Err(e)) => {
-                self.status = format!("Amiga font download failed: {e}");
-                self.amiga_fetch_rx = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.amiga_fetch_rx = None,
+        match crate::amiga_fonts::bundle_zip_path(&self.data_dir) {
+            Some(path) => self.open_folder(path),
+            None => self.status = "Couldn't unpack the bundled Amiga fonts".into(),
         }
     }
 
@@ -11133,73 +11109,108 @@ impl Kaleidotron {
         let mut want_copy = false;
         let mut want_png = false;
         let mut want_cbf = false;
+        let mut changed = false;
 
-        // Header: name, metrics, and the export/reset actions.
+        // ── Header: name + metrics ──────────────────────────────────────────
+        // Title from the FILENAME (the family name in the flat bundle — `ALLOY`), like the TDF
+        // viewer shows `1911.TDF`, since the internal `dfh_Name` is sometimes just the size string.
+        let title = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| font.name.clone());
         ui.horizontal_wrapped(|ui| {
-            ui.strong(egui::RichText::new(&font.name).heading());
+            ui.strong(egui::RichText::new(&title).heading());
             ui.separator();
             let kind = if font.is_color {
-                format!("ColorFont · {}-plane · {} colours", font.depth, font.palette.len())
+                format!("color · {}-plane · {} colours", font.depth, font.palette.len())
             } else {
                 "mono".to_string()
             };
             ui.weak(format!("{}px · {} glyphs · {kind}", font.height, font.glyphs.len()));
-            ui.separator();
-            if ui.button("📋 Copy").on_hover_text("Copy the styled sample as a bitmap").clicked() {
-                want_copy = true;
+            // Surface the internal name too when it adds something (differs from the filename).
+            if !font.name.is_empty() && !title.eq_ignore_ascii_case(&font.name) {
+                ui.weak(format!("· “{}”", font.name));
             }
-            if ui.button("🖼 PNG").on_hover_text("Save the styled sample as a PNG").clicked() {
+        });
+
+        // ── Sample row: label + export buttons (mirrors the TDF viewer's) ───
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sample");
+            if ui.button("📋 PNG").on_hover_text("Save the styled sample as a PNG").clicked() {
                 want_png = true;
+            }
+            if ui.button("📋 Copy").on_hover_text("Copy the styled sample to the clipboard as a bitmap").clicked() {
+                want_copy = true;
             }
             if ui
                 .button("⬇ DRAW font")
-                .on_hover_text(
-                    "Export as a DRAW Color Bitmap Font (.bmp) for ASSETS/FONTS/COLOR_BITMAP/",
-                )
+                .on_hover_text("Export as a DRAW Color Bitmap Font (.bmp) into ASSETS/FONTS/COLOR_BITMAP/")
                 .clicked()
             {
                 want_cbf = true;
             }
         });
+        // The full-width sample field, on its own line — TDF-style.
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.font_sample)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Type a word to render as a logo…"),
+            )
+            .changed()
+        {
+            changed = true;
+        }
 
-        // Controls row: sample text + spacing/line-gap/zoom. `font_sample` is shared with the other
-        // font viewers so the last thing you typed carries across.
-        let mut changed = false;
+        // ── Controls row: sliders for spacing / line height / zoom + toggles ─
         ui.horizontal_wrapped(|ui| {
-            ui.label("Sample");
+            ui.label("Spacing");
             if ui
-                .add(egui::TextEdit::singleline(&mut self.font_sample).desired_width(240.0).hint_text("AMIGA"))
+                .add(egui::Slider::new(&mut self.amiga_spacing, -20..=20).show_value(false))
+                .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with")
                 .changed()
             {
                 changed = true;
             }
-            ui.separator();
-            ui.label("Spacing");
-            if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40).speed(0.3)).on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with").changed() {
+            if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40)).changed() {
                 changed = true;
             }
-            if self.font_sample.contains('\n') {
-                ui.label("Line gap");
-                if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=40).speed(0.3)).changed() {
-                    changed = true;
-                }
+            ui.separator();
+            ui.label("Line height");
+            if ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false)).changed() {
+                changed = true;
+            }
+            if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80)).changed() {
+                changed = true;
             }
             ui.separator();
             ui.label("Zoom");
             ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
-            ui.label(format!("{:.2}×", self.amiga_zoom));
+            ui.label(format!("{:.1}×", self.amiga_zoom));
+            ui.separator();
+            // Snap = integer preview scale (crisp pixels); CRT = ~1.2x vertical stretch.
+            if ui.checkbox(&mut self.amiga_snap, "Snap").on_hover_text("Snap zoom to a whole-pixel scale").changed() {
+                self.amiga_sample_tex = None;
+            }
+            if ui.checkbox(&mut self.amiga_crt, "CRT").on_hover_text("~1.2× vertical stretch for the Amiga's non-square pixels").changed() {
+                self.amiga_sample_tex = None;
+            }
         });
-        ui.separator();
 
-        // The sample string a render/export actually uses (empty → a stock word).
+        // ── Design metrics readout, like TDF's "Design: W × H chars" ────────
         let sample = if self.font_sample.trim().is_empty() {
             "AMIGA".to_string()
         } else {
             self.font_sample.clone()
         };
+        let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap);
+        ui.weak(format!("Design: {} × {} px", rendered.width, rendered.height));
+        ui.separator();
 
+        // Deferred exports (they need `&mut self`, so run after the UI closures above).
         if want_copy {
-            let img = self.recolor_sample(path, crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap));
+            let img = self.recolor_sample(path, rendered.clone());
             self.copy_image_to_clipboard(&img);
         }
         if want_png {
@@ -11209,7 +11220,10 @@ impl Kaleidotron {
             self.export_amiga_cbf(&font);
         }
 
-        // Preview, cached by everything that affects the pixels (incl. the recolor pipeline).
+        // ── The big preview ─────────────────────────────────────────────────
+        // Snap rounds zoom to an integer so nearest-neighbour stays crisp; CRT stretches Y ~1.2×.
+        let eff_zoom = if self.amiga_snap { self.amiga_zoom.round().max(1.0) } else { self.amiga_zoom };
+        let y_stretch = if self.amiga_crt { 1.2 } else { 1.0 };
         let key = format!(
             "{}|{}|{}|{}|{}|{}",
             path.display(),
@@ -11220,27 +11234,37 @@ impl Kaleidotron {
             self.recolor_ident()
         );
         if changed || self.amiga_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap);
             let img = self.recolor_sample(path, rendered);
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [img.width as usize, img.height as usize],
                 &img.rgba_bytes(),
             );
-            // NEAREST: these are pixel-art fonts — keep them crisp when the preview upscales.
             let tex = ctx.load_texture("amiga_sample", color, egui::TextureOptions::NEAREST);
             self.amiga_sample_tex = Some((key, tex));
         }
 
-        // The preview itself: a transparency backdrop (so a font's transparent index reads) then the
-        // upscaled sample, centred.
-        // Copy the handle + size out of `self` so the closure below doesn't hold an immutable
-        // borrow while `paint_transparency_backdrop` needs `&mut self` — the usual egui two-borrow
-        // dance.
+        // Build the glyph grid too, so it lands below the preview.
+        let cell = self.amiga_cell as usize;
+        let grid_cols = 16usize;
+        let gkey = format!("{}|{}|{}|{}", path.display(), cell, self.pipeline_key(), self.recolor_ident());
+        if self.amiga_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+            if let Some((img, codes)) = crate::decode::amiga_font::render_glyph_grid(&font, grid_cols, cell) {
+                let img = self.recolor_sample(path, img);
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba_bytes(),
+                );
+                let tex = ctx.load_texture("amiga_grid", color, egui::TextureOptions::NEAREST);
+                self.amiga_grid_tex = Some((gkey, tex, grid_cols, codes));
+            }
+        }
+
         let preview = self.amiga_sample_tex.as_ref().map(|(_, t)| (t.id(), t.size()));
-        let zoom = self.amiga_zoom;
+        let grid = self.amiga_grid_tex.as_ref().map(|(_, t, ..)| (t.id(), t.size()));
+        let mut cell_edit = self.amiga_cell;
         egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
             if let Some((id, [w, h])) = preview {
-                let size = egui::vec2(w as f32 * zoom, h as f32 * zoom);
+                let size = egui::vec2(w as f32 * eff_zoom, h as f32 * eff_zoom * y_stretch);
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -11254,7 +11278,30 @@ impl Kaleidotron {
                     );
                 });
             }
+            // ── Glyph browser, like TDF's "Glyphs (N) · Cell [slider]" ──────
+            ui.add_space(10.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(format!("Glyphs ({})", font.glyphs.len()));
+                ui.separator();
+                ui.label("Cell");
+                ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
+            });
+            if let Some((id, [w, h])) = grid {
+                ui.add_space(4.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32, h as f32), egui::Sense::hover());
+                ui.painter().image(
+                    id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         });
+        if cell_edit != self.amiga_cell {
+            self.amiga_cell = cell_edit;
+            self.amiga_grid_tex = None;
+        }
     }
 
     /// Decode the Amiga font at `path` once and cache it. `.font` descriptors resolve to their
@@ -30694,17 +30741,6 @@ impl Kaleidotron {
                     action = Some(MenuAction::Home);
                     ui.close();
                 }
-                ui.separator();
-                let amiga_here = crate::amiga_fonts::is_present(&self.amiga_fonts_dir);
-                let label = if amiga_here { "🅰 Amiga ColorFonts" } else { "🅰 Amiga ColorFonts (download)" };
-                if ui
-                    .button(label)
-                    .on_hover_text("768 public-collection Amiga colour fonts — a logo maker; download once (46 MB) then browse offline")
-                    .clicked()
-                {
-                    action = Some(MenuAction::AmigaFonts);
-                    ui.close();
-                }
                 // Pinned places, in favorites order (so a Places reorder is honored here),
                 // styled like the Places pins — custom label + color tag — and split into
                 // Local vs 16colo.rs groups by a divider, mirroring the Places sub-tabs.
@@ -31000,6 +31036,7 @@ impl Kaleidotron {
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
         let mut open_bundled_tdf: Option<Option<&'static str>> = None;
+        let mut open_amiga_fonts = false;
         let mut recent_remove: Option<PathBuf> = None; // Recent → "Remove"
         let mut recent_clear = false;
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
@@ -31160,6 +31197,15 @@ impl Kaleidotron {
                                 open_bundled_tdf = Some(Some("Multi-color"));
                             }
                         });
+                        // The bundled Amiga ColorFonts collection — 564 public-archive colour fonts
+                        // in one flat folder (so Left/Right steps between them), each a logo maker.
+                        if ui
+                            .button("🅰 Amiga ColorFonts")
+                            .on_hover_text("Browse the bundled Amiga colour-font collection — a logo maker per font, export to DRAW")
+                            .clicked()
+                        {
+                            open_amiga_fonts = true;
+                        }
                         if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
                         {
                             nav = Some(p);
@@ -32475,6 +32521,8 @@ impl Kaleidotron {
                     self.status = "Saved search to Places (click it to re-run)".into();
                 }
             }
+        } else if open_amiga_fonts {
+            self.open_amiga_fonts();
         } else if let Some(cat) = open_bundled_tdf {
             self.open_bundled_tdf(cat);
         } else if let Some(p) = nav {
@@ -32844,7 +32892,6 @@ impl eframe::App for Kaleidotron {
         self.poll_web_open(&ctx);
         self.poll_ma();
         self.poll_ma_open(&ctx);
-        self.poll_amiga_fetch();
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);
@@ -34641,6 +34688,9 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::AMIGA_SPACING_KEY, &self.amiga_spacing);
         eframe::set_value(storage, Self::AMIGA_LINE_GAP_KEY, &self.amiga_line_gap);
         eframe::set_value(storage, Self::AMIGA_ZOOM_KEY, &self.amiga_zoom);
+        eframe::set_value(storage, Self::AMIGA_SNAP_KEY, &self.amiga_snap);
+        eframe::set_value(storage, Self::AMIGA_CRT_KEY, &self.amiga_crt);
+        eframe::set_value(storage, Self::AMIGA_CELL_KEY, &self.amiga_cell);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);

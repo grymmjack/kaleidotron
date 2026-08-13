@@ -1320,13 +1320,18 @@ eight bitplanes plus a palette. So these are **indexed pixel art** and `decode` 
   `2c`/`4c`/…/`256c`. Verified against the real archive: **698/698 size files parse, all colour.**
 
 **Logo maker (`draw_amiga_ui`, the TDF viewer's sibling).** Opening a `.font`/size file enters an
-interactive logo maker: type-to-sample via `amiga_font::render_text` (proportional, overlap-aware —
-negative Spacing kerns the 3D fonts into themselves, last-writer-wins on overlap, palette kept), the
-**same `recolor_sample` hook the TDF viewer uses** so the Recolor pane retints a whole logo, plus
-Spacing/Line-gap/Zoom and a transparency-checkerboard preview. One file is one font, so there is no
-font-index picker; `font_sample` is shared with the other font viewers. `is_amiga_font_ext` routes
-the single view; `ensure_amiga_loaded` follows a descriptor to its largest size and caches the parse.
-Exports: **Copy** (bitmap), **PNG**, and **DRAW font** (below).
+interactive logo maker **modelled on the TDF viewer's layout**: a full-width sample field, Spacing /
+Line-height / Zoom **sliders**, **Snap** (integer preview scale) and **CRT** (~1.2× vertical stretch)
+toggles, a `Design: W × H px` readout, the big preview over a transparency checkerboard, and a
+**glyph grid** below (`amiga_font::render_glyph_grid`, 16 cols, a Cell-size slider) — the same shape
+as TDF's "Glyphs (N) · Cell". Type-to-sample is `amiga_font::render_text` (proportional, overlap-
+aware — negative Spacing kerns the 3D fonts into themselves, last-writer-wins on overlap, palette
+kept), and it shares the **`recolor_sample` hook the TDF viewer uses** so the Recolor pane retints a
+whole logo. The header title comes from the **filename** (the family name in the flat bundle, e.g.
+`ALLOY`), like TDF shows `1911.TDF`, since the internal `dfh_Name` is sometimes just the size string.
+`font_sample` is shared with the other font viewers. `is_amiga_font_ext` routes the single view;
+`ensure_amiga_loaded` follows a descriptor to its largest size and caches the parse. Exports: **Copy**
+(bitmap), **PNG**, and **DRAW font** (below).
 
 **DRAW CBF export (`amiga_font::to_draw_cbf`).** Turns a ColorFont into a DRAW **Color Bitmap Font**
 sheet — one strip with a marker row on top, glyphs left-to-right in their real colours. Written
@@ -1341,17 +1346,19 @@ outvote the background and DRAW elects the marker, inverting every glyph. The te
 DRAW's row-0 election so the export is checked against the loader, not against my reading of it.
 `export_amiga_cbf` defaults the dialog into `~/git/DRAW/ASSETS/FONTS/COLOR_BITMAP/` when it exists.
 
-**Fetch (`amiga_fonts.rs`).** Go → **🅰 Amiga ColorFonts** downloads the site's single 46 MB archive
-once (cache-first, `robots.txt`-clean) and unpacks the curated `Fonts/` subtree into
-`<data>/amiga_fonts/` — skipping the six duplicate trees and the 1030 `.iff` previews, so the result
-is ~768 families not 3663 files. The menu label reads "(download)" until `is_present` (one directory
-stat) is true, then "Amiga ColorFonts". Worker thread + `poll_amiga_fetch`, mirroring the modarchive
-fetch. **Gotcha the real download caught:** the archive stores explicit directory entries and
-`ZipArchive::enclosed_name` strips their trailing slash, so `.../18CAROTGOLD/` arrived looking like a
-file, got written as a 0-byte file, and its size files then failed with "Not a directory". Skip dir
-entries by the zip's own `is_dir()` flag. A synthetic zip with clean paths never hit it; the real
-fetch failed on the first family — the `#[ignore]`d `fetches_the_real_archive` test is why it was
-found.
+**Bundle (`amiga_fonts.rs`).** The collection is **embedded in the binary and browsed like the
+TheDraw font library** — no download. `assets/amiga/amiga_colorfonts.zip` (~12.5 MB, 564 families)
+is `include_bytes!`d; `bundle_zip_path` seeds it to `<data>/bundled/Amiga ColorFonts.zip` on first
+run (idempotent size check, exactly like `Kaleidotron::bundle_zip_path` for TDF) and it mounts as an
+archive. A **Places entry** "🅰 Amiga ColorFonts" (right under "🎨 TheDraw Fonts") + a searchable
+`MenuAction::AmigaFonts` open it via `open_amiga_fonts`. **The bundle is FLAT** — one file per family
+in a single directory, named `<FontName>.<colours>c` — because a size file decodes standalone (no
+descriptor needed), so the whole collection lives as siblings in one folder. That is deliberate and
+load-bearing: it is what makes **Left/Right step between fonts in the viewer** (the per-family-
+directory layout put each font in its own folder, so prev/next had nothing to step to). Building it:
+each family's largest size file, verified by hunk magic, copied flat and zipped. (The earlier
+download-into-`<data>/amiga_fonts` approach was scrapped — the repo is private, so an anonymous
+release-asset URL 404s, and bundling is better anyway: offline, no dependency.)
 
 **`decode/iff.rs` — IFF ILBM (`.iff`/`.ilbm`/`.lbm`).** The format the previews are stored in, and a
 generally useful Amiga bitmap decoder. Chunks in a `FORM`: BMHD/CMAP/CAMG/BODY. ILBM is

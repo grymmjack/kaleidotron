@@ -344,6 +344,50 @@ pub fn render_text(f: &ColorFont, text: &str, spacing: i32, line_gap: i32) -> Pi
     PixImage::from_indexed(w, h, indices, f.palette.clone())
 }
 
+/// Render the font's glyphs as a grid, one per cell, for the viewer's glyph browser.
+///
+/// Mirrors the TDF glyph grid: `cols` columns, each glyph fit into a `cell`×`cell` box (snapped to a
+/// whole integer scale when it fits at ≥1× so pixels stay crisp), background transparent so the tile
+/// background shows through. Returns the sheet plus the codes drawn, so the caller can label cells /
+/// map a click back to a character. Palette-preserving.
+pub fn render_glyph_grid(f: &ColorFont, cols: usize, cell: usize) -> Option<(PixImage, Vec<u8>)> {
+    if f.glyphs.is_empty() || cols == 0 || cell == 0 {
+        return None;
+    }
+    let codes: Vec<u8> = f.glyphs.iter().map(|g| g.code).collect();
+    let rows = f.glyphs.len().div_ceil(cols);
+    let (gw, gh) = (cols * cell, rows * cell);
+    let mut indices = vec![0u8; gw * gh];
+    let pad = 4usize; // breathing room + implicit separation between cells
+    let avail = cell.saturating_sub(pad).max(1);
+    for (i, g) in f.glyphs.iter().enumerate() {
+        if g.width == 0 {
+            continue;
+        }
+        let (cx, cy) = ((i % cols) * cell, (i / cols) * cell);
+        // Fit the glyph in the cell. Integer scale so nearest-neighbour stays crisp; a glyph bigger
+        // than the cell shrinks (still integer-divided) rather than clipping.
+        let scale = (avail / (g.width.max(f.height) as usize)).max(1);
+        let (dw, dh) = (g.width as usize * scale, f.height as usize * scale);
+        // Centre within the cell.
+        let ox = cx + (cell.saturating_sub(dw)) / 2;
+        let oy = cy + (cell.saturating_sub(dh)) / 2;
+        for y in 0..dh {
+            for x in 0..dw {
+                let (sx, sy) = (x / scale, y / scale);
+                let v = g.indices[(sy as u32 * g.width + sx as u32) as usize];
+                if v != 0 {
+                    let (px, py) = (ox + x, oy + y);
+                    if px < gw && py < gh {
+                        indices[py * gw + px] = v;
+                    }
+                }
+            }
+        }
+    }
+    Some((PixImage::from_indexed(gw as u32, gh as u32, indices, f.palette.clone()), codes))
+}
+
 /// Decode a size file's bytes straight to a sheet.
 pub fn decode(bytes: &[u8]) -> Result<PixImage, DecodeError> {
     Ok(render_sheet(&parse(bytes)?))
@@ -778,6 +822,20 @@ mod tests {
         assert_eq!(two.height, 8, "two rows of a 4px font");
         let kerned = render_text(&f, "AB", -2, 0);
         assert_eq!(kerned.width, 8, "-2 spacing pulls B two px into A");
+    }
+
+    /// The glyph grid lays every glyph into a cell and keeps the palette.
+    #[test]
+    fn renders_a_glyph_grid() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 4;
+        f.glyphs = (b'!'..=b'0')
+            .map(|code| Glyph { code, width: 4, indices: vec![1u8; 16] })
+            .collect();
+        let (img, codes) = render_glyph_grid(&f, 8, 32).expect("renders");
+        assert_eq!(img.width, 8 * 32, "8 columns of 32px cells");
+        assert_eq!(codes.first().copied(), Some(b'!'), "codes map cells back to characters");
+        assert!(img.indexed.is_some(), "the grid keeps the palette");
     }
 
     /// Export a real font to a DRAW CBF `.bmp` for a look, and for dropping into
