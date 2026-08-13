@@ -1865,7 +1865,10 @@ pub struct Kaleidotron {
     tasks_enabled: bool, // Preferences toggle (persisted); off = never even look for a tasks.json
     tasks: Vec<crate::tasks::Task>,
     task_ws: Option<PathBuf>, // the folder holding `.vscode` — `${workspaceFolder}`
-    task_config: std::collections::HashMap<String, String>, // `.vscode/settings.json`, for `${config:…}`
+    /// The `env` block of the active tasks file: variables kaleidotron itself defines, exported
+    /// into every task and resolvable as `${env:NAME}`. This is where a toolchain path lives —
+    /// deliberately kaleidotron's own configuration rather than another editor's.
+    task_env: std::collections::HashMap<String, String>,
     task_inputs: std::collections::HashMap<String, String>,  // resolvable `${input:…}` values
     /// `<data>/tasks/` — a **global** tasks.json (+ settings.json) folded into every folder's set,
     /// so a general tool ("open this in GIMP") isn't confined to the one repo that declared it.
@@ -3597,7 +3600,7 @@ impl Kaleidotron {
             tasks_enabled: get_bool(Self::TASKS_ENABLED_KEY).unwrap_or(true),
             tasks: Vec::new(),
             task_ws: None,
-            task_config: std::collections::HashMap::new(),
+            task_env: std::collections::HashMap::new(),
             task_inputs: std::collections::HashMap::new(),
             tasks_dir,
             task_run: None,
@@ -16846,7 +16849,7 @@ impl Kaleidotron {
     fn refresh_tasks(&mut self) {
         self.tasks.clear();
         self.task_ws = None;
-        self.task_config.clear();
+        self.task_env.clear();
         self.task_inputs.clear();
         if !self.tasks_enabled {
             return;
@@ -16867,7 +16870,7 @@ impl Kaleidotron {
         // art should still offer "open this in PabloDraw".
         crate::tasks::merge_global(&mut loaded, crate::tasks::load_dir(&self.tasks_dir));
         self.tasks = loaded.tasks;
-        self.task_config = loaded.config;
+        self.task_env = loaded.env;
         self.task_inputs = loaded.inputs;
         // `${workspaceFolder}` for a global-only task is the folder being browsed — there is no
         // project to point at, and the current folder is the only sensible reading.
@@ -16885,7 +16888,7 @@ impl Kaleidotron {
                 file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
             }),
             file: self.resolve_local(file),
-            config: self.task_config.clone(),
+            env: self.task_env.clone(),
             inputs: self.task_inputs.clone(),
         }
     }
@@ -41378,14 +41381,26 @@ const GLOBAL_TASKS_TEMPLATE: &str = r#"// kaleidotron — GLOBAL tasks, in VS Co
 //
 // Variables: ${file} ${fileDirname} ${fileBasename} ${fileBasenameNoExtension}
 //            ${fileExtname} ${relativeFile} ${workspaceFolder} ${env:VAR}
-//            ${config:some.key}  (from settings.json beside this file)
 // An unknown variable is left as-is so you can see it in the output panel.
+//
+// The "env" block below is where you name your toolchain. Everything in it is
+// BOTH substitutable as ${env:NAME} and exported into every task's process, so a
+// compiler that reads its own environment variable just works. Set it here for
+// every folder, or per project in that project's own tasks.json.
 //
 // Not supported: problemMatcher, and interactive inputs (promptString/pickString).
 // A `type: "command"` input naming simpleBrowser.show DOES work — it opens its URL.
 {
     "version": "2.0.0",
+    // "env": {
+    //     "QB64PE": "/home/you/git/QB64pe/qb64pe"
+    // },
     "tasks": [
+        // {
+        //     "label": "BUILD: Compile (QB64PE)",
+        //     "type": "shell",
+        //     "command": "${env:QB64PE} -x \"${file}\" -o \"${fileDirname}/${fileBasenameNoExtension}\""
+        // },
         // {
         //     "label": "IMAGE: Open in GIMP",
         //     "type": "shell",

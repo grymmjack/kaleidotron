@@ -327,8 +327,10 @@ pub struct Vars {
     /// `${file}` — the file the task acts on. For art opened from an archive or 16colo.rs this is
     /// the *resolved local* copy, since a tool spawned by the task can only open a real path.
     pub file: PathBuf,
-    /// `${config:…}` — keys read from `.vscode/settings.json`.
-    pub config: HashMap<String, String>,
+    /// `${env:…}` — variables kaleidotron itself defines, from the `env` block of a
+    /// tasks file. Consulted BEFORE the process environment, so a tool path can be
+    /// pinned per project without exporting anything into the user's shell.
+    pub env: HashMap<String, String>,
     /// `${input:…}` — only the non-interactive ones (see [`parse_inputs`]).
     pub inputs: HashMap<String, String>,
 }
@@ -336,8 +338,8 @@ pub struct Vars {
 /// Expand VS Code's task variables in `src`.
 ///
 /// An **unknown** variable is deliberately left verbatim rather than blanked. A task that silently
-/// becomes `qb64pe -x  -o ` is a mystery to debug; one that visibly still says
-/// `${config:qb64pe.compilerPath}` in the output panel tells you exactly which key is missing.
+/// becomes `qb64pe -x  -o ` is a mystery to debug; one that visibly still says `${env:QB64PE}` in
+/// the output panel tells you exactly which variable is missing.
 pub fn substitute(src: &str, v: &Vars) -> String {
     let file = v.file.to_string_lossy().to_string();
     let dir = |p: &Path| p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
@@ -371,8 +373,12 @@ pub fn substitute(src: &str, v: &Vars) -> String {
             "pathSeparator" | "/" => Some(std::path::MAIN_SEPARATOR.to_string()),
             "userHome" => std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()),
             _ => match name.split_once(':') {
-                Some(("env", k)) => Some(std::env::var(k).unwrap_or_default()),
-                Some(("config", k)) => v.config.get(k).cloned(),
+                // Ours first, then the real environment. A task that wants a tool path
+                // therefore says `${env:QB64PE}` and gets it from the `env` block of a
+                // tasks file — kaleidotron's own configuration, not another editor's.
+                Some(("env", k)) => {
+                    v.env.get(k).cloned().or_else(|| std::env::var(k).ok())
+                }
                 Some(("input", k)) => v.inputs.get(k).cloned(),
                 _ => None,
             },
@@ -443,7 +449,20 @@ pub fn exec_for(t: &Task, v: &Vars) -> Exec {
         .as_ref()
         .map(|c| PathBuf::from(substitute(c, v)))
         .unwrap_or_else(|| v.workspace.clone());
-    let env = t.env.iter().map(|(k, val)| (k.clone(), substitute(val, v))).collect();
+    // The tasks file's own `env` block is exported into EVERY task, with the task's
+    // `options.env` layered on top — so a toolchain is named once and a task can still
+    // override a single variable. This is what a compiler that reads its own env var
+    // (many do) actually sees.
+    let mut env: Vec<(String, String)> =
+        v.env.iter().map(|(k, val)| (k.clone(), val.clone())).collect();
+    env.sort(); // deterministic order, so a failing test reports the same thing twice
+    for (k, val) in &t.env {
+        let val = substitute(val, v);
+        match env.iter_mut().find(|(ek, _)| ek == k) {
+            Some(slot) => slot.1 = val,
+            None => env.push((k.clone(), val)),
+        }
+    }
     // A task whose command resolves to nothing but a URL means "open this link" — the shape a
     // `simpleBrowser.show` input collapses to once its URL is substituted in. Run it through the
     // platform's opener rather than handing a URL to a shell, which could only fail.
@@ -529,41 +548,61 @@ pub fn find_workspace(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Load `<workspace>/.vscode/tasks.json` plus the `${config:…}` values from its `settings.json`.
-///
-/// Both are read together because a task is frequently unusable without the settings half: your
-/// `BUILD: Compile` is entirely `${config:qb64pe.compilerPath}`, and without it the task would
-/// resolve to an empty program and fail with a useless error.
+/// Load `<workspace>/.vscode/tasks.json`.
 pub fn load(workspace: &Path) -> Loaded {
     load_dir(&workspace.join(".vscode"))
 }
 
-/// Everything one `tasks.json` (+ its sibling `settings.json`) contributes.
+/// Everything one tasks file contributes.
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
     pub tasks: Vec<Task>,
-    pub config: HashMap<String, String>,
+    /// The file's `env` block: variables exported into every task it defines, and
+    /// resolvable as `${env:NAME}`.
+    pub env: HashMap<String, String>,
     pub inputs: HashMap<String, String>,
 }
 
-/// Read a `tasks.json` and its sibling `settings.json` from `dir`.
+/// Read a tasks file from `dir`.
 ///
 /// Split out so the same reader serves a project's `.vscode` and the **global** toolbox directory
 /// (see [`merge_global`]) — they are the same file format in a different place, and having two
 /// readers would guarantee they drift.
+///
+/// **Only `tasks.json` is read.** An earlier version also read the sibling `settings.json` to
+/// resolve a `${config:…}` variable, which made kaleidotron's build system depend on another
+/// editor's configuration file: a task could only find its compiler if VS Code had been set up. The
+/// tasks.json *format* is worth borrowing; VS Code's settings are not ours to read. Tool paths now
+/// come from this file's own `env` block — see [`parse_env`].
 pub fn load_dir(dir: &Path) -> Loaded {
     let src = std::fs::read_to_string(dir.join("tasks.json")).unwrap_or_default();
-    let config = std::fs::read_to_string(dir.join("settings.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&s)).ok())
-        .and_then(|v| v.as_object().cloned())
+    Loaded { tasks: parse(&src), inputs: parse_inputs(&src), env: parse_env(&src) }
+}
+
+/// The `env` block: kaleidotron's own place to name the tools a task needs.
+///
+/// ```jsonc
+/// { "env": { "QB64PE": "/home/me/git/QB64pe/qb64pe" },
+///   "tasks": [ { "label": "Build", "command": "${env:QB64PE} -x ${file}" } ] }
+/// ```
+///
+/// These are both **substituted** as `${env:NAME}` and **exported into every task's process**, so a
+/// tool that reads its own environment variable (many compilers and test runners do) sees them
+/// without the task having to mention them at all. That is the generic build-system facility: one
+/// place to say where the toolchain lives, per project or globally, with nothing outside
+/// kaleidotron involved.
+pub fn parse_env(src: &str) -> HashMap<String, String> {
+    let Ok(v): Result<serde_json::Value, _> = serde_json::from_str(&strip_jsonc(src)) else {
+        return HashMap::new();
+    };
+    v.get("env")
+        .and_then(|e| e.as_object())
         .map(|m| {
             m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
-        .unwrap_or_default();
-    Loaded { tasks: parse(&src), inputs: parse_inputs(&src), config }
+        .unwrap_or_default()
 }
 
 /// Fold a **global** task file into a project's, so tasks that aren't really project-specific —
@@ -571,16 +610,17 @@ pub fn load_dir(dir: &Path) -> Loaded {
 /// inside the one repo whose `.vscode` happens to define them.
 ///
 /// The **project wins on a label collision**: a repo that defines its own `BUILD: Compile` means
-/// that one, and a global default silently shadowing it would be the worst possible outcome.
-/// Config and input maps merge the same way.
+/// that one, and a global default silently shadowing it would be the worst possible outcome. The
+/// `env` and input maps merge the same way, so a global `env` names a default toolchain and a
+/// project's own `env` overrides it.
 pub fn merge_global(project: &mut Loaded, global: Loaded) {
     for t in global.tasks {
         if !project.tasks.iter().any(|p| p.label == t.label) {
             project.tasks.push(t);
         }
     }
-    for (k, v) in global.config {
-        project.config.entry(k).or_insert(v);
+    for (k, v) in global.env {
+        project.env.entry(k).or_insert(v);
     }
     for (k, v) in global.inputs {
         project.inputs.entry(k).or_insert(v);
@@ -665,16 +705,52 @@ mod tests {
         assert_eq!(substitute("${workspaceFolder}", &v), "/w");
     }
 
-    /// A config key that IS defined resolves; one that isn't is left visible so the missing setting
-    /// is diagnosable from the output panel instead of vanishing into an empty string.
+    /// A variable the tasks file defines resolves; one nothing defines is left VISIBLE, so a
+    /// missing setting is diagnosable from the output panel instead of vanishing into an empty
+    /// string and producing a baffling shell error.
     #[test]
     fn unknown_variables_survive_verbatim() {
-        let mut config = HashMap::new();
-        config.insert("qb64pe.compilerPath".to_string(), "/opt/qb64pe/qb64pe".to_string());
-        let v = Vars { workspace: "/w".into(), file: "/w/a.bas".into(), config, ..Default::default() };
-        assert_eq!(substitute("${config:qb64pe.compilerPath}", &v), "/opt/qb64pe/qb64pe");
-        assert_eq!(substitute("${config:nope.missing}", &v), "${config:nope.missing}");
+        let mut env = HashMap::new();
+        env.insert("QB64PE".to_string(), "/opt/qb64pe/qb64pe".to_string());
+        let v = Vars { workspace: "/w".into(), file: "/w/a.bas".into(), env, ..Default::default() };
+        assert_eq!(substitute("${env:QB64PE}", &v), "/opt/qb64pe/qb64pe");
+        assert_eq!(substitute("${env:NOTHING_DEFINES_THIS}", &v), "${env:NOTHING_DEFINES_THIS}");
         assert_eq!(substitute("${bogus}", &v), "${bogus}");
+    }
+
+    /// The `env` block is kaleidotron's OWN replacement for the `${config:…}` variable that used to
+    /// read VS Code's `settings.json`. It must do both jobs: substitute into a command line, and
+    /// reach the spawned process as a real environment variable — the second is what lets a
+    /// compiler that reads its own variable work without the task mentioning it.
+    #[test]
+    fn the_env_block_substitutes_and_is_exported() {
+        let src = r#"{
+            "env": { "QB64PE": "/opt/qb64pe/qb64pe", "MODE": "release" },
+            "tasks": [
+                { "label": "Build", "type": "shell", "command": "${env:QB64PE} -x ${file}" },
+                { "label": "Override", "type": "shell", "command": "echo hi",
+                  "options": { "env": { "MODE": "debug" } } }
+            ]
+        }"#;
+        let env = parse_env(src);
+        assert_eq!(env.get("QB64PE").map(|s| s.as_str()), Some("/opt/qb64pe/qb64pe"));
+
+        let ts = parse(src);
+        let v = Vars { workspace: "/w".into(), file: "/w/a.bas".into(), env, ..Default::default() };
+
+        let build = exec_for(&ts[0], &v);
+        assert!(build.display.contains("/opt/qb64pe/qb64pe"), "substituted: {}", build.display);
+        assert!(
+            build.env.iter().any(|(k, val)| k == "QB64PE" && val == "/opt/qb64pe/qb64pe"),
+            "and exported: {:?}",
+            build.env
+        );
+
+        // A task's own options.env wins over the file-level block for that one variable, and
+        // leaves the others in place.
+        let over = exec_for(&ts[1], &v);
+        assert!(over.env.iter().any(|(k, val)| k == "MODE" && val == "debug"), "{:?}", over.env);
+        assert!(over.env.iter().any(|(k, _)| k == "QB64PE"), "others survive: {:?}", over.env);
     }
 
     /// A dependency runs before its dependent, and each label runs once even in a cycle.

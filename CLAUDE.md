@@ -109,7 +109,7 @@ src/
   rating.rs          read/write star ratings via the user.baloo.rating xattr
   ratings.rs         cross-platform ratings sidecar (ratings.json) for virtual art
   tasks.rs           `.vscode/tasks.json` runner (pure): JSONC strip, platform blocks, `${…}`
-                     substitution incl. `${config:}` + URL-opening `${input:}`, sequential
+                     substitution incl. an own `env` block + URL-opening `${input:}`, sequential
                      `dependsOn`, shell/process exec, project+global merge
   git.rs             per-folder git status (shells out to `git status --porcelain -z`);
                      parses to an abs-path→GitStatus map; surfaced as grid badge / table
@@ -1232,11 +1232,19 @@ process spawning and the panel.
   it silently lost whole files) and becomes `npm run <script>`.
 - **Variables (`substitute`).** `${file}` `${fileDirname}` `${fileBasename}`
   `${fileBasenameNoExtension}` `${fileExtname}` `${relativeFile}` `${workspaceFolder}` `${cwd}`
-  `${pathSeparator}` `${userHome}` `${env:X}` and **`${config:X}`** from `.vscode/settings.json` —
-  the last is load-bearing, not optional (a QB64PE `BUILD: Compile` is entirely
-  `${config:qb64pe.compilerPath}`). An **unknown** variable is left **verbatim**: a task that
-  silently becomes `qb64pe -x  -o ` is a mystery, one that still reads `${config:…}` in the output
-  panel names the missing key.
+  `${pathSeparator}` `${userHome}` and `${env:X}`. An **unknown** variable is left **verbatim**: a
+  task that silently becomes `qb64pe -x  -o ` is a mystery, one that still reads `${env:QB64PE}` in
+  the output panel names the missing variable.
+- **The `env` block — kaleidotron's own build configuration, and NOT VS Code's.** A tasks file may
+  carry a top-level `"env": { "QB64PE": "/path/to/qb64pe" }`. Those are both substituted as
+  `${env:NAME}` (consulted **before** the process environment) and **exported into every task's
+  process**, so a compiler that reads its own variable works without the task mentioning it. Set it
+  globally for every folder, or per project in that project's tasks.json; the project's wins.
+  **An earlier version instead resolved `${config:X}` from the sibling `.vscode/settings.json`** —
+  which made this build system depend on another editor's configuration, so a task could only find
+  its compiler if VS Code had been set up on that machine. The tasks.json *format* is worth
+  borrowing; another program's settings are not ours to read. `settings.json` is no longer opened
+  at all.
 - **`${input:…}`: the resolvable half works.** `parse_inputs` reads the file's `inputs` array and
   resolves a **`type: "command"`** input naming `simpleBrowser.show` / `simpleBrowser.api.open` /
   `vscode.open` to its URL — that has a perfectly good meaning outside VS Code. `exec_for` then sees
@@ -1256,7 +1264,7 @@ process spawning and the panel.
   are broken (each label runs once).
 - **Where the file lives — two places, merged.** Nothing is stored or copied by kaleidotron; the
   files are read in place, fresh on every navigation (so an edit in another window lands on the next
-  nav). (1) The **project's** `.vscode/tasks.json`: `find_workspace` walks **up** from the current
+  nav) — and **only `tasks.json`**, never a sibling `settings.json`. (1) The **project's** `.vscode/tasks.json`: `find_workspace` walks **up** from the current
   folder, so a file at the repo root still applies deep inside it. (2) A **global**
   `<data>/tasks/tasks.json` (+ optional `settings.json`), folded in by `merge_global` — a general
   tool ("open this in GIMP", "view in PabloDraw") is not project-specific, and confining it to the
