@@ -314,6 +314,128 @@ pub fn decode_path(path: &Path, bytes: &[u8]) -> Result<PixImage, DecodeError> {
     ))
 }
 
+/// Convert to a **DRAW Color Bitmap Font** sheet.
+///
+/// DRAW's CBF is one bitmap strip with a marker row on top:
+///
+/// ```text
+/// row 0    background everywhere, except ONE pixel of another colour at each glyph's start x
+/// rows 1+  the glyphs, left to right, in their real colours
+/// ```
+///
+/// and its loader (`CBF_detect%` / `CBF_render_glyph` in DRAW's `GUI/FONT-LIST.BM`) infers
+/// everything else: the **background is elected**, not declared — whatever colour is most frequent
+/// in row 0 wins and becomes transparent throughout — and glyph **widths are implied** by the gaps
+/// between markers, so proportional fonts come for free.
+///
+/// Two mappings have to be got right, and they are where an Amiga font and DRAW disagree:
+///
+/// * **DRAW maps glyphs positionally from ASCII 33**, while an Amiga font declares an arbitrary
+///   `tf_LoChar..=tf_HiChar`. A gap anywhere shifts every later character, so gaps inside the
+///   exported range are filled with blank spacers rather than skipped.
+/// * **Space is never a glyph** in a CBF (DRAW advances by the average width), so code 32 is
+///   dropped even though most Amiga fonts start there.
+///
+/// The range deliberately stops at the font's own last character rather than padding out to 126.
+/// These are display fonts — `Aggress` ends at 0x5F, with no lowercase — and DRAW aliases missing
+/// lowercase onto the uppercase glyphs, which is exactly what you want for a logo font. Padding to
+/// 126 with blanks would instead give you a font that types nothing in lowercase.
+pub fn to_draw_cbf(f: &ColorFont) -> Result<PixImage, DecodeError> {
+    let refuse = |m: &str| DecodeError::Malformed(m.to_string());
+
+    // The exported range: from '!' to the font's last glyph, capped at DRAW's addressable end.
+    let last = f.glyphs.iter().map(|g| g.code).max().unwrap_or(0).min(126);
+    if last < b'!' {
+        return Err(refuse("font has no glyphs at or above '!' — nothing DRAW could address"));
+    }
+    let avg = (f.glyphs.iter().map(|g| g.width).sum::<u32>()
+        / f.glyphs.len().max(1) as u32)
+        .max(1);
+
+    // Pick each exported cell: the real glyph, or a blank spacer holding its place.
+    let mut cells: Vec<(u32, Option<&Glyph>)> = Vec::new();
+    for code in b'!'..=last {
+        match f.glyphs.iter().find(|g| g.code == code) {
+            Some(g) if g.width > 0 => cells.push((g.width, Some(g))),
+            _ => cells.push((avg, None)),
+        }
+    }
+    if cells.len() < 2 {
+        return Err(refuse("DRAW needs at least two glyphs"));
+    }
+
+    let width: u32 = cells.iter().map(|(w, _)| *w).sum();
+    let height = f.height + 1; // + the marker row
+    if width < 10 || height < 3 {
+        return Err(refuse("sheet is below DRAW's 10x3 minimum"));
+    }
+    // DRAW elects the most frequent row-0 colour as the background. One marker pixel per glyph
+    // means markers lose that vote as long as glyphs are wider than a pixel or two — below ~3px
+    // average they can outnumber the background and the loader elects the MARKER, turning the
+    // glyphs inside out. Refuse rather than emit a sheet that loads wrong.
+    if avg < 3 {
+        return Err(refuse("glyphs average under 3px — markers would outvote the background"));
+    }
+
+    let bg = f.palette.first().copied().unwrap_or([0, 0, 0, 255]);
+    let bg_rgb = [bg[0], bg[1], bg[2], 255u8];
+    // A marker must differ from the background AND from nothing else in particular — but choosing
+    // a colour the font never uses keeps row 0 unambiguous.
+    let marker = pick_marker(&f.palette, bg_rgb);
+
+    let mut px = vec![bg_rgb; (width * height) as usize];
+    let mut x0 = 0u32;
+    for (w, glyph) in &cells {
+        px[x0 as usize] = marker; // row 0: the glyph's start
+        if let Some(g) = glyph {
+            for y in 0..f.height {
+                for x in 0..g.width {
+                    let idx = g.indices[(y * g.width + x) as usize] as usize;
+                    // Index 0 is the Amiga background: leave it as the CBF background so DRAW
+                    // elects it and renders it transparent.
+                    if idx != 0 {
+                        let c = f.palette.get(idx).copied().unwrap_or(bg);
+                        px[((y + 1) * width + x0 + x) as usize] = [c[0], c[1], c[2], 255];
+                    }
+                }
+            }
+        }
+        x0 += w;
+    }
+    Ok(PixImage::from_rgba(width, height, px))
+}
+
+/// A marker colour the font itself never uses, so row 0 has exactly two colours.
+fn pick_marker(palette: &[[u8; 4]], bg: [u8; 4]) -> [u8; 4] {
+    const CANDIDATES: [[u8; 4]; 4] = [
+        [255, 0, 255, 255],
+        [0, 255, 0, 255],
+        [255, 255, 0, 255],
+        [0, 255, 255, 255],
+    ];
+    let used = |c: [u8; 4]| {
+        c == bg || palette.iter().any(|p| p[0] == c[0] && p[1] == c[1] && p[2] == c[2])
+    };
+    CANDIDATES
+        .into_iter()
+        .find(|&c| !used(c))
+        // Every candidate taken is possible for a rich palette; step through the whole cube
+        // rather than give up, since only ONE unused colour is needed.
+        .unwrap_or_else(|| {
+            for r in (0..=255u8).step_by(17) {
+                for g in (0..=255u8).step_by(17) {
+                    for b in (0..=255u8).step_by(17) {
+                        let c = [r, g, b, 255];
+                        if !used(c) {
+                            return c;
+                        }
+                    }
+                }
+            }
+            [255, 0, 255, 255]
+        })
+}
+
 /// Registry entry. Sniffing is by hunk magic; `.font` descriptors are path-routed in `decode_bytes`
 /// because they need their sibling directory.
 pub struct AmigaFontDecoder;
@@ -457,6 +579,142 @@ mod tests {
         b[260..262].copy_from_slice(&36u16.to_be_bytes());
         let e = parse_descriptor(&b).expect("parses");
         assert_eq!(e, vec![("Aggress/36.8C".to_string(), 36)]);
+    }
+
+    /// Re-implements DRAW's `CBF_detect%` so the export is checked against the LOADER's rules
+    /// rather than against my reading of them: scan row 0, elect the most frequent colour as the
+    /// background, and count background→non-background transitions as glyphs.
+    fn draw_would_see(img: &PixImage) -> (usize, [u8; 4], usize) {
+        let w = img.width as usize;
+        let row0 = &img.pixels[..w];
+        let mut counts: Vec<([u8; 4], usize)> = Vec::new();
+        for &p in row0 {
+            match counts.iter_mut().find(|(c, _)| *c == p) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((p, 1)),
+            }
+        }
+        let distinct = counts.len();
+        let bg = counts.iter().max_by_key(|(_, n)| *n).map(|(c, _)| *c).unwrap();
+        let mut glyphs = 0usize;
+        let mut prev_bg = true;
+        for &p in row0 {
+            if p != bg {
+                if prev_bg {
+                    glyphs += 1;
+                }
+                prev_bg = false;
+            } else {
+                prev_bg = true;
+            }
+        }
+        (distinct, bg, glyphs)
+    }
+
+    /// The export must satisfy every gate DRAW's loader applies, or it silently refuses the font.
+    #[test]
+    fn cbf_export_satisfies_draws_loader() {
+        // A font wide enough to clear the 3px-average guard: 8px glyphs for '!'..'0'.
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 8;
+        f.glyphs = (b'!'..=b'0')
+            .map(|code| Glyph { code, width: 8, indices: vec![1u8; 64] })
+            .collect();
+
+        let sheet = to_draw_cbf(&f).expect("exports");
+        assert!(sheet.width >= 10 && sheet.height >= 3, "DRAW's minimum size");
+        assert_eq!(sheet.height, f.height + 1, "one marker row on top of the glyphs");
+
+        let (distinct, bg, glyphs) = draw_would_see(&sheet);
+        assert!(distinct >= 2, "row 0 needs a background AND a marker colour");
+        assert_eq!(bg, [0, 0, 0, 255], "palette index 0 is the elected background");
+        assert_eq!(glyphs, f.glyphs.len(), "one marker per exported glyph, and DRAW finds them all");
+    }
+
+    /// Space is never a glyph in a CBF, and DRAW maps positionally from '!' — so an Amiga font
+    /// starting at 0x20 must have its space DROPPED, not exported. Getting this wrong shifts every
+    /// character in the font by one.
+    #[test]
+    fn cbf_export_drops_space_and_starts_at_bang() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 8;
+        f.glyphs = (b' '..=b'*')
+            .map(|code| Glyph { code, width: 8, indices: vec![1u8; 64] })
+            .collect();
+
+        let sheet = to_draw_cbf(&f).expect("exports");
+        let (_, _, glyphs) = draw_would_see(&sheet);
+        assert_eq!(
+            glyphs,
+            (b'!'..=b'*').count(),
+            "the space glyph is dropped; the sheet begins at '!'"
+        );
+    }
+
+    /// A gap in the middle of the range has to be PADDED, not skipped: DRAW counts positions, so a
+    /// missing character would shift every later one onto the wrong code.
+    #[test]
+    fn cbf_export_pads_gaps_so_later_glyphs_stay_aligned() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 8;
+        // '!' and '#' present, '"' missing.
+        f.glyphs = [b'!', b'#']
+            .into_iter()
+            .map(|code| Glyph { code, width: 8, indices: vec![1u8; 64] })
+            .collect();
+
+        let sheet = to_draw_cbf(&f).expect("exports");
+        let (_, _, glyphs) = draw_would_see(&sheet);
+        assert_eq!(glyphs, 3, "'!', a blank spacer for '\"', then '#'");
+    }
+
+    /// The refusals are as important as the export: a sheet DRAW would misread should never be
+    /// written. Below ~3px average, the one-pixel markers outnumber the background in row 0 and
+    /// DRAW elects the MARKER as background — rendering every glyph inside out.
+    #[test]
+    fn cbf_export_refuses_sheets_draw_would_misread() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 8;
+        f.glyphs = (b'!'..=b'0')
+            .map(|code| Glyph { code, width: 2, indices: vec![1u8; 16] })
+            .collect();
+        assert!(to_draw_cbf(&f).is_err(), "2px glyphs would invert the background election");
+
+        let mut only_one = parse(&synth()).expect("parses");
+        only_one.glyphs = vec![Glyph { code: b'!', width: 20, indices: vec![1u8; 40] }];
+        assert!(to_draw_cbf(&only_one).is_err(), "DRAW needs at least two glyphs");
+    }
+
+    /// Export a real font to a DRAW CBF `.bmp` for a look, and for dropping into
+    /// `DRAW/ASSETS/FONTS/COLOR_BITMAP/`. Ignored — needs the archive.
+    ///
+    /// ```text
+    /// AMIGA_FONT=<path to a size file> CBF_OUT=/tmp/out.bmp \
+    ///   cargo test dump_cbf -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn dump_cbf_for_draw() {
+        let (Ok(src), Ok(out)) = (std::env::var("AMIGA_FONT"), std::env::var("CBF_OUT")) else {
+            println!("set AMIGA_FONT=<size file> and CBF_OUT=<out.bmp>");
+            return;
+        };
+        let f = parse(&std::fs::read(&src).expect("read")).expect("parse");
+        let sheet = to_draw_cbf(&f).expect("export");
+        let (dis, bg, glyphs) = draw_would_see(&sheet);
+        println!(
+            "{} — {}x{}, {} glyphs; DRAW sees bg {:?}, {} row-0 colours, {} glyphs",
+            f.name, sheet.width, sheet.height, f.glyphs.len(), bg, dis, glyphs
+        );
+        image::save_buffer(
+            &out,
+            &sheet.rgba_bytes(),
+            sheet.width,
+            sheet.height,
+            image::ColorType::Rgba8,
+        )
+        .expect("write bmp");
+        println!("wrote {out}");
     }
 
     /// The real archive, when it happens to be on this machine. Ignored — it is a 46 MB download —
