@@ -1038,6 +1038,7 @@ enum MenuAction {
     Search,
     ToggleTasksPanel, // show/hide the task output panel
     ReloadTasks,      // re-read this project's .vscode/tasks.json
+    AmigaFonts,  // open (fetching first time) the Amiga ColorFonts collection
     Refresh,     // re-scan the current folder (F5)
     HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
@@ -2092,6 +2093,10 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
+    amiga_fonts_dir: PathBuf, // <data>/amiga_fonts — the Stone Oakvalley ColorFonts collection
+    // A background fetch+unpack of the 46 MB ColorFonts archive: the folder to open once it lands,
+    // or an error. `None` when no fetch is in flight.
+    amiga_fetch_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
@@ -2962,6 +2967,7 @@ impl Kaleidotron {
         let gf_dir = data_dir.join("gfonts");
         let web_dir = data_dir.join("web");
         let ma_dir = data_dir.join("modules");
+        let amiga_fonts_dir = data_dir.join("amiga_fonts");
         let mut palette_files = all_palettes(&palette_dir);
         for p in all_palettes(&lospec_dir) {
             if !palette_files.contains(&p) {
@@ -3797,6 +3803,8 @@ impl Kaleidotron {
             ma_files: HashMap::new(),
             ma_open_rx: None,
             ma_dir,
+            amiga_fonts_dir,
+            amiga_fetch_rx: None,
             keybindings_file: kb_file,
             settings_file,
             secrets_file,
@@ -6851,6 +6859,45 @@ impl Kaleidotron {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ma_open_rx = None,
+        }
+    }
+
+    /// Open the Amiga ColorFonts collection, downloading + unpacking the 46 MB archive on a worker
+    /// thread the first time. Already present ⇒ just open the folder. Mirrors the modarchive fetch:
+    /// an `mpsc` result drained by `poll_amiga_fetch`, with the status bar carrying the progress.
+    fn open_amiga_fonts(&mut self) {
+        let dir = self.amiga_fonts_dir.clone();
+        if crate::amiga_fonts::is_present(&dir) {
+            self.open_folder(dir);
+            return;
+        }
+        if self.amiga_fetch_rx.is_some() {
+            self.status = "Already downloading the Amiga fonts…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.amiga_fetch_rx = Some(rx);
+        self.status = "Downloading Amiga ColorFonts (46 MB, first time only)…".into();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::amiga_fonts::fetch_into(&dir).map(|_| dir));
+        });
+    }
+
+    /// Drain the ColorFonts fetch: open the folder when it lands, report an error otherwise.
+    fn poll_amiga_fetch(&mut self) {
+        let Some(rx) = &self.amiga_fetch_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(dir)) => {
+                self.amiga_fetch_rx = None;
+                self.status = "Amiga ColorFonts ready.".into();
+                self.open_folder(dir);
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Amiga font download failed: {e}");
+                self.amiga_fetch_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.amiga_fetch_rx = None,
         }
     }
 
@@ -28901,6 +28948,7 @@ impl Kaleidotron {
             ("Reset thumbnail size".into(), "View".into(), Menu(MenuAction::ResetThumb)),
             ("Go to parent folder".into(), "Go  Backspace".into(), Menu(MenuAction::Up)),
             ("Go home".into(), "Go".into(), Menu(MenuAction::Home)),
+            ("Amiga ColorFonts".into(), "Go".into(), Menu(MenuAction::AmigaFonts)),
         ];
         // Navigating to a source is the commonest thing you'd want a palette for, and these come
         // straight from the rail's own table so the two can't drift.
@@ -30646,6 +30694,17 @@ impl Kaleidotron {
                     action = Some(MenuAction::Home);
                     ui.close();
                 }
+                ui.separator();
+                let amiga_here = crate::amiga_fonts::is_present(&self.amiga_fonts_dir);
+                let label = if amiga_here { "🅰 Amiga ColorFonts" } else { "🅰 Amiga ColorFonts (download)" };
+                if ui
+                    .button(label)
+                    .on_hover_text("768 public-collection Amiga colour fonts — a logo maker; download once (46 MB) then browse offline")
+                    .clicked()
+                {
+                    action = Some(MenuAction::AmigaFonts);
+                    ui.close();
+                }
                 // Pinned places, in favorites order (so a Places reorder is honored here),
                 // styled like the Places pins — custom label + color tag — and split into
                 // Local vs 16colo.rs groups by a divider, mirroring the Places sub-tabs.
@@ -30896,6 +30955,7 @@ impl Kaleidotron {
                     }
                 }
             }
+            MenuAction::AmigaFonts => self.open_amiga_fonts(),
             MenuAction::Home => {
                 if let Some(h) = home_dir() {
                     self.open_folder(h);
@@ -32784,6 +32844,7 @@ impl eframe::App for Kaleidotron {
         self.poll_web_open(&ctx);
         self.poll_ma();
         self.poll_ma_open(&ctx);
+        self.poll_amiga_fetch();
         // Drain finished archive-montage builds.
         while let Ok((p, info)) = self.archive_montage_rx.try_recv() {
             self.archive_montage.insert(p, info);

@@ -1,3 +1,4 @@
+mod amiga_fonts;
 mod anim;
 mod ai;
 mod app;
