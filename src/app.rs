@@ -1550,6 +1550,7 @@ pub struct Kaleidotron {
     grid_gap_y: f32,        // vertical spacing between grid rows, in points
     grid_tile_border: bool, // draw a border + padding around each grid tile (persisted)
     caption_fields: u16,    // bitmask: what to show under each grid thumbnail
+    grid_hover_caption: bool, // hide tile captions; show them OSD-style over the hovered tile
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
     // sample-bank tiles so container kinds read at a glance. Accents are blended into
     // the theme background (`tile_category_bg`); off = the plain default everywhere.
@@ -2336,6 +2337,7 @@ impl Kaleidotron {
     const GAP_Y_KEY: &'static str = "grid_gap_y";
     const TILE_BORDER_KEY: &'static str = "grid_tile_border";
     const CAPTION_KEY: &'static str = "caption_fields";
+    const GRID_HOVER_CAPTION_KEY: &'static str = "grid_hover_caption";
     /// Per-category tile backgrounds, stored as one record: `(enabled, folder, archive, container)`.
     const TILE_BG_KEY: &'static str = "tile_backgrounds";
     /// Draggable thumbnail-band heights for the Details / Recolor panes.
@@ -3343,6 +3345,7 @@ impl Kaleidotron {
             grid_gap_y,
             grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
             caption_fields,
+            grid_hover_caption: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY)).unwrap_or(false),
             tile_bg_enabled,
             tile_bg_folder,
             tile_bg_archive,
@@ -3983,6 +3986,7 @@ impl Kaleidotron {
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
+            e(A, "grid_hover_caption", self.grid_hover_caption, "hide grid captions; show them on hover as an overlay"),
             e(A, "table_grid", self.table_grid, "dividing lines in the table view"),
             e(A, "transp_solid", self.transp_solid, "transparency backdrop: false = checkerboard, true = solid"),
             e(A, "transp_color", self.transp_color, "solid transparency backdrop colour [r, g, b]"),
@@ -4086,6 +4090,9 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "caption_fields") {
             self.caption_fields = v as u16;
+        }
+        if let Some(v) = st::get_bool(&m, "grid_hover_caption") {
+            self.grid_hover_caption = v;
         }
         if let Some(v) = st::get_bool(&m, "table_grid") {
             self.table_grid = v;
@@ -18966,6 +18973,15 @@ impl Kaleidotron {
             if ui.selectable_label(self.table_view, "Table").clicked() {
                 self.table_view = true;
             }
+            // Grid-only: hide the per-tile captions and instead reveal them as a
+            // sliding OSD panel over whichever tile the pointer is on — a clean,
+            // image-only wall of thumbnails until you hover.
+            if !self.table_view {
+                ui.checkbox(&mut self.grid_hover_caption, "Show text on hover")
+                    .on_hover_text(
+                        "Hide tile captions; show name/metadata over the hovered tile instead",
+                    );
+            }
             ui.separator();
             ui.label("Sort:");
             // While browsing YouTube, add Duration + Views to the combo.
@@ -23441,7 +23457,10 @@ impl Kaleidotron {
         let cap_lines =
             (self.caption_fields.count_ones() as usize).max(if any_dir { 1 } else { 0 })
                 + usize::from(in_search);
-        let caption_h = if cap_lines == 0 {
+        // "Show text on hover": collapse the reserved caption strip so the grid is pure
+        // image tiles; the same text is painted as a sliding OSD panel over the hovered
+        // tile instead (see the caption block below).
+        let caption_h = if cap_lines == 0 || self.grid_hover_caption {
             0.0
         } else {
             cap_lines as f32 * CAP_LINE_H + 3.0
@@ -24115,6 +24134,72 @@ impl Kaleidotron {
                                     egui::FontId::proportional(11.0),
                                     color,
                                 );
+                            }
+                        }
+
+                        // "Show text on hover": no reserved caption strip (caption_h == 0), so
+                        // paint the same info as an OSD panel that slides up from the bottom of
+                        // the hovered tile — dark translucent background, light text, mirroring
+                        // the viewer's metadata OSD. Painted within the thumbnail rect and
+                        // clipped to it, so it never bleeds into a neighbouring tile.
+                        if self.grid_hover_caption {
+                            let t = ui.ctx().animate_bool_with_time(
+                                resp.id.with("hovercap"),
+                                resp.hovered(),
+                                0.12,
+                            );
+                            if t > 0.001 {
+                                let folder = (in_search && !entry.is_dir)
+                                    .then(|| self.result_folder_label(&entry.path));
+                                let nm = short_name(&entry.path);
+                                let mut lines = Vec::new();
+                                // The tile itself is now the only label, so lead with the name.
+                                lines.push(nm.clone());
+                                lines.extend(
+                                    caption_lines(
+                                        &entry,
+                                        meta,
+                                        self.caption_fields,
+                                        folder.as_deref(),
+                                    )
+                                    .into_iter()
+                                    // caption_lines already leads with the name for files; drop a
+                                    // duplicate first line so we don't show it twice.
+                                    .enumerate()
+                                    .filter_map(|(i, l)| (!(i == 0 && l == nm)).then_some(l)),
+                                );
+                                let line_h = 13.0_f32;
+                                let pad = 4.0_f32;
+                                let panel_h =
+                                    (lines.len() as f32 * line_h + pad * 2.0).min(rect.height());
+                                // Slide up: fully shown top = rect.bottom() - panel_h.
+                                let top = rect.bottom() - panel_h * t;
+                                let panel = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left(), top),
+                                    egui::pos2(rect.right(), rect.bottom()),
+                                );
+                                let p = ui.painter_at(rect); // clip to the thumbnail
+                                let a = (220.0 * t) as u8;
+                                p.rect_filled(
+                                    panel,
+                                    egui::CornerRadius::same(3),
+                                    egui::Color32::from_black_alpha(a),
+                                );
+                                let ta = (235.0 * t) as u8;
+                                let text_c = egui::Color32::from_white_alpha(ta);
+                                let max_chars = ((tile - 8.0) / 6.0).max(3.0) as usize;
+                                for (li, line) in lines.iter().enumerate() {
+                                    let y = rect.bottom() - panel_h * t
+                                        + pad
+                                        + li as f32 * line_h;
+                                    p.text(
+                                        egui::pos2(rect.center().x, y),
+                                        egui::Align2::CENTER_TOP,
+                                        elide(line, max_chars),
+                                        egui::FontId::proportional(if li == 0 { 11.5 } else { 10.5 }),
+                                        text_c,
+                                    );
+                                }
                             }
                         }
 
@@ -34830,6 +34915,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TILE_BORDER_KEY, &self.grid_tile_border);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
+        eframe::set_value(storage, Self::GRID_HOVER_CAPTION_KEY, &self.grid_hover_caption);
         eframe::set_value(storage, Self::DETAILS_THUMB_H_KEY, &self.details_thumb_h);
         eframe::set_value(storage, Self::RECOLOR_THUMB_H_KEY, &self.recolor_thumb_h);
         eframe::set_value(
