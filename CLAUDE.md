@@ -260,7 +260,7 @@ cargo build --release
 cargo check              # fast type-check during edits
 cargo clippy             # lint
 cargo fmt                # format
-cargo test               # 390 tests (380 unit + 10 headless egui_kittest GUI tests; +40 ignored network / real-trash / PSD-dump / real-tasks.json)
+cargo test               # 391 tests (381 unit + 10 headless egui_kittest GUI tests; +40 ignored network / real-trash / PSD-dump / real-tasks.json)
 cargo test gui_tests     # just the egui_kittest UI tests; cargo test <name> for one
 ```
 
@@ -2186,9 +2186,32 @@ or write a sample `.psd` to `/tmp`):
   AccessKit. Custom-*painted* grid tiles have no a11y label, so kittest covers the
   chrome (menus/dialogs/Preferences), not the tiles.
 
-For a **visual** check on KDE Wayland (KWin has no wlroots screencopy, so `grim`
-fails): run under XWayland so `xdotool` can target the window, capture with KDE's
-`spectacle`:
+### Visual QA lives outside this repo — `qa-harness`
+
+The gap this repo's own tests cannot close is stated above: **custom-painted grid
+tiles have no a11y label**, so kittest sees the chrome and not the art. That gap
+is covered by an external suite —
+`~/git/qa-harness/adapters/kaleidotron` (34 tests, 232 assertions):
+
+```sh
+cd ~/git/kaleidotron && cargo build --release          # it drives the release binary
+cd ~/git/qa-harness  && bin/qa --adapter adapters/kaleidotron   # offscreen by default
+```
+
+It runs the real app inside Xvfb and diffs screen regions, so it asserts things
+no in-process test can observe: that each decoder's tile actually *paints* (and
+in the right colour — a loading spinner is "not blank"), that zoom/fit/pan
+repaint, that CRT aspect and the 9-dot VGA cell change the blit, that the recolor
+pipeline reaches the screen, that a CP437 `.bas` renders as art *and* opens as
+text. It has already found three real bugs here: the settings-before-scan
+ordering, `.tga` being undecodable, and the custom-code-font panic.
+
+**Rebuild the release binary before running it** — the harness tests
+`target/release/kaleidotron`, not your working tree.
+
+For a **one-off visual** check on KDE Wayland (KWin has no wlroots screencopy, so
+`grim` fails): run under XWayland so `xdotool` can target the window, capture with
+KDE's `spectacle`:
 `env -u WAYLAND_DISPLAY DISPLAY=:1 ./target/release/kaleidotron --folder DIR &`,
 then `WID=$(DISPLAY=:1 xdotool search --name kaleidotron)`, drive with
 `xdotool`/`ydotool` (you're in the `input` group), `spectacle -b -n -f -o shot.png`.
