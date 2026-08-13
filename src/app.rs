@@ -43273,7 +43273,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip", "pdf", "xmind",
+        "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {

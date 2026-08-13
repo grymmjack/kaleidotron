@@ -22,6 +22,7 @@ pub mod tdf;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
+mod iff;
 pub mod mesh3d; // 3D models (OBJ/STL/PLY/glTF/GLB/DAE) → CPU-rendered thumbnail + geometry
 pub mod opl3; // OPL3 FM-synth chip emulator (Opal port) — drives RAD playback
 mod pcx;
@@ -130,6 +131,7 @@ impl Registry {
             video_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
+                Box::new(iff::IlbmDecoder),           // .iff/.ilbm/.lbm Amiga ILBM (palette-preserving)
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
                 Box::new(psd::PsdDecoder),            // .psd flattened (psd crate)
                 Box::new(xcf::XcfDecoder),            // .xcf composited (xcf crate)
