@@ -1684,6 +1684,15 @@ pub struct Kaleidotron {
     font_pending_face: Option<usize>, // FON face to select once the font finishes loading (recall)
     // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
     tdf_path: Option<PathBuf>,
+    // Amiga (Color)Font logo maker — the parallel of the TDF viewer for `.font`/size files.
+    // One file is one font (unlike a TDF pack), so there's no font-index picker; everything else
+    // mirrors the TDF controls. Persisted where it makes sense so a session's look survives.
+    amiga_font: Option<crate::decode::amiga_font::ColorFont>, // the loaded font (None until opened)
+    amiga_path: Option<PathBuf>,                              // what `amiga_font` was decoded from
+    amiga_spacing: i32,  // per-glyph advance delta; negative kerns the overlap these fonts draw with
+    amiga_line_gap: i32, // extra pixels between rows of multi-line sample text
+    amiga_zoom: f32,     // preview zoom multiplier (persisted)
+    amiga_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "path|sample|spacing|recolor"
     tdf_bytes: Vec<u8>,
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
@@ -2401,6 +2410,9 @@ impl Kaleidotron {
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
+    const AMIGA_SPACING_KEY: &'static str = "amiga_spacing";
+    const AMIGA_LINE_GAP_KEY: &'static str = "amiga_line_gap";
+    const AMIGA_ZOOM_KEY: &'static str = "amiga_zoom";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
@@ -3467,6 +3479,24 @@ impl Kaleidotron {
                 .unwrap_or_default(),
             font_preset_name: String::new(),
             font_pending_face: None,
+            amiga_font: None,
+            amiga_path: None,
+            amiga_sample_tex: None,
+            amiga_spacing: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_SPACING_KEY))
+                .unwrap_or(0)
+                .clamp(-40, 40),
+            amiga_line_gap: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_LINE_GAP_KEY))
+                .unwrap_or(2)
+                .clamp(-40, 40),
+            amiga_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::AMIGA_ZOOM_KEY))
+                .unwrap_or(2.0)
+                .clamp(0.25, 8.0),
             tdf_path: None,
             tdf_bytes: Vec::new(),
             tdf_fonts: Vec::new(),
@@ -11033,6 +11063,219 @@ impl Kaleidotron {
         if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{slug}.tdf")).add_filter("TheDraw font", &["tdf"]).save_file() {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// The Amiga (Color)Font **logo maker** — the TDF viewer's sibling for `.font`/size files.
+    ///
+    /// Type text, it lays out through `amiga_font::render_text` (proportional, overlap-aware,
+    /// palette-preserving), and the same `recolor_sample` hook the TDF viewer uses means the Recolor
+    /// pane retints a whole logo. Exports the styled sample as a PNG or, closing the loop to DRAW, as
+    /// a Color Bitmap Font.
+    ///
+    /// One file is one font, so there is no font-index picker; otherwise the controls mirror TDF.
+    fn draw_amiga_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
+        self.ensure_amiga_loaded(path);
+        let Some(font) = self.amiga_font.clone() else {
+            ui.centered_and_justified(|ui| ui.label("Could not read this Amiga font."));
+            return;
+        };
+
+        let mut want_copy = false;
+        let mut want_png = false;
+        let mut want_cbf = false;
+
+        // Header: name, metrics, and the export/reset actions.
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(egui::RichText::new(&font.name).heading());
+            ui.separator();
+            let kind = if font.is_color {
+                format!("ColorFont · {}-plane · {} colours", font.depth, font.palette.len())
+            } else {
+                "mono".to_string()
+            };
+            ui.weak(format!("{}px · {} glyphs · {kind}", font.height, font.glyphs.len()));
+            ui.separator();
+            if ui.button("📋 Copy").on_hover_text("Copy the styled sample as a bitmap").clicked() {
+                want_copy = true;
+            }
+            if ui.button("🖼 PNG").on_hover_text("Save the styled sample as a PNG").clicked() {
+                want_png = true;
+            }
+            if ui
+                .button("⬇ DRAW font")
+                .on_hover_text(
+                    "Export as a DRAW Color Bitmap Font (.bmp) for ASSETS/FONTS/COLOR_BITMAP/",
+                )
+                .clicked()
+            {
+                want_cbf = true;
+            }
+        });
+
+        // Controls row: sample text + spacing/line-gap/zoom. `font_sample` is shared with the other
+        // font viewers so the last thing you typed carries across.
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sample");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.font_sample).desired_width(240.0).hint_text("AMIGA"))
+                .changed()
+            {
+                changed = true;
+            }
+            ui.separator();
+            ui.label("Spacing");
+            if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40).speed(0.3)).on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with").changed() {
+                changed = true;
+            }
+            if self.font_sample.contains('\n') {
+                ui.label("Line gap");
+                if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=40).speed(0.3)).changed() {
+                    changed = true;
+                }
+            }
+            ui.separator();
+            ui.label("Zoom");
+            ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
+            ui.label(format!("{:.2}×", self.amiga_zoom));
+        });
+        ui.separator();
+
+        // The sample string a render/export actually uses (empty → a stock word).
+        let sample = if self.font_sample.trim().is_empty() {
+            "AMIGA".to_string()
+        } else {
+            self.font_sample.clone()
+        };
+
+        if want_copy {
+            let img = self.recolor_sample(path, crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap));
+            self.copy_image_to_clipboard(&img);
+        }
+        if want_png {
+            self.export_amiga_png(&font, &sample);
+        }
+        if want_cbf {
+            self.export_amiga_cbf(&font);
+        }
+
+        // Preview, cached by everything that affects the pixels (incl. the recolor pipeline).
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}",
+            path.display(),
+            sample,
+            self.amiga_spacing,
+            self.amiga_line_gap,
+            self.pipeline_key(),
+            self.recolor_ident()
+        );
+        if changed || self.amiga_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap);
+            let img = self.recolor_sample(path, rendered);
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba_bytes(),
+            );
+            // NEAREST: these are pixel-art fonts — keep them crisp when the preview upscales.
+            let tex = ctx.load_texture("amiga_sample", color, egui::TextureOptions::NEAREST);
+            self.amiga_sample_tex = Some((key, tex));
+        }
+
+        // The preview itself: a transparency backdrop (so a font's transparent index reads) then the
+        // upscaled sample, centred.
+        // Copy the handle + size out of `self` so the closure below doesn't hold an immutable
+        // borrow while `paint_transparency_backdrop` needs `&mut self` — the usual egui two-borrow
+        // dance.
+        let preview = self.amiga_sample_tex.as_ref().map(|(_, t)| (t.id(), t.size()));
+        let zoom = self.amiga_zoom;
+        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
+            if let Some((id, [w, h])) = preview {
+                let size = egui::vec2(w as f32 * zoom, h as f32 * zoom);
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    let ppp = ui.ctx().pixels_per_point();
+                    self.paint_transparency_backdrop(ui.painter(), rect, ppp);
+                    ui.painter().image(
+                        id,
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                });
+            }
+        });
+    }
+
+    /// Decode the Amiga font at `path` once and cache it. `.font` descriptors resolve to their
+    /// largest size; size files decode directly.
+    fn ensure_amiga_loaded(&mut self, path: &Path) {
+        if self.amiga_path.as_deref() == Some(path) && self.amiga_font.is_some() {
+            return;
+        }
+        let real = self.resolve_local(path);
+        self.amiga_font = std::fs::read(&real).ok().and_then(|bytes| {
+            let is_desc =
+                path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("font"));
+            if is_desc {
+                // Follow the descriptor to a size file, then parse THAT for the glyph data.
+                let entries = crate::decode::amiga_font::parse_descriptor(&bytes).ok()?;
+                let dir = real.parent()?;
+                let mut entries = entries;
+                entries.sort_by_key(|(_, y)| std::cmp::Reverse(*y));
+                entries.iter().find_map(|(rel, _)| {
+                    let sz = std::fs::read(dir.join(rel.replace('\\', "/"))).ok()?;
+                    crate::decode::amiga_font::parse(&sz).ok()
+                })
+            } else {
+                crate::decode::amiga_font::parse(&bytes).ok()
+            }
+        });
+        self.amiga_path = Some(path.to_path_buf());
+        self.amiga_sample_tex = None;
+    }
+
+    /// Save the styled Amiga sample as a PNG next to a chosen path.
+    fn export_amiga_png(&mut self, font: &crate::decode::amiga_font::ColorFont, sample: &str) {
+        let path = self.amiga_path.clone().unwrap_or_default();
+        let img = self.recolor_sample(&path, crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap));
+        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        if let Some(dst) = rfd::FileDialog::new().set_file_name(format!("{slug}.png")).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&dst, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&dst)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Export the font as a DRAW Color Bitmap Font `.bmp` (see `amiga_font::to_draw_cbf`).
+    ///
+    /// The whole font, not the sample — a CBF is a character set, and DRAW does the logo assembly
+    /// itself once it has the glyphs. Defaults into `~/git/DRAW/ASSETS/FONTS/COLOR_BITMAP/` when
+    /// that directory exists, which is where DRAW picks fonts up at startup.
+    fn export_amiga_cbf(&mut self, font: &crate::decode::amiga_font::ColorFont) {
+        let sheet = match crate::decode::amiga_font::to_draw_cbf(font) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Can't export “{}”: {e}", font.name);
+                return;
+            }
+        };
+        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        let mut dlg = rfd::FileDialog::new().set_file_name(format!("{slug}.bmp")).add_filter("BMP", &["bmp"]);
+        if let Some(home) = std::env::var_os("HOME") {
+            let draw = PathBuf::from(home).join("git/DRAW/ASSETS/FONTS/COLOR_BITMAP");
+            if draw.is_dir() {
+                dlg = dlg.set_directory(draw);
+            }
+        }
+        if let Some(dst) = dlg.save_file() {
+            // BMP through the image crate so DRAW's `_LOADIMAGE` reads it straight.
+            match image::save_buffer(&dst, &sheet.rgba_bytes(), sheet.width, sheet.height, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Exported CBF → {}", short_name(&dst)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
         }
@@ -25305,6 +25548,11 @@ impl Kaleidotron {
                 self.draw_fon_ui(ctx, ui, &p);
                 return;
             }
+            // Amiga (Color)Font logo maker (.font / <size>.<n>C): type-to-sample + PNG/CBF export.
+            if is_amiga_font_ext(&p) {
+                self.draw_amiga_ui(ctx, ui, &p);
+                return;
+            }
         }
 
         // Video: transport (play/pause, seek, speed, PNG/audio/markers) + the frame.
@@ -34329,6 +34577,9 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
+        eframe::set_value(storage, Self::AMIGA_SPACING_KEY, &self.amiga_spacing);
+        eframe::set_value(storage, Self::AMIGA_LINE_GAP_KEY, &self.amiga_line_gap);
+        eframe::set_value(storage, Self::AMIGA_ZOOM_KEY, &self.amiga_zoom);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
@@ -39718,6 +39969,14 @@ fn is_font_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::font::FONT_EXTS.contains(&e.as_str()))
 }
 
+/// An Amiga (Color)Font — a `.font` descriptor or a `<size>.<n>C` size file → the logo maker.
+fn is_amiga_font_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::amiga_font::AMIGA_FONT_EXTS.contains(&e.as_str()))
+}
+
 /// A TheDraw font file (.tdf) → the interactive TDF font viewer (picker + type-to-sample).
 fn is_tdf_ext(p: &Path) -> bool {
     p.extension()
@@ -42968,6 +43227,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::font::FONT_EXTS.contains(&x.as_str())
                 || crate::decode::tdf::TDF_EXTS.contains(&x.as_str())
                 || crate::decode::fon::FON_EXTS.contains(&x.as_str())
+                || crate::decode::amiga_font::AMIGA_FONT_EXTS.contains(&x.as_str())
                 || crate::decode::EPS_EXTS.contains(&x.as_str())
                 || x == "ai"
         }

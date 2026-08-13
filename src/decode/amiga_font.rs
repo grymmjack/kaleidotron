@@ -277,6 +277,73 @@ pub fn render_sheet(f: &ColorFont) -> PixImage {
     PixImage::from_indexed(w, h, indices, f.palette.clone())
 }
 
+/// Render sample text as a logo — the point of the whole feature.
+///
+/// Amiga fonts are proportional (`tf_CharLoc` gives each glyph its own width) and often overlap by
+/// design, so `spacing` is a per-glyph delta added after each character: 0 abuts glyphs, a small
+/// negative kerns a 3D font into itself the way it was drawn to sit. Newlines start a new row,
+/// `line_gap` added to the font height between rows.
+///
+/// A character the font does not define is skipped rather than boxed — a logo maker wants the word,
+/// not a row of tofu. Space advances by the average glyph width, because a ColorFont has no space
+/// glyph (`tf_LoChar` is usually `!`).
+///
+/// Palette-preserving: the result is `from_indexed`, so the recolor pane can retint a whole logo
+/// and the swatches read the font's colours.
+pub fn render_text(f: &ColorFont, text: &str, spacing: i32, line_gap: i32) -> PixImage {
+    let avg = (f.glyphs.iter().map(|g| g.width).sum::<u32>() / f.glyphs.len().max(1) as u32).max(1);
+    let line_h = f.height as i32 + line_gap.max(-(f.height as i32) + 1);
+
+    // Lay out into (x, y, glyph) placements first so the canvas can be sized to the real extent —
+    // overlapping/negative spacing means a line's width is not just the sum of widths.
+    let mut placed: Vec<(i32, i32, &Glyph)> = Vec::new();
+    let (mut x, mut y, mut max_x) = (0i32, 0i32, 0i32);
+    for ch in text.chars() {
+        if ch == '\n' {
+            x = 0;
+            y += line_h;
+            continue;
+        }
+        if ch == ' ' {
+            x += avg as i32 + spacing;
+            continue;
+        }
+        let code = ch as u32;
+        match f.glyphs.iter().find(|g| g.code as u32 == code) {
+            Some(g) if g.width > 0 => {
+                placed.push((x, y, g));
+                x += g.width as i32 + spacing;
+                max_x = max_x.max(x - spacing); // the glyph's right edge, not the post-advance cursor
+            }
+            _ => x += avg as i32 + spacing, // undefined char / lowercase a font lacks: advance, no box
+        }
+    }
+    let w = max_x.max(1) as u32;
+    let h = (y + f.height as i32).max(1) as u32;
+    let mut indices = vec![0u8; (w * h) as usize];
+    for (gx, gy, g) in placed {
+        for row in 0..f.height as i32 {
+            let py = gy + row;
+            if py < 0 || py as u32 >= h {
+                continue;
+            }
+            for col in 0..g.width as i32 {
+                let px = gx + col;
+                if px < 0 || px as u32 >= w {
+                    continue;
+                }
+                let idx = g.indices[(row as u32 * g.width + col as u32) as usize];
+                if idx != 0 {
+                    // Last writer wins where glyphs overlap — which is how these fonts were drawn
+                    // to layer, so a negative `spacing` looks right rather than showing seams.
+                    indices[(py as u32 * w + px as u32) as usize] = idx;
+                }
+            }
+        }
+    }
+    PixImage::from_indexed(w, h, indices, f.palette.clone())
+}
+
 /// Decode a size file's bytes straight to a sheet.
 pub fn decode(bytes: &[u8]) -> Result<PixImage, DecodeError> {
     Ok(render_sheet(&parse(bytes)?))
@@ -685,6 +752,34 @@ mod tests {
         assert!(to_draw_cbf(&only_one).is_err(), "DRAW needs at least two glyphs");
     }
 
+    /// Sample text lays out into a logo whose canvas fits the real extent, undefined characters
+    /// are skipped rather than boxed, and the palette is kept.
+    #[test]
+    fn renders_sample_text_as_a_logo() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 4;
+        f.glyphs = [(b'A', 6u32), (b'B', 4)]
+            .into_iter()
+            .map(|(code, w)| Glyph { code, width: w, indices: vec![1u8; (w * 4) as usize] })
+            .collect();
+
+        // "AB" with zero spacing is 6 + 4 = 10 wide, 4 tall, indexed and palette-preserving.
+        let img = render_text(&f, "AB", 0, 0);
+        assert_eq!((img.width, img.height), (10, 4));
+        assert!(img.indexed.is_some(), "a logo keeps the font palette");
+
+        // A character the font lacks ('Z') advances by the average width but paints nothing, so
+        // the canvas is wider than "AB" yet only "AB" is drawn.
+        let with_gap = render_text(&f, "AZB", 0, 0);
+        assert!(with_gap.width > img.width, "the missing glyph still advances the cursor");
+
+        // Two lines stack; negative spacing overlaps rather than overflowing the canvas.
+        let two = render_text(&f, "A\nB", 0, 0);
+        assert_eq!(two.height, 8, "two rows of a 4px font");
+        let kerned = render_text(&f, "AB", -2, 0);
+        assert_eq!(kerned.width, 8, "-2 spacing pulls B two px into A");
+    }
+
     /// Export a real font to a DRAW CBF `.bmp` for a look, and for dropping into
     /// `DRAW/ASSETS/FONTS/COLOR_BITMAP/`. Ignored — needs the archive.
     ///
@@ -692,6 +787,24 @@ mod tests {
     /// AMIGA_FONT=<path to a size file> CBF_OUT=/tmp/out.bmp \
     ///   cargo test dump_cbf -- --ignored --nocapture
     /// ```
+    /// Render a word from a real font to a PNG, for a look. Ignored — needs the archive.
+    ///   AMIGA_FONT=<size file> LOGO_TEXT=HELLO LOGO_OUT=/tmp/logo.png \\
+    ///     cargo test dump_logo -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_logo() {
+        let (Ok(src), Ok(out)) = (std::env::var("AMIGA_FONT"), std::env::var("LOGO_OUT")) else {
+            println!("set AMIGA_FONT and LOGO_OUT");
+            return;
+        };
+        let text = std::env::var("LOGO_TEXT").unwrap_or_else(|_| "AMIGA".into());
+        let f = parse(&std::fs::read(&src).expect("read")).expect("parse");
+        let img = render_text(&f, &text, 0, 0);
+        image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8)
+            .expect("write");
+        println!("wrote {out}: {}x{} for {text:?}", img.width, img.height);
+    }
+
     #[test]
     #[ignore]
     fn dump_cbf_for_draw() {
