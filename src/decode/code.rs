@@ -592,14 +592,24 @@ impl Palette {
     /// Falling back per *field* rather than per theme means a sparse theme still contributes what
     /// it does define instead of being discarded wholesale.
     fn resolve(ext: &str) -> Palette {
+        let guard = SYNTAX_THEME.read().ok();
+        Palette::resolve_with(ext, guard.as_ref().and_then(|g| g.as_ref()).map(|t| t.as_ref()))
+    }
+
+    /// The resolution itself, with the theme passed in.
+    ///
+    /// Split from [`Self::resolve`] so it can be tested without the process-global. The global is
+    /// shared with the running app — a GUI test that boots a `Kaleidotron` installs its own theme
+    /// through `sync_syntax_theme` — so a test that set the global and then asserted on it raced
+    /// the rest of the suite and failed perhaps one run in four.
+    fn resolve_with(ext: &str, theme: Option<&crate::theme::Theme>) -> Palette {
         let mut p = Palette {
             bg: BG,
             gutter: GUTTER,
             trunc: TRUNC,
             toks: ALL_TOKS.map(|t| t.color()),
         };
-        let guard = SYNTAX_THEME.read().ok();
-        let Some(theme) = guard.as_ref().and_then(|g| g.as_ref()) else {
+        let Some(theme) = theme else {
             return p;
         };
         let rgb = |c: Option<[u8; 4]>| c.map(|c| [c[0], c[1], c[2]]);
@@ -926,6 +936,82 @@ fn find_at(line: &[char], from: usize, pat: &str) -> Option<usize> {
     (from..=line.len() - pc.len()).find(|&i| line[i..i + pc.len()] == pc[..])
 }
 
+/// A text encoding the viewer can read a source file as.
+///
+/// Deliberately tiny. These three cover what actually turns up in the kind of files this program is
+/// pointed at: modern UTF-8, DOS-era **CP437** (a QB64 `.bas` with a box-drawing comment banner, an
+/// `.nfo`), and **Latin-1**, which is what a lot of older European source is and which — unlike
+/// CP437 — never fails to decode, so it doubles as the "just show me the bytes" option.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Encoding {
+    #[default]
+    Utf8,
+    Cp437,
+    Latin1,
+}
+
+impl Encoding {
+    pub const ALL: [Encoding; 3] = [Encoding::Utf8, Encoding::Cp437, Encoding::Latin1];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "UTF-8",
+            Encoding::Cp437 => "CP437",
+            Encoding::Latin1 => "Latin-1",
+        }
+    }
+}
+
+/// Decode a source file, guessing the encoding.
+///
+/// `read_to_string` is not enough. DOS-era source is **CP437 bytes, not UTF-8**, so a plain UTF-8
+/// read fails on exactly the files this program is for — and the caller then falls through to some
+/// other viewer with no explanation. UTF-8 is tried first because it is both the common case and
+/// self-validating (a byte sequence that decodes cleanly as UTF-8 is overwhelmingly likely to *be*
+/// UTF-8); anything else is read as CP437, which can never fail.
+///
+/// Returns the encoding used so the caller can show it, let the reader override it, and re-encode
+/// on save instead of silently rewriting the file as UTF-8.
+pub fn decode_text(bytes: &[u8]) -> (String, Encoding) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), Encoding::Utf8),
+        Err(_) => (decode_with(bytes, Encoding::Cp437), Encoding::Cp437),
+    }
+}
+
+/// Decode as a specific encoding — the reader's explicit override.
+///
+/// Note the asymmetry: CP437 and Latin-1 are single-byte, so every byte maps to some character and
+/// the decode always succeeds. Only UTF-8 can fail, and it falls back to Latin-1 rather than
+/// erroring, so picking the "wrong" encoding shows mojibake you can undo instead of an empty pane.
+pub fn decode_with(bytes: &[u8], enc: Encoding) -> String {
+    match enc {
+        Encoding::Utf8 => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => decode_with(bytes, Encoding::Latin1),
+        },
+        Encoding::Cp437 => {
+            bytes.iter().map(|&b| retrofont::tdf::CP437_TO_UNICODE[b as usize]).collect()
+        }
+        // Latin-1 IS the first 256 Unicode code points, so the cast is the whole conversion.
+        Encoding::Latin1 => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Re-encode an edited buffer. The inverse of [`decode_text`] — pass the encoding it reported, or a
+/// CP437 file would be silently converted to UTF-8 the first time it is saved, mangling every
+/// box-drawing character in it.
+pub fn encode_text(text: &str, enc: Encoding) -> Vec<u8> {
+    match enc {
+        Encoding::Utf8 => text.as_bytes().to_vec(),
+        Encoding::Cp437 => text.chars().map(crate::decode::tdf::unicode_to_cp437).collect(),
+        Encoding::Latin1 => text
+            .chars()
+            .map(|c| if (c as u32) < 0x100 { c as u8 } else { b'?' })
+            .collect(),
+    }
+}
+
 /// Map a Unicode char to a CP437 byte for the bitmap font. ASCII passes through; a few
 /// common punctuation lookalikes are folded; anything else becomes '?'.
 fn to_cp437(c: char) -> u8 {
@@ -944,7 +1030,18 @@ fn to_cp437(c: char) -> u8 {
         '←' => 0x1b,
         '©' => 0x63,
         _ if u < 0x20 => b' ',
-        _ => b'?',
+        // Before giving up, try the real CP437 table — a box-drawing or shade character IS in
+        // CP437 and has a glyph in the font. The round-trip check matters: `unicode_to_cp437`
+        // answers with a solid block for anything it doesn't know, which would silently turn every
+        // unmappable character into █ rather than an honest '?'.
+        _ => {
+            let b = crate::decode::tdf::unicode_to_cp437(c);
+            if retrofont::tdf::CP437_TO_UNICODE[b as usize] == c {
+                b
+            } else {
+                b'?'
+            }
+        }
     }
 }
 
@@ -1237,7 +1334,10 @@ impl CodeDecoder {
                 ipynb_to_text(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
             return Ok(render_text(&text, &HASH, "py"));
         }
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        // NOT `from_utf8_lossy`: that turns every byte of a CP437 file into U+FFFD, which then
+        // rasterises as a row of '?' — so a DOS-era source file's box-drawing comment banner, the
+        // exact thing this preview is nicest for, came out as `REM ????`.
+        let (text, _) = decode_text(bytes);
         Ok(render_text(&text, lang_for(ext), ext))
     }
 }
@@ -1319,20 +1419,83 @@ mod tests {
     fn the_raster_palette_follows_the_active_theme() {
         // The grid tile is a bitmap painted on a worker thread, so the theme reaches it as a
         // process-global. Without this the viewer restyles and the thumbnails beside it don't.
-        let plain = Palette::resolve("bas");
-        assert_eq!(plain.bg, BG, "no theme set -> built-in palette");
+        //
+        // Asserted through `resolve_with` rather than by setting the global: the global is shared
+        // with every other test in the process, including the GUI ones that boot a real app and
+        // install their own, so setting it here made this test fail intermittently.
+        let plain = Palette::resolve_with("bas", None);
+        assert_eq!(plain.bg, BG, "no theme -> built-in palette");
 
         let json = r##"{ "name": "T", "type": "dark",
             "colors": { "editor.background": "#0000aa" },
             "tokenColors": [{ "scope": "comment", "settings": { "foreground": "#8681C9" } }] }"##;
-        let t = std::sync::Arc::new(crate::theme::Theme::from_json(json, "t").unwrap());
-        set_syntax_theme(Some(t));
-        let themed = Palette::resolve("bas");
+        let t = crate::theme::Theme::from_json(json, "t").unwrap();
+        let themed = Palette::resolve_with("bas", Some(&t));
         assert_eq!(themed.bg, [0x00, 0x00, 0xAA], "tile uses editor.background");
         assert_eq!(themed.of(Tok::Comment), [0x86, 0x81, 0xC9]);
         // A theme silent on a kind contributes nothing there rather than blanking it.
         assert_eq!(themed.of(Tok::Str), STRING);
+    }
+
+    /// The global path still wires up — covered separately, and without asserting on a value
+    /// another test could change underneath it.
+    #[test]
+    fn setting_the_global_syntax_theme_is_accepted() {
+        let json = r##"{ "name": "T", "colors": { "editor.background": "#0000aa" } }"##;
+        let t = std::sync::Arc::new(crate::theme::Theme::from_json(json, "t").unwrap());
+        set_syntax_theme(Some(t));
+        let _ = Palette::resolve("bas"); // must not deadlock or panic
         set_syntax_theme(None);
+    }
+
+    /// A DOS-era source file round-trips byte-for-byte: CP437 in, same CP437 out.
+    ///
+    /// This is the whole point of the fallback — a `.bas` whose comment banner is drawn in
+    /// box-drawing characters must not come back as UTF-8 (or as a row of `?`) the first time it is
+    /// saved. The bytes here are `░▒▓█` and `╔═╗`, the ones such banners are actually made of.
+    #[test]
+    fn cp437_source_round_trips_through_decode_and_encode() {
+        let original: Vec<u8> = b"REM \xb0\xb1\xb2\xdb \xc9\xcd\xbb\nPRINT \"hi\"\n".to_vec();
+        assert!(std::str::from_utf8(&original).is_err(), "fixture must not be valid UTF-8");
+
+        let (text, enc) = decode_text(&original);
+        assert_eq!(enc, Encoding::Cp437, "invalid UTF-8 must fall back to CP437");
+        assert!(text.contains('\u{2591}'), "0xB0 -> light shade: {text:?}");
+        assert!(text.contains('\u{2554}'), "0xC9 -> box corner: {text:?}");
+        assert!(text.contains("PRINT"), "ASCII survives: {text:?}");
+        assert_eq!(encode_text(&text, enc), original, "must round-trip byte-for-byte");
+
+        // …and an explicit override reads the same bytes a different way, without failing.
+        let latin = decode_with(&original, Encoding::Latin1);
+        assert!(latin.contains('\u{b0}'), "0xB0 as Latin-1 is a degree sign: {latin:?}");
+        assert_eq!(encode_text(&latin, Encoding::Latin1), original, "Latin-1 round-trips too");
+    }
+
+    /// A UTF-8 file is left completely alone — not routed through CP437, which would mangle any
+    /// character outside the 256-entry table.
+    #[test]
+    fn utf8_source_is_untouched() {
+        let original = "' café — naïve\nPRINT 1\n".as_bytes().to_vec();
+        let (text, enc) = decode_text(&original);
+        assert_eq!(enc, Encoding::Utf8);
+        assert_eq!(text, String::from_utf8(original.clone()).unwrap());
+        assert_eq!(encode_text(&text, enc), original);
+    }
+
+    /// A CP437 source file reaches the rasteriser as its own glyphs, not as `?`.
+    ///
+    /// Two bugs met here: `from_utf8_lossy` replaced each byte with U+FFFD, and `to_cp437` had no
+    /// entry for box-drawing characters — so the tile for a `.bas` with a comment banner rendered
+    /// `REM ????`, which is precisely the preview this program is nicest for.
+    #[test]
+    fn cp437_source_rasterises_as_its_own_glyphs() {
+        let bytes: &[u8] = b"\xc9\xcd\xbb\xb0\xb1\xb2\xdb";
+        let (text, enc) = decode_text(bytes);
+        assert_eq!(enc, Encoding::Cp437);
+        let back: Vec<u8> = text.chars().map(to_cp437).collect();
+        assert_eq!(back, bytes, "every glyph must survive the round trip to the font");
+        // …while a character genuinely absent from CP437 still degrades to '?', not to a block.
+        assert_eq!(to_cp437('\u{4e2d}'), b'?');
     }
 
     #[test]

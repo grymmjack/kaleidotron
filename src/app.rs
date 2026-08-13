@@ -1036,6 +1036,8 @@ enum MenuAction {
     File(FileAction),
     Undo,
     Search,
+    ToggleTasksPanel, // show/hide the task output panel
+    ReloadTasks,      // re-read this project's .vscode/tasks.json
     Refresh,     // re-scan the current folder (F5)
     HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
@@ -1846,6 +1848,37 @@ pub struct Kaleidotron {
     git_info: Option<crate::git::GitInfo>, // current folder's status map (runtime)
     #[allow(clippy::type_complexity)]
     git_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Option<crate::git::GitInfo>)>>, // pending compute
+    // The current folder's project tasks, read from its `.vscode/tasks.json` (see `tasks.rs`).
+    // Rediscovered on every folder change by walking up for a `.vscode`, so browsing into a repo
+    // picks its tasks up with no configuration; empty everywhere else, and then the Run menus
+    // simply don't appear.
+    /// The encoding the open document was read as — remembered so saving re-encodes it rather than
+    /// silently rewriting a DOS-era source file as UTF-8. Mirrors `text_crlf`.
+    text_enc: crate::decode::Encoding,
+    /// The document's bytes exactly as read. Kept so switching encoding re-decodes instantly from
+    /// memory rather than re-reading — which also means it works for a file inside an archive, and
+    /// that an edited buffer's original bytes are never lost by the switch.
+    text_raw: Vec<u8>,
+    /// One-shot override for the next `load_full`: which viewer the user explicitly asked for.
+    /// Cleared as it is consumed, so it can never stick to a later, unrelated open.
+    force_open: Option<OpenAs>,
+    tasks_enabled: bool, // Preferences toggle (persisted); off = never even look for a tasks.json
+    tasks: Vec<crate::tasks::Task>,
+    task_ws: Option<PathBuf>, // the folder holding `.vscode` — `${workspaceFolder}`
+    task_config: std::collections::HashMap<String, String>, // `.vscode/settings.json`, for `${config:…}`
+    task_inputs: std::collections::HashMap<String, String>,  // resolvable `${input:…}` values
+    /// `<data>/tasks/` — a **global** tasks.json (+ settings.json) folded into every folder's set,
+    /// so a general tool ("open this in GIMP") isn't confined to the one repo that declared it.
+    tasks_dir: PathBuf,
+    task_run: Option<TaskRun>, // the active or most recent run, shown in the output panel
+    task_rx: Option<std::sync::mpsc::Receiver<TaskMsg>>,
+    /// The running child, shared with the worker so Stop can kill it. A pid would not be enough:
+    /// killing portably means holding the `Child`, and the worker owns it while it waits.
+    task_child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    /// Set when Stop is pressed, so the worker abandons the rest of a `dependsOn` chain rather than
+    /// carrying on to compile something whose prerequisite was just cancelled.
+    task_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    show_tasks_panel: bool,
     // Headless-Blender renders of `.blend` files (right-click → Render). The result is cached
     // and becomes the file's thumbnail. Runs off-thread (a render can take a while).
     #[allow(clippy::type_complexity)]
@@ -2057,6 +2090,20 @@ pub struct Kaleidotron {
     /// restrained chrome (or the reverse), so the two halves are independently switchable.
     theme_scope: u8,
     themes: Vec<crate::theme::Theme>,
+    /// Point size of the code viewer's monospace text. Separate from the whole-UI zoom on purpose:
+    /// reading code comfortably is a different setting from sizing the chrome, and changing one to
+    /// fix the other is the frustration this avoids.
+    code_font_size: f32,
+    /// A `.ttf`/`.otf` to render code with; empty = egui's built-in monospace. Registered into the
+    /// font stack lazily as a named family (see `ensure_code_font`) rather than at startup, so a
+    /// file that has since been deleted or renamed just falls back instead of failing the launch.
+    code_font_path: String,
+    /// The font path currently installed in the egui context, so `ensure_code_font` re-reads the
+    /// file only when the choice actually changes rather than every frame.
+    code_font_loaded: Option<String>,
+    /// Tint the line the cursor is on. Cheap and, in a viewer used to follow along in a listing,
+    /// the single most useful editor affordance after syntax colour.
+    code_line_highlight: bool,
     /// Dock layout per mode, keyed by the mode's stable id. Saved when leaving a mode and restored
     /// when entering one.
     panel_layouts: HashMap<u8, PanelLayout>,
@@ -2252,6 +2299,7 @@ impl Kaleidotron {
     const TD_LIGHT_KEY: &'static str = "td_light"; // [yaw, pitch]
     const TD_BG_KEY: &'static str = "td_bg";
     const GIT_ENABLED_KEY: &'static str = "git_enabled";
+    const TASKS_ENABLED_KEY: &'static str = "tasks_enabled";
     const OSD_ENABLED_KEY: &'static str = "osd_enabled";
     const OSD_POSITION_KEY: &'static str = "osd_position";
     const OSD_SECS_KEY: &'static str = "osd_secs";
@@ -2945,6 +2993,16 @@ impl Kaleidotron {
         let kb_file = crate::keybindings::path(&data_dir);
         let settings_file = crate::settings::path(&data_dir);
         let secrets_file = crate::secrets::path(&data_dir);
+        let tasks_dir = data_dir.join("tasks");
+        // Seed a commented starter for the GLOBAL task file — same rule as the themes and the
+        // PixelFX presets: create it once, never overwrite what the user has edited. It ships with
+        // an empty `tasks` array, so it contributes nothing until something is actually added; its
+        // job is to document the format and be findable.
+        let _ = std::fs::create_dir_all(&tasks_dir);
+        let global_tasks = tasks_dir.join("tasks.json");
+        if !global_tasks.exists() {
+            let _ = std::fs::write(&global_tasks, GLOBAL_TASKS_TEMPLATE);
+        }
         let themes_dir = crate::theme::dir(&data_dir);
         // Seed the bundled themes on first run — same pattern as the PixelFX presets: a starting
         // set plus worked examples to copy. Never overwrite a file the user may have edited.
@@ -3533,6 +3591,20 @@ impl Kaleidotron {
             git_enabled,
             git_info: None,
             git_rx: None,
+            text_enc: crate::decode::Encoding::default(),
+            text_raw: Vec::new(),
+            force_open: None,
+            tasks_enabled: get_bool(Self::TASKS_ENABLED_KEY).unwrap_or(true),
+            tasks: Vec::new(),
+            task_ws: None,
+            task_config: std::collections::HashMap::new(),
+            task_inputs: std::collections::HashMap::new(),
+            tasks_dir,
+            task_run: None,
+            task_rx: None,
+            task_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            show_tasks_panel: false,
             blend_render_tx,
             blend_render_rx,
             blend_render_pending: 0,
@@ -3699,6 +3771,10 @@ impl Kaleidotron {
             theme_name: String::new(),
             theme_scope: 0,
             themes,
+            code_font_size: 13.0,
+            code_font_path: String::new(),
+            code_font_loaded: None,
+            code_line_highlight: true,
             panel_layouts: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<(u8, [bool; 3])>>(s, Self::PANEL_LAYOUTS_KEY))
@@ -3770,18 +3846,6 @@ impl Kaleidotron {
         // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
         crate::decode::font::set_thumb_sample(if app.font_preview_on { &app.font_preview_text } else { "" });
 
-        // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
-        // visible on launch instead of an empty window. `open_folder` itself routes the
-        // virtual cases, so allow a real dir, a 16colo.rs path (re-fetched), or an
-        // archive file (re-extracted) — not only an on-disk directory.
-        if let Some(dir) = open_target {
-            if dir.is_dir()
-                || crate::sixteen::is_remote(&dir)
-                || (dir.is_file() && (crate::archive::is_archive(&dir) || is_sample_bank(&dir)))
-            {
-                app.open_folder(dir);
-            }
-        }
         // `settings.json` overrides the persisted defaults, then is (re)written so a fresh install
         // finds a documented file immediately rather than after a clean exit.
         // API keys come from `secrets.json` when present. They're still read from the legacy
@@ -3794,8 +3858,36 @@ impl Kaleidotron {
         if let Some(v) = sec.get("ma_key") {
             app.ma_key = v.clone();
         }
+        // BEFORE the first folder is opened, not after. Both of these change what that scan
+        // produces, and doing them afterwards meant the launch listing ignored them:
+        //
+        //   * `apply_settings_file` pushes the format-plugin flags to the `Registry`, and
+        //     `known_extension` is what filters a folder listing. Enabling the source-code plugin
+        //     in settings.json left every `.bas` missing from the grid until the user pressed F5 or
+        //     navigated somewhere — the setting looked broken. Same for `git_enabled`, which is
+        //     read when `show_folder` kicks off the status job.
+        //   * `apply_theme` calls `sync_syntax_theme`, which hands the code rasteriser its palette
+        //     through a process-global. Scanning first meant the thumbnailer could start decoding
+        //     source tiles with no theme installed, so a themed install painted its first few code
+        //     thumbnails in the built-in colours.
+        //
+        // Nothing here depends on a folder being open: `apply_settings_file` only assigns fields
+        // and sets registry flags, and `sync_syntax_theme`'s cache-drop is a no-op on an empty
+        // listing — which is precisely the point of doing it while the listing is still empty.
         app.apply_settings_file();
         app.apply_theme(&cc.egui_ctx);
+        // Reopen wherever we left off so the grid, breadcrumb, and favorites are all
+        // visible on launch instead of an empty window. `open_folder` itself routes the
+        // virtual cases, so allow a real dir, a 16colo.rs path (re-fetched), or an
+        // archive file (re-extracted) — not only an on-disk directory.
+        if let Some(dir) = open_target {
+            if dir.is_dir()
+                || crate::sixteen::is_remote(&dir)
+                || (dir.is_file() && (crate::archive::is_archive(&dir) || is_sample_bank(&dir)))
+            {
+                app.open_folder(dir);
+            }
+        }
         // Re-emit the file so a new setting appears in it — but NOT when it exists and could not be
         // read. That file holds settings somebody typed; replacing it with defaults would destroy
         // them silently. Keep a copy and leave the original alone instead.
@@ -3833,6 +3925,9 @@ impl Kaleidotron {
             e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
             e(A, "theme_name", self.theme_name.clone(), "themes/<name>.json (blank = built-in dark/light)"),
             e(A, "theme_scope", self.theme_scope, "what the theme styles: 0 = all, 1 = syntax only, 2 = chrome only"),
+            e(A, "code_font_size", self.code_font_size, "point size of the code viewer's text"),
+            e(A, "code_font_path", self.code_font_path.clone(), "a .ttf/.otf for code (blank = built-in monospace)"),
+            e(A, "code_line_highlight", self.code_line_highlight, "tint the line the cursor is on"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
@@ -3890,6 +3985,7 @@ impl Kaleidotron {
             e(PA, "yt_download_dir", self.yt_download_dir.clone(), "where YouTube downloads land (null = default)"),
             e(PA, "yt_max_height", self.yt_max_height, "YouTube download resolution cap, e.g. 720"),
             e(PA, "git_enabled", self.git_enabled, "show git status badges in local repos"),
+            e(PA, "tasks_enabled", self.tasks_enabled, "read .vscode/tasks.json and offer its tasks"),
         ]
     }
 
@@ -3918,6 +4014,17 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "theme_scope") {
             self.theme_scope = (v as u8).min(2);
+        }
+        if let Some(v) = st::get_f32(&m, "code_font_size") {
+            // Clamped rather than trusted: settings.json is hand-editable, and a 0 or a 4000 here
+            // would either vanish the text or lay out a galley big enough to stall the frame.
+            self.code_font_size = v.clamp(6.0, 48.0);
+        }
+        if let Some(v) = st::get_string(&m, "code_font_path") {
+            self.code_font_path = v;
+        }
+        if let Some(v) = st::get_bool(&m, "code_line_highlight") {
+            self.code_line_highlight = v;
         }
         if let Some(v) = st::get_f32(&m, "rail_icon_size") {
             self.rail_icon_size = v.clamp(12.0, 48.0);
@@ -4054,6 +4161,9 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_bool(&m, "git_enabled") {
             self.git_enabled = v;
+        }
+        if let Some(v) = st::get_bool(&m, "tasks_enabled") {
+            self.tasks_enabled = v;
         }
         // Plain flags — no registry side effect.
         for (key, flag) in [
@@ -4361,6 +4471,7 @@ impl Kaleidotron {
         self.set_mode(Mode::Grid);
         self.rebuild_view();
         self.start_git_status(); // compute this folder's git status off-thread
+        self.refresh_tasks(); // pick up this project's .vscode/tasks.json, if it has one
     }
 
     /// Navigate the virtual 16colo.rs tree. Level 0 (root) lists Years synchronously;
@@ -16562,6 +16673,350 @@ impl Kaleidotron {
         self.rebuild_view();
     }
 
+    /// The bottom output panel: what ran, its live output, and how it ended.
+    ///
+    /// Output is monospace and uses the code font, so a compiler's column-aligned diagnostics line
+    /// up the way they were meant to.
+    fn ui_tasks_panel(&mut self, ui: &mut egui::Ui) {
+        let mut stop = false;
+        let mut clear = false;
+        let mut rerun: Option<String> = None;
+        let (label, running, ok, elapsed) = match self.task_run.as_ref() {
+            Some(r) => (
+                r.label.clone(),
+                r.running,
+                r.ok,
+                r.finished.unwrap_or_else(|| self.egui_ctx.input(|i| i.time)) - r.started,
+            ),
+            None => (String::new(), false, None, 0.0),
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Task").weak());
+            ui.label(egui::RichText::new(&label).strong());
+            // Status reads as a word plus a colour, not a colour alone — a red dot is invisible to
+            // a good fraction of people and ambiguous to everyone else.
+            match (running, ok) {
+                (true, _) => {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(egui::RichText::new("running").weak());
+                }
+                (false, Some(true)) => {
+                    ui.label(egui::RichText::new("ok").color(egui::Color32::from_rgb(0x5c, 0xb8, 0x5c)));
+                }
+                (false, Some(false)) => {
+                    ui.label(egui::RichText::new("failed").color(ui.visuals().error_fg_color));
+                }
+                _ => {}
+            }
+            if elapsed > 0.05 {
+                ui.label(egui::RichText::new(format!("{elapsed:.1}s")).weak());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("\u{d7}").on_hover_text("Hide the output panel").clicked() {
+                    self.show_tasks_panel = false;
+                }
+                if ui.small_button("Clear").clicked() {
+                    clear = true;
+                }
+                if running {
+                    if ui.small_button("Stop").clicked() {
+                        stop = true;
+                    }
+                } else if !label.is_empty() && ui.small_button("Re-run").clicked() {
+                    rerun = Some(label.clone());
+                }
+            });
+        });
+        ui.separator();
+        let font = self.code_font(&self.egui_ctx.clone());
+        egui::ScrollArea::both()
+            .auto_shrink([false; 2])
+            // A build's interesting output is at the end, and following it while it streams is the
+            // reason to have the panel open at all.
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if let Some(run) = self.task_run.as_ref() {
+                    for line in &run.lines {
+                        // The echoed command lines and the status footers are the panel's own
+                        // structure, so they're tinted to separate them from program output.
+                        let c = if line.starts_with("$ ") {
+                            ui.visuals().hyperlink_color
+                        } else if line.starts_with("· ") {
+                            ui.visuals().weak_text_color()
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        ui.label(egui::RichText::new(line).font(font.clone()).color(c));
+                    }
+                } else {
+                    ui.weak("No task has run yet.");
+                }
+            });
+        if stop {
+            self.stop_task();
+        }
+        if clear {
+            if let Some(run) = self.task_run.as_mut() {
+                run.lines.clear();
+            }
+        }
+        if let Some(l) = rerun {
+            let file = self.task_target_file();
+            self.run_task(&l, &file);
+        }
+    }
+
+    /// The file a task should act on when run from a menu rather than a specific tile: the open
+    /// file if there is one, else the selected entry, else the folder itself.
+    ///
+    /// The folder fallback matters — plenty of tasks (`npm: watch`, a test suite) don't reference
+    /// `${file}` at all, and refusing to run them just because nothing is open would be arbitrary.
+    fn task_target_file(&self) -> PathBuf {
+        self.full_tex
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .or_else(|| self.text_doc.as_ref().map(|(p, _)| p.clone()))
+            .or_else(|| self.entries.iter().find(|e| self.selection.contains(&e.path)).map(|e| e.path.clone()))
+            .or_else(|| self.folder.clone())
+            .unwrap_or_default()
+    }
+
+    /// An owned snapshot of the tasks for the context menu.
+    ///
+    /// Owned, not borrowed, for the same reason `opener_items` is: `entry_context_menu` is a free
+    /// function precisely so it cannot borrow `self` while the surrounding grid loop already does.
+    fn task_items(&self) -> Vec<TaskItem> {
+        self.tasks
+            .iter()
+            .map(|t| TaskItem {
+                label: t.label.clone(),
+                detail: t.detail.clone(),
+                unsupported: t.needs_input(&self.task_inputs),
+            })
+            .collect()
+    }
+
+    /// A Run menu listing the discovered tasks, grouped as VS Code groups them. Shared by the code
+    /// viewer's toolbar and the menu bar so the two can't drift apart.
+    ///
+    /// Returns the label picked, if any — the caller runs it *after* the menu closure, since an
+    /// egui closure can't borrow `self` twice (the deferred-action idiom used throughout).
+    fn tasks_menu(&self, ui: &mut egui::Ui) -> Option<String> {
+        let mut pick = None;
+        // Build before default; then everything else. Ordering by group rather than by file order
+        // puts the thing you press most at the top.
+        for (title, want) in [("Build", "build"), ("Test", "test"), ("Other", "")] {
+            let group: Vec<&crate::tasks::Task> = self
+                .tasks
+                .iter()
+                .filter(|t| if want.is_empty() { t.group != "build" && t.group != "test" } else { t.group == want })
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            ui.label(egui::RichText::new(title).weak().small());
+            for t in group {
+                let name = if t.is_default { format!("{}  \u{2605}", t.label) } else { t.label.clone() };
+                let mut b = ui.button(name);
+                if !t.detail.is_empty() {
+                    b = b.on_hover_text(&t.detail);
+                } else if t.needs_input(&self.task_inputs) {
+                    b = b.on_hover_text("Uses ${input:…}, which only VS Code can answer");
+                }
+                if b.clicked() {
+                    pick = Some(t.label.clone());
+                    ui.close();
+                }
+            }
+            ui.separator();
+        }
+        pick
+    }
+
+    /// Rediscover the project tasks for the current folder.
+    ///
+    /// Called on every folder change. Cheap enough to do eagerly — [`tasks::find_workspace`] stats
+    /// one path per ancestor and stops at the first hit — and doing it eagerly is what makes tasks
+    /// appear simply by browsing into a project, with nothing to configure. Reading the files again
+    /// each time also means editing `tasks.json` in another window takes effect on the next
+    /// navigation, rather than needing a restart.
+    ///
+    /// Skipped for virtual folders (16colo.rs, YouTube, an archive mount): `${workspaceFolder}`
+    /// would be a temp directory that vanishes, and no project owns those files.
+    fn refresh_tasks(&mut self) {
+        self.tasks.clear();
+        self.task_ws = None;
+        self.task_config.clear();
+        self.task_inputs.clear();
+        if !self.tasks_enabled {
+            return;
+        }
+        let Some(folder) = self.folder.clone() else {
+            return;
+        };
+        if any_remote(&folder) || self.archive_mount.is_some() {
+            return;
+        }
+        let ws = crate::tasks::find_workspace(&folder);
+        let mut loaded = match &ws {
+            Some(ws) => crate::tasks::load(ws),
+            None => crate::tasks::Loaded::default(),
+        };
+        // The global toolbox is folded in second, so a project's own task of the same name wins.
+        // It applies even with no project at all — that is the point: browsing a plain folder of
+        // art should still offer "open this in PabloDraw".
+        crate::tasks::merge_global(&mut loaded, crate::tasks::load_dir(&self.tasks_dir));
+        self.tasks = loaded.tasks;
+        self.task_config = loaded.config;
+        self.task_inputs = loaded.inputs;
+        // `${workspaceFolder}` for a global-only task is the folder being browsed — there is no
+        // project to point at, and the current folder is the only sensible reading.
+        self.task_ws = ws.or(Some(folder));
+    }
+
+    /// The variables a task expands against, for a run acting on `file`.
+    ///
+    /// `file` goes through `resolve_local` because a task spawns a real program: handing GIMP the
+    /// virtual path of a piece inside a zip would just fail to open. The task sees the extracted
+    /// copy, which is the file it can actually act on.
+    fn task_vars(&self, file: &Path) -> crate::tasks::Vars {
+        crate::tasks::Vars {
+            workspace: self.task_ws.clone().unwrap_or_else(|| {
+                file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+            }),
+            file: self.resolve_local(file),
+            config: self.task_config.clone(),
+            inputs: self.task_inputs.clone(),
+        }
+    }
+
+    /// Run the task named `label`, with `${file}` bound to `file`.
+    ///
+    /// Dependencies run first and **sequentially** (see [`tasks::plan`]); a non-zero exit abandons
+    /// the rest of the chain, because the whole point of `BUILD: Compile` depending on
+    /// `BUILD: Remove` is that the second step is meaningless if the first failed.
+    fn run_task(&mut self, label: &str, file: &Path) {
+        if self.task_run.as_ref().is_some_and(|r| r.running) {
+            self.toast(ToastKind::Error, "A task is already running");
+            return;
+        }
+        let Some(task) = self.tasks.iter().find(|t| t.label == label).cloned() else {
+            return;
+        };
+        if task.needs_input(&self.task_inputs) {
+            // Honest failure beats running `${input:x}` as a command and showing a shell error
+            // about a file that doesn't exist.
+            self.toast(
+                ToastKind::Error,
+                format!("“{label}” uses ${{input:…}}, which VS Code answers with its own prompt — not supported"),
+            );
+            return;
+        }
+        let chain = crate::tasks::plan(&self.tasks, label);
+        let vars = self.task_vars(file);
+        let execs: Vec<crate::tasks::Exec> =
+            chain.iter().map(|t| crate::tasks::exec_for(t, &vars)).collect();
+        let labels: Vec<String> = chain.iter().map(|t| t.label.clone()).collect();
+        let (tx, rx) = std::sync::mpsc::channel::<TaskMsg>();
+        self.task_rx = Some(rx);
+        self.task_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.task_cancel.clone();
+        let child_slot = self.task_child.clone();
+        let ctx = self.egui_ctx.clone();
+        self.task_run = Some(TaskRun {
+            label: label.to_string(),
+            current: String::new(),
+            lines: Vec::new(),
+            running: true,
+            ok: None,
+            started: self.egui_ctx.input(|i| i.time),
+            finished: None,
+        });
+        // `reveal: never` is how a "just open this in GIMP" task says it has nothing to show. The
+        // panel is still populated — it's the record of what ran — it simply isn't forced open.
+        if task.reveals() {
+            self.show_tasks_panel = true;
+        }
+        std::thread::spawn(move || {
+            let mut all_ok = true;
+            for (e, lbl) in execs.iter().zip(labels.iter()) {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    all_ok = false;
+                    break;
+                }
+                let _ = tx.send(TaskMsg::Begin(lbl.clone(), e.display.clone()));
+                let code = run_one_exec(e, &tx, &child_slot, &ctx);
+                let _ = tx.send(TaskMsg::End(code));
+                if code != Some(0) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            let _ = tx.send(TaskMsg::Done(all_ok));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain a running task's output into the panel. Called every frame from the poll battery.
+    fn poll_tasks(&mut self) {
+        let Some(rx) = self.task_rx.as_ref() else {
+            return;
+        };
+        let mut done = false;
+        let msgs: Vec<TaskMsg> = rx.try_iter().collect();
+        for m in msgs {
+            let Some(run) = self.task_run.as_mut() else {
+                continue;
+            };
+            match m {
+                TaskMsg::Begin(lbl, cmd) => {
+                    run.current = cmd.clone();
+                    run.lines.push(format!("$ [{lbl}] {cmd}"));
+                }
+                TaskMsg::Line(l) => {
+                    run.lines.push(l);
+                    // Drop from the front rather than stopping: on a long build the *recent* output
+                    // is the part you need, and the tail is where an error will be.
+                    if run.lines.len() > TASK_LINE_CAP {
+                        run.lines.drain(..run.lines.len() - TASK_LINE_CAP);
+                    }
+                }
+                TaskMsg::End(code) => match code {
+                    Some(0) => run.lines.push("· ok".into()),
+                    Some(c) => run.lines.push(format!("· exit {c}")),
+                    None => run.lines.push("· could not start (is the program on PATH?)".into()),
+                },
+                TaskMsg::Done(ok) => {
+                    run.running = false;
+                    run.ok = Some(ok);
+                    run.finished = Some(self.egui_ctx.input(|i| i.time));
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.task_rx = None;
+            if let Some(run) = self.task_run.as_ref() {
+                let (kind, msg) = if run.ok == Some(true) {
+                    (ToastKind::Info, format!("{} finished", run.label))
+                } else {
+                    (ToastKind::Error, format!("{} failed", run.label))
+                };
+                self.toast(kind, msg);
+            }
+        }
+    }
+
+    /// Cancel the running task: kill the live child, then flag the chain so no later step starts.
+    fn stop_task(&mut self) {
+        self.task_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut slot) = self.task_child.lock() {
+            if let Some(child) = slot.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
     /// Kick off a background `git status` for the current local folder. A no-op (and
     /// clears any stale info) for remote / archive-mount / virtual folders, or when the
     /// feature is off. Runs off-thread so a big monorepo can't hitch navigation; the
@@ -17027,15 +17482,24 @@ impl Kaleidotron {
         // Source/text opens in the REAL text viewer (selectable, copyable, searchable) rather than
         // the rasterised tile. Capped: the layouter colours the whole document, so a huge log would
         // stall a frame — beyond the cap it falls through to the raster path, which is bounded.
-        if crate::decode::CODE_EXTS
-            .contains(&path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase().as_str())
-            && self.plugin_code
-        {
+        // Which viewer? An explicit "View as text" / "Preview as image" pick wins; otherwise a
+        // source file defaults to the text editor as before.
+        let want = self.force_open.take();
+        let is_code = crate::decode::CODE_EXTS
+            .contains(&path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase().as_str());
+        if is_code && self.plugin_code && want != Some(OpenAs::Image) {
             let real = self.resolve_local(&path);
             const MAX_TEXT: u64 = 4 * 1024 * 1024;
             let small = std::fs::metadata(&real).map(|m| m.len() <= MAX_TEXT).unwrap_or(false);
             if small {
-                if let Ok(raw) = std::fs::read_to_string(&real) {
+                // Bytes, not `read_to_string`. A QB64 `.bas` with a box-drawing comment banner is
+                // CP437, not UTF-8, so `read_to_string` fails on exactly the files this program is
+                // for — and the open then fell through to the image viewer with no explanation.
+                // `decode_text` falls back to CP437 and reports it so saving can re-encode.
+                if let Ok(bytes) = std::fs::read(&real) {
+                    let (raw, enc) = crate::decode::decode_text(&bytes);
+                    self.text_enc = enc;
+                    self.text_raw = bytes;
                     // Normalise to LF so every offset (galley, cursor, find) refers to the same
                     // thing; `text_crlf` restores the file's own endings on save.
                     self.text_crlf = raw.contains("\r\n");
@@ -17043,6 +17507,7 @@ impl Kaleidotron {
                     self.text_orig = body.clone();
                     self.text_doc = Some((path.clone(), body));
                     self.text_follow_len = std::fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
+                    self.text_edit = want == Some(OpenAs::TextEdit);
                     self.set_mode(Mode::Single);
                     self.full_tex = None;
                     self.mark_viewed(&path);
@@ -22703,6 +23168,11 @@ impl Kaleidotron {
         let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
+        // A "Tasks ▸" pick, applied after the loop like every other tile action.
+        let mut run_task_on: Option<(usize, String)> = None;
+        let task_items = self.task_items();
+        // Ditto the explicit "open this as…" pick.
+        let mut open_as: Option<(usize, OpenAs)> = None;
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -23308,6 +23778,13 @@ impl Kaleidotron {
                                 self.video_lists.iter().map(|l| l.name.clone()).collect();
                             let is_vid = self.is_video_entry(&entry.path);
                             let ph_hdri = self.is_ph_hdri(&entry.path);
+                            // Source/text files get the Preview / View / Edit choice; nothing else does.
+                            let is_code_entry = !entry.is_dir
+                                && self.plugin_code
+                                && crate::decode::CODE_EXTS.contains(
+                                    &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
+                                        .to_ascii_lowercase().as_str(),
+                                );
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -23324,6 +23801,8 @@ impl Kaleidotron {
                                 is_vid,
                                 &list_names,
                                 ph_hdri,
+                                &task_items,
+                                is_code_entry,
                             ) {
                                 match pick {
                                     p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -23350,6 +23829,8 @@ impl Kaleidotron {
                                     TilePick::PhHdr(res) => ph_hdr = Some((idx, res)),
                                     TilePick::Steam(a) => steam_act = Some((idx, a)),
                                     TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
+                                    TilePick::Task(l) => run_task_on = Some((idx, l)),
+                                    TilePick::Open(m) => open_as = Some((idx, m)),
                                 }
                             }
                         });
@@ -23466,6 +23947,18 @@ impl Kaleidotron {
         if let Some((i, h)) = yt_quality {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.start_yt_open_quality(p, h);
+            }
+        }
+        if let Some((i, label)) = run_task_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.run_task(&label, &p);
+            }
+        }
+        if let Some((i, mode)) = open_as {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.force_open = Some(mode);
+                let ctx = ui.ctx().clone();
+                self.load_full(&ctx, p);
             }
         }
         if pin_current {
@@ -23809,6 +24302,11 @@ impl Kaleidotron {
         let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
+        // A "Tasks ▸" pick, applied after the loop like every other tile action.
+        let mut run_task_on: Option<(usize, String)> = None;
+        let task_items = self.task_items();
+        // Ditto the explicit "open this as…" pick.
+        let mut open_as: Option<(usize, OpenAs)> = None;
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -24329,6 +24827,13 @@ impl Kaleidotron {
                             self.video_lists.iter().map(|l| l.name.clone()).collect();
                         let is_vid = self.is_video_entry(&entry.path);
                         let ph_hdri = self.is_ph_hdri(&entry.path);
+                        // Source/text files get the Preview / View / Edit choice; nothing else does.
+                        let is_code_entry = !entry.is_dir
+                            && self.plugin_code
+                            && crate::decode::CODE_EXTS.contains(
+                                &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
+                                    .to_ascii_lowercase().as_str(),
+                            );
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -24345,6 +24850,8 @@ impl Kaleidotron {
                             is_vid,
                             &list_names,
                             ph_hdri,
+                            &task_items,
+                            is_code_entry,
                         ) {
                             match pick {
                                 p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -24371,6 +24878,8 @@ impl Kaleidotron {
                                 TilePick::PhHdr(res) => ph_hdr = Some((idx, res)),
                                 TilePick::Steam(a) => steam_act = Some((idx, a)),
                                 TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
+                                TilePick::Task(l) => run_task_on = Some((idx, l)),
+                                TilePick::Open(m) => open_as = Some((idx, m)),
                             }
                         }
                     });
@@ -24535,6 +25044,18 @@ impl Kaleidotron {
         if let Some((i, h)) = yt_quality {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.start_yt_open_quality(p, h);
+            }
+        }
+        if let Some((i, label)) = run_task_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.run_task(&label, &p);
+            }
+        }
+        if let Some((i, mode)) = open_as {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.force_open = Some(mode);
+                let ctx = ui.ctx().clone();
+                self.load_full(&ctx, p);
             }
         }
         if pin_current {
@@ -28122,6 +28643,8 @@ impl Kaleidotron {
             ("Toggle Explorer pane".into(), "View".into(), Menu(MenuAction::ToggleExplorer)),
             ("Toggle Details pane".into(), "View".into(), Menu(MenuAction::ToggleDetails)),
             ("Toggle Recolor pane".into(), "View".into(), Menu(MenuAction::ToggleRecolor)),
+            ("Toggle task output".into(), "View".into(), Menu(MenuAction::ToggleTasksPanel)),
+            ("Reload project tasks".into(), "View".into(), Menu(MenuAction::ReloadTasks)),
             ("Toggle grid / table view".into(), "View  T".into(), Menu(MenuAction::ToggleTable)),
             ("Toggle hidden files".into(), "View".into(), Menu(MenuAction::ToggleHidden)),
             ("Reset thumbnail size".into(), "View".into(), Menu(MenuAction::ResetThumb)),
@@ -28310,6 +28833,59 @@ impl Kaleidotron {
         }
     }
 
+    /// Install the chosen code font if it isn't already, then hand back the `FontId` the code
+    /// viewer should draw with.
+    ///
+    /// Loading is lazy and self-healing: the file is read only when the *choice* changes, and a
+    /// path that no longer resolves (moved font, external drive unplugged) clears the preference
+    /// and falls back to the built-in monospace instead of leaving the viewer blank. `set_fonts`
+    /// rebuilds atlases, so doing this per frame would be a real cost — hence `code_font_loaded`.
+    fn ensure_code_font(&mut self, ctx: &egui::Context) -> egui::FontId {
+        let want = self.code_font_path.trim().to_string();
+        if self.code_font_loaded.as_deref() != Some(want.as_str()) {
+            if want.is_empty() {
+                // Startup already installed the no-code-font stack, so the first frame with no
+                // chosen font must not pay for a redundant rebuild.
+                if self.code_font_loaded.is_some() {
+                    apply_fonts(ctx, None);
+                }
+                self.code_font_loaded = Some(String::new());
+            } else {
+                match std::fs::read(&want) {
+                    Ok(bytes) => {
+                        apply_fonts(ctx, Some(bytes));
+                        self.code_font_loaded = Some(want.clone());
+                    }
+                    Err(e) => {
+                        self.toast(ToastKind::Error, format!("Code font: {e}"));
+                        self.code_font_path.clear();
+                        self.code_font_loaded = Some(String::new());
+                    }
+                }
+            }
+            // The new stack is only live from the next frame, so ask for one — otherwise an idle UI
+            // would sit showing the fallback until something else caused a repaint.
+            ctx.request_repaint();
+        }
+        self.code_font(ctx)
+    }
+
+    /// The code viewer's font, at the chosen size and family.
+    ///
+    /// **The family is verified to be bound before it is named.** `Context::set_fonts` does not take
+    /// effect until the *next* frame, so laying text out with `FontFamily::Name("code")` in the same
+    /// frame that installed it panics inside epaint — `FontFamily::Name("code") is not bound to any
+    /// fonts` — which killed the app the moment a source file was opened with a custom font chosen.
+    /// Asking `Fonts::families()` is exact and also covers the case where the font failed to parse
+    /// and egui silently kept the old set.
+    fn code_font(&self, ctx: &egui::Context) -> egui::FontId {
+        let named = egui::FontFamily::Name(CODE_FAMILY.into());
+        let bound = self.code_font_loaded.as_deref().is_some_and(|p| !p.is_empty())
+            && ctx.fonts(|f| f.families().contains(&named));
+        let family = if bound { named } else { egui::FontFamily::Monospace };
+        egui::FontId::new(self.code_font_size, family)
+    }
+
     /// Push the active syntax theme to the code rasteriser and drop any tile it already painted.
     ///
     /// The grid tile for a source file is a bitmap the worker threads rendered with whatever
@@ -28440,6 +29016,8 @@ impl Kaleidotron {
         self.text_edit = false;
         self.text_orig.clear();
         self.text_crlf = false;
+        self.text_enc = crate::decode::Encoding::default();
+        self.text_raw = Vec::new();
         self.text_find_open = false;
         self.text_find_idx = 0;
         self.text_find_seek = false;
@@ -28463,7 +29041,10 @@ impl Kaleidotron {
             return Err("nothing open".into());
         };
         let out = if self.text_crlf { body.replace('\n', "\r\n") } else { body.clone() };
-        std::fs::write(path, out).map_err(|e| e.to_string())?;
+        // Re-encode to whatever the file was, so a CP437 source isn't quietly rewritten as UTF-8
+        // the first time it is saved — that would mangle every box-drawing character in it.
+        let bytes = crate::decode::encode_text(&out, self.text_enc);
+        std::fs::write(path, bytes).map_err(|e| e.to_string())?;
         self.text_orig = body;
         Ok(())
     }
@@ -28586,6 +29167,8 @@ impl Kaleidotron {
         let mut back = false;
         let (mut want_edit, mut want_revert, mut want_save, mut want_save_as) = (false, false, false, false);
         let mut want_follow: Option<bool> = None;
+        let mut want_task: Option<String> = None;
+        let mut want_enc: Option<crate::decode::Encoding> = None;
         let mut wrap = self.text_wrap;
         let mut find_open = self.text_find_open;
         if !immersive {
@@ -28649,6 +29232,32 @@ impl Kaleidotron {
                 if ui.button("📋 Copy").clicked() {
                     ui.ctx().copy_text(body.clone());
                 }
+                // Code page. Shown always, not only when the guess was CP437: knowing what a file
+                // was read AS is part of reading it, and a file that decodes cleanly as UTF-8 can
+                // still be a CP437 file that happens to contain only ASCII.
+                let enc = self.text_enc;
+                egui::ComboBox::from_id_salt("text_enc")
+                    .selected_text(enc.label())
+                    .width(84.0)
+                    .show_ui(ui, |ui| {
+                        for e in crate::decode::Encoding::ALL {
+                            if ui.selectable_label(enc == e, e.label()).clicked() && e != enc {
+                                want_enc = Some(e);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Re-read this file as a different code page");
+                // The project's own build/run commands, straight from its .vscode/tasks.json.
+                // Hidden entirely when the folder has none, so it costs nothing everywhere else.
+                if !self.tasks.is_empty() {
+                    ui.separator();
+                    ui.menu_button("▶ Run", |ui| {
+                        want_task = self.tasks_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("Tasks from this project's .vscode/tasks.json");
+                }
             });
             if find_open {
                 self.text_find_open = true;
@@ -28690,6 +29299,27 @@ impl Kaleidotron {
             self.text_follow_t = 0.0;
             self.text_follow_jump = on;
         }
+        if let Some(e) = want_enc {
+            // Re-decoding replaces the buffer, so an unsaved edit would go with it. The edit was
+            // made against a mis-decoded buffer anyway, but it is still the reader's to keep.
+            if self.confirm_discard_text() {
+                let raw = std::mem::take(&mut self.text_raw);
+                let text = crate::decode::decode_with(&raw, e);
+                self.text_crlf = text.contains("\r\n");
+                let body = if self.text_crlf { text.replace("\r\n", "\n") } else { text };
+                self.text_orig = body.clone();
+                self.text_doc = Some((path.clone(), body));
+                self.text_raw = raw;
+                self.text_enc = e;
+                self.text_find_idx = 0;
+            }
+        }
+        if let Some(label) = want_task {
+            // The open document is what `${file}` should mean here, even if the grid selection has
+            // since moved on.
+            let file = path.clone();
+            self.run_task(&label, &file);
+        }
         if back {
             if !self.confirm_discard_text() {
                 return;
@@ -28716,11 +29346,33 @@ impl Kaleidotron {
                     .unwrap_or_else(|| crate::decode::tok_rgb(*k))
             })
             .collect();
+        // Token colours are only *part* of what a theme says about code. The raster tile resolves
+        // three fields (`Palette::resolve`): the tokens, `editor.background`, and the gutter tint.
+        // The viewer took only the tokens, so with the theme scoped to "syntax only" — chrome
+        // deliberately left alone — the pane kept the plain dark backdrop and the default grey
+        // line numbers, and read as unthemed next to its own correctly-themed thumbnail. Resolve
+        // the same two fields here so both surfaces are driven by one set of theme keys.
+        let rgb = |c: Option<[u8; 4]>| c.map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]));
+        let code_bg = active.and_then(|t| rgb(t.extreme_bg.or(t.window_bg)));
+        let gutter_col = active.and_then(|t| rgb(t.weak_text));
         let kind_idx = |k: crate::decode::Tok| -> usize {
             crate::decode::ALL_TOKS.iter().position(|t| *t == k).unwrap_or(0)
         };
-        let mono = egui::FontId::monospace(13.0);
-        let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * 8.0 + 12.0;
+        // One `FontId` for the whole surface — the layouter, the TextEdit and the gutter must agree
+        // exactly or the numbers drift from their lines.
+        let mono = self.ensure_code_font(&ui.ctx().clone());
+        // Measured, not assumed: the old `* 8.0` was the width of one digit at 13pt in the built-in
+        // monospace, which stops being true the moment either the size or the face is changed.
+        let digit_w = ui
+            .painter()
+            .layout_no_wrap("0".to_string(), mono.clone(), egui::Color32::WHITE)
+            .rect
+            .width();
+        let gutter_w = format!("{}", spans.len().max(1)).len() as f32 * digit_w + 12.0;
+        // The layouter below is a `move` closure and takes `mono` with it, so the TextEdit and the
+        // gutter — which must use the very same font — keep their own handle.
+        let code_font = mono.clone();
+        let line_hl = self.code_line_highlight;
         let wrap_at = if wrap { ui.available_width() - gutter_w } else { f32::INFINITY };
         // Search hits are painted by the layouter, so highlighting is a property of the text rather
         // than an overlay that would have to be kept in step with scrolling and wrapping.
@@ -28792,6 +29444,14 @@ impl Kaleidotron {
         // it must be a real target — an enormous `vertical_scroll_offset` is not clamped to the
         // content and simply lands past the end, showing an empty pane.
         let jump = std::mem::take(&mut self.text_follow_jump);
+        // Paint the theme's editor background across the whole pane, not just behind the glyphs:
+        // `TextEdit` fills only its own frame, so a short file over a default-dark panel would
+        // still show a mismatched band under the last line. Setting `extreme_bg_color` as well
+        // keeps the widget's own frame in step with it.
+        if let Some(bg) = code_bg {
+            ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
+            ui.visuals_mut().extreme_bg_color = bg;
+        }
         egui::ScrollArea::both()
             .auto_shrink([false; 2])
             // Following a growing file means staying at its end, which is the whole point of tail.
@@ -28819,17 +29479,37 @@ impl Kaleidotron {
                 } else {
                     &mut scratch
                 };
+                // Reserve the current-line shape BEFORE the text so the tint lands underneath it —
+                // the same pre-allocate-then-`set` idiom the recolor rows use for their zebra
+                // stripes. Painting it afterwards would wash out the glyphs it is meant to pick out.
+                let hl_slot = ui.painter().add(egui::Shape::Noop);
                 let out = egui::TextEdit::multiline(target)
                     .id(text_id)
-                    .font(egui::FontId::monospace(13.0))
+                    .font(code_font.clone())
                     .desired_width(f32::INFINITY)
                     .layouter(&mut layouter)
                     .show(ui);
+                // Highlight the row the cursor sits on. Driven off the galley rather than a line
+                // count so it stays correct under wrapping, where one logical line owns several
+                // rows and only the one actually containing the cursor should light up.
+                if line_hl {
+                    if let Some(range) = out.cursor_range {
+                        let r = out.galley.pos_from_cursor(range.primary);
+                        let row = egui::Rect::from_min_max(
+                            egui::pos2(ui.clip_rect().min.x, out.galley_pos.y + r.min.y),
+                            egui::pos2(ui.clip_rect().max.x, out.galley_pos.y + r.max.y),
+                        );
+                        // A tint off the theme's own selection colour, so it tracks an imported
+                        // theme instead of being a fixed grey that clashes with half of them.
+                        let c = ui.visuals().selection.bg_fill.gamma_multiply(0.22);
+                        ui.painter().set(hl_slot, egui::Shape::rect_filled(row, 0.0, c));
+                    }
+                }
                 // Wrapping breaks the one-row-per-line assumption the numbering relies on, so the
                 // gutter is omitted there rather than shown wrong.
                 if !wrap {
-                    let color = ui.visuals().weak_text_color();
-                    let font = egui::FontId::monospace(13.0);
+                    let color = gutter_col.unwrap_or_else(|| ui.visuals().weak_text_color());
+                    let font = code_font.clone();
                     let clip = ui.clip_rect();
                     for (i, row) in out.galley.rows.iter().enumerate() {
                         let y = out.galley_pos.y + row.pos.y;
@@ -29659,6 +30339,19 @@ impl Kaleidotron {
                     action = Some(MenuAction::ResetThumb);
                     ui.close();
                 }
+                // Only meaningful in a project that has tasks, so it stays out of the way in the
+                // folders — the overwhelming majority — that don't.
+                if !self.tasks.is_empty() {
+                    ui.separator();
+                    if ui.selectable_label(self.show_tasks_panel, "Task output").clicked() {
+                        action = Some(MenuAction::ToggleTasksPanel);
+                        ui.close();
+                    }
+                }
+                if self.tasks_enabled && ui.button("Reload tasks").on_hover_text("Re-read this project's .vscode/tasks.json").clicked() {
+                    action = Some(MenuAction::ReloadTasks);
+                    ui.close();
+                }
                 ui.separator();
                 if ui
                     .button("Associations…")
@@ -29927,6 +30620,12 @@ impl Kaleidotron {
             MenuAction::ToggleExplorer => self.show_explorer = !self.show_explorer,
             MenuAction::ToggleDetails => self.show_details = !self.show_details,
             MenuAction::ToggleRecolor => self.show_recolor = !self.show_recolor,
+            MenuAction::ToggleTasksPanel => self.show_tasks_panel = !self.show_tasks_panel,
+            MenuAction::ReloadTasks => {
+                self.refresh_tasks();
+                let n = self.tasks.len();
+                self.toast(ToastKind::Info, format!("{n} task(s) loaded"));
+            }
             MenuAction::ToggleFavBarColored => {
                 self.fav_bar_colored_only = !self.fav_bar_colored_only
             }
@@ -31555,6 +32254,26 @@ impl eframe::App for Kaleidotron {
                 self.text_find_open = false;
             }
         }
+        // Ctrl+Shift+B — the default build task, the same binding VS Code uses, so muscle memory
+        // carries over. Consumed (not just read) because it fires while a text field has focus:
+        // building is exactly what you want mid-edit, and letting the B reach the buffer as well
+        // would type a stray character into the file.
+        if !self.tasks.is_empty()
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::B)
+            })
+        {
+            match self.tasks.iter().find(|t| t.is_default).map(|t| t.label.clone()) {
+                Some(label) => {
+                    let file = self.task_target_file();
+                    self.run_task(&label, &file);
+                }
+                None => self.toast(
+                    ToastKind::Error,
+                    "No default build task — set \"group\": { \"kind\": \"build\", \"isDefault\": true } on one",
+                ),
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
@@ -31789,6 +32508,7 @@ impl eframe::App for Kaleidotron {
         self.poll_remote();
         self.poll_search();
         self.poll_git_status();
+        self.poll_tasks();
         self.poll_blend_render();
         self.poll_dir_changes(&ctx);
         self.poll_random();
@@ -32229,6 +32949,15 @@ impl eframe::App for Kaleidotron {
             if self.folder.is_some() {
                 egui::Panel::bottom("sortbar").show_inside(ui, |ui| self.ui_sortbar(ui));
             }
+            // Mounted last of the bottom group, so it sits above the sort and status rows and
+            // grows upward into the central panel rather than displacing them.
+            if self.show_tasks_panel {
+                egui::Panel::bottom("tasks")
+                    .resizable(true)
+                    .default_size(180.0)
+                    .size_range(80.0..=600.0)
+                    .show_inside(ui, |ui| self.ui_tasks_panel(ui));
+            }
         }
 
         // Left dock: Details on top (takes the bulk of the height), Explorer
@@ -32478,6 +33207,41 @@ impl eframe::App for Kaleidotron {
                                     self.theme_name = name;
                                     theme_apply = true;
                                 }
+                                ui.add_space(6.0);
+                                ui.label("Code viewer");
+                                ui.horizontal(|ui| {
+                                    ui.label("Size");
+                                    ui.add(
+                                        egui::Slider::new(&mut self.code_font_size, 6.0..=32.0)
+                                            .step_by(0.5)
+                                            .suffix(" pt"),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Font");
+                                    // Shown by file name, not full path: a font lives at a long
+                                    // path nobody reads, and the name is the part being chosen.
+                                    let cur = std::path::Path::new(self.code_font_path.trim())
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "Built-in monospace".into());
+                                    if ui.button(cur).on_hover_text(if self.code_font_path.is_empty() {
+                                        "Pick a .ttf/.otf to read code in".to_string()
+                                    } else {
+                                        self.code_font_path.clone()
+                                    }).clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .add_filter("Font", &["ttf", "otf", "ttc"])
+                                            .pick_file()
+                                        {
+                                            self.code_font_path = p.to_string_lossy().to_string();
+                                        }
+                                    }
+                                    if !self.code_font_path.is_empty() && ui.small_button("\u{d7}").on_hover_text("Back to the built-in monospace").clicked() {
+                                        self.code_font_path.clear();
+                                    }
+                                });
+                                ui.checkbox(&mut self.code_line_highlight, "Highlight the current line");
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut theme, 0, "Dark");
@@ -33016,6 +33780,47 @@ impl eframe::App for Kaleidotron {
                                     self.start_git_status(); // recompute now (or clear) so it's immediate
                                 }
                                 ui.weak("Add a \"Git\" column via the table header's right-click menu.");
+
+                                ui.add_space(10.0);
+                                ui.label("Project tasks");
+                                if ui
+                                    .checkbox(
+                                        &mut self.tasks_enabled,
+                                        "Read .vscode/tasks.json",
+                                    )
+                                    .on_hover_text(
+                                        "Offer a project's own build/run/tool commands: a \"▶ Run\" \
+                                         menu in the code viewer and a \"Tasks\" submenu on any \
+                                         file's right-click menu. Found by walking up from the \
+                                         current folder for a .vscode/tasks.json.",
+                                    )
+                                    .changed()
+                                {
+                                    self.refresh_tasks(); // pick up (or drop) them immediately
+                                }
+                                if self.tasks_enabled {
+                                    ui.weak(format!(
+                                        "{} task(s) available here.",
+                                        self.tasks.len()
+                                    ));
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button("Open global tasks folder")
+                                            .on_hover_text(
+                                                "Tasks defined here are offered in EVERY folder, on \
+                                                 top of a project's own .vscode/tasks.json",
+                                            )
+                                            .clicked()
+                                        {
+                                            let d = self.tasks_dir.to_string_lossy().to_string();
+                                            self.open_url(&d);
+                                        }
+                                        if ui.small_button("Reload").clicked() {
+                                            self.refresh_tasks();
+                                        }
+                                    });
+                                    ui.weak(format!("Global: {}", self.tasks_dir.join("tasks.json").display()));
+                                }
 
                                 ui.add_space(10.0);
                                 }
@@ -33583,6 +34388,7 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::TD_BG_KEY, &self.td_bg);
         eframe::set_value(storage, Self::GIT_ENABLED_KEY, &self.git_enabled);
+        eframe::set_value(storage, Self::TASKS_ENABLED_KEY, &self.tasks_enabled);
         eframe::set_value(storage, Self::OSD_ENABLED_KEY, &self.osd_enabled);
         eframe::set_value(storage, Self::OSD_POSITION_KEY, &self.osd_position);
         eframe::set_value(storage, Self::OSD_SECS_KEY, &self.osd_secs);
@@ -33973,6 +34779,19 @@ fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
 /// platform with no system font dependency. (DejaVu Fonts License — a permissive Bitstream-Vera
 /// derivative; redistribution/embedding allowed.)
 fn install_fallback_font(ctx: &egui::Context) {
+    apply_fonts(ctx, None);
+}
+
+/// The egui family name a user-chosen code font is registered under. A *named* family rather than
+/// replacing `Monospace`: the monospace family is used by the rest of the app (paths, hex fields,
+/// the audio readouts), and someone picking a display font to read a listing in has not asked for
+/// it to leak into every other widget.
+const CODE_FAMILY: &str = "code";
+
+/// Build and install egui's font stack, optionally registering `code` as the [`CODE_FAMILY`]
+/// family. Called once at startup and again whenever the code-font preference changes — `set_fonts`
+/// replaces the whole stack, so the fallbacks have to be re-added here rather than layered on.
+fn apply_fonts(ctx: &egui::Context, code: Option<Vec<u8>>) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "NerdFontSymbols".to_owned(),
@@ -33993,6 +34812,17 @@ fn install_fallback_font(ctx: &egui::Context) {
         let fam = fonts.families.entry(family).or_default();
         fam.push("NerdFontSymbols".to_owned());
         fam.push("DejaVuSans".to_owned());
+    }
+    // The code family keeps the same two fallbacks behind it, so a programming font with no arrows
+    // or box-drawing glyphs still renders them rather than tofuing mid-listing.
+    if let Some(bytes) = code {
+        fonts
+            .font_data
+            .insert("CodeFont".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.families.insert(
+            egui::FontFamily::Name(CODE_FAMILY.into()),
+            vec!["CodeFont".to_owned(), "NerdFontSymbols".to_owned(), "DejaVuSans".to_owned()],
+        );
     }
     ctx.set_fonts(fonts);
 }
@@ -40456,6 +41286,160 @@ fn compute_peaks(samples: &[rodio::Sample], channels: usize, buckets: usize) -> 
     out
 }
 
+/// Spawn one resolved command, stream both its streams into `tx`, and return its exit code.
+///
+/// A free function, not a method: it runs on the worker thread and must not touch `Kaleidotron`.
+///
+/// stdout and stderr are read on **separate threads** feeding one channel. Reading them in
+/// sequence is the classic deadlock — a compiler that fills the stderr pipe while we are still
+/// blocked reading stdout stops dead, and the app looks hung with a half-finished build. (The same
+/// hazard the PDF decoder's stdin feeder thread exists to avoid.)
+fn run_one_exec(
+    e: &crate::tasks::Exec,
+    tx: &std::sync::mpsc::Sender<TaskMsg>,
+    child_slot: &std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    ctx: &egui::Context,
+) -> Option<i32> {
+    use std::io::BufRead;
+    let mut cmd = std::process::Command::new(&e.program);
+    cmd.args(&e.args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // No inherited stdin: a task that decides to prompt would otherwise block forever on a
+        // terminal that isn't there.
+        .stdin(std::process::Stdio::null());
+    if e.cwd.is_dir() {
+        cmd.current_dir(&e.cwd);
+    }
+    for (k, v) in &e.env {
+        cmd.env(k, v);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = tx.send(TaskMsg::Line(format!("{}: {err}", e.program)));
+            return None;
+        }
+    };
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    if let Ok(mut slot) = child_slot.lock() {
+        *slot = Some(child);
+    }
+    let pump = |r: Option<Box<dyn std::io::Read + Send>>, tx: std::sync::mpsc::Sender<TaskMsg>, ctx: egui::Context| {
+        std::thread::spawn(move || {
+            let Some(r) = r else { return };
+            for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
+                if tx.send(TaskMsg::Line(line)).is_err() {
+                    return;
+                }
+                // Without this an idle UI wouldn't repaint, so output would appear only when the
+                // mouse moved — the same trap the MIDI callback hit.
+                ctx.request_repaint();
+            }
+        })
+    };
+    let h1 = pump(out.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), tx.clone(), ctx.clone());
+    let h2 = pump(err.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), tx.clone(), ctx.clone());
+    let _ = h1.join();
+    let _ = h2.join();
+    // Take the child back out to wait on it: holding the lock across `wait` would block Stop for
+    // exactly as long as the task runs, which is when Stop matters.
+    let status = child_slot.lock().ok().and_then(|mut s| s.take()).and_then(|mut c| c.wait().ok());
+    status.and_then(|s| s.code())
+}
+
+/// One line of a running task's output, or the end of one.
+///
+/// Streamed over an `mpsc` exactly like the 16colors and search walkers: the UI thread must never
+/// block on a compile, and the point of an output panel is to watch it *arrive*.
+enum TaskMsg {
+    /// A new command in the chain started: its label and the command line as it was resolved.
+    Begin(String, String),
+    Line(String),
+    /// Exit status of the command that just finished; `None` when it could not be spawned at all.
+    End(Option<i32>),
+    /// The whole chain is over — carries `true` if every step succeeded.
+    Done(bool),
+}
+
+/// The starter written to `<data>/tasks/tasks.json` on first run.
+///
+/// Deliberately inert (`"tasks": []`): the point is that the file exists, is findable, and explains
+/// the format. Anything pre-filled would run programs the user never asked for and would differ from
+/// machine to machine.
+const GLOBAL_TASKS_TEMPLATE: &str = r#"// kaleidotron — GLOBAL tasks, in VS Code's tasks.json format.
+//
+// Tasks here are offered in EVERY folder, on top of whatever the project's own
+// .vscode/tasks.json defines. A project task of the same label wins, so this is
+// the place for general tools rather than per-project builds:
+//
+//   "IMAGE: Open in GIMP", "TEXTMODE: View in PabloDraw", "Convert to PNG", …
+//
+// Variables: ${file} ${fileDirname} ${fileBasename} ${fileBasenameNoExtension}
+//            ${fileExtname} ${relativeFile} ${workspaceFolder} ${env:VAR}
+//            ${config:some.key}  (from settings.json beside this file)
+// An unknown variable is left as-is so you can see it in the output panel.
+//
+// Not supported: problemMatcher, and interactive inputs (promptString/pickString).
+// A `type: "command"` input naming simpleBrowser.show DOES work — it opens its URL.
+{
+    "version": "2.0.0",
+    "tasks": [
+        // {
+        //     "label": "IMAGE: Open in GIMP",
+        //     "type": "shell",
+        //     "linux":   { "command": "setsid --fork gimp \"${file}\"" },
+        //     "osx":     { "command": "open -a GIMP \"${file}\"" },
+        //     "windows": { "command": "start \"\" gimp \"${file}\"" },
+        //     "presentation": { "reveal": "never" }
+        // }
+    ]
+}
+"#;
+
+/// A project task as the context menu needs it — enough to draw a row, borrowing nothing.
+#[derive(Clone)]
+struct TaskItem {
+    label: String,
+    detail: String,
+    /// Uses `${input:…}`; shown but disabled, so it is clear the task exists and why it can't run.
+    unsupported: bool,
+}
+
+/// What the output panel is showing: the run in progress, or the last one that finished.
+struct TaskRun {
+    /// The task the user actually asked for (dependencies run under its name).
+    label: String,
+    /// The command line currently executing, for the panel header.
+    current: String,
+    lines: Vec<String>,
+    running: bool,
+    /// `Some(true)` succeeded, `Some(false)` failed, `None` still running.
+    ok: Option<bool>,
+    started: f64,
+    finished: Option<f64>,
+}
+
+/// How many output lines one run keeps. A watch task or a verbose compile can emit output without
+/// end, and an unbounded `Vec<String>` is a slow memory leak that only shows up after an hour.
+const TASK_LINE_CAP: usize = 5000;
+
+/// Which viewer to use for a file that could plausibly go to either.
+///
+/// A source file has two genuinely useful readings: the rasterised page — which pans and takes the
+/// navigator, and is the nicest way to *look* at a listing — and the real text editor. Neither is
+/// wrong, so the choice is offered rather than guessed.
+#[derive(Clone, Copy, PartialEq)]
+enum OpenAs {
+    /// The rasterised tile blown up in the image viewer (navigator, zoom, recolor).
+    Image,
+    /// The text viewer, read-only.
+    Text,
+    /// The text viewer, with editing already switched on.
+    TextEdit,
+}
+
 enum TilePick {
     Pin,
     PinFolder, // pin the *current* folder (e.g. the 16colo artist/group/search) to Places
@@ -40475,6 +41459,8 @@ enum TilePick {
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
+    Task(String),          // "Tasks ▸" → run this project task with ${file} = this entry
+    Open(OpenAs),          // a source/text file → open it as image / text / text-and-edit
     PhHdr(&'static str),   // a Poly Haven HDRI → save the real .hdr at this resolution
     Steam(SteamAct),       // a Steam game → launch / open a Steam page / find videos
     YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
@@ -40944,8 +41930,55 @@ fn entry_context_menu(
     is_video: bool,         // a video (youtube or local) → offer "Add to list ▸"
     video_lists: &[String], // existing list names (for the "Add to list" submenu)
     ph_hdri: bool,          // this entry is a Poly Haven HDRI (→ offer the real .hdr download)
+    tasks: &[TaskItem],     // the project's .vscode tasks (→ "Tasks ▸", run with ${file} = entry)
+    is_code: bool,          // a source/text file → offer Preview (image) / View / Edit as text
 ) -> Option<TilePick> {
     let mut pick = None;
+    // A source/text file reads two ways and both are wanted: the rasterised page (pannable, with
+    // the navigator) and the real editor. Offered explicitly rather than guessed — and it is also
+    // the escape hatch when one of them can't handle a particular file.
+    if is_code {
+        if ui
+            .button("\u{1f5bc} Preview (image)")
+            .on_hover_text("The rendered page, with pan/zoom and the navigator")
+            .clicked()
+        {
+            pick = Some(TilePick::Open(OpenAs::Image));
+            ui.close();
+        }
+        if ui.button("\u{1f4c4} View (text)").on_hover_text("Selectable, searchable text").clicked() {
+            pick = Some(TilePick::Open(OpenAs::Text));
+            ui.close();
+        }
+        if ui.button("\u{270e} Edit (text)").on_hover_text("Open the text editor, editing enabled").clicked() {
+            pick = Some(TilePick::Open(OpenAs::TextEdit));
+            ui.close();
+        }
+        ui.separator();
+    }
+    // Project tasks, above "Open in…": a tasks.json entry is a per-project tool and generally more
+    // specific than a global file association, so it belongs where the eye lands first.
+    if !tasks.is_empty() {
+        ui.menu_button("\u{25b6} Tasks", |ui| {
+            for t in tasks {
+                let btn = egui::Button::new(&t.label);
+                let mut r = ui.add_enabled(!t.unsupported, btn);
+                if !t.detail.is_empty() {
+                    r = r.on_hover_text(&t.detail);
+                }
+                if t.unsupported {
+                    r = r.on_disabled_hover_text("Uses ${input:…}, which only VS Code can answer");
+                }
+                if r.clicked() {
+                    pick = Some(TilePick::Task(t.label.clone()));
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Run a task from this project's .vscode/tasks.json on this file");
+        ui.separator();
+    }
     // Open in… an external program registered for this file's type (View → Associations).
     if !entry.is_dir {
         let ext = entry
@@ -44914,6 +45947,40 @@ mod gui_tests {
         // The menu bar's top-level items exist in the accessibility tree.
         harness.get_by_label("File");
         harness.get_by_label("Help");
+    }
+
+    /// Opening a source file with a custom code font chosen must not panic.
+    ///
+    /// The regression: `Context::set_fonts` only takes effect on the *next* frame, so naming
+    /// `FontFamily::Name("code")` in the same frame that installed it panicked inside epaint
+    /// ("is not bound to any fonts") and killed the app the instant a `.bas` was opened. The font
+    /// here is the embedded DejaVu — a real, parseable TTF — so this exercises the success path,
+    /// which is the one that crashed; a font that fails to load never registered the family at all.
+    #[test]
+    fn opening_code_with_a_custom_font_does_not_panic() {
+        let dir = std::env::temp_dir().join("kt_code_font_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("PROG.BAS");
+        std::fs::write(&src, "DEFINT A-Z\nPRINT \"hi\"\nEND\n").expect("write");
+        let font = dir.join("test.ttf");
+        std::fs::write(&font, include_bytes!("../assets/DejaVuSans.ttf")).expect("write font");
+
+        let font_path = font.to_string_lossy().to_string();
+        let mut harness = Harness::builder().build_eframe(move |cc| {
+            let mut app = Kaleidotron::new(cc, CliArgs::default());
+            app.plugin_code = true;
+            app.registry.set_plugin("code", true);
+            app.code_font_path = font_path.clone();
+            app
+        });
+        // One frame to install the font, then open the file and keep drawing: the crash happened on
+        // the very first frame that laid out code, so several frames must survive.
+        harness.run_steps(2);
+        let ctx = harness.ctx.clone();
+        harness.state_mut().load_full(&ctx, src.clone());
+        harness.run_steps(3);
+        assert!(harness.state().text_doc.is_some(), "a .bas must open in the text viewer");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
