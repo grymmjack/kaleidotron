@@ -1297,6 +1297,72 @@ process spawning and the panel.
 - **Not implemented:** `problemMatcher` (compiler errors are text, not clickable), interactive
   `${input:…}` kinds, `isBackground`, task-level `dependsOrder`.
 
+## Amiga (Color)Fonts — decode, logo maker, DRAW export, IFF previews
+
+Five pieces, added together, for the Stone Oakvalley public ColorFonts collection (768 families).
+
+**`decode/amiga_font.rs` — the decoder.** An Amiga font family is a `NAME.font` *descriptor* naming
+one or more sizes, plus a sibling `NAME/` directory with a file per size (`36.8C`, `144.16C`). The
+size file is a complete **AmigaOS hunk executable** — its one code hunk is a `DiskFontHeader`, a
+`TextFont` struct and the glyph bitmaps, behind a real `moveq #0,d0 / rts` stub. A **ColorFont** is
+that `TextFont` with `FSF_COLORFONT` (0x40) in `tf_Style`, reinterpreted as a `ColorTextFont`: up to
+eight bitplanes plus a palette. So these are **indexed pixel art** and `decode` returns
+`PixImage::from_indexed` — swatches, `.GPL` export and the recolor pipeline all work on a font sheet.
+
+- **The one thing that will trip you: every `APTR` is a SEGMENT-relative offset, not a file offset.**
+  On a real load the hunk relocation records add the segment address to each, so the stored value is
+  the delta. `seg` is computed once (after the hunk header) and added to every pointer.
+- Palette entries are 4 bits/channel scaled by **17, not `<<4`**, so `0xF`→`0xFF` (a shift darkens
+  every font). Index 0 is the Amiga background and is forced transparent.
+- `.font` descriptors are **path-routed** in `decode_bytes` (like meshes/video) — they carry no
+  glyphs, only a relative path into a sibling dir; size files decode from bytes alone via the sniff
+  path, so a folder of them browses with no descriptors present. `AMIGA_FONT_EXTS` = `font` +
+  `2c`/`4c`/…/`256c`. Verified against the real archive: **698/698 size files parse, all colour.**
+
+**Logo maker (`draw_amiga_ui`, the TDF viewer's sibling).** Opening a `.font`/size file enters an
+interactive logo maker: type-to-sample via `amiga_font::render_text` (proportional, overlap-aware —
+negative Spacing kerns the 3D fonts into themselves, last-writer-wins on overlap, palette kept), the
+**same `recolor_sample` hook the TDF viewer uses** so the Recolor pane retints a whole logo, plus
+Spacing/Line-gap/Zoom and a transparency-checkerboard preview. One file is one font, so there is no
+font-index picker; `font_sample` is shared with the other font viewers. `is_amiga_font_ext` routes
+the single view; `ensure_amiga_loaded` follows a descriptor to its largest size and caches the parse.
+Exports: **Copy** (bitmap), **PNG**, and **DRAW font** (below).
+
+**DRAW CBF export (`amiga_font::to_draw_cbf`).** Turns a ColorFont into a DRAW **Color Bitmap Font**
+sheet — one strip with a marker row on top, glyphs left-to-right in their real colours. Written
+against DRAW's actual loader (`CBF_detect%` in `GUI/FONT-LIST.BM`), which INFERS almost everything:
+the background is **elected** (most frequent row-0 colour → transparent), widths are **implied** by
+marker gaps, glyphs map **positionally from ASCII 33**. Two disagreements silently corrupt the font
+if missed: **space is never a glyph** in a CBF (dropped, or every char shifts one early), and an
+internal gap must be **padded** not skipped. The range stops at the font's own last character (these
+are display fonts — DRAW aliases missing lowercase onto uppercase, which is what a logo font wants).
+It **refuses** rather than emit a sheet DRAW would misread — under ~3px average, the one-pixel markers
+outvote the background and DRAW elects the marker, inverting every glyph. The tests re-implement
+DRAW's row-0 election so the export is checked against the loader, not against my reading of it.
+`export_amiga_cbf` defaults the dialog into `~/git/DRAW/ASSETS/FONTS/COLOR_BITMAP/` when it exists.
+
+**Fetch (`amiga_fonts.rs`).** Go → **🅰 Amiga ColorFonts** downloads the site's single 46 MB archive
+once (cache-first, `robots.txt`-clean) and unpacks the curated `Fonts/` subtree into
+`<data>/amiga_fonts/` — skipping the six duplicate trees and the 1030 `.iff` previews, so the result
+is ~768 families not 3663 files. The menu label reads "(download)" until `is_present` (one directory
+stat) is true, then "Amiga ColorFonts". Worker thread + `poll_amiga_fetch`, mirroring the modarchive
+fetch. **Gotcha the real download caught:** the archive stores explicit directory entries and
+`ZipArchive::enclosed_name` strips their trailing slash, so `.../18CAROTGOLD/` arrived looking like a
+file, got written as a 0-byte file, and its size files then failed with "Not a directory". Skip dir
+entries by the zip's own `is_dir()` flag. A synthetic zip with clean paths never hit it; the real
+fetch failed on the first family — the `#[ignore]`d `fetches_the_real_archive` test is why it was
+found.
+
+**`decode/iff.rs` — IFF ILBM (`.iff`/`.ilbm`/`.lbm`).** The format the previews are stored in, and a
+generally useful Amiga bitmap decoder. Chunks in a `FORM`: BMHD/CMAP/CAMG/BODY. ILBM is
+**plane-interleaved** (plane 0's whole row, then plane 1's, …) so the core is un-interleaving to one
+index per pixel. Palette-preserving (`from_indexed`) like PCX, except the two Amiga colour modes,
+both per-pixel: **HAM** (hold-and-modify → true colour, no palette, returns RGBA) and **EHB**
+(extra-half-brite → a 64-entry palette, 32–63 the half-brights, stays indexed). Compression 0 (none)
+and 1 (ByteRun1/PackBits, output-bounded), 1–8 planes, optional mask plane skipped, grey-ramp
+fallback for a short CMAP. Verified: **all 1030 previews decode, 0 failures.** `is_image_ext` includes
+the exts so previews open in the viewer.
+
 ## Code viewer font + current-line highlight
 
 Preferences → Appearance → "Code viewer": `code_font_size` (6–32 pt), `code_font_path` (any
