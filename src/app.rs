@@ -1697,6 +1697,8 @@ pub struct Kaleidotron {
     amiga_snap: bool, // snap the preview zoom to an integer scale (crisp pixels), persisted
     amiga_crt: bool,  // ~1.2x vertical CRT-aspect stretch in the preview, persisted
     amiga_cell: u32,  // glyph-grid cell size in px, persisted
+    amiga_bg: [u8; 3],  // solid background colour for the preview + PNG/Copy (when amiga_bg_on)
+    amiga_bg_on: bool,  // fill the background (else a transparency checkerboard), persisted
     #[allow(clippy::type_complexity)]
     amiga_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<u8>)>, // key, tex, cols, codes
     tdf_bytes: Vec<u8>,
@@ -2422,6 +2424,8 @@ impl Kaleidotron {
     const AMIGA_SNAP_KEY: &'static str = "amiga_snap";
     const AMIGA_CRT_KEY: &'static str = "amiga_crt";
     const AMIGA_CELL_KEY: &'static str = "amiga_cell";
+    const AMIGA_BG_KEY: &'static str = "amiga_bg";
+    const AMIGA_BG_ON_KEY: &'static str = "amiga_bg_on";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
@@ -3495,6 +3499,8 @@ impl Kaleidotron {
             amiga_snap: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_SNAP_KEY)).unwrap_or(true),
             amiga_crt: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_CRT_KEY)).unwrap_or(false),
             amiga_cell: cc.storage.and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY)).unwrap_or(64).clamp(24, 160),
+            amiga_bg: cc.storage.and_then(|st| eframe::get_value::<[u8;3]>(st, Self::AMIGA_BG_KEY)).unwrap_or([0,0,0]),
+            amiga_bg_on: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_BG_ON_KEY)).unwrap_or(false),
             amiga_spacing: cc
                 .storage
                 .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_SPACING_KEY))
@@ -11151,12 +11157,14 @@ impl Kaleidotron {
                 want_cbf = true;
             }
         });
-        // The full-width sample field, on its own line — TDF-style.
+        // The full-width sample field — multiline, so Enter starts a new logo line (the same as
+        // the TDF viewer). Line height below controls the gap between rows.
         if ui
             .add(
-                egui::TextEdit::singleline(&mut self.font_sample)
+                egui::TextEdit::multiline(&mut self.font_sample)
+                    .desired_rows(2)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Type a word to render as a logo…"),
+                    .hint_text("type here — press Enter for a new line"),
             )
             .changed()
         {
@@ -11196,6 +11204,17 @@ impl Kaleidotron {
             if ui.checkbox(&mut self.amiga_crt, "CRT").on_hover_text("~1.2× vertical stretch for the Amiga's non-square pixels").changed() {
                 self.amiga_sample_tex = None;
             }
+            ui.separator();
+            // Background: a solid fill (baked into the preview + PNG/Copy) or the transparency
+            // checkerboard when off — mirrors the TTF viewer's BG control.
+            if ui.checkbox(&mut self.amiga_bg_on, "BG").on_hover_text("Fill the background with a solid colour (baked into PNG/Copy)").changed() {
+                self.amiga_sample_tex = None;
+            }
+            ui.add_enabled_ui(self.amiga_bg_on, |ui| {
+                if ui.color_edit_button_srgb(&mut self.amiga_bg).on_hover_text("Background colour").changed() {
+                    self.amiga_sample_tex = None;
+                }
+            });
         });
 
         // ── Design metrics readout, like TDF's "Design: W × H chars" ────────
@@ -11210,7 +11229,8 @@ impl Kaleidotron {
 
         // Deferred exports (they need `&mut self`, so run after the UI closures above).
         if want_copy {
-            let img = self.recolor_sample(path, rendered.clone());
+            let recolored = self.recolor_sample(path, rendered.clone());
+            let img = self.amiga_with_bg(recolored);
             self.copy_image_to_clipboard(&img);
         }
         if want_png {
@@ -11224,8 +11244,9 @@ impl Kaleidotron {
         // Snap rounds zoom to an integer so nearest-neighbour stays crisp; CRT stretches Y ~1.2×.
         let eff_zoom = if self.amiga_snap { self.amiga_zoom.round().max(1.0) } else { self.amiga_zoom };
         let y_stretch = if self.amiga_crt { 1.2 } else { 1.0 };
+        let bgk = if self.amiga_bg_on { format!("bg{:?}", self.amiga_bg) } else { "nobg".into() };
         let key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{bgk}",
             path.display(),
             sample,
             self.amiga_spacing,
@@ -11234,7 +11255,8 @@ impl Kaleidotron {
             self.recolor_ident()
         );
         if changed || self.amiga_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            let img = self.recolor_sample(path, rendered);
+            let recolored = self.recolor_sample(path, rendered);
+            let img = self.amiga_with_bg(recolored);
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [img.width as usize, img.height as usize],
                 &img.rgba_bytes(),
@@ -11261,6 +11283,7 @@ impl Kaleidotron {
 
         let preview = self.amiga_sample_tex.as_ref().map(|(_, t)| (t.id(), t.size()));
         let grid = self.amiga_grid_tex.as_ref().map(|(_, t, ..)| (t.id(), t.size()));
+        let bg_on = self.amiga_bg_on;
         let mut cell_edit = self.amiga_cell;
         egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
             if let Some((id, [w, h])) = preview {
@@ -11268,8 +11291,10 @@ impl Kaleidotron {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                    let ppp = ui.ctx().pixels_per_point();
-                    self.paint_transparency_backdrop(ui.painter(), rect, ppp);
+                    if !bg_on {
+                        let ppp = ui.ctx().pixels_per_point();
+                        self.paint_transparency_backdrop(ui.painter(), rect, ppp);
+                    }
                     ui.painter().image(
                         id,
                         rect,
@@ -11333,9 +11358,38 @@ impl Kaleidotron {
     }
 
     /// Save the styled Amiga sample as a PNG next to a chosen path.
+    /// Flatten the logo onto the chosen solid background when BG is on — so the preview, the PNG and
+    /// the clipboard bitmap all agree. Off, the image keeps its transparency (checkerboard preview,
+    /// transparent PNG). Runs AFTER recolor, so the background sits under the retinted art.
+    fn amiga_with_bg(&self, img: crate::image_types::PixImage) -> crate::image_types::PixImage {
+        if !self.amiga_bg_on {
+            return img;
+        }
+        let bg = [self.amiga_bg[0], self.amiga_bg[1], self.amiga_bg[2], 255];
+        let pixels: Vec<[u8; 4]> = img
+            .pixels
+            .iter()
+            .map(|&p| {
+                if p[3] == 0 {
+                    bg
+                } else if p[3] == 255 {
+                    [p[0], p[1], p[2], 255]
+                } else {
+                    // Alpha-blend a partial pixel over the background (a recoloured edge).
+                    let a = p[3] as u32;
+                    let mix = |f: u8, b: u8| ((f as u32 * a + b as u32 * (255 - a)) / 255) as u8;
+                    [mix(p[0], bg[0]), mix(p[1], bg[1]), mix(p[2], bg[2]), 255]
+                }
+            })
+            .collect();
+        crate::image_types::PixImage::from_rgba(img.width, img.height, pixels)
+    }
+
     fn export_amiga_png(&mut self, font: &crate::decode::amiga_font::ColorFont, sample: &str) {
         let path = self.amiga_path.clone().unwrap_or_default();
-        let img = self.recolor_sample(&path, crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap));
+        let rendered = crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap);
+        let recolored = self.recolor_sample(&path, rendered);
+        let img = self.amiga_with_bg(recolored);
         let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         if let Some(dst) = rfd::FileDialog::new().set_file_name(format!("{slug}.png")).add_filter("PNG", &["png"]).save_file() {
             match image::save_buffer(&dst, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
@@ -34691,6 +34745,8 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::AMIGA_SNAP_KEY, &self.amiga_snap);
         eframe::set_value(storage, Self::AMIGA_CRT_KEY, &self.amiga_crt);
         eframe::set_value(storage, Self::AMIGA_CELL_KEY, &self.amiga_cell);
+        eframe::set_value(storage, Self::AMIGA_BG_KEY, &self.amiga_bg);
+        eframe::set_value(storage, Self::AMIGA_BG_ON_KEY, &self.amiga_bg_on);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
