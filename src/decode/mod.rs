@@ -256,6 +256,14 @@ impl Registry {
             if audio::AUDIO_EXTS.contains(&ext.as_str()) {
                 return caught(|| audio::SoundDecoder::decode_ext(bytes, &ext));
             }
+            // TGA has NO magic bytes, so the sniff pass above can never match it and the
+            // image crate's `with_guessed_format` fails on it — every .tga spun forever.
+            // Hand the format in explicitly; the extension is the only evidence there is.
+            if ext == "tga" {
+                return caught(|| {
+                    builtin::ImageCrateDecoder::decode_with(bytes, image::ImageFormat::Tga)
+                });
+            }
             for d in &self.decoders {
                 if d.extensions().iter().any(|e| *e == ext) {
                     return decode_caught(d.as_ref(), bytes);
@@ -332,6 +340,54 @@ mod tests {
         assert!(r.known_extension("PNG"));
         assert!(r.known_extension("png"));
         assert!(!r.known_extension("xyz"));
+    }
+
+    /// A `.tga` decodes — the one format in the image-crate list with NO magic bytes.
+    ///
+    /// It carries no signature at the start of the file, so `guess_format` cannot identify it:
+    /// the sniff pass never matches, and `with_guessed_format` then fails, which meant every
+    /// single `.tga` ever opened produced a decode error and a thumbnail that spun forever —
+    /// while the extension was advertised as supported. Found by the QA harness, where the
+    /// fixture tile never stopped spinning.
+    ///
+    /// The fixture is written here by hand rather than by an encoder, so the test pins the
+    /// plain 24-bit uncompressed layout instead of whatever a tool happens to emit (ImageMagick,
+    /// for one, writes a colour-mapped TGA unless the image has enough colours to prevent it).
+    #[test]
+    fn decodes_a_tga_which_has_no_magic_bytes() {
+        let (w, h) = (4u16, 3u16);
+        let mut tga = vec![
+            0, // id length
+            0, // no colour map
+            2, // uncompressed true-colour
+            0, 0, 0, 0, 0, // colour map spec
+            0, 0, 0, 0, // x/y origin
+        ];
+        tga.extend_from_slice(&w.to_le_bytes());
+        tga.extend_from_slice(&h.to_le_bytes());
+        tga.push(24); // bits per pixel
+        tga.push(0); // descriptor: bottom-left origin
+        // BGR, bottom row first — so the LAST row written is the image's TOP row.
+        for row in 0..h {
+            for _ in 0..w {
+                if row == 0 {
+                    tga.extend_from_slice(&[0x00, 0x00, 0xFF]); // bottom row: red
+                } else {
+                    tga.extend_from_slice(&[0xFF, 0x00, 0x00]); // rest: blue
+                }
+            }
+        }
+
+        let reg = Registry::with_builtins();
+        let img = reg
+            .decode_bytes(&tga, Path::new("fixture.tga"))
+            .expect("a plain 24-bit TGA must decode");
+        assert_eq!((img.width, img.height), (4, 3));
+        // Bottom-left origin means the first row of the file is the BOTTOM of the image, so
+        // the decoder must flip it: the top-left pixel is blue and the bottom-left is red.
+        assert_eq!(img.pixels[0], [0x00, 0x00, 0xFF, 0xFF], "top-left should be blue");
+        let bottom_left = (img.height as usize - 1) * img.width as usize;
+        assert_eq!(img.pixels[bottom_left], [0xFF, 0x00, 0x00, 0xFF], "bottom-left should be red");
     }
 
     #[test]
