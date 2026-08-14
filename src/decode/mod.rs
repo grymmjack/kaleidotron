@@ -17,10 +17,12 @@ pub mod font;
 pub mod font3d; // 3D font extrusion (the "3D logo maker") → an extruded Mesh3D for mesh3d::render
 pub mod fon;
 pub mod ico;
+pub mod amiga_font;
 pub mod tdf;
 mod cp437_font;
 mod cp437_font_8x8;
 mod idf;
+mod iff;
 pub mod mesh3d; // 3D models (OBJ/STL/PLY/glTF/GLB/DAE) → CPU-rendered thumbnail + geometry
 pub mod opl3; // OPL3 FM-synth chip emulator (Opal port) — drives RAD playback
 mod pcx;
@@ -129,6 +131,7 @@ impl Registry {
             video_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
+                Box::new(iff::IlbmDecoder),           // .iff/.ilbm/.lbm Amiga ILBM (palette-preserving)
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
                 Box::new(psd::PsdDecoder),            // .psd flattened (psd crate)
                 Box::new(xcf::XcfDecoder),            // .xcf composited (xcf crate)
@@ -136,6 +139,7 @@ impl Registry {
                 Box::new(font::FontDecoder),          // .ttf/.otf/.ttc sample render (ab_glyph)
                 Box::new(tdf::TdfDecoder),            // .tdf TheDraw fonts (retrofont → CP437 render)
                 Box::new(fon::FonDecoder),            // .fon/.fnt Windows bitmap fonts (hand-rolled FNT)
+                Box::new(amiga_font::AmigaFontDecoder), // .font + <size>.<n>C Amiga (Color)Fonts
                 Box::new(xmind::XMindDecoder),        // .xmind mind map → SVG → raster (resvg)
                 Box::new(ansi::AnsiDecoder),          // .ans/.asc/.nfo/.diz (CP437 + ANSI)
                 Box::new(xbin::XBinDecoder),          // .xb/.xbin (binary ANSI: palette/font/RLE)
@@ -233,6 +237,12 @@ impl Registry {
             // tile is a real grabbed frame. `decode(bytes)` is never used for video.
             if video::VIDEO_EXTS.contains(&ext.as_str()) {
                 return caught(|| video::decode_thumb(path, 512));
+            }
+            // An Amiga `.font` is only a DESCRIPTOR: it names a size file in a sibling directory
+            // (`Aggress/36.8C`) and holds no glyphs itself, so it needs the PATH. The size files
+            // decode from bytes alone and go through the ordinary sniff/extension path.
+            if ext == "font" {
+                return caught(|| amiga_font::decode_path(path, bytes));
             }
         }
 

@@ -1038,6 +1038,7 @@ enum MenuAction {
     Search,
     ToggleTasksPanel, // show/hide the task output panel
     ReloadTasks,      // re-read this project's .vscode/tasks.json
+    AmigaFonts,  // open the bundled Amiga ColorFonts collection
     Refresh,     // re-scan the current folder (F5)
     HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
@@ -1549,6 +1550,7 @@ pub struct Kaleidotron {
     grid_gap_y: f32,        // vertical spacing between grid rows, in points
     grid_tile_border: bool, // draw a border + padding around each grid tile (persisted)
     caption_fields: u16,    // bitmask: what to show under each grid thumbnail
+    grid_hover_caption: bool, // hide tile captions; show them OSD-style over the hovered tile
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
     // sample-bank tiles so container kinds read at a glance. Accents are blended into
     // the theme background (`tile_category_bg`); off = the plain default everywhere.
@@ -1684,6 +1686,25 @@ pub struct Kaleidotron {
     font_pending_face: Option<usize>, // FON face to select once the font finishes loading (recall)
     // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
     tdf_path: Option<PathBuf>,
+    // Amiga (Color)Font logo maker — the parallel of the TDF viewer for `.font`/size files.
+    // One file is one font (unlike a TDF pack), so there's no font-index picker; everything else
+    // mirrors the TDF controls. Persisted where it makes sense so a session's look survives.
+    amiga_font: Option<crate::decode::amiga_font::ColorFont>, // the loaded font (None until opened)
+    amiga_path: Option<PathBuf>,                              // what `amiga_font` was decoded from
+    amiga_spacing: i32,  // per-glyph advance delta; negative kerns the overlap these fonts draw with
+    amiga_line_gap: i32, // extra pixels between rows of multi-line sample text
+    amiga_zoom: f32,     // preview zoom multiplier (persisted)
+    amiga_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "path|sample|spacing|recolor"
+    amiga_snap: bool, // snap the preview zoom to an integer scale (crisp pixels), persisted
+    amiga_crt: bool,  // ~1.2x vertical CRT-aspect stretch in the preview, persisted
+    amiga_cell: u32,  // glyph-grid cell size in px, persisted
+    amiga_bg: [u8; 3],  // solid background colour for the preview + PNG/Copy (when amiga_bg_on)
+    amiga_bg_on: bool,  // fill the background (else a transparency checkerboard), persisted
+    amiga_top_down: bool, // multi-line overlap z-order: top line wins (else bottom), persisted
+    amiga_presets: Vec<AmigaPreset>, // saved logo-maker setups (like the TDF/TTF viewers), persisted
+    amiga_preset_name: String,       // the Save-as / pick name field
+    #[allow(clippy::type_complexity)]
+    amiga_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<u8>)>, // key, tex, cols, codes
     tdf_bytes: Vec<u8>,
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
@@ -2319,6 +2340,7 @@ impl Kaleidotron {
     const GAP_Y_KEY: &'static str = "grid_gap_y";
     const TILE_BORDER_KEY: &'static str = "grid_tile_border";
     const CAPTION_KEY: &'static str = "caption_fields";
+    const GRID_HOVER_CAPTION_KEY: &'static str = "grid_hover_caption";
     /// Per-category tile backgrounds, stored as one record: `(enabled, folder, archive, container)`.
     const TILE_BG_KEY: &'static str = "tile_backgrounds";
     /// Draggable thumbnail-band heights for the Details / Recolor panes.
@@ -2401,6 +2423,16 @@ impl Kaleidotron {
     const FONT_PREVIEW_KEY: &'static str = "font_preview_text";
     const FONT_PREVIEW_ON_KEY: &'static str = "font_preview_on";
     const FONT_GRID_CELL_KEY: &'static str = "font_grid_cell";
+    const AMIGA_SPACING_KEY: &'static str = "amiga_spacing";
+    const AMIGA_LINE_GAP_KEY: &'static str = "amiga_line_gap";
+    const AMIGA_ZOOM_KEY: &'static str = "amiga_zoom";
+    const AMIGA_SNAP_KEY: &'static str = "amiga_snap";
+    const AMIGA_CRT_KEY: &'static str = "amiga_crt";
+    const AMIGA_CELL_KEY: &'static str = "amiga_cell";
+    const AMIGA_BG_KEY: &'static str = "amiga_bg";
+    const AMIGA_BG_ON_KEY: &'static str = "amiga_bg_on";
+    const AMIGA_TOP_DOWN_KEY: &'static str = "amiga_top_down";
+    const AMIGA_PRESETS_KEY: &'static str = "amiga_presets";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
@@ -3318,6 +3350,7 @@ impl Kaleidotron {
             grid_gap_y,
             grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
             caption_fields,
+            grid_hover_caption: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY)).unwrap_or(false),
             tile_bg_enabled,
             tile_bg_folder,
             tile_bg_archive,
@@ -3467,6 +3500,33 @@ impl Kaleidotron {
                 .unwrap_or_default(),
             font_preset_name: String::new(),
             font_pending_face: None,
+            amiga_font: None,
+            amiga_path: None,
+            amiga_sample_tex: None,
+            amiga_grid_tex: None,
+            amiga_snap: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_SNAP_KEY)).unwrap_or(true),
+            amiga_crt: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_CRT_KEY)).unwrap_or(false),
+            amiga_cell: cc.storage.and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY)).unwrap_or(64).clamp(24, 160),
+            amiga_bg: cc.storage.and_then(|st| eframe::get_value::<[u8;3]>(st, Self::AMIGA_BG_KEY)).unwrap_or([0,0,0]),
+            amiga_bg_on: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_BG_ON_KEY)).unwrap_or(false),
+            amiga_top_down: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_TOP_DOWN_KEY)).unwrap_or(true),
+            amiga_presets: cc.storage.and_then(|st| eframe::get_value::<Vec<AmigaPreset>>(st, Self::AMIGA_PRESETS_KEY)).unwrap_or_default(),
+            amiga_preset_name: String::new(),
+            amiga_spacing: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_SPACING_KEY))
+                .unwrap_or(0)
+                .clamp(-40, 40),
+            amiga_line_gap: cc
+                .storage
+                .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_LINE_GAP_KEY))
+                .unwrap_or(2)
+                .clamp(-40, 40),
+            amiga_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::AMIGA_ZOOM_KEY))
+                .unwrap_or(2.0)
+                .clamp(0.25, 8.0),
             tdf_path: None,
             tdf_bytes: Vec::new(),
             tdf_fonts: Vec::new(),
@@ -3934,6 +3994,7 @@ impl Kaleidotron {
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
+            e(A, "grid_hover_caption", self.grid_hover_caption, "hide grid captions; show them on hover as an overlay"),
             e(A, "table_grid", self.table_grid, "dividing lines in the table view"),
             e(A, "transp_solid", self.transp_solid, "transparency backdrop: false = checkerboard, true = solid"),
             e(A, "transp_color", self.transp_color, "solid transparency backdrop colour [r, g, b]"),
@@ -4037,6 +4098,9 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "caption_fields") {
             self.caption_fields = v as u16;
+        }
+        if let Some(v) = st::get_bool(&m, "grid_hover_caption") {
+            self.grid_hover_caption = v;
         }
         if let Some(v) = st::get_bool(&m, "table_grid") {
             self.table_grid = v;
@@ -6821,6 +6885,16 @@ impl Kaleidotron {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ma_open_rx = None,
+        }
+    }
+
+    /// Open the bundled Amiga ColorFonts collection — seed the embedded zip to `<data>/bundled/`
+    /// (first run only) and browse it as an archive, exactly like the TheDraw font library. The
+    /// bundle is FLAT (one file per font in one folder), so Left/Right steps between fonts.
+    fn open_amiga_fonts(&mut self) {
+        match crate::amiga_fonts::bundle_zip_path(&self.data_dir) {
+            Some(path) => self.open_folder(path),
+            None => self.status = "Couldn't unpack the bundled Amiga fonts".into(),
         }
     }
 
@@ -11033,6 +11107,506 @@ impl Kaleidotron {
         if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{slug}.tdf")).add_filter("TheDraw font", &["tdf"]).save_file() {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&path)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// The Amiga (Color)Font **logo maker** — the TDF viewer's sibling for `.font`/size files.
+    ///
+    /// Type text, it lays out through `amiga_font::render_text` (proportional, overlap-aware,
+    /// palette-preserving), and the same `recolor_sample` hook the TDF viewer uses means the Recolor
+    /// pane retints a whole logo. Exports the styled sample as a PNG or, closing the loop to DRAW, as
+    /// a Color Bitmap Font.
+    ///
+    /// One file is one font, so there is no font-index picker; otherwise the controls mirror TDF.
+    fn draw_amiga_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path) {
+        self.ensure_amiga_loaded(path);
+        let Some(font) = self.amiga_font.clone() else {
+            ui.centered_and_justified(|ui| ui.label("Could not read this Amiga font."));
+            return;
+        };
+
+        let mut want_copy = false;
+        let mut want_png = false;
+        let mut want_cbf = false;
+        let mut changed = false;
+
+        // ── Header: name + metrics ──────────────────────────────────────────
+        // Title from the FILENAME (the family name in the flat bundle — `ALLOY`), like the TDF
+        // viewer shows `1911.TDF`, since the internal `dfh_Name` is sometimes just the size string.
+        let title = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| font.name.clone());
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(egui::RichText::new(&title).heading());
+            ui.separator();
+            let kind = if font.is_color {
+                format!("color · {}-plane · {} colours", font.depth, font.palette.len())
+            } else {
+                "mono".to_string()
+            };
+            ui.weak(format!("{}px · {} glyphs · {kind}", font.height, font.glyphs.len()));
+            // Surface the internal name too when it adds something (differs from the filename).
+            if !font.name.is_empty() && !title.eq_ignore_ascii_case(&font.name) {
+                ui.weak(format!("· “{}”", font.name));
+            }
+        });
+        ui.separator();
+
+        // ── Presets: save/recall/delete the whole logo setup by name (mirrors the TDF/TTF
+        //    viewers). Deferred — the combo closures can't borrow `self` while also mutating it.
+        let mut recall_amiga: Option<AmigaPreset> = None;
+        let mut save_amiga = false;
+        let mut delete_amiga: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let sel = if self.amiga_preset_name.is_empty() {
+                "— pick —".to_string()
+            } else {
+                self.amiga_preset_name.clone()
+            };
+            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
+            egui::ComboBox::from_id_salt("amiga_preset_pick")
+                .width(220.0)
+                .height(max_h)
+                .selected_text(sel)
+                .show_ui(ui, |ui| {
+                    for p in &self.amiga_presets {
+                        if ui
+                            .selectable_label(p.name == self.amiga_preset_name, &p.name)
+                            .clicked()
+                        {
+                            recall_amiga = Some(p.clone());
+                        }
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.amiga_preset_name)
+                    .desired_width(140.0)
+                    .hint_text("name…"),
+            );
+            if ui
+                .button("💾 Save")
+                .on_hover_text("Save the current font + settings under this name")
+                .clicked()
+            {
+                save_amiga = true;
+            }
+            let can_del = self
+                .amiga_presets
+                .iter()
+                .any(|p| p.name == self.amiga_preset_name.trim());
+            if ui
+                .add_enabled(can_del, egui::Button::new("✕"))
+                .on_hover_text("Delete this preset")
+                .clicked()
+            {
+                delete_amiga = Some(self.amiga_preset_name.trim().to_string());
+            }
+        });
+        if let Some(p) = recall_amiga {
+            self.apply_amiga_preset(ctx, &p);
+            changed = true;
+        }
+        if save_amiga {
+            let name = self.amiga_preset_name.clone();
+            self.save_amiga_preset(&name);
+        }
+        if let Some(name) = delete_amiga {
+            self.amiga_presets.retain(|p| p.name != name);
+            self.status = format!("Deleted preset “{name}”");
+        }
+
+        // ── Sample row: label + export buttons (mirrors the TDF viewer's) ───
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Sample");
+            if ui.button("📋 PNG").on_hover_text("Save the styled sample as a PNG").clicked() {
+                want_png = true;
+            }
+            if ui.button("📋 Copy").on_hover_text("Copy the styled sample to the clipboard as a bitmap").clicked() {
+                want_copy = true;
+            }
+            if ui
+                .button("⬇ DRAW font")
+                .on_hover_text("Export as a DRAW Color Bitmap Font (.bmp) into ASSETS/FONTS/COLOR_BITMAP/")
+                .clicked()
+            {
+                want_cbf = true;
+            }
+        });
+        // The full-width sample field — multiline, so Enter starts a new logo line (the same as
+        // the TDF viewer). Line height below controls the gap between rows.
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut self.font_sample)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("type here — press Enter for a new line"),
+            )
+            .changed()
+        {
+            changed = true;
+        }
+
+        // ── Controls row: sliders for spacing / line height / zoom + toggles ─
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Spacing");
+            if ui
+                .add(egui::Slider::new(&mut self.amiga_spacing, -20..=20).show_value(false))
+                .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40)).changed() {
+                changed = true;
+            }
+            ui.separator();
+            ui.label("Line height");
+            if ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false)).changed() {
+                changed = true;
+            }
+            if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80)).changed() {
+                changed = true;
+            }
+            ui.separator();
+            ui.label("Zoom");
+            ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
+            ui.label(format!("{:.1}×", self.amiga_zoom));
+            ui.separator();
+            // Snap = integer preview scale (crisp pixels); CRT = ~1.2x vertical stretch.
+            if ui.checkbox(&mut self.amiga_snap, "Snap").on_hover_text("Snap zoom to a whole-pixel scale").changed() {
+                self.amiga_sample_tex = None;
+            }
+            if ui.checkbox(&mut self.amiga_crt, "CRT").on_hover_text("~1.2× vertical stretch for the Amiga's non-square pixels").changed() {
+                self.amiga_sample_tex = None;
+            }
+            ui.separator();
+            // Background: a solid fill (baked into the preview + PNG/Copy) or the transparency
+            // checkerboard when off — mirrors the TTF viewer's BG control.
+            if ui.checkbox(&mut self.amiga_bg_on, "BG").on_hover_text("Fill the background with a solid colour (baked into PNG/Copy)").changed() {
+                self.amiga_sample_tex = None;
+            }
+            ui.add_enabled_ui(self.amiga_bg_on, |ui| {
+                if ui.color_edit_button_srgb(&mut self.amiga_bg).on_hover_text("Background colour").changed() {
+                    self.amiga_sample_tex = None;
+                }
+            });
+            ui.separator();
+            // Multi-line overlap z-order — which line wins where a tight (negative) line-height
+            // makes rows touch. Mirrors the TTF/TDF viewer's "Lines" control.
+            ui.label("Lines");
+            let cur = if self.amiga_top_down { "Top Down" } else { "Bottom Up" };
+            egui::ComboBox::from_id_salt("amiga_zorder")
+                .selected_text(cur)
+                .show_ui(ui, |ui| {
+                    let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
+                    let b = ui.selectable_value(&mut self.amiga_top_down, false, "Bottom Up");
+                    if a.changed() || b.changed() {
+                        self.amiga_sample_tex = None;
+                    }
+                })
+                .response
+                .on_hover_text("Which line draws on top where rows overlap");
+        });
+
+        // ── Design metrics readout, like TDF's "Design: W × H chars" ────────
+        let sample = if self.font_sample.trim().is_empty() {
+            "AMIGA".to_string()
+        } else {
+            self.font_sample.clone()
+        };
+        let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
+        ui.weak(format!("Design: {} × {} px", rendered.width, rendered.height));
+        ui.separator();
+
+        // Deferred exports (they need `&mut self`, so run after the UI closures above).
+        if want_copy {
+            let recolored = self.recolor_sample(path, rendered.clone());
+            let img = self.amiga_with_bg(recolored);
+            self.copy_image_to_clipboard(&img);
+        }
+        if want_png {
+            self.export_amiga_png(&font, &sample);
+        }
+        if want_cbf {
+            self.export_amiga_cbf(&font);
+        }
+
+        // ── The big preview ─────────────────────────────────────────────────
+        // Snap rounds zoom to an integer so nearest-neighbour stays crisp; CRT stretches Y ~1.2×.
+        let eff_zoom = if self.amiga_snap { self.amiga_zoom.round().max(1.0) } else { self.amiga_zoom };
+        let y_stretch = if self.amiga_crt { 1.2 } else { 1.0 };
+        let bgk = if self.amiga_bg_on { format!("bg{:?}", self.amiga_bg) } else { "nobg".into() };
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}|{bgk}",
+            path.display(),
+            sample,
+            self.amiga_spacing,
+            self.amiga_line_gap,
+            self.pipeline_key(),
+            self.recolor_ident()
+        );
+        if changed || self.amiga_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            let recolored = self.recolor_sample(path, rendered);
+            let img = self.amiga_with_bg(recolored);
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba_bytes(),
+            );
+            let tex = ctx.load_texture("amiga_sample", color, egui::TextureOptions::NEAREST);
+            self.amiga_sample_tex = Some((key, tex));
+        }
+
+        // Build the glyph grid too, so it lands below the preview.
+        let cell = self.amiga_cell as usize;
+        let grid_cols = 16usize;
+        let gkey = format!("{}|{}|{}|{}", path.display(), cell, self.pipeline_key(), self.recolor_ident());
+        if self.amiga_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+            if let Some((img, codes)) = crate::decode::amiga_font::render_glyph_grid(&font, grid_cols, cell) {
+                let img = self.recolor_sample(path, img);
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba_bytes(),
+                );
+                let tex = ctx.load_texture("amiga_grid", color, egui::TextureOptions::NEAREST);
+                self.amiga_grid_tex = Some((gkey, tex, grid_cols, codes));
+            }
+        }
+
+        let preview = self.amiga_sample_tex.as_ref().map(|(_, t)| (t.id(), t.size()));
+        let grid = self.amiga_grid_tex.as_ref().map(|(_, t, ..)| (t.id(), t.size()));
+        let bg_on = self.amiga_bg_on;
+        let mut cell_edit = self.amiga_cell;
+        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
+            if let Some((id, [w, h])) = preview {
+                let size = egui::vec2(w as f32 * eff_zoom, h as f32 * eff_zoom * y_stretch);
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    if !bg_on {
+                        let ppp = ui.ctx().pixels_per_point();
+                        self.paint_transparency_backdrop(ui.painter(), rect, ppp);
+                    }
+                    ui.painter().image(
+                        id,
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                });
+            }
+            // ── Glyph browser, like TDF's "Glyphs (N) · Cell [slider]" ──────
+            ui.add_space(10.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(format!("Glyphs ({})", font.glyphs.len()));
+                ui.separator();
+                ui.label("Cell");
+                ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
+            });
+            if let Some((id, [w, h])) = grid {
+                ui.add_space(4.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32, h as f32), egui::Sense::hover());
+                ui.painter().image(
+                    id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+        if cell_edit != self.amiga_cell {
+            self.amiga_cell = cell_edit;
+            self.amiga_grid_tex = None;
+        }
+    }
+
+    /// Decode the Amiga font at `path` once and cache it. `.font` descriptors resolve to their
+    /// largest size; size files decode directly.
+    fn ensure_amiga_loaded(&mut self, path: &Path) {
+        if self.amiga_path.as_deref() == Some(path) && self.amiga_font.is_some() {
+            return;
+        }
+        let real = self.resolve_local(path);
+        self.amiga_font = std::fs::read(&real).ok().and_then(|bytes| {
+            let is_desc =
+                path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("font"));
+            if is_desc {
+                // Follow the descriptor to a size file, then parse THAT for the glyph data.
+                let entries = crate::decode::amiga_font::parse_descriptor(&bytes).ok()?;
+                let dir = real.parent()?;
+                let mut entries = entries;
+                entries.sort_by_key(|(_, y)| std::cmp::Reverse(*y));
+                entries.iter().find_map(|(rel, _)| {
+                    let sz = std::fs::read(dir.join(rel.replace('\\', "/"))).ok()?;
+                    crate::decode::amiga_font::parse(&sz).ok()
+                })
+            } else {
+                crate::decode::amiga_font::parse(&bytes).ok()
+            }
+        });
+        self.amiga_path = Some(path.to_path_buf());
+        self.amiga_sample_tex = None;
+    }
+
+    /// Save the current Amiga logo-maker setup under a name (replacing a same-named preset), incl. a
+    /// full Recolor-pane snapshot. Mirrors `save_tdf_preset`.
+    fn save_amiga_preset(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "Name the preset first.".into();
+            return;
+        }
+        let preset = AmigaPreset {
+            name: name.to_string(),
+            font_path: self
+                .amiga_path
+                .as_ref()
+                .map(|p| self.to_display(p).display().to_string())
+                .unwrap_or_default(),
+            font_real: self
+                .amiga_path
+                .as_ref()
+                .map(|p| self.resolve_local(p).display().to_string())
+                .unwrap_or_default(),
+            sample: self.font_sample.clone(),
+            spacing: self.amiga_spacing,
+            line_gap: self.amiga_line_gap,
+            zoom: self.amiga_zoom,
+            top_down: self.amiga_top_down,
+            snap: self.amiga_snap,
+            crt: self.amiga_crt,
+            bg: self.amiga_bg,
+            bg_on: self.amiga_bg_on,
+            fx: Some(self.capture_fx_preset(String::new())),
+        };
+        if let Some(slot) = self.amiga_presets.iter_mut().find(|p| p.name == name) {
+            *slot = preset;
+            self.status = format!("Updated preset “{name}”");
+        } else {
+            self.amiga_presets.push(preset);
+            self.status = format!("Saved preset “{name}”");
+        }
+    }
+
+    /// Recall an Amiga preset: open its font (if different — re-mounting the bundle if the temp is
+    /// gone from a previous session), then apply every setting incl. the full recolor. Mirrors
+    /// `apply_tdf_preset`.
+    fn apply_amiga_preset(&mut self, ctx: &egui::Context, preset: &AmigaPreset) {
+        let target = if preset.font_real.is_empty() {
+            PathBuf::from(&preset.font_path)
+        } else {
+            PathBuf::from(&preset.font_real)
+        };
+        let cur_real = self.amiga_path.as_ref().map(|p| self.resolve_local(p));
+        let mut loaded = false;
+        if !target.as_os_str().is_empty() && cur_real.as_deref() != Some(target.as_path()) {
+            // A bundled font lives in the mounted-archive temp dir, which may not exist in a fresh
+            // session — seed + mount the collection so the deterministic temp path resolves again.
+            if !target.exists() {
+                if let Some(zip) = crate::amiga_fonts::bundle_zip_path(&self.data_dir) {
+                    self.enter_archive(zip);
+                }
+            }
+            if target.exists() {
+                self.load_full(ctx, target);
+                loaded = true;
+            } else {
+                self.status = format!(
+                    "Preset “{}”: font not found — open the Amiga ColorFonts library once, then retry.",
+                    preset.name
+                );
+            }
+        }
+        let _ = loaded;
+        self.font_sample = preset.sample.clone();
+        self.amiga_spacing = preset.spacing.clamp(-40, 40);
+        self.amiga_line_gap = preset.line_gap.clamp(-40, 80);
+        self.amiga_zoom = if preset.zoom > 0.0 { preset.zoom } else { 2.0 };
+        self.amiga_top_down = preset.top_down;
+        self.amiga_snap = preset.snap;
+        self.amiga_crt = preset.crt;
+        self.amiga_bg = preset.bg;
+        self.amiga_bg_on = preset.bg_on;
+        if let Some(fx) = &preset.fx {
+            let fx = fx.clone();
+            self.apply_fx_preset(&fx);
+        }
+        self.amiga_preset_name = preset.name.clone();
+        self.amiga_sample_tex = None; // force a re-render with the recalled settings
+    }
+
+    /// Save the styled Amiga sample as a PNG next to a chosen path.
+    /// Flatten the logo onto the chosen solid background when BG is on — so the preview, the PNG and
+    /// the clipboard bitmap all agree. Off, the image keeps its transparency (checkerboard preview,
+    /// transparent PNG). Runs AFTER recolor, so the background sits under the retinted art.
+    fn amiga_with_bg(&self, img: crate::image_types::PixImage) -> crate::image_types::PixImage {
+        if !self.amiga_bg_on {
+            return img;
+        }
+        let bg = [self.amiga_bg[0], self.amiga_bg[1], self.amiga_bg[2], 255];
+        let pixels: Vec<[u8; 4]> = img
+            .pixels
+            .iter()
+            .map(|&p| {
+                if p[3] == 0 {
+                    bg
+                } else if p[3] == 255 {
+                    [p[0], p[1], p[2], 255]
+                } else {
+                    // Alpha-blend a partial pixel over the background (a recoloured edge).
+                    let a = p[3] as u32;
+                    let mix = |f: u8, b: u8| ((f as u32 * a + b as u32 * (255 - a)) / 255) as u8;
+                    [mix(p[0], bg[0]), mix(p[1], bg[1]), mix(p[2], bg[2]), 255]
+                }
+            })
+            .collect();
+        crate::image_types::PixImage::from_rgba(img.width, img.height, pixels)
+    }
+
+    fn export_amiga_png(&mut self, font: &crate::decode::amiga_font::ColorFont, sample: &str) {
+        let path = self.amiga_path.clone().unwrap_or_default();
+        let rendered = crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
+        let recolored = self.recolor_sample(&path, rendered);
+        let img = self.amiga_with_bg(recolored);
+        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        if let Some(dst) = rfd::FileDialog::new().set_file_name(format!("{slug}.png")).add_filter("PNG", &["png"]).save_file() {
+            match image::save_buffer(&dst, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Saved {}", short_name(&dst)),
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Export the font as a DRAW Color Bitmap Font `.bmp` (see `amiga_font::to_draw_cbf`).
+    ///
+    /// The whole font, not the sample — a CBF is a character set, and DRAW does the logo assembly
+    /// itself once it has the glyphs. Defaults into `~/git/DRAW/ASSETS/FONTS/COLOR_BITMAP/` when
+    /// that directory exists, which is where DRAW picks fonts up at startup.
+    fn export_amiga_cbf(&mut self, font: &crate::decode::amiga_font::ColorFont) {
+        let sheet = match crate::decode::amiga_font::to_draw_cbf(font) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Can't export “{}”: {e}", font.name);
+                return;
+            }
+        };
+        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        let mut dlg = rfd::FileDialog::new().set_file_name(format!("{slug}.bmp")).add_filter("BMP", &["bmp"]);
+        if let Some(home) = std::env::var_os("HOME") {
+            let draw = PathBuf::from(home).join("git/DRAW/ASSETS/FONTS/COLOR_BITMAP");
+            if draw.is_dir() {
+                dlg = dlg.set_directory(draw);
+            }
+        }
+        if let Some(dst) = dlg.save_file() {
+            // BMP through the image crate so DRAW's `_LOADIMAGE` reads it straight.
+            match image::save_buffer(&dst, &sheet.rgba_bytes(), sheet.width, sheet.height, image::ColorType::Rgba8) {
+                Ok(()) => self.status = format!("Exported CBF → {}", short_name(&dst)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
         }
@@ -18575,6 +19149,15 @@ impl Kaleidotron {
             if ui.selectable_label(self.table_view, "Table").clicked() {
                 self.table_view = true;
             }
+            // Grid-only: hide the per-tile captions and instead reveal them as a
+            // sliding OSD panel over whichever tile the pointer is on — a clean,
+            // image-only wall of thumbnails until you hover.
+            if !self.table_view {
+                ui.checkbox(&mut self.grid_hover_caption, "Show text on hover")
+                    .on_hover_text(
+                        "Hide tile captions; show name/metadata over the hovered tile instead",
+                    );
+            }
             ui.separator();
             ui.label("Sort:");
             // While browsing YouTube, add Duration + Views to the combo.
@@ -23050,7 +23633,10 @@ impl Kaleidotron {
         let cap_lines =
             (self.caption_fields.count_ones() as usize).max(if any_dir { 1 } else { 0 })
                 + usize::from(in_search);
-        let caption_h = if cap_lines == 0 {
+        // "Show text on hover": collapse the reserved caption strip so the grid is pure
+        // image tiles; the same text is painted as a sliding OSD panel over the hovered
+        // tile instead (see the caption block below).
+        let caption_h = if cap_lines == 0 || self.grid_hover_caption {
             0.0
         } else {
             cap_lines as f32 * CAP_LINE_H + 3.0
@@ -23724,6 +24310,72 @@ impl Kaleidotron {
                                     egui::FontId::proportional(11.0),
                                     color,
                                 );
+                            }
+                        }
+
+                        // "Show text on hover": no reserved caption strip (caption_h == 0), so
+                        // paint the same info as an OSD panel that slides up from the bottom of
+                        // the hovered tile — dark translucent background, light text, mirroring
+                        // the viewer's metadata OSD. Painted within the thumbnail rect and
+                        // clipped to it, so it never bleeds into a neighbouring tile.
+                        if self.grid_hover_caption {
+                            let t = ui.ctx().animate_bool_with_time(
+                                resp.id.with("hovercap"),
+                                resp.hovered(),
+                                0.12,
+                            );
+                            if t > 0.001 {
+                                let folder = (in_search && !entry.is_dir)
+                                    .then(|| self.result_folder_label(&entry.path));
+                                let nm = short_name(&entry.path);
+                                let mut lines = Vec::new();
+                                // The tile itself is now the only label, so lead with the name.
+                                lines.push(nm.clone());
+                                lines.extend(
+                                    caption_lines(
+                                        &entry,
+                                        meta,
+                                        self.caption_fields,
+                                        folder.as_deref(),
+                                    )
+                                    .into_iter()
+                                    // caption_lines already leads with the name for files; drop a
+                                    // duplicate first line so we don't show it twice.
+                                    .enumerate()
+                                    .filter_map(|(i, l)| (!(i == 0 && l == nm)).then_some(l)),
+                                );
+                                let line_h = 13.0_f32;
+                                let pad = 4.0_f32;
+                                let panel_h =
+                                    (lines.len() as f32 * line_h + pad * 2.0).min(rect.height());
+                                // Slide up: fully shown top = rect.bottom() - panel_h.
+                                let top = rect.bottom() - panel_h * t;
+                                let panel = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left(), top),
+                                    egui::pos2(rect.right(), rect.bottom()),
+                                );
+                                let p = ui.painter_at(rect); // clip to the thumbnail
+                                let a = (220.0 * t) as u8;
+                                p.rect_filled(
+                                    panel,
+                                    egui::CornerRadius::same(3),
+                                    egui::Color32::from_black_alpha(a),
+                                );
+                                let ta = (235.0 * t) as u8;
+                                let text_c = egui::Color32::from_white_alpha(ta);
+                                let max_chars = ((tile - 8.0) / 6.0).max(3.0) as usize;
+                                for (li, line) in lines.iter().enumerate() {
+                                    let y = rect.bottom() - panel_h * t
+                                        + pad
+                                        + li as f32 * line_h;
+                                    p.text(
+                                        egui::pos2(rect.center().x, y),
+                                        egui::Align2::CENTER_TOP,
+                                        elide(line, max_chars),
+                                        egui::FontId::proportional(if li == 0 { 11.5 } else { 10.5 }),
+                                        text_c,
+                                    );
+                                }
                             }
                         }
 
@@ -25303,6 +25955,11 @@ impl Kaleidotron {
             // Windows bitmap-font viewer (.fon/.fnt): size picker + type-to-sample + glyph grid.
             if is_fon_ext(&p) {
                 self.draw_fon_ui(ctx, ui, &p);
+                return;
+            }
+            // Amiga (Color)Font logo maker (.font / <size>.<n>C): type-to-sample + PNG/CBF export.
+            if is_amiga_font_ext(&p) {
+                self.draw_amiga_ui(ctx, ui, &p);
                 return;
             }
         }
@@ -28653,6 +29310,7 @@ impl Kaleidotron {
             ("Reset thumbnail size".into(), "View".into(), Menu(MenuAction::ResetThumb)),
             ("Go to parent folder".into(), "Go  Backspace".into(), Menu(MenuAction::Up)),
             ("Go home".into(), "Go".into(), Menu(MenuAction::Home)),
+            ("Amiga ColorFonts".into(), "Go".into(), Menu(MenuAction::AmigaFonts)),
         ];
         // Navigating to a source is the commonest thing you'd want a palette for, and these come
         // straight from the rail's own table so the two can't drift.
@@ -30648,6 +31306,7 @@ impl Kaleidotron {
                     }
                 }
             }
+            MenuAction::AmigaFonts => self.open_amiga_fonts(),
             MenuAction::Home => {
                 if let Some(h) = home_dir() {
                     self.open_folder(h);
@@ -30692,6 +31351,7 @@ impl Kaleidotron {
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
         // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
         let mut open_bundled_tdf: Option<Option<&'static str>> = None;
+        let mut open_amiga_fonts = false;
         let mut recent_remove: Option<PathBuf> = None; // Recent → "Remove"
         let mut recent_clear = false;
         let mut steam_random = false; // "Random game → videos" clicked in the Steam tab
@@ -30852,6 +31512,15 @@ impl Kaleidotron {
                                 open_bundled_tdf = Some(Some("Multi-color"));
                             }
                         });
+                        // The bundled Amiga ColorFonts collection — 564 public-archive colour fonts
+                        // in one flat folder (so Left/Right steps between them), each a logo maker.
+                        if ui
+                            .button("🅰 Amiga ColorFonts")
+                            .on_hover_text("Browse the bundled Amiga colour-font collection — a logo maker per font, export to DRAW")
+                            .clicked()
+                        {
+                            open_amiga_fonts = true;
+                        }
                         if let Some(p) = self.favorites_buttons(ui, "📁", |p| !any_remote(p), false)
                         {
                             nav = Some(p);
@@ -32167,6 +32836,8 @@ impl Kaleidotron {
                     self.status = "Saved search to Places (click it to re-run)".into();
                 }
             }
+        } else if open_amiga_fonts {
+            self.open_amiga_fonts();
         } else if let Some(cat) = open_bundled_tdf {
             self.open_bundled_tdf(cat);
         } else if let Some(p) = nav {
@@ -34329,6 +35000,16 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::FONT_PREVIEW_KEY, &self.font_preview_text);
         eframe::set_value(storage, Self::FONT_PREVIEW_ON_KEY, &self.font_preview_on);
         eframe::set_value(storage, Self::FONT_GRID_CELL_KEY, &self.font_grid_cell);
+        eframe::set_value(storage, Self::AMIGA_SPACING_KEY, &self.amiga_spacing);
+        eframe::set_value(storage, Self::AMIGA_LINE_GAP_KEY, &self.amiga_line_gap);
+        eframe::set_value(storage, Self::AMIGA_ZOOM_KEY, &self.amiga_zoom);
+        eframe::set_value(storage, Self::AMIGA_SNAP_KEY, &self.amiga_snap);
+        eframe::set_value(storage, Self::AMIGA_CRT_KEY, &self.amiga_crt);
+        eframe::set_value(storage, Self::AMIGA_CELL_KEY, &self.amiga_cell);
+        eframe::set_value(storage, Self::AMIGA_BG_KEY, &self.amiga_bg);
+        eframe::set_value(storage, Self::AMIGA_BG_ON_KEY, &self.amiga_bg_on);
+        eframe::set_value(storage, Self::AMIGA_TOP_DOWN_KEY, &self.amiga_top_down);
+        eframe::set_value(storage, Self::AMIGA_PRESETS_KEY, &self.amiga_presets);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
@@ -34412,6 +35093,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TILE_BORDER_KEY, &self.grid_tile_border);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
+        eframe::set_value(storage, Self::GRID_HOVER_CAPTION_KEY, &self.grid_hover_caption);
         eframe::set_value(storage, Self::DETAILS_THUMB_H_KEY, &self.details_thumb_h);
         eframe::set_value(storage, Self::RECOLOR_THUMB_H_KEY, &self.recolor_thumb_h);
         eframe::set_value(
@@ -35601,6 +36283,30 @@ struct FontPreset {
     apply_recolor: bool,
     face_index: usize, // FON: which embedded face
     fx: Option<FxPreset>,
+}
+
+/// A saved logo-maker "setup" for the **Amiga ColorFont** viewer (parallels [`TdfPreset`] /
+/// [`FontPreset`]): the font file + sample text + spacing / line-height / zoom / z-order / display
+/// toggles + background + the full recolor snapshot. `#[serde(default)]` so old saves survive new
+/// fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct AmigaPreset {
+    name: String,
+    font_path: String, // display path (breadcrumb — e.g. `Amiga ColorFonts.zip/Aggress.8c`)
+    font_real: String, // resolvable on-disk path (a mount temp for a bundled font)
+    sample: String,
+    spacing: i32,
+    line_gap: i32,
+    zoom: f32,
+    #[serde(default = "default_true")]
+    top_down: bool, // multi-line overlap order (top line wins)
+    snap: bool,
+    crt: bool,
+    bg: [u8; 3],
+    bg_on: bool,
+    #[serde(default)]
+    fx: Option<FxPreset>, // full Recolor-pane snapshot so a retinted colour font restores as saved
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -39718,6 +40424,14 @@ fn is_font_ext(p: &Path) -> bool {
         .is_some_and(|e| crate::decode::font::FONT_EXTS.contains(&e.as_str()))
 }
 
+/// An Amiga (Color)Font — a `.font` descriptor or a `<size>.<n>C` size file → the logo maker.
+fn is_amiga_font_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| crate::decode::amiga_font::AMIGA_FONT_EXTS.contains(&e.as_str()))
+}
+
 /// A TheDraw font file (.tdf) → the interactive TDF font viewer (picker + type-to-sample).
 fn is_tdf_ext(p: &Path) -> bool {
     p.extension()
@@ -42953,7 +43667,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip", "pdf", "xmind",
+        "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
@@ -42968,6 +43682,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
                 || crate::decode::font::FONT_EXTS.contains(&x.as_str())
                 || crate::decode::tdf::TDF_EXTS.contains(&x.as_str())
                 || crate::decode::fon::FON_EXTS.contains(&x.as_str())
+                || crate::decode::amiga_font::AMIGA_FONT_EXTS.contains(&x.as_str())
                 || crate::decode::EPS_EXTS.contains(&x.as_str())
                 || x == "ai"
         }
