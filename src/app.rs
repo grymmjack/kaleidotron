@@ -1700,6 +1700,9 @@ pub struct Kaleidotron {
     amiga_cell: u32,  // glyph-grid cell size in px, persisted
     amiga_bg: [u8; 3],  // solid background colour for the preview + PNG/Copy (when amiga_bg_on)
     amiga_bg_on: bool,  // fill the background (else a transparency checkerboard), persisted
+    amiga_top_down: bool, // multi-line overlap z-order: top line wins (else bottom), persisted
+    amiga_presets: Vec<AmigaPreset>, // saved logo-maker setups (like the TDF/TTF viewers), persisted
+    amiga_preset_name: String,       // the Save-as / pick name field
     #[allow(clippy::type_complexity)]
     amiga_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<u8>)>, // key, tex, cols, codes
     tdf_bytes: Vec<u8>,
@@ -2428,6 +2431,8 @@ impl Kaleidotron {
     const AMIGA_CELL_KEY: &'static str = "amiga_cell";
     const AMIGA_BG_KEY: &'static str = "amiga_bg";
     const AMIGA_BG_ON_KEY: &'static str = "amiga_bg_on";
+    const AMIGA_TOP_DOWN_KEY: &'static str = "amiga_top_down";
+    const AMIGA_PRESETS_KEY: &'static str = "amiga_presets";
     const TDF_SPACING_KEY: &'static str = "tdf_spacing";
     const TDF_LINE_GAP_KEY: &'static str = "tdf_line_gap";
     const TDF_ZOOM_KEY: &'static str = "tdf_zoom";
@@ -3504,6 +3509,9 @@ impl Kaleidotron {
             amiga_cell: cc.storage.and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY)).unwrap_or(64).clamp(24, 160),
             amiga_bg: cc.storage.and_then(|st| eframe::get_value::<[u8;3]>(st, Self::AMIGA_BG_KEY)).unwrap_or([0,0,0]),
             amiga_bg_on: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_BG_ON_KEY)).unwrap_or(false),
+            amiga_top_down: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_TOP_DOWN_KEY)).unwrap_or(true),
+            amiga_presets: cc.storage.and_then(|st| eframe::get_value::<Vec<AmigaPreset>>(st, Self::AMIGA_PRESETS_KEY)).unwrap_or_default(),
+            amiga_preset_name: String::new(),
             amiga_spacing: cc
                 .storage
                 .and_then(|s| eframe::get_value::<i32>(s, Self::AMIGA_SPACING_KEY))
@@ -11146,6 +11154,71 @@ impl Kaleidotron {
                 ui.weak(format!("· “{}”", font.name));
             }
         });
+        ui.separator();
+
+        // ── Presets: save/recall/delete the whole logo setup by name (mirrors the TDF/TTF
+        //    viewers). Deferred — the combo closures can't borrow `self` while also mutating it.
+        let mut recall_amiga: Option<AmigaPreset> = None;
+        let mut save_amiga = false;
+        let mut delete_amiga: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let sel = if self.amiga_preset_name.is_empty() {
+                "— pick —".to_string()
+            } else {
+                self.amiga_preset_name.clone()
+            };
+            let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
+            egui::ComboBox::from_id_salt("amiga_preset_pick")
+                .width(220.0)
+                .height(max_h)
+                .selected_text(sel)
+                .show_ui(ui, |ui| {
+                    for p in &self.amiga_presets {
+                        if ui
+                            .selectable_label(p.name == self.amiga_preset_name, &p.name)
+                            .clicked()
+                        {
+                            recall_amiga = Some(p.clone());
+                        }
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.amiga_preset_name)
+                    .desired_width(140.0)
+                    .hint_text("name…"),
+            );
+            if ui
+                .button("💾 Save")
+                .on_hover_text("Save the current font + settings under this name")
+                .clicked()
+            {
+                save_amiga = true;
+            }
+            let can_del = self
+                .amiga_presets
+                .iter()
+                .any(|p| p.name == self.amiga_preset_name.trim());
+            if ui
+                .add_enabled(can_del, egui::Button::new("✕"))
+                .on_hover_text("Delete this preset")
+                .clicked()
+            {
+                delete_amiga = Some(self.amiga_preset_name.trim().to_string());
+            }
+        });
+        if let Some(p) = recall_amiga {
+            self.apply_amiga_preset(ctx, &p);
+            changed = true;
+        }
+        if save_amiga {
+            let name = self.amiga_preset_name.clone();
+            self.save_amiga_preset(&name);
+        }
+        if let Some(name) = delete_amiga {
+            self.amiga_presets.retain(|p| p.name != name);
+            self.status = format!("Deleted preset “{name}”");
+        }
 
         // ── Sample row: label + export buttons (mirrors the TDF viewer's) ───
         ui.horizontal_wrapped(|ui| {
@@ -11222,6 +11295,22 @@ impl Kaleidotron {
                     self.amiga_sample_tex = None;
                 }
             });
+            ui.separator();
+            // Multi-line overlap z-order — which line wins where a tight (negative) line-height
+            // makes rows touch. Mirrors the TTF/TDF viewer's "Lines" control.
+            ui.label("Lines");
+            let cur = if self.amiga_top_down { "Top Down" } else { "Bottom Up" };
+            egui::ComboBox::from_id_salt("amiga_zorder")
+                .selected_text(cur)
+                .show_ui(ui, |ui| {
+                    let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
+                    let b = ui.selectable_value(&mut self.amiga_top_down, false, "Bottom Up");
+                    if a.changed() || b.changed() {
+                        self.amiga_sample_tex = None;
+                    }
+                })
+                .response
+                .on_hover_text("Which line draws on top where rows overlap");
         });
 
         // ── Design metrics readout, like TDF's "Design: W × H chars" ────────
@@ -11230,7 +11319,7 @@ impl Kaleidotron {
         } else {
             self.font_sample.clone()
         };
-        let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap);
+        let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
         ui.weak(format!("Design: {} × {} px", rendered.width, rendered.height));
         ui.separator();
 
@@ -11364,6 +11453,93 @@ impl Kaleidotron {
         self.amiga_sample_tex = None;
     }
 
+    /// Save the current Amiga logo-maker setup under a name (replacing a same-named preset), incl. a
+    /// full Recolor-pane snapshot. Mirrors `save_tdf_preset`.
+    fn save_amiga_preset(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "Name the preset first.".into();
+            return;
+        }
+        let preset = AmigaPreset {
+            name: name.to_string(),
+            font_path: self
+                .amiga_path
+                .as_ref()
+                .map(|p| self.to_display(p).display().to_string())
+                .unwrap_or_default(),
+            font_real: self
+                .amiga_path
+                .as_ref()
+                .map(|p| self.resolve_local(p).display().to_string())
+                .unwrap_or_default(),
+            sample: self.font_sample.clone(),
+            spacing: self.amiga_spacing,
+            line_gap: self.amiga_line_gap,
+            zoom: self.amiga_zoom,
+            top_down: self.amiga_top_down,
+            snap: self.amiga_snap,
+            crt: self.amiga_crt,
+            bg: self.amiga_bg,
+            bg_on: self.amiga_bg_on,
+            fx: Some(self.capture_fx_preset(String::new())),
+        };
+        if let Some(slot) = self.amiga_presets.iter_mut().find(|p| p.name == name) {
+            *slot = preset;
+            self.status = format!("Updated preset “{name}”");
+        } else {
+            self.amiga_presets.push(preset);
+            self.status = format!("Saved preset “{name}”");
+        }
+    }
+
+    /// Recall an Amiga preset: open its font (if different — re-mounting the bundle if the temp is
+    /// gone from a previous session), then apply every setting incl. the full recolor. Mirrors
+    /// `apply_tdf_preset`.
+    fn apply_amiga_preset(&mut self, ctx: &egui::Context, preset: &AmigaPreset) {
+        let target = if preset.font_real.is_empty() {
+            PathBuf::from(&preset.font_path)
+        } else {
+            PathBuf::from(&preset.font_real)
+        };
+        let cur_real = self.amiga_path.as_ref().map(|p| self.resolve_local(p));
+        let mut loaded = false;
+        if !target.as_os_str().is_empty() && cur_real.as_deref() != Some(target.as_path()) {
+            // A bundled font lives in the mounted-archive temp dir, which may not exist in a fresh
+            // session — seed + mount the collection so the deterministic temp path resolves again.
+            if !target.exists() {
+                if let Some(zip) = crate::amiga_fonts::bundle_zip_path(&self.data_dir) {
+                    self.enter_archive(zip);
+                }
+            }
+            if target.exists() {
+                self.load_full(ctx, target);
+                loaded = true;
+            } else {
+                self.status = format!(
+                    "Preset “{}”: font not found — open the Amiga ColorFonts library once, then retry.",
+                    preset.name
+                );
+            }
+        }
+        let _ = loaded;
+        self.font_sample = preset.sample.clone();
+        self.amiga_spacing = preset.spacing.clamp(-40, 40);
+        self.amiga_line_gap = preset.line_gap.clamp(-40, 80);
+        self.amiga_zoom = if preset.zoom > 0.0 { preset.zoom } else { 2.0 };
+        self.amiga_top_down = preset.top_down;
+        self.amiga_snap = preset.snap;
+        self.amiga_crt = preset.crt;
+        self.amiga_bg = preset.bg;
+        self.amiga_bg_on = preset.bg_on;
+        if let Some(fx) = &preset.fx {
+            let fx = fx.clone();
+            self.apply_fx_preset(&fx);
+        }
+        self.amiga_preset_name = preset.name.clone();
+        self.amiga_sample_tex = None; // force a re-render with the recalled settings
+    }
+
     /// Save the styled Amiga sample as a PNG next to a chosen path.
     /// Flatten the logo onto the chosen solid background when BG is on — so the preview, the PNG and
     /// the clipboard bitmap all agree. Off, the image keeps its transparency (checkerboard preview,
@@ -11394,7 +11570,7 @@ impl Kaleidotron {
 
     fn export_amiga_png(&mut self, font: &crate::decode::amiga_font::ColorFont, sample: &str) {
         let path = self.amiga_path.clone().unwrap_or_default();
-        let rendered = crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap);
+        let rendered = crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
         let recolored = self.recolor_sample(&path, rendered);
         let img = self.amiga_with_bg(recolored);
         let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
@@ -34832,6 +35008,8 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::AMIGA_CELL_KEY, &self.amiga_cell);
         eframe::set_value(storage, Self::AMIGA_BG_KEY, &self.amiga_bg);
         eframe::set_value(storage, Self::AMIGA_BG_ON_KEY, &self.amiga_bg_on);
+        eframe::set_value(storage, Self::AMIGA_TOP_DOWN_KEY, &self.amiga_top_down);
+        eframe::set_value(storage, Self::AMIGA_PRESETS_KEY, &self.amiga_presets);
         eframe::set_value(storage, Self::TDF_SPACING_KEY, &self.tdf_spacing);
         eframe::set_value(storage, Self::TDF_LINE_GAP_KEY, &self.tdf_line_gap);
         eframe::set_value(storage, Self::TDF_ZOOM_KEY, &self.tdf_zoom);
@@ -36105,6 +36283,30 @@ struct FontPreset {
     apply_recolor: bool,
     face_index: usize, // FON: which embedded face
     fx: Option<FxPreset>,
+}
+
+/// A saved logo-maker "setup" for the **Amiga ColorFont** viewer (parallels [`TdfPreset`] /
+/// [`FontPreset`]): the font file + sample text + spacing / line-height / zoom / z-order / display
+/// toggles + background + the full recolor snapshot. `#[serde(default)]` so old saves survive new
+/// fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct AmigaPreset {
+    name: String,
+    font_path: String, // display path (breadcrumb — e.g. `Amiga ColorFonts.zip/Aggress.8c`)
+    font_real: String, // resolvable on-disk path (a mount temp for a bundled font)
+    sample: String,
+    spacing: i32,
+    line_gap: i32,
+    zoom: f32,
+    #[serde(default = "default_true")]
+    top_down: bool, // multi-line overlap order (top line wins)
+    snap: bool,
+    crt: bool,
+    bg: [u8; 3],
+    bg_on: bool,
+    #[serde(default)]
+    fx: Option<FxPreset>, // full Recolor-pane snapshot so a retinted colour font restores as saved
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

@@ -290,18 +290,26 @@ pub fn render_sheet(f: &ColorFont) -> PixImage {
 ///
 /// Palette-preserving: the result is `from_indexed`, so the recolor pane can retint a whole logo
 /// and the swatches read the font's colours.
-pub fn render_text(f: &ColorFont, text: &str, spacing: i32, line_gap: i32) -> PixImage {
+pub fn render_text(
+    f: &ColorFont,
+    text: &str,
+    spacing: i32,
+    line_gap: i32,
+    top_down: bool,
+) -> PixImage {
     let avg = (f.glyphs.iter().map(|g| g.width).sum::<u32>() / f.glyphs.len().max(1) as u32).max(1);
     let line_h = f.height as i32 + line_gap.max(-(f.height as i32) + 1);
 
-    // Lay out into (x, y, glyph) placements first so the canvas can be sized to the real extent —
-    // overlapping/negative spacing means a line's width is not just the sum of widths.
-    let mut placed: Vec<(i32, i32, &Glyph)> = Vec::new();
+    // Lay out into (x, y, line, glyph) placements first so the canvas can be sized to the real
+    // extent — overlapping/negative spacing means a line's width is not just the sum of widths.
+    let mut placed: Vec<(i32, i32, usize, &Glyph)> = Vec::new();
     let (mut x, mut y, mut max_x) = (0i32, 0i32, 0i32);
+    let mut line = 0usize;
     for ch in text.chars() {
         if ch == '\n' {
             x = 0;
             y += line_h;
+            line += 1;
             continue;
         }
         if ch == ' ' {
@@ -311,7 +319,7 @@ pub fn render_text(f: &ColorFont, text: &str, spacing: i32, line_gap: i32) -> Pi
         let code = ch as u32;
         match f.glyphs.iter().find(|g| g.code as u32 == code) {
             Some(g) if g.width > 0 => {
-                placed.push((x, y, g));
+                placed.push((x, y, line, g));
                 x += g.width as i32 + spacing;
                 max_x = max_x.max(x - spacing); // the glyph's right edge, not the post-advance cursor
             }
@@ -321,7 +329,14 @@ pub fn render_text(f: &ColorFont, text: &str, spacing: i32, line_gap: i32) -> Pi
     let w = max_x.max(1) as u32;
     let h = (y + f.height as i32).max(1) as u32;
     let mut indices = vec![0u8; (w * h) as usize];
-    for (gx, gy, g) in placed {
+    // Overlap z-order (matters when a negative line-gap makes rows touch): last writer wins, so
+    // for `top_down` draw the LOWER lines first and let line 0 (the top) overwrite — else the
+    // natural reading order leaves the bottom line on top. A stable sort by descending line index
+    // keeps each line's own left-to-right glyph order intact.
+    if top_down {
+        placed.sort_by_key(|&(_, _, l, _)| std::cmp::Reverse(l));
+    }
+    for (gx, gy, _line, g) in placed {
         for row in 0..f.height as i32 {
             let py = gy + row;
             if py < 0 || py as u32 >= h {
@@ -808,20 +823,42 @@ mod tests {
             .collect();
 
         // "AB" with zero spacing is 6 + 4 = 10 wide, 4 tall, indexed and palette-preserving.
-        let img = render_text(&f, "AB", 0, 0);
+        let img = render_text(&f, "AB", 0, 0, true);
         assert_eq!((img.width, img.height), (10, 4));
         assert!(img.indexed.is_some(), "a logo keeps the font palette");
 
         // A character the font lacks ('Z') advances by the average width but paints nothing, so
         // the canvas is wider than "AB" yet only "AB" is drawn.
-        let with_gap = render_text(&f, "AZB", 0, 0);
+        let with_gap = render_text(&f, "AZB", 0, 0, true);
         assert!(with_gap.width > img.width, "the missing glyph still advances the cursor");
 
         // Two lines stack; negative spacing overlaps rather than overflowing the canvas.
-        let two = render_text(&f, "A\nB", 0, 0);
+        let two = render_text(&f, "A\nB", 0, 0, true);
         assert_eq!(two.height, 8, "two rows of a 4px font");
-        let kerned = render_text(&f, "AB", -2, 0);
+        let kerned = render_text(&f, "AB", -2, 0, true);
         assert_eq!(kerned.width, 8, "-2 spacing pulls B two px into A");
+    }
+
+    /// The `top_down` flag flips which line wins where two rows overlap: top-down keeps the top
+    /// line's pixels, bottom-up keeps the bottom line's.
+    #[test]
+    fn z_order_chooses_the_overlap_winner() {
+        let mut f = parse(&synth()).expect("parses");
+        f.height = 4;
+        // Two glyphs painting *different* palette indices, so the overlap winner is observable.
+        f.glyphs = vec![
+            Glyph { code: b'A', width: 4, indices: vec![1u8; 16] },
+            Glyph { code: b'B', width: 4, indices: vec![2u8; 16] },
+        ];
+        // A big negative line-gap collapses the two rows onto each other so they overlap.
+        let top = render_text(&f, "A\nB", 0, -3, true);
+        let bot = render_text(&f, "A\nB", 0, -3, false);
+        let ti = top.indexed.expect("indexed").indices;
+        let bi = bot.indexed.expect("indexed").indices;
+        // Row 1 is the first overlapping scanline (line 0's row 1 and line 1's row 0 coincide).
+        let px = |ix: &[u8], x: u32, y: u32| ix[(y * top.width + x) as usize];
+        assert_eq!(px(&ti, 0, 1), 1, "top-down keeps the top line ('A' = index 1)");
+        assert_eq!(px(&bi, 0, 1), 2, "bottom-up keeps the bottom line ('B' = index 2)");
     }
 
     /// The glyph grid lays every glyph into a cell and keeps the palette.
@@ -857,7 +894,7 @@ mod tests {
         };
         let text = std::env::var("LOGO_TEXT").unwrap_or_else(|_| "AMIGA".into());
         let f = parse(&std::fs::read(&src).expect("read")).expect("parse");
-        let img = render_text(&f, &text, 0, 0);
+        let img = render_text(&f, &text, 0, 0, true);
         image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8)
             .expect("write");
         println!("wrote {out}: {}x{} for {text:?}", img.width, img.height);
