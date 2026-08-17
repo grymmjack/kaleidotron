@@ -19559,6 +19559,20 @@ impl Kaleidotron {
         }
     }
 
+    /// The ANSI-shade cell size in source (working) pixels — the same precedence
+    /// `pipe_aux` bakes into `shade_cw`/`shade_ch`: VGA50 → 8×8; else Snap 9×16 →
+    /// 9×16; else the Cell W/H (`dither_scale_x`×`dither_scale_y`). Drives the viewer
+    /// character ruler (cols/rows) so it matches the grid the export would produce.
+    fn ansi_cell_dims(&self) -> (usize, usize) {
+        if self.shade_vga50 {
+            (8, 8)
+        } else if self.shade_snap916 {
+            (9, 16)
+        } else {
+            (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
+        }
+    }
+
     /// The effective dither cell size on one axis when the pipeline runs on a `buf`-px
     /// buffer whose native size is `native`. The authored `raw` scale is defined
     /// against the full-res image, so on a downscaled buffer (preview / grid thumb) we
@@ -23555,26 +23569,29 @@ impl Kaleidotron {
                         });
                         // The fill fractions the ░▒▓ shade blocks stand for; the leading
                         // checkbox toggles whether that shade level is a candidate at all.
+                        // Each shade's slider is bounded to its own interior band (light
+                        // ░ ≤ mid ▒ ≤ dark ▓, never 0 or 1) so the ramp can't be inverted
+                        // or degenerate into a fake solid.
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f1_on, "");
                             ui.label("F1 ░");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.0..=1.0));
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
                             middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.10f32, 0.40f32);
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f2_on, "");
                             ui.label("F2 ▒");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.0..=1.0));
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
                             middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.40f32, 0.60f32);
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f3_on, "");
                             ui.label("F3 ▓");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.0..=1.0));
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
                             middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.60f32, 0.90f32);
                         });
                         if recolor.is_none() {
                             ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
@@ -23939,17 +23956,14 @@ impl Kaleidotron {
                     0u8,
                 )
             } else {
-                if palette.len() > 16 {
-                    note = format!(
-                        " (palette {} colors → mapped to nearest of first 16)",
-                        palette.len()
-                    );
+                // XBin embeds the palette (best-16 of the colours actually used), so it
+                // only "loses" colour when >16 distinct colours were used.
+                let (xb, reduced) =
+                    crate::thumb::ansi_grid_to_xbin(&grid, font_8x8, self.shade_ice);
+                if reduced {
+                    note = " (>16 colors used → reduced to 16 for XBin)".into();
                 }
-                (
-                    crate::thumb::ansi_grid_to_xbin(&grid, font_8x8, self.shade_ice),
-                    "xbin",
-                    1u8,
-                )
+                (xb, "xbin", 1u8)
             }
         } else {
             note = if depth == 2 {
@@ -28182,6 +28196,143 @@ impl Kaleidotron {
         ctx.request_repaint();
     }
 
+    /// Paint the ANSI-shade character ruler around the displayed image: column ticks +
+    /// numbers along the top, row ticks + numbers down the left, and a `cols×rows`
+    /// summary at the corner. `viewport` is the on-screen panel rect, `img_rect` the
+    /// (zoom+pan) on-screen image rect, `img_w`/`img_h` the source pixel dims. Ticks sit
+    /// in the margin just outside the art, clamped into the viewport when the image is
+    /// flush/overflowing so they stay visible. Subtle 1px lines + a small mono font.
+    fn draw_ansi_ruler(
+        &self,
+        painter: &egui::Painter,
+        viewport: egui::Rect,
+        img_rect: egui::Rect,
+        img_w: f32,
+        img_h: f32,
+    ) {
+        if img_w < 1.0 || img_h < 1.0 {
+            return;
+        }
+        let (cw, ch) = self.ansi_cell_dims();
+        let (cwf, chf) = (cw.max(1) as f32, ch.max(1) as f32);
+        let cols = (img_w / cwf).ceil() as usize;
+        let rows = (img_h / chf).ceil() as usize;
+        // Sanity: skip when there'd be thousands of ticks (avoids a slow, unreadable ruler).
+        if cols == 0 || rows == 0 || cols > 2000 || rows > 2000 {
+            return;
+        }
+        let sx = img_rect.width() / img_w; // screen px per source px, X
+        let sy = img_rect.height() / img_h; // screen px per source px, Y
+        let cell_sw = cwf * sx; // screen px per column
+        let cell_sh = chf * sy; // screen px per row
+        if cell_sw < 0.5 || cell_sh < 0.5 {
+            return; // too tiny to read anything meaningful
+        }
+        // Theme-aware, semi-transparent so the ruler doesn't fight the art.
+        let tc = painter.ctx().global_style().visuals.weak_text_color();
+        let line_col = egui::Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 150);
+        let major_col = egui::Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 210);
+        let text_col = egui::Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), 235);
+        let font = egui::FontId::monospace(9.0);
+        // Every-cell ticks only when a cell is ≥3px on screen; else just the majors.
+        let dense_x = cell_sw >= 3.0;
+        let dense_y = cell_sh >= 3.0;
+        // Smallest "nice" step whose on-screen spacing clears `min_gap` px (label thinning).
+        let nice_step = |cell_px: f32, min_gap: f32| -> usize {
+            for &n in &[1usize, 2, 5, 10, 20, 50, 100, 200, 500, 1000] {
+                if n as f32 * cell_px >= min_gap {
+                    return n;
+                }
+            }
+            1000
+        };
+        let label_step_x = nice_step(cell_sw, 30.0);
+        let label_step_y = nice_step(cell_sh, 22.0);
+        let (t_short, t_mid, t_major) = (3.0f32, 5.0, 8.0);
+        // Prefer the margin just outside the image; clamp into the viewport when the art
+        // is flush/overflowing so the ticks + labels remain on-screen.
+        let top_base = if img_rect.top() - viewport.top() >= 16.0 {
+            img_rect.top()
+        } else {
+            viewport.top() + 16.0
+        };
+        let left_base = if img_rect.left() - viewport.left() >= 26.0 {
+            img_rect.left()
+        } else {
+            viewport.left() + 26.0
+        };
+        // --- Top ruler (columns) ---
+        for c in 0..=cols {
+            let x = img_rect.left() + c as f32 * cell_sw;
+            if x < viewport.left() - 0.5 || x > viewport.right() + 0.5 {
+                continue; // off-screen horizontally
+            }
+            let is10 = c % 10 == 0;
+            if !dense_x && !is10 {
+                continue;
+            }
+            let (len, col) = if is10 {
+                (t_major, major_col)
+            } else if c % 5 == 0 {
+                (t_mid, line_col)
+            } else {
+                (t_short, line_col)
+            };
+            painter.line_segment(
+                [egui::pos2(x, top_base), egui::pos2(x, top_base - len)],
+                egui::Stroke::new(1.0, col),
+            );
+            if c % label_step_x == 0 {
+                painter.text(
+                    egui::pos2(x, top_base - t_major - 1.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    c.to_string(),
+                    font.clone(),
+                    text_col,
+                );
+            }
+        }
+        // --- Left ruler (rows) ---
+        for r in 0..=rows {
+            let y = img_rect.top() + r as f32 * cell_sh;
+            if y < viewport.top() - 0.5 || y > viewport.bottom() + 0.5 {
+                continue; // off-screen vertically
+            }
+            let is10 = r % 10 == 0;
+            if !dense_y && !is10 {
+                continue;
+            }
+            let (len, col) = if is10 {
+                (t_major, major_col)
+            } else if r % 5 == 0 {
+                (t_mid, line_col)
+            } else {
+                (t_short, line_col)
+            };
+            painter.line_segment(
+                [egui::pos2(left_base, y), egui::pos2(left_base - len, y)],
+                egui::Stroke::new(1.0, col),
+            );
+            if r % label_step_y == 0 {
+                painter.text(
+                    egui::pos2(left_base - t_major - 2.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    r.to_string(),
+                    font.clone(),
+                    text_col,
+                );
+            }
+        }
+        // --- Corner summary: cols×rows, just inside the top-left where the rulers meet. ---
+        painter.text(
+            egui::pos2(left_base + 3.0, top_base + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{cols}×{rows}"),
+            egui::FontId::monospace(10.0),
+            text_col,
+        );
+    }
+
     /// Single-view image painter: wheel-zoom + pinch + drag-pan (persisted zoom),
     /// then blit `tt` at its logical size. Shared by static images and GIF frames.
     /// Returns `Some(forward)` when a plain wheel turn should step the image
@@ -28518,6 +28669,17 @@ impl Kaleidotron {
                 );
                 painter.image(t.tex.id(), dst, full_uv, egui::Color32::WHITE);
             }
+        }
+
+        // --- ANSI Shade character ruler: column/row ticks + numbers around the image,
+        // so the user can read off the cell grid (cols×rows). Only in ANSI-shade mode
+        // with a live recolor, and never over an actual text-mode art file. `img_rect`
+        // already encodes zoom+pan, so the ruler tracks the art as it moves. ---
+        if self.dither_method == crate::thumb::DITHER_ANSI
+            && self.any_recolor_active()
+            && !self.viewing_textmode
+        {
+            self.draw_ansi_ruler(&painter, resp.rect, img_rect, sw, sh);
         }
 
         // --- navigator: scaled-down overview + the red "you are here" box ---

@@ -732,17 +732,21 @@ pub fn ansi_shade_grid(
         return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells };
     }
     // The active (coverage, glyph) candidates: always the space (0.0) and full block
-    // (1.0); the ░▒▓ mid levels only when their per-shade toggle is on.
+    // (1.0); the ░▒▓ mid levels only when their per-shade toggle is on. Each mid-shade
+    // is clamped to its OWN interior band (light→mid→dark) so it can never reach 0.0 or
+    // 1.0 — a coverage of exactly 0/1 turns a shade into a fake penalty-free solid that
+    // then out-competes █ and swallows the whole image (the "only F3" bug). The bands
+    // also keep the ramp ordered near each glyph's true fill (░≈¼ ▒≈½ ▓≈¾).
     let mut coverages: Vec<(f32, u8)> = Vec::with_capacity(5);
     coverages.push((0.0, SHADE_GLYPHS[0])); // space
     if f1_on {
-        coverages.push((f1.clamp(0.0, 1.0), SHADE_GLYPHS[1])); // ░
+        coverages.push((f1.clamp(0.10, 0.40), SHADE_GLYPHS[1])); // ░
     }
     if f2_on {
-        coverages.push((f2.clamp(0.0, 1.0), SHADE_GLYPHS[2])); // ▒
+        coverages.push((f2.clamp(0.40, 0.60), SHADE_GLYPHS[2])); // ▒
     }
     if f3_on {
-        coverages.push((f3.clamp(0.0, 1.0), SHADE_GLYPHS[3])); // ▓
+        coverages.push((f3.clamp(0.60, 0.90), SHADE_GLYPHS[3])); // ▓
     }
     coverages.push((1.0, SHADE_GLYPHS[4])); // █
     // Palette as f32 triples for the joint search.
@@ -1238,62 +1242,112 @@ pub fn palette_is_ega16(palette: &[[u8; 4]]) -> bool {
             .all(|a| palette.iter().any(|p| [p[0], p[1], p[2]] == *a))
 }
 
-/// Serialize an [`AnsiGrid`] to an **XBIN** file (embeds the exact palette + font, so
-/// non-EGA colours survive). Header `XBIN\x1A`, `width`/`height` (u16 LE cells),
-/// `fontsize` (8/16), `flags`; then a 16-colour 6-bit-DAC palette block, the CP437
-/// font bitmap, and `width*height` `(char, attribute)` cell pairs where
-/// `attribute = bg<<4 | fg` (palette indices mapped into 0..15). No SAUCE trailer —
-/// the caller appends that (shared with the `.ans` path).
-pub fn ansi_grid_to_xbin(grid: &AnsiGrid, font_8x8: bool, ice: bool) -> Vec<u8> {
+/// Serialize an [`AnsiGrid`] to an **XBIN** file (embeds the palette so non-EGA
+/// colours survive). Header `XBIN\x1A`, `width`/`height` (u16 LE cells), `fontsize`,
+/// `flags`; then a 16-colour 6-bit-DAC palette block, an *optional* font, and
+/// `width*height` `(char, attribute)` cell pairs where `attribute = bg16<<4 | fg16`.
+///
+/// The embedded 16-colour palette is built from the colours the grid ACTUALLY USES
+/// (not `palette[..16]`, which for e.g. ANSI32 is all cold blues/greys and would
+/// wreck warm cells): distinct used colours are embedded verbatim when ≤16, else
+/// median-cut to 16 representatives; every cell's fg/bg is remapped to its nearest
+/// embedded slot. A font is embedded ONLY for VGA50/8×8 (`font_8x8`); the 9×16 path
+/// draws standard CP437, so it omits the font (fontsize 0, flag clear) and lets the
+/// decoder fall back to the default 8×16 VGA font. No SAUCE trailer — the caller
+/// appends that. Returns `(bytes, reduced)` where `reduced` is true iff >16 distinct
+/// colours were used and had to be median-cut.
+pub fn ansi_grid_to_xbin(grid: &AnsiGrid, font_8x8: bool, ice: bool) -> (Vec<u8>, bool) {
+    // 1) Distinct palette indices actually referenced by the cells (fg + bg), in
+    //    first-seen order — the candidates for the embedded 16-colour palette.
+    let mut used: Vec<usize> = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    for cell in &grid.cells {
+        for idx in [cell.fg as usize, cell.bg as usize] {
+            if idx < grid.palette.len() && seen.insert(idx) {
+                used.push(idx);
+            }
+        }
+    }
+    let reduced = used.len() > 16;
+    // Embedded RGB palette (16 slots) + a map from ORIGINAL palette index → slot 0..15.
+    let mut embedded: Vec<[u8; 3]> = Vec::with_capacity(16);
+    let mut map16 = vec![0u8; grid.palette.len().max(1)];
+    if !reduced {
+        // ≤16 used → embed exactly those colours; each used index maps to its slot.
+        for (slot, &oi) in used.iter().enumerate() {
+            let c = grid.palette[oi];
+            embedded.push([c[0], c[1], c[2]]);
+            map16[oi] = slot as u8;
+        }
+    } else {
+        // >16 used → median-cut the used colours' RGB to 16 reps, then map each used
+        // index to its nearest embedded rep.
+        let used_rgba: Vec<[u8; 4]> = used
+            .iter()
+            .map(|&oi| {
+                let c = grid.palette[oi];
+                [c[0], c[1], c[2], 255]
+            })
+            .collect();
+        for r in median_cut(&used_rgba, 16) {
+            embedded.push([r[0], r[1], r[2]]);
+        }
+        let emb_rgba: Vec<[u8; 4]> = embedded.iter().map(|c| [c[0], c[1], c[2], 255]).collect();
+        for &oi in &used {
+            let c = grid.palette[oi];
+            map16[oi] = nearest_index([c[0], c[1], c[2]], &emb_rgba) & 0x0F;
+        }
+    }
+    while embedded.len() < 16 {
+        embedded.push([0, 0, 0]); // pad unused slots with black
+    }
+
+    // 2) Header.
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(b"XBIN");
     out.push(0x1A); // EOF marker inside the header
     out.extend_from_slice(&(grid.cols as u16).to_le_bytes());
     out.extend_from_slice(&(grid.rows as u16).to_le_bytes());
-    let fontsize: u8 = if font_8x8 { 8 } else { 16 };
+    // Only VGA50/8×8 embeds a font; the 9×16 path relies on the default 8×16 VGA font.
+    let (fontsize, has_font): (u8, bool) = if font_8x8 { (8, true) } else { (0, false) };
     out.push(fontsize);
-    // flags: bit0 palette present, bit1 font present, bit3 non-blink / iCE.
-    let mut flags = 0b0000_0011u8;
+    // flags: bit0 palette present; bit1 font present (VGA50 only); bit3 non-blink / iCE.
+    let mut flags = 0b0000_0001u8;
+    if has_font {
+        flags |= 0b0000_0010;
+    }
     if ice {
         flags |= 0b0000_1000;
     }
     out.push(flags);
-    // Palette block: 16 colours × RGB, each channel down to the 6-bit VGA DAC (v>>2).
-    for i in 0..16 {
-        let c = grid.palette.get(i).copied().unwrap_or([0, 0, 0, 255]);
+    // 3) Palette block: 16 × RGB, each channel down to the 6-bit VGA DAC (v>>2).
+    for c in &embedded {
         out.push(c[0] >> 2);
         out.push(c[1] >> 2);
         out.push(c[2] >> 2);
     }
-    // Font block: `fontsize` bytes per glyph × 256 glyphs (MSB-left, row-major).
-    for ch in 0..256usize {
-        if font_8x8 {
+    // 4) Font block — VGA50 only (256 × 8 rows, MSB-left).
+    if has_font {
+        for ch in 0..256usize {
             out.extend_from_slice(&CP437_8X8[ch]);
-        } else {
-            out.extend_from_slice(&CP437_8X16[ch]);
         }
     }
-    // Image data: (char, attribute) per cell. XBin attributes are 16-colour, so map
-    // any index ≥16 (palette larger than 16) to the nearest of the first 16 entries.
-    let first16 = &grid.palette[..grid.palette.len().min(16)];
-    let map16 = |idx: u8| -> u8 {
+    // 5) Image data: (char, attribute) per cell, indices remapped into the embedded 0..15.
+    let emap = |idx: u8| -> u8 {
         let i = idx as usize;
-        if i < 16 {
-            idx & 0x0F
-        } else if !first16.is_empty() {
-            let c = grid.palette[i.min(grid.palette.len().saturating_sub(1))];
-            nearest_index([c[0], c[1], c[2]], first16) & 0x0F
+        if i < map16.len() {
+            map16[i] & 0x0F
         } else {
             0
         }
     };
     for cell in &grid.cells {
         out.push(cell.ch);
-        let fg = map16(cell.fg);
-        let bg = map16(cell.bg);
+        let fg = emap(cell.fg);
+        let bg = emap(cell.bg);
         out.push((bg << 4) | fg);
     }
-    out
+    (out, reduced)
 }
 
 /// Build a thumbnail. Pixel art that already fits `max_dim` is stored at its

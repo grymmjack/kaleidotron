@@ -213,21 +213,25 @@ pub fn sauce_record(
     s[98..100].copy_from_slice(&rows.to_le_bytes()); // TInfo2 = height
     s[100..104].copy_from_slice(&[0, 0, 0, 0]); // TInfo3 / TInfo4
     s[104] = 0; // Comments
-    // TFlags: bit0 iCE/non-blink; bits1–2 letter-spacing (10 = 9px VGA, 01 = 8px VGA50).
-    let mut tflags = 0u8;
-    if ice {
-        tflags |= 0x01;
-    }
-    tflags |= if font_8x8 { 0b01 << 1 } else { 0b10 << 1 };
-    s[105] = tflags;
-    // TInfoS[22] = font name, NUL-padded.
+    // TFlags + TInfoS are CHARACTER-type hints. XBin (format 1) carries iCE + letter-
+    // spacing + font in its own binary header, so SAUCE leaves both blank; ANSi (0) and
+    // Tundra (2) keep the iCE + 9px/8px spacing bits and the font name.
     for b in s[106..128].iter_mut() {
-        *b = 0;
+        *b = 0; // TInfoS[22] — NUL-padded (blank for XBin)
     }
-    let font = if font_8x8 { "IBM VGA50" } else { "IBM VGA" };
-    let fb = font.as_bytes();
-    let n = fb.len().min(22);
-    s[106..106 + n].copy_from_slice(&fb[..n]);
+    let mut tflags = 0u8;
+    if format != 1 {
+        // TFlags: bit0 iCE/non-blink; bits1–2 letter-spacing (10 = 9px VGA, 01 = 8px VGA50).
+        if ice {
+            tflags |= 0x01;
+        }
+        tflags |= if font_8x8 { 0b01 << 1 } else { 0b10 << 1 };
+        let font = if font_8x8 { "IBM VGA50" } else { "IBM VGA" };
+        let fb = font.as_bytes();
+        let n = fb.len().min(22);
+        s[106..106 + n].copy_from_slice(&fb[..n]);
+    }
+    s[105] = tflags;
     s
 }
 
@@ -354,13 +358,19 @@ mod tests {
         assert!(p.ice);
         assert_eq!(p.date_pretty(), "2026-08-17");
         assert_eq!(p.font, "IBM VGA");
-        // XBin variant (format 1): DataType 6, 8×8 font name.
-        let x = sauce_record("X", 40, 12, 1, false, true, "20260817", 10);
+        // XBin variant (format 1): DataType 6. TFlags + font name are Character-type
+        // hints carried in the XBIN binary header, so SAUCE leaves them blank — even
+        // though font_8x8/ice are passed, the record must NOT reflect them.
+        let x = sauce_record("X", 40, 12, 1, true, true, "20260817", 10);
         let xf = x.to_vec();
         let px = parse(&xf).expect("xbin SAUCE parses");
         assert_eq!(px.kind_label(), "XBin");
-        assert_eq!(px.font, "IBM VGA50");
-        assert!(!px.ice);
+        assert_eq!(px.font, ""); // blank for XBin
+        assert!(!px.ice); // TFlags = 0 for XBin regardless of the ice arg
+        // TInfo1/TInfo2 (cols/rows) are still written; XBin reads its own header width,
+        // so `char_width()` (DataType 1/5 only) returns None — check the raw fields.
+        assert_eq!(px.tinfo1, 40);
+        assert_eq!(px.tinfo2, 12);
         // TundraDraw variant (format 2): DataType 1 / FileType 8 → "TundraDraw".
         let t = sauce_record("T", 100, 50, 2, false, false, "20260817", 20);
         let tf = t.to_vec();

@@ -319,4 +319,75 @@ mod tests {
         let img = XBinDecoder.decode(&d).unwrap();
         assert_eq!(img.pixels[0], [255, 255, 255, 255]);
     }
+
+    #[test]
+    fn xbin_encoder_embeds_used_colours_not_first_16() {
+        // A 32-colour palette whose first 16 are cold blues/greys and whose WARM red
+        // lives at index 20. A cell drawn in that red must decode back to pure red —
+        // proving the encoder embeds the USED colours, not palette[..16] (which has no
+        // red, so a first-16 mapping would pick a cold colour instead).
+        use crate::thumb::{ansi_grid_to_xbin, AnsiCell, AnsiGrid};
+        let mut palette: Vec<[u8; 4]> = (0..32)
+            .map(|i| [0, 0, (60 + i * 4) as u8, 255]) // cold blues, no red anywhere else
+            .collect();
+        palette[20] = [255, 0, 0, 255]; // warm red at index 20
+        let grid = AnsiGrid {
+            cols: 1,
+            rows: 1,
+            cell_w: 8,
+            cell_h: 16,
+            palette,
+            cells: vec![AnsiCell { fg: 20, bg: 0, ch: 0xDB }], // full block in red
+        };
+        let (bytes, reduced) = ansi_grid_to_xbin(&grid, false, false);
+        assert!(!reduced, "only 2 distinct colours used → no reduction");
+        let img = XBinDecoder.decode(&bytes).unwrap();
+        assert_eq!(img.pixels[0], [255, 0, 0, 255], "best-16, not first-16");
+    }
+
+    #[test]
+    fn xbin_9x16_omits_font_vga50_embeds_it() {
+        use crate::thumb::{ansi_grid_to_xbin, AnsiCell, AnsiGrid};
+        let mk = |font_8x8: bool| AnsiGrid {
+            cols: 1,
+            rows: 1,
+            cell_w: if font_8x8 { 8 } else { 9 },
+            cell_h: if font_8x8 { 8 } else { 16 },
+            palette: vec![[255, 255, 255, 255], [0, 0, 0, 255]],
+            cells: vec![AnsiCell { fg: 0, bg: 1, ch: 0xDB }],
+        };
+        // 9×16 path: no embedded font → fontsize 0, flag bit1 clear. Still decodes
+        // (falls back to the default 8×16 VGA font).
+        let (b916, _) = ansi_grid_to_xbin(&mk(false), false, false);
+        assert_eq!(b916[9], 0, "9×16 fontsize byte = 0");
+        assert_eq!(b916[10] & 0x02, 0, "9×16 font flag clear");
+        assert_eq!(b916[10] & 0x01, 0x01, "palette flag still set");
+        assert!(XBinDecoder.decode(&b916).is_ok());
+        // VGA50 path: embeds the 8×8 font → fontsize 8, flag bit1 set.
+        let (bv50, _) = ansi_grid_to_xbin(&mk(true), true, false);
+        assert_eq!(bv50[9], 8, "VGA50 fontsize byte = 8");
+        assert_eq!(bv50[10] & 0x02, 0x02, "VGA50 font flag set");
+        assert!(XBinDecoder.decode(&bv50).is_ok());
+    }
+
+    #[test]
+    fn xbin_encoder_reduces_when_over_16_used() {
+        // >16 distinct colours used → median-cut to 16, `reduced` flag set, still decodes.
+        use crate::thumb::{ansi_grid_to_xbin, AnsiCell, AnsiGrid};
+        let palette: Vec<[u8; 4]> = (0..40).map(|i| [(i * 6) as u8, 0, 0, 255]).collect();
+        let cells: Vec<AnsiCell> = (0..20)
+            .map(|i| AnsiCell { fg: i as u8, bg: (i + 1) as u8, ch: 0xDB })
+            .collect();
+        let grid = AnsiGrid {
+            cols: 20,
+            rows: 1,
+            cell_w: 8,
+            cell_h: 16,
+            palette,
+            cells,
+        };
+        let (bytes, reduced) = ansi_grid_to_xbin(&grid, false, false);
+        assert!(reduced, ">16 distinct colours used → reduced");
+        assert!(XBinDecoder.decode(&bytes).is_ok());
+    }
 }
