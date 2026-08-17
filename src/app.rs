@@ -45241,6 +45241,10 @@ pub struct CliArgs {
     pub batch_inputs: Vec<PathBuf>,   // --batch: images/folders to convert
     pub batch_preset: Option<String>, // --preset "NAME"
     pub batch_list: bool,             // --list-presets: print preset names and exit
+    // Per-run overrides of the preset's Fit-to-chars grid + cell (manifest-driven packs).
+    pub batch_cols: Option<usize>,        // --cols N: force the char grid width
+    pub batch_rows: Option<usize>,        // --rows N: force the char grid height
+    pub batch_cell: Option<(usize, usize)>, // --cell WxH: 8x8 | 8x16 | 9x16
 }
 
 const USAGE: &str = "\
@@ -45282,6 +45286,9 @@ BATCH OPTIONS (apply a PixelFX preset to images → textmode .ans/.xb/.tnd, no w
         --outdir <DIR>            Output folder (created if needed). Default: beside input.
         --format <FMT>            Textmode format override: auto | ans | ans16 | ans256 |
                                   ansrgb | xb | tnd. Default: the preset's export format.
+        --cols <N> / --rows <N>   Force the Fit-to-chars grid (overrides the preset's), so
+                                  a manifest can drive a per-asset size.
+        --cell <WxH>              Text cell: 8x8 (VGA50) | 8x16 (board) | 9x16 (VGA).
 
 Settings passed here override the persisted ones and are remembered afterward.
 ";
@@ -45344,6 +45351,18 @@ impl CliArgs {
                     None => cli_fail("--preset requires a preset name"),
                 },
                 "--list-presets" => out.batch_list = true,
+                "--cols" => match args.next().and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 => out.batch_cols = Some(n),
+                    _ => cli_fail("--cols requires a positive integer"),
+                },
+                "--rows" => match args.next().and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 => out.batch_rows = Some(n),
+                    _ => cli_fail("--rows requires a positive integer"),
+                },
+                "--cell" => match args.next().as_deref().and_then(parse_cell_dims) {
+                    Some(wh) => out.batch_cell = Some(wh),
+                    None => cli_fail("--cell requires WxH (8x8, 8x16, or 9x16)"),
+                },
                 "--font-9px" => out.render_font_9px = true,
                 "--scale" => match args.next() {
                     Some(v) => match v.parse::<u32>() {
@@ -45388,6 +45407,15 @@ fn cli_fail(msg: &str) -> ! {
 
 /// Parse a thumbnail size given as `N` or `WxH`. Tiles are square, so `WxH`
 /// collapses to `max(W, H)`.
+/// Parse a `WxH` text-cell size for `--cell` — one of the three real cells (8×8 VGA50,
+/// 8×16 board, 9×16 VGA). Anything else is rejected.
+fn parse_cell_dims(s: &str) -> Option<(usize, usize)> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let w = w.trim().parse::<usize>().ok()?;
+    let h = h.trim().parse::<usize>().ok()?;
+    matches!((w, h), (8, 8) | (8, 16) | (9, 16)).then_some((w, h))
+}
+
 fn parse_thumb_size(s: &str) -> Result<f32, String> {
     let bad = || format!("invalid thumbnail size '{s}' (use e.g. 160 or 120x160)");
     if let Some((w, h)) = s.split_once(['x', 'X', '×']) {
@@ -45849,6 +45877,42 @@ pub fn run_batch(cli: &CliArgs) -> i32 {
         );
         return 2;
     };
+    // Apply the per-run Fit-to-chars / cell overrides on a COPY of the preset — the preset
+    // supplies the look (palette + shading), `--cols/--rows/--cell` drive the size (so a
+    // manifest can dictate a per-asset grid while every piece keeps one colour identity).
+    let preset = {
+        let mut p = preset.clone();
+        if cli.batch_cols.is_some() || cli.batch_rows.is_some() || cli.batch_cell.is_some() {
+            p.shade_fit_chars = true;
+        }
+        if let Some(c) = cli.batch_cols {
+            p.shade_fit_cols = c;
+        }
+        if let Some(r) = cli.batch_rows {
+            p.shade_fit_rows = r;
+        }
+        if let Some((cw, ch)) = cli.batch_cell {
+            match (cw, ch) {
+                (8, 8) => {
+                    p.shade_vga50 = true;
+                    p.shade_snap916 = false;
+                }
+                (9, 16) => {
+                    p.shade_snap916 = true;
+                    p.shade_vga50 = false;
+                }
+                _ => {
+                    // 8×16 board cell: the "Cell W/H" path (neither snap toggle).
+                    p.shade_vga50 = false;
+                    p.shade_snap916 = false;
+                    p.dither_scale_x = cw;
+                    p.dither_scale_y = ch;
+                }
+            }
+        }
+        p
+    };
+    let preset = &preset;
     if let Some(d) = &cli.render_outdir {
         if let Err(e) = std::fs::create_dir_all(d) {
             eprintln!("kaleidotron: cannot create output dir {}: {e}", d.display());
