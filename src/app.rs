@@ -1582,9 +1582,15 @@ pub struct Kaleidotron {
     shade_f1_on: bool,    // include ░ (176) as a shade candidate
     shade_f2_on: bool,    // include ▒ (177) as a shade candidate
     shade_f3_on: bool,    // include ▓ (178) as a shade candidate
+    // Per half-block controls (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐), gated by `shade_half`.
+    // `shade_half_on[i]` includes that glyph as a candidate; `shade_half_use[i]` in
+    // 0..1 biases how often it's chosen (0.5 = neutral, higher = more).
+    shade_half_on: [bool; 4],
+    shade_half_use: [f32; 4],
     shade_vga50: bool,    // force 8×8 VGA50 cells + the 8×8 font (overrides snap 9×16)
     shade_amount: f32,    // 0..1: how much shading vs flat color (low = flats stay solid)
     shade_smooth: f32,    // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
+    shade_detail: f32,    // 0..1: half-block detail weight (high = keep edges crisp when shrunk)
     shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
     // Textmode EXPORT format (explicit): 0=Auto, 1=ANSI16 .ans, 2=ANSI256 .ans,
     // 3=ANSI truecolor .ans, 4=XBin .xb, 5=Tundra .tnd.
@@ -1624,10 +1630,10 @@ pub struct Kaleidotron {
     // + the remapped texture (keyed by a recolor string), so it updates live.
     preview_src: Option<(PathBuf, usize, usize, Vec<u8>)>,
     preview_tex: Option<(PathBuf, String, egui::TextureHandle)>,
-    // Cached ▓▒░ shade-glyph swatch textures (CP437 176/177/178) for the F1/F2/F3 UI
-    // rows — built from the real 8×16 glyph bitmap + NEAREST filtering so they're crisp
-    // at any UI scale. Rebuilt only when the theme fg/bg (the key) changes.
-    shade_swatch_tex: [Option<egui::TextureHandle>; 3],
+    // Cached CP437 glyph swatch textures (░▒▓ for F1/F2/F3, ▀▄▌▐ for F5–F8), keyed by
+    // the glyph byte — built from the real 8×16 glyph bitmap + NEAREST filtering so
+    // they're crisp at any UI scale. Cleared when the theme fg/bg (the key) changes.
+    shade_swatch_tex: HashMap<u8, egui::TextureHandle>,
     shade_swatch_key: Option<(u32, u32)>,
     // hotkeys (round 2 #12)
     keymap: HashMap<Action, egui::Key>,
@@ -2399,9 +2405,12 @@ impl Kaleidotron {
     const SHADE_F1_ON_KEY: &'static str = "shade_f1_on";
     const SHADE_F2_ON_KEY: &'static str = "shade_f2_on";
     const SHADE_F3_ON_KEY: &'static str = "shade_f3_on";
+    const SHADE_HALF_ON_KEY: &'static str = "shade_half_on";
+    const SHADE_HALF_USE_KEY: &'static str = "shade_half_use";
     const SHADE_VGA50_KEY: &'static str = "shade_vga50";
     const SHADE_AMOUNT_KEY: &'static str = "shade_amount";
     const SHADE_SMOOTH_KEY: &'static str = "shade_smooth";
+    const SHADE_DETAIL_KEY: &'static str = "shade_detail";
     const SHADE_ICE_KEY: &'static str = "shade_ice";
     const SHADE_EXPORT_FORMAT_KEY: &'static str = "shade_export_format";
     const SHADE_FIT_CHARS_KEY: &'static str = "shade_fit_chars";
@@ -2992,6 +3001,14 @@ impl Kaleidotron {
         let shade_f1_on = get_bool(Self::SHADE_F1_ON_KEY).unwrap_or(true);
         let shade_f2_on = get_bool(Self::SHADE_F2_ON_KEY).unwrap_or(true);
         let shade_f3_on = get_bool(Self::SHADE_F3_ON_KEY).unwrap_or(true);
+        let shade_half_on = cc
+            .storage
+            .and_then(|s| eframe::get_value::<[bool; 4]>(s, Self::SHADE_HALF_ON_KEY))
+            .unwrap_or([true; 4]);
+        let shade_half_use = cc
+            .storage
+            .and_then(|s| eframe::get_value::<[f32; 4]>(s, Self::SHADE_HALF_USE_KEY))
+            .unwrap_or([0.5; 4]);
         let shade_vga50 = get_bool(Self::SHADE_VGA50_KEY).unwrap_or(false);
         let shade_amount = cc
             .storage
@@ -3002,6 +3019,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_SMOOTH_KEY))
             .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let shade_detail = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_DETAIL_KEY))
+            .unwrap_or(0.30)
             .clamp(0.0, 1.0);
         let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
         let shade_export_format = cc
@@ -3467,9 +3489,12 @@ impl Kaleidotron {
             shade_f1_on,
             shade_f2_on,
             shade_f3_on,
+            shade_half_on,
+            shade_half_use,
             shade_vga50,
             shade_amount,
             shade_smooth,
+            shade_detail,
             shade_ice,
             shade_export_format,
             shade_fit_chars,
@@ -3495,7 +3520,7 @@ impl Kaleidotron {
             loaded_palettes: HashMap::new(),
             preview_src: None,
             preview_tex: None,
-            shade_swatch_tex: [None, None, None],
+            shade_swatch_tex: HashMap::new(),
             shade_swatch_key: None,
             keymap,
             rebinding: None,
@@ -19563,8 +19588,11 @@ impl Kaleidotron {
             shade_f1_on: self.shade_f1_on,
             shade_f2_on: self.shade_f2_on,
             shade_f3_on: self.shade_f3_on,
+            shade_half_on: self.shade_half_on,
+            shade_half_use: self.shade_half_use,
             shade_amount: self.shade_amount,
             shade_smooth: self.shade_smooth,
+            shade_detail: self.shade_detail,
             // Effective cell + font, in precedence order: VGA50 (8×8 cell + 8×8 font)
             // → snap 9×16 (8×16 font) → Cell W/H (8×16 font).
             shade_cw: if self.shade_vga50 {
@@ -19605,27 +19633,27 @@ impl Kaleidotron {
         }
     }
 
-    /// Paint a crisp preview of an actual CP437 shade glyph (░ 176 / ▒ 177 / ▓ 178) for
-    /// the F1/F2/F3 rows. `gi` is 0/1/2. Built ONCE per theme as an 8×16 texture from the
-    /// real glyph bitmap (fg where the bit is set, bg where clear) and blitted with
-    /// NEAREST filtering, so it stays sharp at any UI scale (100/125/150/200%) — unlike
+    /// Paint a crisp preview of an actual CP437 glyph (░▒▓ for F1/F2/F3, ▀▄▌▐ for F5–F8)
+    /// by its byte code. Built ONCE per theme as an 8×16 texture from the real glyph
+    /// bitmap (fg where the bit is set, bg where clear) and blitted with NEAREST
+    /// filtering, so it stays sharp at any UI scale (100/125/150/200%) — unlike
     /// hand-drawn rects, which aliased — and is independent of the UI font (which lacks ▓).
-    fn paint_shade_swatch(&mut self, ui: &mut egui::Ui, gi: usize) {
-        const GLYPHS: [usize; 3] = [176, 177, 178];
-        let gi = gi.min(2);
+    fn paint_shade_swatch(&mut self, ui: &mut egui::Ui, glyph_code: u8) {
         let (fg, bg, border) = {
             let v = ui.visuals();
             (v.text_color(), v.extreme_bg_color, v.weak_text_color())
         };
-        // Rebuild all three when the theme colours change (pack fg/bg into the key).
+        // Rebuild all swatches when the theme colours change (pack fg/bg into the key).
         let pack = |c: egui::Color32| (c.r() as u32) << 16 | (c.g() as u32) << 8 | c.b() as u32;
         let key = (pack(fg), pack(bg));
         if self.shade_swatch_key != Some(key) {
             self.shade_swatch_key = Some(key);
-            self.shade_swatch_tex = [None, None, None];
+            self.shade_swatch_tex.clear();
         }
-        if self.shade_swatch_tex[gi].is_none() {
-            let glyph = &crate::decode::cp437_font::CP437_8X16[GLYPHS[gi]]; // [u8;16], MSB left
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            self.shade_swatch_tex.entry(glyph_code)
+        {
+            let glyph = &crate::decode::cp437_font::CP437_8X16[glyph_code as usize]; // [u8;16], MSB left
             let mut bytes = Vec::with_capacity(8 * 16 * 4);
             for &bits in glyph.iter() {
                 for rx in 0..8 {
@@ -19635,15 +19663,15 @@ impl Kaleidotron {
             }
             let img = egui::ColorImage::from_rgba_unmultiplied([8, 16], &bytes);
             let tex = ui.ctx().load_texture(
-                format!("shade_swatch_{gi}"),
+                format!("shade_swatch_{glyph_code}"),
                 img,
                 egui::TextureOptions::NEAREST,
             );
-            self.shade_swatch_tex[gi] = Some(tex);
+            slot.insert(tex);
         }
         // Blit into a ~9×16 pt rect (keeps the glyph's 1:2 aspect), + a subtle border.
         let (rect, _resp) = ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
-        if let Some(tex) = &self.shade_swatch_tex[gi] {
+        if let Some(tex) = self.shade_swatch_tex.get(&glyph_code) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
         }
@@ -19751,9 +19779,12 @@ impl Kaleidotron {
             shade_f1_on: self.shade_f1_on,
             shade_f2_on: self.shade_f2_on,
             shade_f3_on: self.shade_f3_on,
+            shade_half_on: self.shade_half_on,
+            shade_half_use: self.shade_half_use,
             shade_vga50: self.shade_vga50,
             shade_amount: self.shade_amount,
             shade_smooth: self.shade_smooth,
+            shade_detail: self.shade_detail,
             shade_ice: self.shade_ice,
             shade_export_format: self.shade_export_format,
             shade_fit_chars: self.shade_fit_chars,
@@ -19807,9 +19838,12 @@ impl Kaleidotron {
         self.shade_f1_on = p.shade_f1_on;
         self.shade_f2_on = p.shade_f2_on;
         self.shade_f3_on = p.shade_f3_on;
+        self.shade_half_on = p.shade_half_on;
+        self.shade_half_use = p.shade_half_use.map(|u| u.clamp(0.0, 1.0));
         self.shade_vga50 = p.shade_vga50;
         self.shade_amount = p.shade_amount.clamp(0.0, 1.0);
         self.shade_smooth = p.shade_smooth.clamp(0.0, 1.0);
+        self.shade_detail = p.shade_detail.clamp(0.0, 1.0);
         self.shade_ice = p.shade_ice;
         self.shade_export_format = p.shade_export_format.min(5);
         self.shade_fit_chars = p.shade_fit_chars;
@@ -19903,7 +19937,7 @@ impl Kaleidotron {
         // half-block / snap toggles won't invalidate the cached preview.
         let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
             format!(
-                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}|Fit{}:{}x{}",
+                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}|H{:?}:{:?}|Fit{}:{}x{}",
                 self.shade_f1,
                 self.shade_f2,
                 self.shade_f3,
@@ -19916,6 +19950,11 @@ impl Kaleidotron {
                 self.shade_amount,
                 self.shade_ice as u8,
                 self.shade_smooth,
+                self.shade_detail,
+                // Per half-block toggles + usage — moving an F5–F8 slider/checkbox must
+                // invalidate the cached preview too.
+                self.shade_half_on,
+                self.shade_half_use,
                 // Fit-to-chars changes the working resolution, so it MUST invalidate the
                 // preview cache or toggling it does nothing on screen.
                 self.shade_fit_chars as u8,
@@ -20193,8 +20232,11 @@ impl Kaleidotron {
             shade_f1_on: true,
             shade_f2_on: true,
             shade_f3_on: true,
+            shade_half_on: [true; 4],
+            shade_half_use: [0.5; 4],
             shade_amount: 1.0,
             shade_smooth: 0.5,
+            shade_detail: 0.30,
             shade_cw: 9,
             shade_ch: 16,
             font_8x8: false,
@@ -20354,6 +20396,30 @@ impl Kaleidotron {
     /// A full-resolution texture of the inspected image remapped to `palette` — the
     /// viewer's recolor view. Reuses the full pixels cached by `load_full` (else
     /// decodes), and rebuilds only when the path or recolor (`key`) changes.
+    /// Reset the ANSI-shade controls to a clean, known-good baseline: F1–F3 fills +
+    /// toggles on, the F5–F8 half-blocks on at neutral usage, Shading and Smoothness at
+    /// 0.5, the authentic 9×16 VGA cell, half-blocks on, iCE off, and Fit-to-chars
+    /// cleared. Leaves only the export Format alone (that's a save choice, not a look).
+    fn reset_ansi_shade(&mut self) {
+        self.shade_f1 = 0.25;
+        self.shade_f2 = 0.50;
+        self.shade_f3 = 0.75;
+        self.shade_f1_on = true;
+        self.shade_f2_on = true;
+        self.shade_f3_on = true;
+        self.shade_half = true;
+        self.shade_half_on = [true; 4];
+        self.shade_half_use = [0.5; 4];
+        self.shade_amount = 0.5;
+        self.shade_smooth = 0.5;
+        self.shade_detail = 0.30;
+        // Structural baseline: authentic 9×16 cell (VGA50 off), iCE off, Fit cleared.
+        self.shade_snap916 = true;
+        self.shade_vga50 = false;
+        self.shade_ice = false;
+        self.shade_fit_chars = false;
+    }
+
     /// THE single source of truth for the ANSI-shade grid. Both the on-screen preview
     /// ([`make_full_reduced`]) and every export format ([`export_textmode`]) call this,
     /// so a rendered `.ans`/`.xb`/`.tnd` is guaranteed **cell-identical** to what the
@@ -20384,14 +20450,33 @@ impl Kaleidotron {
         aux.skip_dither_palette = true;
         let mut work = if tw == w && th == h {
             rgba.to_vec()
+        } else if self.shade_fit_chars {
+            // Fit to chars preserves the source aspect ratio: scale to fit inside the
+            // cols×rows canvas and centre it, leaving blank (space) cells as negative
+            // space — instead of stretching the art to the exact grid.
+            crate::thumb::letterbox(rgba, w, h, tw, th)
         } else {
             crate::thumb::box_downscale(rgba, w, h, tw, th)
         };
+        // ANSI art has no alpha — the canvas is a solid colour. Composite the working
+        // buffer onto BLACK so the Fit letterbox's negative space (and any transparent
+        // source pixels) become solid black cells, not see-through checkerboard. Done
+        // before the value ops so brightness/contrast/etc. treat it as one opaque image.
+        for px in work.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a < 255 {
+                px[0] = (px[0] as u32 * a / 255) as u8;
+                px[1] = (px[1] as u32 * a / 255) as u8;
+                px[2] = (px[2] as u32 * a / 255) as u8;
+                px[3] = 255;
+            }
+        }
         apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
         let grid = crate::thumb::ansi_shade_grid(
             &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
             self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-            self.shade_amount, self.shade_ice, self.shade_smooth,
+            self.shade_half_on, self.shade_half_use, self.shade_amount, self.shade_ice,
+            self.shade_smooth, self.shade_detail,
         );
         (grid, work, tw, th, font_8x8)
     }
@@ -20426,10 +20511,15 @@ impl Kaleidotron {
             if let Some(pal) = palette {
                 let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
                 crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8);
-                // Nearest-upscale the rendered tw×th buffer back to the display w×h (a
-                // straight move when Fit/Resize is off, i.e. tw==w && th==h).
-                let disp = if tw == w && th == h {
-                    work
+                // Fit-to-chars: show the grid at its NATURAL cols·cell_w × rows·cell_h px,
+                // so the ANSI is genuinely redrawn at the smaller character grid (and the
+                // character ruler, which reads the displayed texture's size, reports the
+                // real cols×rows) — not upscaled back to full res, which just looked
+                // pixelated at the same footprint. Any OTHER resize (the Resize slider)
+                // keeps the old behaviour: nearest-upscale back to w×h so the on-screen
+                // size stays put while detail drops.
+                let (disp, disp_size) = if self.shade_fit_chars || (tw == w && th == h) {
+                    (work, [tw, th])
                 } else {
                     let mut d = vec![0u8; w * h * 4];
                     for y in 0..h {
@@ -20441,9 +20531,10 @@ impl Kaleidotron {
                             d[o..o + 4].copy_from_slice(&work[s..s + 4]);
                         }
                     }
-                    d
+                    (d, [w, h])
                 };
-                let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", size, &disp, view_tex_opts());
+                let tt =
+                    TiledTexture::from_rgba(ctx, "pv_full_reduced", disp_size, &disp, view_tex_opts());
                 self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
                 return Some(tt);
             }
@@ -23666,6 +23757,20 @@ impl Kaleidotron {
                     }
                     // ----- ANSI Shade controls (textmode shade-block rendering) -----
                     if self.dither_method == crate::thumb::DITHER_ANSI {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("ANSI Shade").strong());
+                            if ui
+                                .small_button("↺ Reset")
+                                .on_hover_text(
+                                    "Reset the ANSI-shade tuning (F1–F8, Shading, Smoothness, \
+                                     Half-blocks) to defaults. Leaves cell/VGA50/iCE/format/Fit \
+                                     as they are.",
+                                )
+                                .clicked()
+                            {
+                                self.reset_ansi_shade();
+                            }
+                        });
                         // Snap 9×16 and Snap 8×8 (VGA50) are mutually exclusive — the
                         // cell can only be one authentic text size at a time.
                         if ui
@@ -23689,7 +23794,10 @@ impl Kaleidotron {
                             self.shade_snap916 = false;
                         }
                         ui.checkbox(&mut self.shade_half, "Half-blocks (▀▄▌▐)")
-                            .on_hover_text("Allow half-block glyphs for sharper cell edges");
+                            .on_hover_text(
+                                "Master toggle for the half-block glyphs (sharper cell edges). \
+                                 Tune each one's usage with the F5–F8 sliders below.",
+                            );
                         ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
                             .on_hover_text(
                                 "iCE color: allow all 16 colors as backgrounds (else 8). \
@@ -23748,7 +23856,15 @@ impl Kaleidotron {
                         });
                         ui.horizontal(|ui| {
                             for (label, c, r) in
-                                [("80×25", 80, 25), ("80×50", 80, 50), ("132×50", 132, 50), ("40×25", 40, 25)]
+                                [
+                                    ("40×25", 40, 25),
+                                    ("50×15", 50, 15),
+                                    ("60×20", 60, 20),
+                                    ("80×25", 80, 25),
+                                    ("80×50", 80, 50),
+                                    ("132×50", 132, 50),
+                                    ("160×80", 160, 80),
+                                ]
                             {
                                 if ui.small_button(label).clicked() {
                                     self.shade_fit_cols = c;
@@ -23790,6 +23906,21 @@ impl Kaleidotron {
                             middle_reset(ui, &resp, &mut self.shade_smooth, 0.5f32);
                             wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 1.0f32);
                         });
+                        // Detail: how hard a cell's internal contrast pulls the search toward
+                        // half-blocks. Higher = crisper edges when shrunk (more ▀▄▌▐, less
+                        // shade blur); 0 = half-blocks only via their own F5–F8 usage.
+                        ui.horizontal(|ui| {
+                            ui.label("Detail");
+                            let resp = ui
+                                .add(egui::Slider::new(&mut self.shade_detail, 0.0..=1.0))
+                                .on_hover_text(
+                                    "Edge detail retention when shrinking — higher makes cells \
+                                     with a strong internal contrast render as crisp half-blocks \
+                                     (▀▄▌▐) instead of averaged shades. Scales the F5–F8 usage.",
+                                );
+                            middle_reset(ui, &resp, &mut self.shade_detail, 0.30f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_detail, 0.05, 0.0f32, 1.0f32);
+                        });
                         // The fill fractions the ░▒▓ shade blocks stand for; the leading
                         // checkbox toggles whether that shade level is a candidate at all.
                         // Each shade's slider is bounded to its own interior band (light
@@ -23797,7 +23928,7 @@ impl Kaleidotron {
                         // or degenerate into a fake solid.
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f1_on, "");
-                            self.paint_shade_swatch(ui, 0);
+                            self.paint_shade_swatch(ui, 176); // ░
                             ui.label("F1");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
                             middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
@@ -23805,7 +23936,7 @@ impl Kaleidotron {
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f2_on, "");
-                            self.paint_shade_swatch(ui, 1);
+                            self.paint_shade_swatch(ui, 177); // ▒
                             ui.label("F2");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
                             middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
@@ -23813,11 +23944,38 @@ impl Kaleidotron {
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f3_on, "");
-                            self.paint_shade_swatch(ui, 2);
+                            self.paint_shade_swatch(ui, 178); // ▓
                             ui.label("F3");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
                             middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
                             wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.60f32, 0.90f32);
+                        });
+                        // Half-block usage (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐). The leading checkbox
+                        // includes that glyph as a candidate; the slider biases how often the
+                        // search picks it (0.5 = neutral, right = more, left = less). All are
+                        // gated by the master "Half-blocks" toggle above. ▀/▄ (and ▌/▐) are
+                        // the same split with fg/bg swapped, so dialing one up favours that
+                        // character for horizontal (or vertical) edges.
+                        ui.add_enabled_ui(self.shade_half, |ui| {
+                            const HALF: [(u8, &str); 4] =
+                                [(223, "F5"), (220, "F6"), (221, "F7"), (222, "F8")];
+                            for (i, (glyph, label)) in HALF.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.shade_half_on[i], "");
+                                    self.paint_shade_swatch(ui, *glyph);
+                                    ui.label(*label);
+                                    let resp = ui
+                                        .add(egui::Slider::new(&mut self.shade_half_use[i], 0.0..=1.0))
+                                        .on_hover_text(
+                                            "How often this half-block is used — right = more, \
+                                             left = less, middle = neutral.",
+                                        );
+                                    middle_reset(ui, &resp, &mut self.shade_half_use[i], 0.5f32);
+                                    wheel_adjust(
+                                        ui, &resp, &mut self.shade_half_use[i], 0.05, 0.0f32, 1.0f32,
+                                    );
+                                });
+                            }
                         });
                         if recolor.is_none() {
                             ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
@@ -35981,9 +36139,12 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SHADE_F1_ON_KEY, &self.shade_f1_on);
         eframe::set_value(storage, Self::SHADE_F2_ON_KEY, &self.shade_f2_on);
         eframe::set_value(storage, Self::SHADE_F3_ON_KEY, &self.shade_f3_on);
+        eframe::set_value(storage, Self::SHADE_HALF_ON_KEY, &self.shade_half_on);
+        eframe::set_value(storage, Self::SHADE_HALF_USE_KEY, &self.shade_half_use);
         eframe::set_value(storage, Self::SHADE_VGA50_KEY, &self.shade_vga50);
         eframe::set_value(storage, Self::SHADE_AMOUNT_KEY, &self.shade_amount);
         eframe::set_value(storage, Self::SHADE_SMOOTH_KEY, &self.shade_smooth);
+        eframe::set_value(storage, Self::SHADE_DETAIL_KEY, &self.shade_detail);
         eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
         eframe::set_value(storage, Self::SHADE_EXPORT_FORMAT_KEY, &self.shade_export_format);
         eframe::set_value(storage, Self::SHADE_FIT_CHARS_KEY, &self.shade_fit_chars);
@@ -36059,7 +36220,7 @@ fn today_ccyymmdd() -> String {
     };
     let z = secs.div_euclid(86_400) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
@@ -36870,8 +37031,11 @@ struct PipeAux<'a> {
     shade_f1_on: bool,  // include ░ as a shade candidate
     shade_f2_on: bool,  // include ▒ as a shade candidate
     shade_f3_on: bool,  // include ▓ as a shade candidate
+    shade_half_on: [bool; 4], // per half-block toggle (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐)
+    shade_half_use: [f32; 4], // per half-block usage bias 0..1 (0.5 = neutral)
     shade_amount: f32,  // 0..1: shading vs flat color
     shade_smooth: f32,  // 0..1: contrast penalty on shade blocks (avoid garish dithers)
+    shade_detail: f32,  // 0..1: half-block detail weight (keep edges crisp when shrunk)
     shade_cw: usize,
     shade_ch: usize,
     font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
@@ -36937,10 +37101,13 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                             aux.shade_f1_on,
                             aux.shade_f2_on,
                             aux.shade_f3_on,
+                            aux.shade_half_on,
+                            aux.shade_half_use,
                             aux.shade_amount,
                             aux.font_8x8,
                             aux.shade_ice,
                             aux.shade_smooth,
+                            aux.shade_detail,
                         );
                     }
                 } else {
@@ -37106,6 +37273,10 @@ fn default_true() -> bool {
 /// serde default for `FxPreset::shade_smooth` — matches the live App default (0.5).
 fn default_half() -> f32 {
     0.5
+}
+/// serde default for `FxPreset::shade_detail` — matches the live App default (0.30).
+fn default_detail() -> f32 {
+    0.30
 }
 /// serde defaults for `FxPreset` fit-to-chars grid (80×25 classic textmode screen).
 fn default_fit_cols() -> usize {
@@ -37290,10 +37461,17 @@ struct FxPreset {
     shade_f1_on: bool,
     shade_f2_on: bool,
     shade_f3_on: bool,
+    // Per half-block toggle + usage bias (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐). Struct-level
+    // `#[serde(default)]` fills these from the Default impl for presets saved before
+    // they existed (all on, neutral 0.5 usage).
+    shade_half_on: [bool; 4],
+    shade_half_use: [f32; 4],
     shade_vga50: bool,
     shade_amount: f32,
     #[serde(default = "default_half")]
     shade_smooth: f32,
+    #[serde(default = "default_detail")]
+    shade_detail: f32,
     shade_ice: bool,
     #[serde(default)]
     shade_export_format: u8,
@@ -37344,9 +37522,12 @@ impl Default for FxPreset {
             shade_f1_on: true,
             shade_f2_on: true,
             shade_f3_on: true,
+            shade_half_on: [true; 4],
+            shade_half_use: [0.5; 4],
             shade_vga50: false,
             shade_amount: 1.0,
             shade_smooth: 0.5,
+            shade_detail: 0.30,
             shade_ice: false,
             shade_export_format: 0,
             shade_fit_chars: false,
@@ -37637,8 +37818,11 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             shade_f1_on: true,
             shade_f2_on: true,
             shade_f3_on: true,
+            shade_half_on: [true; 4],
+            shade_half_use: [0.5; 4],
             shade_amount: 1.0,
             shade_smooth: 0.5,
+            shade_detail: 0.30,
             shade_cw: 9,
             shade_ch: 16,
             font_8x8: false,
@@ -47152,8 +47336,11 @@ mod tests {
             shade_f1_on: true,
             shade_f2_on: true,
             shade_f3_on: true,
+            shade_half_on: [true; 4],
+            shade_half_use: [0.5; 4],
             shade_amount: 1.0,
             shade_smooth: 0.5,
+            shade_detail: 0.30,
             shade_cw: 9,
             shade_ch: 16,
             font_8x8: false,
@@ -47337,8 +47524,11 @@ mod tests {
             shade_f1_on: true,
             shade_f2_on: true,
             shade_f3_on: true,
+            shade_half_on: [true; 4],
+            shade_half_use: [0.5; 4],
             shade_amount: 1.0,
             shade_smooth: 0.5,
+            shade_detail: 0.30,
             shade_cw: 9,
             shade_ch: 16,
             font_8x8: false,

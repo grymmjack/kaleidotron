@@ -189,9 +189,7 @@ pub fn sauce_record(
         let b = val.as_bytes();
         let n = b.len().min(len);
         s[off..off + n].copy_from_slice(&b[..n]);
-        for i in off + n..off + len {
-            s[i] = b' ';
-        }
+        s[off + n..off + len].fill(b' ');
     };
     put(&mut s, 7, 35, title); // Title
     put(&mut s, 42, 20, "kaleidotron"); // Author

@@ -733,9 +733,12 @@ pub fn ansi_shade_grid(
     f1_on: bool,
     f2_on: bool,
     f3_on: bool,
+    half_on: [bool; 4],
+    half_use: [f32; 4],
     shade_amount: f32,
     ice: bool,
     smooth: f32,
+    detail: f32,
 ) -> AnsiGrid {
     let cw = cell_w.max(1);
     let ch_ = cell_h.max(1);
@@ -910,27 +913,69 @@ pub fn ansi_shade_grid(
                 }
             }
 
-            // --- HALF-BLOCK candidates (▀ upper-half, ▌ left-half). The bg half must
-            // also land in a legal background slot (non-iCE), else skip the candidate. ---
+            // --- HALF-BLOCK candidates: all four directions, each its own candidate so
+            // the per-glyph toggle + usage slider (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐) can bias
+            // which one the search prefers. ▀/▄ are the same horizontal split with fg/bg
+            // swapped, ▌/▐ the same vertical split — but which CHARACTER gets written
+            // still matters to the artist. `half_use[i]` in 0..1 scales the candidate's
+            // error (0.5 = neutral); higher use → smaller error → the glyph wins more
+            // cells, lower → fewer. The bg half must land in a legal background slot
+            // (non-iCE), else the candidate is skipped. ---
             if half_blocks {
-                // ▀ 223: top = fg, bottom = bg.
-                let fg = nearest_index([top_avg[0] as u8, top_avg[1] as u8, top_avg[2] as u8], palette);
-                let bg = nearest_index([bot_avg[0] as u8, bot_avg[1] as u8, bot_avg[2] as u8], palette);
-                let err = 0.5 * dist2(top_avg, pf[fg as usize]) + 0.5 * dist2(bot_avg, pf[bg as usize]);
-                if bg_ok[bg as usize] && err < best_err {
-                    best_err = err;
-                    best_fg = fg;
-                    best_bg = bg;
-                    best_ch = 223;
+                // (glyph, fg-half average, bg-half average) in F5..F8 order. ▀/▄ are the
+                // same horizontal split with fg/bg swapped (rows 0–6 | 7–15), ▌/▐ the same
+                // vertical split — so which of a pair is chosen is a CHARACTER choice, not a
+                // visual one. Listed with ▀/▌ first so, at equal usage, the strict `<` below
+                // keeps them the default (matching classic art) unless F6/F8 is dialed up.
+                let halves: [(u8, [f32; 3], [f32; 3]); 4] = [
+                    (223, top_avg, bot_avg),    // ▀ F5: top = fg, bottom = bg
+                    (220, bot_avg, top_avg),    // ▄ F6: bottom = fg, top = bg
+                    (221, left_avg, right_avg), // ▌ F7: left = fg, right = bg
+                    (222, right_avg, left_avg), // ▐ F8: right = fg, left = bg
+                ];
+                // Pick the best-scoring enabled half-block. `half_use` in 0..1 shifts a
+                // candidate's error by up to ±max_threshold (scaled to the palette so it's
+                // resolution/palette-invariant): >0.5 favours the glyph, <0.5 suppresses it.
+                let mut hb_err = f32::MAX;
+                let mut hb: Option<(u8, u8, u8)> = None;
+                for (i, &(glyph, fg_avg, bg_avg)) in halves.iter().enumerate() {
+                    if !half_on[i] {
+                        continue;
+                    }
+                    let fg = nearest_index([fg_avg[0] as u8, fg_avg[1] as u8, fg_avg[2] as u8], palette);
+                    let bg = nearest_index([bg_avg[0] as u8, bg_avg[1] as u8, bg_avg[2] as u8], palette);
+                    if !bg_ok[bg as usize] {
+                        continue;
+                    }
+                    let err = 0.5 * dist2(fg_avg, pf[fg as usize]) + 0.5 * dist2(bg_avg, pf[bg as usize]);
+                    let use_i = half_use[i].clamp(0.0, 1.0);
+                    // DETAIL: reward the half-block in proportion to how DIFFERENT its two
+                    // halves are — a big top/bottom (or left/right) contrast is real sub-cell
+                    // structure that a shade or solid would blur into one tone. This is what
+                    // keeps a shrunk image sharp: cells carrying an edge become a crisp
+                    // half-block instead of grey mush. Scaled by the "Detail" weight AND each
+                    // glyph's usage, so Detail dials retention globally and F5–F8 per
+                    // direction; the flat ±bias still shifts the baseline.
+                    let contrast = dist2(fg_avg, bg_avg);
+                    let bias = (use_i - 0.5) * 2.0 * max_threshold + use_i * detail * contrast;
+                    let err_eff = err - bias;
+                    if err_eff < hb_err {
+                        hb_err = err_eff;
+                        hb = Some((glyph, fg, bg));
+                    }
                 }
-                // ▌ 221: left = fg, right = bg.
-                let fg = nearest_index([left_avg[0] as u8, left_avg[1] as u8, left_avg[2] as u8], palette);
-                let bg = nearest_index([right_avg[0] as u8, right_avg[1] as u8, right_avg[2] as u8], palette);
-                let err = 0.5 * dist2(left_avg, pf[fg as usize]) + 0.5 * dist2(right_avg, pf[bg as usize]);
-                if bg_ok[bg as usize] && err < best_err {
-                    best_fg = fg;
-                    best_bg = bg;
-                    best_ch = 221;
+                // Half-blocks win TIES against shades/solids (`<=`): a genuine edge whose
+                // average a shade could also hit should render as the crisp half-block, not
+                // a grey dither that only matches the average. Usage>0.5 lets them win
+                // near-ties too; usage<0.5 makes them yield.
+                if let Some((glyph, fg, bg)) = hb {
+                    if hb_err <= best_err {
+                        // best_err isn't read past this point (cell is pushed next), so no
+                        // need to update it — just take the half-block's fg/bg/glyph.
+                        best_fg = fg;
+                        best_bg = bg;
+                        best_ch = glyph;
+                    }
                 }
             }
             cells.push(AnsiCell { fg: best_fg, bg: best_bg, ch: best_ch });
@@ -1029,17 +1074,20 @@ pub fn ansi_shade_pass(
     f1_on: bool,
     f2_on: bool,
     f3_on: bool,
+    half_on: [bool; 4],
+    half_use: [f32; 4],
     shade_amount: f32,
     font_8x8: bool,
     ice: bool,
     smooth: f32,
+    detail: f32,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
     let grid = ansi_shade_grid(
         rgba, w, h, palette, cell_w, cell_h, f1, f2, f3, half_blocks, f1_on, f2_on, f3_on,
-        shade_amount, ice, smooth,
+        half_on, half_use, shade_amount, ice, smooth, detail,
     );
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
@@ -1105,10 +1153,10 @@ fn nearest_xterm256(c: [u8; 3]) -> u8 {
         }
     }
     // 6×6×6 cube (16..231).
-    for r in 0..6 {
-        for g in 0..6 {
-            for b in 0..6 {
-                let d = d2([XTERM_CUBE[r], XTERM_CUBE[g], XTERM_CUBE[b]]);
+    for (r, &cr) in XTERM_CUBE.iter().enumerate() {
+        for (g, &cg) in XTERM_CUBE.iter().enumerate() {
+            for (b, &cb) in XTERM_CUBE.iter().enumerate() {
+                let d = d2([cr, cg, cb]);
                 if d < best_d {
                     best_d = d;
                     best = 16 + (36 * r + 6 * g + b) as u8;
@@ -1170,18 +1218,26 @@ pub fn ansi_grid_to_ans(grid: &AnsiGrid, ice: bool, depth: u8) -> Vec<u8> {
                         sgr.push_str(&format!(";48;2;{};{};{}", bg[0], bg[1], bg[2]));
                     }
                     _ => {
-                        // 16-colour: nearest ANSI, with the classic bold/aixterm rules.
+                        // 16-colour, encoded the way the ANSI-art scene (PabloDraw/Moebius)
+                        // actually reads it:
+                        //  • bright FG → bold (SGR 1) + base fg 30-37.
+                        //  • bright BG → the BLINK bit (SGR 5) + base bg 40-47, and the
+                        //    SAUCE iCE flag tells viewers to render blink as a bright
+                        //    background (no flashing). This is the whole point of "iCE
+                        //    colors". We previously emitted xterm's aixterm 100-107, which
+                        //    those tools DON'T honor — so every bright background dropped to
+                        //    black (the "black gaps"). Without iCE a bright bg clamps to its
+                        //    base color (a real non-iCE screen has only 8 backgrounds).
                         let f = nearest_ansi16(fg);
                         let b = nearest_ansi16(bg);
                         if f >= 8 {
                             sgr.push_str(";1"); // bold → bright fg
                         }
-                        sgr.push_str(&format!(";{}", 30 + (f % 8)));
                         if b >= 8 && ice {
-                            sgr.push_str(&format!(";{}", 100 + (b % 8))); // aixterm bright bg
-                        } else {
-                            sgr.push_str(&format!(";{}", 40 + (b % 8))); // clamp to 0-7
+                            sgr.push_str(";5"); // blink bit → bright bg under iCE
                         }
+                        sgr.push_str(&format!(";{}", 30 + (f % 8)));
+                        sgr.push_str(&format!(";{}", 40 + (b % 8)));
                     }
                 }
                 sgr.push('m');
@@ -1348,8 +1404,8 @@ pub fn ansi_grid_to_xbin(grid: &AnsiGrid, font_8x8: bool, ice: bool) -> (Vec<u8>
     }
     // 4) Font block — VGA50 only (256 × 8 rows, MSB-left).
     if has_font {
-        for ch in 0..256usize {
-            out.extend_from_slice(&CP437_8X8[ch]);
+        for glyph in CP437_8X8.iter() {
+            out.extend_from_slice(glyph);
         }
     }
     // 5) Image data: (char, attribute) per cell, indices remapped into the embedded 0..15.
@@ -1468,6 +1524,35 @@ pub fn box_downscale(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> 
     out
 }
 
+/// Scale `src` (`sw×sh`) to fit *inside* a `dw×dh` canvas while preserving its aspect
+/// ratio, anchored to the **top-left**, with the leftover margin (right and/or bottom)
+/// left fully transparent. Unlike a straight [`box_downscale`] (which stretches to the
+/// exact target), this keeps circles round — the ANSI "Fit to chars" grid uses it so a
+/// square sprite fitting an 80×50 canvas gets blank (space) cells instead of being
+/// squashed. Top-left anchoring means column/row 0 is the art's own origin, so the
+/// character ruler reads naturally and it's obvious where the art runs past the grid.
+/// The transparent padding becomes empty cells downstream (`ansi_shade_grid` maps
+/// fully-transparent cells to a space). Degenerate source/target → transparent canvas.
+pub fn letterbox(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let (dw, dh) = (dw.max(1), dh.max(1));
+    let mut out = vec![0u8; dw * dh * 4]; // transparent canvas
+    if sw == 0 || sh == 0 {
+        return out;
+    }
+    // Largest integer content box that fits dw×dh at the source aspect.
+    let scale = (dw as f32 / sw as f32).min(dh as f32 / sh as f32);
+    let cw = ((sw as f32 * scale).round() as usize).clamp(1, dw);
+    let ch = ((sh as f32 * scale).round() as usize).clamp(1, dh);
+    let scaled = box_downscale(src, sw, sh, cw, ch);
+    // Anchor top-left (offset 0,0): the padding falls on the right and bottom.
+    for y in 0..ch {
+        let dst = (y * dw) * 4;
+        let s = y * cw * 4;
+        out[dst..dst + cw * 4].copy_from_slice(&scaled[s..s + cw * 4]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,9 +1604,11 @@ mod tests {
         }
         let grid = ansi_shade_grid(
             &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
+            [true; 4], [0.5; 4], // all half-blocks on, neutral usage
             1.0,   // full shading amount → always run the shade search
             false, // no iCE
             0.0,   // Smoothness 0 → proves the ALWAYS-ON baseline kills false colour
+            0.30,  // Detail weight
         );
         for (i, cell) in grid.cells.iter().enumerate() {
             assert!(
@@ -1535,6 +1622,87 @@ mod tests {
                 cell.ch
             );
         }
+    }
+
+    #[test]
+    fn ansi_shade_sharp_edge_prefers_half_block_over_shade() {
+        // A cell that is top-half white / bottom-half black is a genuine horizontal edge:
+        // the crisp answer is a half-block (▀/▄), NOT a 50%-shade ▒ that only matches the
+        // grey average. One 9×16 cell.
+        let palette: Vec<[u8; 4]> =
+            vec![[0, 0, 0, 255], [128, 128, 128, 255], [255, 255, 255, 255]];
+        let (w, h) = (9usize, 16usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let v = if y < 8 { 255u8 } else { 0u8 }; // top white, bottom black
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                rgba[i] = v;
+                rgba[i + 1] = v;
+                rgba[i + 2] = v;
+                rgba[i + 3] = 255;
+            }
+        }
+        // Half-blocks ON → expect a horizontal half-block (▀ 223 or ▄ 220), not a shade.
+        let g_on = ansi_shade_grid(
+            &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
+            [true; 4], [0.5; 4], 1.0, true, 0.0, 0.30,
+        );
+        assert!(
+            matches!(g_on.cells[0].ch, 220 | 223),
+            "sharp edge should be a half-block, got glyph {}",
+            g_on.cells[0].ch
+        );
+        // Horizontal pair OFF (F5 ▀ + F6 ▄), vertical still on → must NOT be ▀/▄.
+        let g_off = ansi_shade_grid(
+            &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
+            [false, false, true, true], [0.5; 4], 1.0, true, 0.0, 0.30,
+        );
+        assert!(
+            !matches!(g_off.cells[0].ch, 220 | 223),
+            "horizontal half-blocks disabled, yet got {}",
+            g_off.cells[0].ch
+        );
+    }
+
+    #[test]
+    fn ansi16_export_uses_blink_bit_for_bright_bg_under_ice() {
+        // A cell with a BRIGHT background (index 12 = bright blue) must be encoded the
+        // scene-standard iCE way — the blink bit (SGR 5) + the base bg (44) — not xterm's
+        // aixterm 104, which PabloDraw/Moebius ignore (dropping the bg to black).
+        let palette: Vec<[u8; 4]> = ANSI16.iter().map(|c| [c[0], c[1], c[2], 255]).collect();
+        let grid = AnsiGrid {
+            cols: 1,
+            rows: 1,
+            cell_w: 9,
+            cell_h: 16,
+            palette,
+            cells: vec![AnsiCell { fg: 15, bg: 12, ch: 219 }], // white on bright blue █
+        };
+        // The output carries raw CP437 glyph bytes (0xDB), so compare on the SGR prefix
+        // (everything up to the glyph) as a lossy string.
+        let ice_bytes = ansi_grid_to_ans(&grid, true, 1);
+        let ice = String::from_utf8_lossy(&ice_bytes);
+        assert!(ice.contains(";5;"), "iCE bright bg must set the blink bit: {ice:?}");
+        assert!(ice.contains("44"), "bright blue bg encodes as base blue 44: {ice:?}");
+        assert!(!ice.contains("104"), "must NOT use aixterm 104: {ice:?}");
+        // Without iCE, a bright bg has nowhere to go on a real screen → clamp to base, no blink.
+        let noice_bytes = ansi_grid_to_ans(&grid, false, 1);
+        let noice = String::from_utf8_lossy(&noice_bytes);
+        assert!(!noice.contains(";5;"), "no blink bit without iCE: {noice:?}");
+    }
+
+    #[test]
+    fn letterbox_preserves_aspect_left_justified() {
+        // A 4×4 opaque square fit into an 8×4 canvas → a 4×4 content box anchored top-LEFT
+        // (cols 0–3 opaque), with the right margin (cols 4–7) fully transparent.
+        let src = vec![255u8; 4 * 4 * 4]; // opaque (all 255 incl alpha)
+        let out = letterbox(&src, 4, 4, 8, 4);
+        assert_eq!(out.len(), 8 * 4 * 4);
+        assert_eq!(out[(0 * 8 + 0) * 4 + 3], 255, "col 0 (art origin) opaque");
+        assert_eq!(out[(0 * 8 + 3) * 4 + 3], 255, "col 3 (art edge) opaque");
+        assert_eq!(out[(0 * 8 + 4) * 4 + 3], 0, "col 4 (right margin) transparent");
+        assert_eq!(out[(0 * 8 + 7) * 4 + 3], 0, "col 7 (right margin) transparent");
     }
 
     #[test]
