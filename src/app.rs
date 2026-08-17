@@ -1586,7 +1586,14 @@ pub struct Kaleidotron {
     shade_amount: f32,    // 0..1: how much shading vs flat color (low = flats stay solid)
     shade_smooth: f32,    // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
     shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
-    shade_color_depth: u8, // textmode EXPORT color depth: 0=Auto, 1=16, 2=256, 3=RGB truecolor
+    // Textmode EXPORT format (explicit): 0=Auto, 1=ANSI16 .ans, 2=ANSI256 .ans,
+    // 3=ANSI truecolor .ans, 4=XBin .xb, 5=Tundra .tnd.
+    shade_export_format: u8,
+    // Fit-to-character-grid: force the recolor working image to exactly cols×rows cells
+    // (cols*cell_w × rows*cell_h px) so the ANSI grid is an exact size. Aspect NOT kept.
+    shade_fit_chars: bool,
+    shade_fit_cols: usize,
+    shade_fit_rows: usize,
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2391,7 +2398,10 @@ impl Kaleidotron {
     const SHADE_AMOUNT_KEY: &'static str = "shade_amount";
     const SHADE_SMOOTH_KEY: &'static str = "shade_smooth";
     const SHADE_ICE_KEY: &'static str = "shade_ice";
-    const SHADE_COLOR_DEPTH_KEY: &'static str = "shade_color_depth";
+    const SHADE_EXPORT_FORMAT_KEY: &'static str = "shade_export_format";
+    const SHADE_FIT_CHARS_KEY: &'static str = "shade_fit_chars";
+    const SHADE_FIT_COLS_KEY: &'static str = "shade_fit_cols";
+    const SHADE_FIT_ROWS_KEY: &'static str = "shade_fit_rows";
     const PIXELATE_H_KEY: &'static str = "pixelate_h";
     const PIXELATE_LOCK_KEY: &'static str = "pixelate_lock";
     const POSTFX_KEY: &'static str = "postfx"; // CRT post-filters (record)
@@ -2989,11 +2999,22 @@ impl Kaleidotron {
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
         let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
-        let shade_color_depth = cc
+        let shade_export_format = cc
             .storage
-            .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_COLOR_DEPTH_KEY))
+            .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_EXPORT_FORMAT_KEY))
             .unwrap_or(0)
-            .min(3);
+            .min(5);
+        let shade_fit_chars = get_bool(Self::SHADE_FIT_CHARS_KEY).unwrap_or(false);
+        let shade_fit_cols = cc
+            .storage
+            .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
+            .unwrap_or(80)
+            .clamp(1, 1000);
+        let shade_fit_rows = cc
+            .storage
+            .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_ROWS_KEY))
+            .unwrap_or(25)
+            .clamp(1, 1000);
         let pixelate_h = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::PIXELATE_H_KEY))
@@ -3445,7 +3466,10 @@ impl Kaleidotron {
             shade_amount,
             shade_smooth,
             shade_ice,
-            shade_color_depth,
+            shade_export_format,
+            shade_fit_chars,
+            shade_fit_cols,
+            shade_fit_rows,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19573,6 +19597,47 @@ impl Kaleidotron {
         }
     }
 
+    /// Paint a tiny font-independent shade-density swatch (≈14×14 px) inline in a UI
+    /// row — a Bayer-4×4 dot pattern at `density` (0..1) over the theme's dark bg in
+    /// the text colour. Replaces the ░▒▓ unicode labels, whose ▓ glyph egui's font
+    /// renders as a broken box.
+    fn paint_shade_swatch(ui: &mut egui::Ui, density: f32) {
+        let sz = 14.0;
+        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::hover());
+        let (bg, fg, border) = {
+            let v = ui.visuals();
+            (v.extreme_bg_color, v.text_color(), v.weak_text_color())
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, bg);
+        // Bayer 4×4 ordered threshold → an authentic 25/50/75% dither look.
+        #[rustfmt::skip]
+        const BAYER4: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+        let n = 4usize;
+        let cell = (sz - 2.0) / n as f32;
+        let d = density.clamp(0.0, 1.0);
+        for gy in 0..n {
+            for gx in 0..n {
+                let thr = (BAYER4[gy * n + gx] as f32 + 0.5) / 16.0;
+                if thr < d {
+                    let x = rect.left() + 1.0 + gx as f32 * cell;
+                    let y = rect.top() + 1.0 + gy as f32 * cell;
+                    p.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell, cell)),
+                        0.0,
+                        fg,
+                    );
+                }
+            }
+        }
+        p.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     /// The effective dither cell size on one axis when the pipeline runs on a `buf`-px
     /// buffer whose native size is `native`. The authored `raw` scale is defined
     /// against the full-res image, so on a downscaled buffer (preview / grid thumb) we
@@ -19617,6 +19682,13 @@ impl Kaleidotron {
     /// callers can unconditionally pass the result to [`apply_pipeline_resized`].
     /// Factor-based (not absolute px) so preview + full-res degrade by the same ratio.
     fn resize_target(&self, w: usize, h: usize) -> (usize, usize) {
+        // Fit-to-character-grid (ANSI Shade): force the working image to exactly
+        // cols*cell_w × rows*cell_h px so the ANSI grid is precisely cols×rows. Wins
+        // over the resize slider, and may UP-scale (aspect is intentionally not kept).
+        if self.shade_fit_chars && self.dither_method == crate::thumb::DITHER_ANSI {
+            let (cw, ch) = self.ansi_cell_dims();
+            return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
+        }
         if !self.resize_on {
             return (w, h);
         }
@@ -19666,7 +19738,10 @@ impl Kaleidotron {
             shade_amount: self.shade_amount,
             shade_smooth: self.shade_smooth,
             shade_ice: self.shade_ice,
-            shade_color_depth: self.shade_color_depth,
+            shade_export_format: self.shade_export_format,
+            shade_fit_chars: self.shade_fit_chars,
+            shade_fit_cols: self.shade_fit_cols,
+            shade_fit_rows: self.shade_fit_rows,
             pixelate_h: self.pixelate_h,
             pixelate_lock: self.pixelate_lock,
             balance_color: self.balance_color,
@@ -19719,7 +19794,10 @@ impl Kaleidotron {
         self.shade_amount = p.shade_amount.clamp(0.0, 1.0);
         self.shade_smooth = p.shade_smooth.clamp(0.0, 1.0);
         self.shade_ice = p.shade_ice;
-        self.shade_color_depth = p.shade_color_depth.min(3);
+        self.shade_export_format = p.shade_export_format.min(5);
+        self.shade_fit_chars = p.shade_fit_chars;
+        self.shade_fit_cols = p.shade_fit_cols.clamp(1, 1000);
+        self.shade_fit_rows = p.shade_fit_rows.clamp(1, 1000);
         self.pixelate_h = p.pixelate_h.clamp(0.0, 32.0);
         self.pixelate_lock = p.pixelate_lock;
         self.balance_color = p.balance_color;
@@ -23522,24 +23600,74 @@ impl Kaleidotron {
                                 "iCE color: allow all 16 colors as backgrounds (else 8). \
                                  Affects both the preview and the exported file.",
                             );
-                        // Export color depth (export only — does not affect the preview).
+                        // Explicit EXPORT format (export only — does not affect the preview).
+                        // Each entry names the actual output file `export_textmode` writes.
                         ui.horizontal(|ui| {
-                            ui.label("Colors").on_hover_text(
-                                "Export color depth. Auto = 16-color .ans (EGA-16) or \
-                                 truecolor .ans; 16-color → .ans (EGA) / .xbin (non-EGA); \
-                                 256-color → .ans; RGB → .tnd (TundraDraw 24-bit binary).",
+                            ui.label("Format").on_hover_text(
+                                "Textmode export file:\n\
+                                 • Auto — EGA→ANSI 16-color .ans, else truecolor .ans\n\
+                                 • ANSI 16-color (.ans) — nearest-ANSI16 SGR\n\
+                                 • ANSI 256-color (.ans) — xterm-256 SGR\n\
+                                 • ANSI truecolor (.ans) — 24-bit SGR\n\
+                                 • XBin 16-color (.xb) — embeds palette + font (Moebius)\n\
+                                 • Tundra 24-bit (.tnd) — binary truecolor",
                             );
-                            let mut d = self.shade_color_depth as usize;
-                            const DEPTHS: [&str; 4] = ["Auto", "16-color", "256-color", "RGB (truecolor)"];
-                            let cr = egui::ComboBox::from_id_salt("shade_color_depth")
-                                .selected_text(DEPTHS[d.min(3)])
+                            let mut f = self.shade_export_format as usize;
+                            const FORMATS: [&str; 6] = [
+                                "Auto",
+                                "ANSI 16-color (.ans)",
+                                "ANSI 256-color (.ans)",
+                                "ANSI truecolor (.ans)",
+                                "XBin 16-color (.xb)",
+                                "Tundra 24-bit (.tnd)",
+                            ];
+                            let cr = egui::ComboBox::from_id_salt("shade_export_format")
+                                .selected_text(FORMATS[f.min(5)])
                                 .show_ui(ui, |ui| {
-                                    for (i, name) in DEPTHS.iter().enumerate() {
-                                        ui.selectable_value(&mut d, i, *name);
+                                    for (i, name) in FORMATS.iter().enumerate() {
+                                        ui.selectable_value(&mut f, i, *name);
                                     }
                                 });
-                            wheel_cycle(ui, &cr.response, &mut d, DEPTHS.len());
-                            self.shade_color_depth = d as u8;
+                            wheel_cycle(ui, &cr.response, &mut f, FORMATS.len());
+                            self.shade_export_format = f as u8;
+                        });
+                        // Fit-to-character-grid: force the working image to an exact
+                        // cols×rows cell grid (aspect NOT preserved). Feeds preview + export.
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
+                                .on_hover_text(
+                                    "Force the image to exactly cols×rows character cells \
+                                     (cols·cell_w × rows·cell_h px). The source aspect ratio \
+                                     is NOT preserved — it's stretched to the char grid.",
+                                );
+                            ui.add(
+                                egui::DragValue::new(&mut self.shade_fit_cols)
+                                    .range(1..=1000)
+                                    .prefix("cols "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.shade_fit_rows)
+                                    .range(1..=1000)
+                                    .prefix("rows "),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            for (label, c, r) in
+                                [("80×25", 80, 25), ("80×50", 80, 50), ("132×50", 132, 50), ("40×25", 40, 25)]
+                            {
+                                if ui.small_button(label).clicked() {
+                                    self.shade_fit_cols = c;
+                                    self.shade_fit_rows = r;
+                                    self.shade_fit_chars = true;
+                                }
+                            }
+                            // Resulting pixel size at the current cell dims.
+                            let (cw, ch) = self.ansi_cell_dims();
+                            ui.weak(format!(
+                                "→ {}×{} px",
+                                self.shade_fit_cols.max(1) * cw,
+                                self.shade_fit_rows.max(1) * ch
+                            ));
                         });
                         // Shading amount: how much shade/half-blocks vs flat color.
                         ui.horizontal(|ui| {
@@ -23574,21 +23702,24 @@ impl Kaleidotron {
                         // or degenerate into a fake solid.
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f1_on, "");
-                            ui.label("F1 ░");
+                            Self::paint_shade_swatch(ui, self.shade_f1);
+                            ui.label("F1");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
                             middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
                             wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.10f32, 0.40f32);
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f2_on, "");
-                            ui.label("F2 ▒");
+                            Self::paint_shade_swatch(ui, self.shade_f2);
+                            ui.label("F2");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
                             middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
                             wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.40f32, 0.60f32);
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f3_on, "");
-                            ui.label("F3 ▓");
+                            Self::paint_shade_swatch(ui, self.shade_f3);
+                            ui.label("F3");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
                             middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
                             wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.60f32, 0.90f32);
@@ -23909,7 +24040,6 @@ impl Kaleidotron {
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
         let aux = self.pipe_aux(Some(palette.as_slice()), dsx, dsy);
-        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         // Effective cell + font, same precedence as pipe_aux: VGA50 (8×8) → snap
         // 9×16 → Cell W/H.
         let font_8x8 = self.shade_vga50;
@@ -23920,62 +24050,74 @@ impl Kaleidotron {
         } else {
             (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
         };
-        let grid = crate::thumb::ansi_shade_grid(
-            &rgba, w, h, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-            self.shade_amount, self.shade_ice, self.shade_smooth,
-        );
-        // Resolve the export format from the color-depth selector. `user_depth` (0=Auto,
-        // 1=16, 2=256, 3=RGB); the effective SGR `depth` for the .ans encoder resolves
-        // Auto → 16 on an EGA palette, else truecolor.
-        let ega = crate::thumb::palette_is_ega16(&palette);
-        let user_depth = self.shade_color_depth;
-        let depth = match user_depth {
-            0 => {
-                if ega {
-                    1
-                } else {
-                    3
-                }
-            }
-            d => d,
-        };
-        let mut note = String::new();
-        // Format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra):
-        // - explicit RGB (user_depth 3) → .tnd (scene-native 24-bit binary),
-        // - 16-color depth → EGA .ans / non-EGA .xbin (embeds the palette),
-        // - 256 / Auto-truecolor → portable .ans (SGR).
-        let (mut bytes, ext, sauce_fmt) = if user_depth == 3 {
-            note = " (TundraDraw 24-bit)".into();
-            (crate::thumb::ansi_grid_to_tundra(&grid), "tnd", 2u8)
-        } else if depth == 1 {
-            if ega {
-                (
-                    crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 1),
-                    "ans",
-                    0u8,
-                )
+        // Grid size: fit-to-chars grids at the EXACT resize target (tw×th → cols×rows);
+        // otherwise keep the historical behavior of gridding at the full working size.
+        let (gw, gh, grid) = if self.shade_fit_chars {
+            let mut work = if tw == w && th == h {
+                rgba
             } else {
-                // XBin embeds the palette (best-16 of the colours actually used), so it
-                // only "loses" colour when >16 distinct colours were used.
+                crate::thumb::box_downscale(&rgba, w, h, tw, th)
+            };
+            apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
+            let g = crate::thumb::ansi_shade_grid(
+                &work, tw, th, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+                self.shade_amount, self.shade_ice, self.shade_smooth,
+            );
+            (tw, th, g)
+        } else {
+            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+            let g = crate::thumb::ansi_shade_grid(
+                &rgba, w, h, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+                self.shade_amount, self.shade_ice, self.shade_smooth,
+            );
+            (w, h, g)
+        };
+        let _ = (gw, gh); // grid dims are carried on `grid.cols`/`grid.rows`
+        // Explicit export-format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra).
+        //   0 Auto  → EGA palette: ANSI 16-color .ans; else truecolor .ans
+        //   1 ANSI 16-color .ans   2 ANSI 256-color .ans   3 ANSI truecolor .ans
+        //   4 XBin .xb (embeds used palette + VGA50 font)   5 Tundra .tnd (24-bit)
+        let ega = crate::thumb::palette_is_ega16(&palette);
+        let note: String; // set by every match arm below
+        let (mut bytes, ext, sauce_fmt) = match self.shade_export_format {
+            5 => {
+                note = " (TundraDraw 24-bit)".into();
+                (crate::thumb::ansi_grid_to_tundra(&grid), "tnd", 2u8)
+            }
+            4 => {
                 let (xb, reduced) =
                     crate::thumb::ansi_grid_to_xbin(&grid, font_8x8, self.shade_ice);
-                if reduced {
-                    note = " (>16 colors used → reduced to 16 for XBin)".into();
-                }
-                (xb, "xbin", 1u8)
+                note = if reduced {
+                    " (XBin — >16 colors used → reduced to 16)".into()
+                } else {
+                    " (XBin 16-color)".into()
+                };
+                (xb, "xb", 1u8)
             }
-        } else {
-            note = if depth == 2 {
-                " (256-color)".into()
-            } else {
-                " (24-bit truecolor)".into()
-            };
-            (
-                crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, depth),
-                "ans",
-                0u8,
-            )
+            3 => {
+                note = " (ANSI 24-bit truecolor)".into();
+                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 3), "ans", 0u8)
+            }
+            2 => {
+                note = " (ANSI 256-color)".into();
+                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 2), "ans", 0u8)
+            }
+            1 => {
+                note = " (ANSI 16-color)".into();
+                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 1), "ans", 0u8)
+            }
+            // 0 = Auto: EGA → 16-color .ans; non-EGA → truecolor .ans (portable).
+            _ => {
+                let depth = if ega { 1 } else { 3 };
+                note = if ega {
+                    " (Auto: ANSI 16-color)".into()
+                } else {
+                    " (Auto: ANSI truecolor)".into()
+                };
+                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, depth), "ans", 0u8)
+            }
         };
         // Append a SAUCE trailer to every format: EOF byte + 128-byte record. FileSize
         // is the content length BEFORE the EOF + record.
@@ -23995,14 +24137,15 @@ impl Kaleidotron {
         bytes.push(0x1A); // DOS EOF before the record
         bytes.extend_from_slice(&sauce);
         let name = format!("{stem}_{}.{ext}", self.recolor_tag());
-        let filter = match ext {
-            "tnd" => "TundraDraw",
-            "xbin" => "XBin",
-            _ => "ANSI art",
+        // Filter name + accepted extensions per format (XBin accepts .xb and .xbin).
+        let (filter, exts): (&str, &[&str]) = match ext {
+            "tnd" => ("TundraDraw", &["tnd"]),
+            "xb" => ("XBin", &["xb", "xbin"]),
+            _ => ("ANSI art", &["ans"]),
         };
         let Some(dest) = rfd::FileDialog::new()
             .set_file_name(&name)
-            .add_filter(filter, &[ext])
+            .add_filter(filter, exts)
             .save_file()
         else {
             return; // cancelled
@@ -28322,6 +28465,52 @@ impl Kaleidotron {
                     text_col,
                 );
             }
+        }
+        // --- Standard textmode dimensions in a distinct accent colour, so the user can
+        // see where 80 cols / 25 rows fall relative to the grey grid ticks. Bolder +
+        // taller marks; clamped on-screen like the rest. ---
+        let accent = egui::Color32::from_rgb(90, 210, 235); // cyan, distinct from the greys
+        let special_len = t_major + 4.0;
+        let sfont = egui::FontId::monospace(9.5);
+        for &sc in &[40usize, 80, 132, 160] {
+            if sc > cols {
+                continue;
+            }
+            let x = img_rect.left() + sc as f32 * cell_sw;
+            if x < viewport.left() - 0.5 || x > viewport.right() + 0.5 {
+                continue;
+            }
+            painter.line_segment(
+                [egui::pos2(x, top_base), egui::pos2(x, top_base - special_len)],
+                egui::Stroke::new(1.5, accent),
+            );
+            painter.text(
+                egui::pos2(x, top_base - special_len - 1.0),
+                egui::Align2::CENTER_BOTTOM,
+                sc.to_string(),
+                sfont.clone(),
+                accent,
+            );
+        }
+        for &sr in &[24usize, 25, 50, 100] {
+            if sr > rows {
+                continue;
+            }
+            let y = img_rect.top() + sr as f32 * cell_sh;
+            if y < viewport.top() - 0.5 || y > viewport.bottom() + 0.5 {
+                continue;
+            }
+            painter.line_segment(
+                [egui::pos2(left_base, y), egui::pos2(left_base - special_len, y)],
+                egui::Stroke::new(1.5, accent),
+            );
+            painter.text(
+                egui::pos2(left_base - special_len - 2.0, y),
+                egui::Align2::RIGHT_CENTER,
+                sr.to_string(),
+                sfont.clone(),
+                accent,
+            );
         }
         // --- Corner summary: cols×rows, just inside the top-left where the rulers meet. ---
         painter.text(
@@ -35736,7 +35925,10 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SHADE_AMOUNT_KEY, &self.shade_amount);
         eframe::set_value(storage, Self::SHADE_SMOOTH_KEY, &self.shade_smooth);
         eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
-        eframe::set_value(storage, Self::SHADE_COLOR_DEPTH_KEY, &self.shade_color_depth);
+        eframe::set_value(storage, Self::SHADE_EXPORT_FORMAT_KEY, &self.shade_export_format);
+        eframe::set_value(storage, Self::SHADE_FIT_CHARS_KEY, &self.shade_fit_chars);
+        eframe::set_value(storage, Self::SHADE_FIT_COLS_KEY, &self.shade_fit_cols);
+        eframe::set_value(storage, Self::SHADE_FIT_ROWS_KEY, &self.shade_fit_rows);
         eframe::set_value(storage, Self::PIXELATE_H_KEY, &self.pixelate_h);
         eframe::set_value(storage, Self::PIXELATE_LOCK_KEY, &self.pixelate_lock);
         eframe::set_value(storage, Self::RESIZE_ON_KEY, &self.resize_on);
@@ -36846,6 +37038,13 @@ fn default_true() -> bool {
 fn default_half() -> f32 {
     0.5
 }
+/// serde defaults for `FxPreset` fit-to-chars grid (80×25 classic textmode screen).
+fn default_fit_cols() -> usize {
+    80
+}
+fn default_fit_rows() -> usize {
+    25
+}
 fn default_ink() -> [u8; 3] {
     [235, 235, 235]
 }
@@ -37028,7 +37227,13 @@ struct FxPreset {
     shade_smooth: f32,
     shade_ice: bool,
     #[serde(default)]
-    shade_color_depth: u8,
+    shade_export_format: u8,
+    #[serde(default)]
+    shade_fit_chars: bool,
+    #[serde(default = "default_fit_cols")]
+    shade_fit_cols: usize,
+    #[serde(default = "default_fit_rows")]
+    shade_fit_rows: usize,
     pixelate_h: f32,
     pixelate_lock: bool,
     balance_color: [u8; 3],
@@ -37074,7 +37279,10 @@ impl Default for FxPreset {
             shade_amount: 1.0,
             shade_smooth: 0.5,
             shade_ice: false,
-            shade_color_depth: 0,
+            shade_export_format: 0,
+            shade_fit_chars: false,
+            shade_fit_cols: 80,
+            shade_fit_rows: 25,
             pixelate_h: 0.0,
             pixelate_lock: true,
             balance_color: [128, 128, 128],
@@ -37275,7 +37483,10 @@ fn apply_pipeline_resized(
     a: &Adjust,
     aux: &PipeAux,
 ) {
-    if (tw >= w && th >= h) || tw == 0 || th == 0 || w == 0 || h == 0 {
+    // Only skip resampling when the target IS the source. (Normal resize never
+    // up-scales, so `tw>=w && th>=h` used to imply equality; fit-to-chars can now
+    // exceed the source, so an exact-equality check is needed to still resample then.)
+    if (tw == w && th == h) || tw == 0 || th == 0 || w == 0 || h == 0 {
         apply_pipeline(rgba, w, h, a, aux);
         return;
     }
