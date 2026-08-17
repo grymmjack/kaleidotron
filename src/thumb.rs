@@ -676,6 +676,22 @@ fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
     dr * dr + dg * dg + db * db
 }
 
+/// Squared distance between two colours with each one's own brightness removed — i.e.
+/// how differently they're *tinted*, independent of how light/dark they are. Subtract a
+/// colour's mean (its grey/luma component) and what remains is its chroma vector; grey
+/// has a zero chroma vector, so two greys (or white↔black) are chroma-distance 0, while
+/// two different HUES (yellow↔blue) are far apart. Used to penalise dithering two hues
+/// together (false colour) while leaving brightness-only shading free.
+#[inline]
+fn chroma_dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let la = (a[0] + a[1] + a[2]) * (1.0 / 3.0);
+    let lb = (b[0] + b[1] + b[2]) * (1.0 / 3.0);
+    let dr = (a[0] - la) - (b[0] - lb);
+    let dg = (a[1] - la) - (b[1] - lb);
+    let db = (a[2] - la) - (b[2] - lb);
+    dr * dr + dg * dg + db * db
+}
+
 /// Characteristic palette spacing: the median nearest-neighbour squared distance among
 /// the palette colours. A cell sitting at the midpoint of two adjacent colours has a
 /// solid-error of about spacing/4, so this is what scales the shading-amount threshold —
@@ -761,13 +777,16 @@ pub fn ansi_shade_grid(
     // midpoint cell = spacing/4), so the FULL 0..1 slider is useful on any palette.
     let max_threshold = palette_spacing(&pf) * 0.25;
     let threshold = (1.0 - shade_amount.clamp(0.0, 1.0)) * max_threshold;
-    // "Smoothness": a contrast penalty on the mid-shade glyphs (░▒▓) so the greedy
-    // pair search doesn't dither wildly-different colours (white▒black, yellow▒purple)
-    // that AVERAGE to the target but look garish. At smooth=1.0 a full-contrast pair
-    // (dist²≈195075) pays that whole cost, so it's only picked on a near-perfect match;
-    // at smooth=0.0 the penalty vanishes (the old greedy behaviour). Solids and the
-    // half-blocks are exempt — see the loop below.
+    // "Smoothness" = false-colour avoidance. The greedy pair search would happily dither
+    // two DIFFERENT HUES that average to the target (yellow▒blue → grey) — garish false
+    // colour the source never had. We penalise mid-shade glyphs (░▒▓) by their CHROMA
+    // distance (hue difference with brightness removed), so mixing hues is costly but
+    // brightness-only shading (grey▓grey, white▒black) — which has ~zero chroma distance
+    // — stays free at ANY Smoothness. A baseline weight is always applied so greys never
+    // dither into colour even at Smoothness 0; the slider adds more on top. Solids and
+    // the half-blocks are exempt (see the loop below): they show real, un-blended colour.
     let smooth_w = smooth.clamp(0.0, 1.0);
+    let chroma_w = 0.10 + 0.40 * smooth_w;
     // Perf: a cell this small can't show a visible shade pattern, so it always
     // renders as a flat colour — a constant of the effective cell size, hoisted out.
     let tiny_cell = cw < 3 || ch_ < 3;
@@ -872,11 +891,12 @@ pub fn ansi_shade_grid(
                             pf[fg][2] * cov + pf[bg][2] * (1.0 - cov),
                         ];
                         // Mid-shade glyphs (░▒▓, 0 < cov < 1) mix BOTH colours, so add a
-                        // contrast penalty to avoid garish complementary dithers. Solids
+                        // CHROMA penalty: mixing two different hues (false colour) is
+                        // costly, but mixing brightness (grey▓grey shading) is free. Solids
                         // (space cov 0 → only bg; █ cov 1 → only fg) show one colour → no
                         // penalty; they always win a flat/near-flat cell.
                         let err_eff = if cov != 0.0 && cov != 1.0 {
-                            dist2(avg, pred) + smooth_w * dist2(pf[fg], pf[bg])
+                            dist2(avg, pred) + chroma_w * chroma_dist2(pf[fg], pf[bg])
                         } else {
                             dist2(avg, pred)
                         };
@@ -938,7 +958,7 @@ fn ansi_dot_on(bits: u8, rx: usize, ch: u8) -> bool {
 /// The authentic mask is 9×16 (VGA text cell) — or 8×8 when `font_8x8` (VGA50 mode,
 /// which has no 9th column); when the cell size differs it's nearest-sampled to
 /// `cell_w`×`cell_h`. Original alpha is preserved.
-fn ansi_render_grid(grid: &AnsiGrid, rgba: &mut [u8], w: usize, h: usize, font_8x8: bool) {
+pub fn ansi_render_grid(grid: &AnsiGrid, rgba: &mut [u8], w: usize, h: usize, font_8x8: bool) {
     if grid.palette.is_empty() {
         return;
     }
@@ -1465,6 +1485,56 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert!((120..=135).contains(&out[0]), "≈50% grey, got {}", out[0]);
         assert_eq!(out[3], 255, "opaque");
+    }
+
+    #[test]
+    fn ansi_shade_grey_source_never_invents_false_colour() {
+        // Regression for the "phantom yellow" bug: a purely GREY source, given a palette
+        // that also contains saturated yellow + blue, must be shaded with greys only —
+        // never yellow▒blue (which averages to grey but is garish false colour). The
+        // chroma penalty in `ansi_shade_grid` is what forbids the hue-mix.
+        let palette: Vec<[u8; 4]> = vec![
+            [0, 0, 0, 255],       // 0 black
+            [64, 64, 64, 255],    // 1 dark grey
+            [128, 128, 128, 255], // 2 mid grey
+            [192, 192, 192, 255], // 3 light grey
+            [255, 255, 255, 255], // 4 white
+            [255, 255, 0, 255],   // 5 yellow   (must NOT appear)
+            [0, 0, 255, 255],     // 6 blue     (must NOT appear)
+        ];
+        // 18×32 image: left half grey 96, right half grey 168 — tones that sit BETWEEN
+        // palette greys, so the shade search is genuinely exercised (not a solid short-
+        // circuit). Cell 9×16 → a 2×2 grid.
+        let (w, h) = (18usize, 32usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 96u8 } else { 168u8 };
+                let i = (y * w + x) * 4;
+                rgba[i] = v;
+                rgba[i + 1] = v;
+                rgba[i + 2] = v;
+                rgba[i + 3] = 255;
+            }
+        }
+        let grid = ansi_shade_grid(
+            &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
+            1.0,   // full shading amount → always run the shade search
+            false, // no iCE
+            0.0,   // Smoothness 0 → proves the ALWAYS-ON baseline kills false colour
+        );
+        for (i, cell) in grid.cells.iter().enumerate() {
+            assert!(
+                cell.fg != 5 && cell.bg != 5,
+                "cell {i} used YELLOW (glyph {}) on a grey source",
+                cell.ch
+            );
+            assert!(
+                cell.fg != 6 && cell.bg != 6,
+                "cell {i} used BLUE (glyph {}) on a grey source",
+                cell.ch
+            );
+        }
     }
 
     #[test]

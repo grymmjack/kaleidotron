@@ -20354,6 +20354,48 @@ impl Kaleidotron {
     /// A full-resolution texture of the inspected image remapped to `palette` — the
     /// viewer's recolor view. Reuses the full pixels cached by `load_full` (else
     /// decodes), and rebuilds only when the path or recolor (`key`) changes.
+    /// THE single source of truth for the ANSI-shade grid. Both the on-screen preview
+    /// ([`make_full_reduced`]) and every export format ([`export_textmode`]) call this,
+    /// so a rendered `.ans`/`.xb`/`.tnd` is guaranteed **cell-identical** to what the
+    /// viewer shows — there is only one place the cell/glyph decisions are made.
+    ///
+    /// `rgba` is the post-[`scale_source`] buffer at `w`×`h`. Returns `(grid, work, tw,
+    /// th, font_8x8)`: the grid, the pre-shade working buffer at `tw`×`th` (the preview
+    /// renders glyphs into it — it carries the correct alpha), the working dims, and
+    /// whether the VGA50 8×8 font is active.
+    fn build_ansi_grid(
+        &self,
+        w: usize,
+        h: usize,
+        rgba: &[u8],
+        palette: &[[u8; 4]],
+    ) -> (crate::thumb::AnsiGrid, Vec<u8>, usize, usize, bool) {
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let (tw, th) = self.resize_target(w, h);
+        let (cw, ch_) = self.ansi_cell_dims();
+        let font_8x8 = self.shade_vga50;
+        let mut aux = self.pipe_aux(Some(palette), dsx, dsy);
+        // Pre-shade buffer: run the value ops + resize but NOT the ANSI dither render or
+        // the Palette snap — the exact pixels `ansi_shade_grid` must analyze. Skipping the
+        // snap is what keeps preview and export matching no matter where the user dragged
+        // the Palette op in the order (a pre-Dither snap would feed the grid different
+        // pixels on one path only, inventing false colour).
+        aux.skip_dither_palette = true;
+        let mut work = if tw == w && th == h {
+            rgba.to_vec()
+        } else {
+            crate::thumb::box_downscale(rgba, w, h, tw, th)
+        };
+        apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
+        let grid = crate::thumb::ansi_shade_grid(
+            &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+            self.shade_amount, self.shade_ice, self.shade_smooth,
+        );
+        (grid, work, tw, th, font_8x8)
+    }
+
     fn make_full_reduced(
         &mut self,
         ctx: &egui::Context,
@@ -20376,6 +20418,36 @@ impl Kaleidotron {
         // Pixel-art upscale (if any) first; the enlarged art feeds the pipeline + Save.
         let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
         let size = [w, h];
+        // ANSI Shade preview: build the grid through the SAME `build_ansi_grid` the
+        // export uses, then render its glyphs — so what the viewer shows is exactly the
+        // `.ans`/`.xb`/`.tnd` that gets written. (Every other dither method stays on the
+        // generic resized pipeline below.)
+        if self.dither_method == crate::thumb::DITHER_ANSI {
+            if let Some(pal) = palette {
+                let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
+                crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8);
+                // Nearest-upscale the rendered tw×th buffer back to the display w×h (a
+                // straight move when Fit/Resize is off, i.e. tw==w && th==h).
+                let disp = if tw == w && th == h {
+                    work
+                } else {
+                    let mut d = vec![0u8; w * h * 4];
+                    for y in 0..h {
+                        let sy = y * th / h;
+                        for x in 0..w {
+                            let sx = x * tw / w;
+                            let s = (sy * tw + sx) * 4;
+                            let o = (y * w + x) * 4;
+                            d[o..o + 4].copy_from_slice(&work[s..s + 4]);
+                        }
+                    }
+                    d
+                };
+                let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", size, &disp, view_tex_opts());
+                self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
+                return Some(tt);
+            }
+        }
         // Full-res buffer: native == buffer, so eff_dither_scale is the raw scale.
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
@@ -24057,41 +24129,12 @@ impl Kaleidotron {
                 }
             },
         };
-        // Run the recolor pipeline exactly as displayed, then grid the result.
+        // Build the grid through the SAME `build_ansi_grid` the on-screen preview uses,
+        // so the exported file is guaranteed cell-identical to the viewer. (It runs the
+        // value ops + resize on the pre-shade buffer, then grids once — the preview then
+        // renders that very grid's glyphs.)
         let (w, h, rgba) = self.scale_source(size[0], size[1], rgba);
-        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
-        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
-        let (tw, th) = self.resize_target(w, h);
-        let mut aux = self.pipe_aux(Some(palette.as_slice()), dsx, dsy);
-        // Effective cell + font, same precedence as pipe_aux: VGA50 (8×8) → snap
-        // 9×16 → Cell W/H.
-        let font_8x8 = self.shade_vga50;
-        let (cw, ch_) = if self.shade_vga50 {
-            (8, 8)
-        } else if self.shade_snap916 {
-            (9, 16)
-        } else {
-            (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
-        };
-        // Bug A fix: build the PRE-SHADE image (value ops + resize, but NOT the ANSI
-        // Dither render and NOT the Palette rematch — the exact buffer the preview's
-        // internal `ansi_shade_pass` sees), then grid it ONCE with `ansi_shade_grid`.
-        // Gridding an already-rendered+snapped buffer collapsed most cells to solids,
-        // losing the shading. We grid at the pipeline target (tw×th) so the exported
-        // grid equals the preview's (same input, same cell size); fit-to-chars makes
-        // tw×th the exact cols×rows char grid.
-        aux.skip_dither_palette = true;
-        let mut work = if tw == w && th == h {
-            rgba
-        } else {
-            crate::thumb::box_downscale(&rgba, w, h, tw, th)
-        };
-        apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
-        let grid = crate::thumb::ansi_shade_grid(
-            &work, tw, th, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-            self.shade_amount, self.shade_ice, self.shade_smooth,
-        );
+        let (grid, _work, _tw, _th, font_8x8) = self.build_ansi_grid(w, h, &rgba, &palette);
         // Explicit export-format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra).
         //   0 Auto  → EGA palette: ANSI 16-color .ans; else truecolor .ans
         //   1 ANSI 16-color .ans   2 ANSI 256-color .ans   3 ANSI truecolor .ans
