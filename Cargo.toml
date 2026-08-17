@@ -6,6 +6,8 @@ description = "A fast, pixel-art-first media browser — images, scene art, 3D, 
 
 [dependencies]
 asefile = "0.3.8"
+# Data-parallel the ANSI-shade cell search (the live-preview hot loop) across cores.
+rayon = "1"
 # eframe re-exports egui, so we depend on eframe only — guarantees matching versions.
 # "persistence" enables on-disk storage (eframe::{get,set}_value) to remember the UI zoom.
 eframe = { version = "0.34", features = ["persistence"] }

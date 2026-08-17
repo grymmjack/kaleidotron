@@ -9,6 +9,7 @@
 
 use crate::decode::cp437_font::CP437_8X16;
 use crate::decode::cp437_font_8x8::CP437_8X8;
+use rayon::prelude::*;
 use crate::decode::Registry;
 use crate::image_types::PixImage;
 use std::collections::{HashMap, HashSet};
@@ -798,7 +799,6 @@ pub fn ansi_shade_grid(
     // ~6 nearest, refilling a SINGLE scratch buffer each cell (never a fresh Vec).
     let small_pal = pf.len() <= 32;
     let all_idx: Vec<usize> = (0..pf.len()).collect();
-    let mut cand_buf: Vec<usize> = Vec::with_capacity(pf.len());
     // Which palette entries are legal as a BACKGROUND? Standard textmode has only 8
     // backgrounds (the non-bright ANSI slots 0–7); iCE-color mode unlocks all 16. So
     // a palette colour that maps to a bright ANSI slot (≥8) can't be a bg unless iCE —
@@ -807,7 +807,17 @@ pub fn ansi_shade_grid(
         .iter()
         .map(|c| ice || nearest_ansi16([c[0] as u8, c[1] as u8, c[2] as u8]) < 8)
         .collect();
-    for cy in 0..rows {
+    // Compute the grid in PARALLEL, one row per task. Each cell is an independent
+    // function of the (read-only) source + palette, so rows fan out across cores while
+    // writing into a pre-sized buffer preserves the exact serial order — the grid, and
+    // thus preview==export, is byte-identical to the single-threaded result. This is the
+    // live-preview hot loop, so the speedup is what keeps slider drags smooth.
+    cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
+    cells.par_chunks_mut(cols).enumerate().for_each(|(cy, row)| {
+        // Per-task scratch for the big-palette nearest-6 candidate list — no shared state.
+        let mut cand_buf: Vec<usize> = Vec::with_capacity(pf.len());
+        // `cx` is a cell COORDINATE (drives x0 = cx*cw, midx, …), not just the row index.
+        #[allow(clippy::needless_range_loop)]
         for cx in 0..cols {
             let x0 = cx * cw;
             let y0 = cy * ch_;
@@ -837,7 +847,7 @@ pub fn ansi_shade_grid(
                 }
             }
             if n == 0 {
-                cells.push(AnsiCell { fg: 0, bg: 0, ch: 32 }); // wholly transparent
+                row[cx] = AnsiCell { fg: 0, bg: 0, ch: 32 }; // wholly transparent
                 continue;
             }
             let avg = [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32];
@@ -845,7 +855,7 @@ pub fn ansi_shade_grid(
             // Tiny-cell short-circuit: a <3px cell can't render a shade pattern, so
             // it's always a flat colour — skip the whole search (makes 1×1 instant).
             if tiny_cell {
-                cells.push(AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 });
+                row[cx] = AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 };
                 continue;
             }
             // Shading-amount gate: if `avg` is already close to a solid palette colour
@@ -853,7 +863,7 @@ pub fn ansi_shade_grid(
             // so large flat regions stay solid instead of being needlessly dithered.
             let solid_err = dist2(avg, pf[solid_idx as usize]);
             if solid_err <= threshold {
-                cells.push(AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 });
+                row[cx] = AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 };
                 continue;
             }
             let mean = |acc: [f32; 3], cnt: u32| {
@@ -887,19 +897,21 @@ pub fn ansi_shade_grid(
                     continue; // bright bg only allowed in iCE mode
                 }
                 for &fg in cand {
+                    // Mid-shade glyphs (░▒▓, 0 < cov < 1) mix BOTH colours, so pay a CHROMA
+                    // penalty: mixing two different hues (false colour) is costly, but mixing
+                    // brightness (grey▓grey shading) is free. It depends only on the fg/bg
+                    // pair, so hoist it out of the coverage loop. Solids (space cov 0 → only
+                    // bg; █ cov 1 → only fg) show one colour → no penalty; they always win a
+                    // flat/near-flat cell.
+                    let chroma_pen = chroma_w * chroma_dist2(pf[fg], pf[bg]);
                     for &(cov, glyph) in &coverages {
                         let pred = [
                             pf[fg][0] * cov + pf[bg][0] * (1.0 - cov),
                             pf[fg][1] * cov + pf[bg][1] * (1.0 - cov),
                             pf[fg][2] * cov + pf[bg][2] * (1.0 - cov),
                         ];
-                        // Mid-shade glyphs (░▒▓, 0 < cov < 1) mix BOTH colours, so add a
-                        // CHROMA penalty: mixing two different hues (false colour) is
-                        // costly, but mixing brightness (grey▓grey shading) is free. Solids
-                        // (space cov 0 → only bg; █ cov 1 → only fg) show one colour → no
-                        // penalty; they always win a flat/near-flat cell.
                         let err_eff = if cov != 0.0 && cov != 1.0 {
-                            dist2(avg, pred) + chroma_w * chroma_dist2(pf[fg], pf[bg])
+                            dist2(avg, pred) + chroma_pen
                         } else {
                             dist2(avg, pred)
                         };
@@ -978,9 +990,9 @@ pub fn ansi_shade_grid(
                     }
                 }
             }
-            cells.push(AnsiCell { fg: best_fg, bg: best_bg, ch: best_ch });
+            row[cx] = AnsiCell { fg: best_fg, bg: best_bg, ch: best_ch };
         }
-    }
+    });
     AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells }
 }
 
