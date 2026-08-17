@@ -19,8 +19,8 @@ pub mod fon;
 pub mod ico;
 pub mod amiga_font;
 pub mod tdf;
-mod cp437_font;
-mod cp437_font_8x8;
+pub(crate) mod cp437_font; // shared with the ANSI-shade renderer in `thumb`
+pub(crate) mod cp437_font_8x8; // 8×8 VGA50 font, also shared with the ANSI-shade renderer
 mod idf;
 mod iff;
 pub mod mesh3d; // 3D models (OBJ/STL/PLY/glTF/GLB/DAE) → CPU-rendered thumbnail + geometry

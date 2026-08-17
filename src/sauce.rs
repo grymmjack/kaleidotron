@@ -163,6 +163,74 @@ pub fn strip(data: &[u8]) -> &[u8] {
     &data[..cut]
 }
 
+/// Build a 128-byte SAUCE record for an exported textmode file. `title` is the piece
+/// name (source stem); `cols`/`rows` the canvas size; `format` selects the DataType/
+/// FileType pair — 0 = ANSi (1/1), 1 = XBin (6/0), 2 = TundraDraw (1/8); `ice` sets
+/// the non-blink TFlag; `font_8x8` picks the 8×8 (VGA50) letter-spacing + font name;
+/// `date_ccyymmdd` is today as `CCYYMMDD` (or non-8-char → left blank); `filesize` is
+/// the byte length of the file content BEFORE the EOF + this record. Mirrors the
+/// offsets [`parse`] reads back.
+#[allow(clippy::too_many_arguments)]
+pub fn sauce_record(
+    title: &str,
+    cols: u16,
+    rows: u16,
+    format: u8,
+    ice: bool,
+    font_8x8: bool,
+    date_ccyymmdd: &str,
+    filesize: u32,
+) -> [u8; 128] {
+    let mut s = [b' '; 128]; // text fields are space-padded
+    s[..5].copy_from_slice(b"SAUCE");
+    s[5..7].copy_from_slice(b"00");
+    // Write a space-padded string field (truncated to `len`).
+    let put = |s: &mut [u8; 128], off: usize, len: usize, val: &str| {
+        let b = val.as_bytes();
+        let n = b.len().min(len);
+        s[off..off + n].copy_from_slice(&b[..n]);
+        for i in off + n..off + len {
+            s[i] = b' ';
+        }
+    };
+    put(&mut s, 7, 35, title); // Title
+    put(&mut s, 42, 20, "kaleidotron"); // Author
+    put(&mut s, 62, 20, ""); // Group
+    // Date[8] = CCYYMMDD; leave the space padding if we couldn't format one.
+    let d = date_ccyymmdd.as_bytes();
+    if d.len() == 8 {
+        s[82..90].copy_from_slice(d);
+    }
+    s[90..94].copy_from_slice(&filesize.to_le_bytes()); // FileSize u32 LE
+    let (data_type, file_type) = match format {
+        1 => (6u8, 0u8), // XBin
+        2 => (1u8, 8u8), // TundraDraw (Character / TundraDraw)
+        _ => (1u8, 1u8), // ANSi
+    };
+    s[94] = data_type;
+    s[95] = file_type;
+    s[96..98].copy_from_slice(&cols.to_le_bytes()); // TInfo1 = width
+    s[98..100].copy_from_slice(&rows.to_le_bytes()); // TInfo2 = height
+    s[100..104].copy_from_slice(&[0, 0, 0, 0]); // TInfo3 / TInfo4
+    s[104] = 0; // Comments
+    // TFlags: bit0 iCE/non-blink; bits1–2 letter-spacing (10 = 9px VGA, 01 = 8px VGA50).
+    let mut tflags = 0u8;
+    if ice {
+        tflags |= 0x01;
+    }
+    tflags |= if font_8x8 { 0b01 << 1 } else { 0b10 << 1 };
+    s[105] = tflags;
+    // TInfoS[22] = font name, NUL-padded.
+    for b in s[106..128].iter_mut() {
+        *b = 0;
+    }
+    let font = if font_8x8 { "IBM VGA50" } else { "IBM VGA" };
+    let fb = font.as_bytes();
+    let n = fb.len().min(22);
+    s[106..106 + n].copy_from_slice(&fb[..n]);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +336,39 @@ mod tests {
         assert_eq!(file.len(), 130);
         assert_eq!(parse(&file), None);
         assert_eq!(strip(&file), &file[..]);
+    }
+
+    #[test]
+    fn writer_round_trips_through_parser() {
+        // A record built by sauce_record must read back with the same fields — guards
+        // the byte offsets against the parser (the source of truth for reading).
+        let s = sauce_record("MyPiece", 80, 25, 0, true, false, "20260817", 4096);
+        let mut file = b"ART\x1a".to_vec();
+        file.extend_from_slice(&s);
+        let p = parse(&file).expect("written SAUCE parses");
+        assert_eq!(p.title, "MyPiece");
+        assert_eq!(p.author, "kaleidotron");
+        assert_eq!(p.kind_label(), "ANSi");
+        assert_eq!(p.char_width(), Some(80));
+        assert_eq!(p.tinfo2, 25);
+        assert!(p.ice);
+        assert_eq!(p.date_pretty(), "2026-08-17");
+        assert_eq!(p.font, "IBM VGA");
+        // XBin variant (format 1): DataType 6, 8×8 font name.
+        let x = sauce_record("X", 40, 12, 1, false, true, "20260817", 10);
+        let xf = x.to_vec();
+        let px = parse(&xf).expect("xbin SAUCE parses");
+        assert_eq!(px.kind_label(), "XBin");
+        assert_eq!(px.font, "IBM VGA50");
+        assert!(!px.ice);
+        // TundraDraw variant (format 2): DataType 1 / FileType 8 → "TundraDraw".
+        let t = sauce_record("T", 100, 50, 2, false, false, "20260817", 20);
+        let tf = t.to_vec();
+        let pt = parse(&tf).expect("tundra SAUCE parses");
+        assert_eq!(pt.data_type, 1);
+        assert_eq!(pt.file_type, 8);
+        assert_eq!(pt.kind_label(), "TundraDraw");
+        assert_eq!(pt.char_width(), Some(100));
+        assert_eq!(pt.tinfo2, 50);
     }
 }

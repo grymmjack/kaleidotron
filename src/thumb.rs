@@ -7,6 +7,8 @@
 //! (a box filter) so high-frequency block/shade art shrinks faithfully (a 50% dither
 //! reads as 50% grey) instead of aliasing — those downscaled thumbs display LINEAR.
 
+use crate::decode::cp437_font::CP437_8X16;
+use crate::decode::cp437_font_8x8::CP437_8X8;
 use crate::decode::Registry;
 use crate::image_types::PixImage;
 use std::collections::{HashMap, HashSet};
@@ -401,10 +403,18 @@ pub const DITHER_NAMES: &[&str] = &[
     "Floyd–Steinberg",
     "Atkinson",
     "Custom",
+    "ANSI Shade",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
 pub const DITHER_CUSTOM: u8 = 6;
+
+/// `DITHER_NAMES` index for the textmode/ANSI shade-block renderer. Unlike the
+/// other modes this one paints CP437 glyphs (space ░▒▓█ + half-blocks) drawn in a
+/// two-colour palette per cell — a hard-quantized, blocky "ANSI art" look. Needs a
+/// palette (like error-diffusion), and it already outputs palette colours so a
+/// following Palette snap is a no-op.
+pub const DITHER_ANSI: u8 = 7;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -606,6 +616,684 @@ fn nearest_color(c: [u8; 3], palette: &[[u8; 4]]) -> [u8; 3] {
         }
     }
     best
+}
+
+/// Index of the palette entry nearest to `c` (squared RGB distance). Companion to
+/// [`nearest_color`] for the ANSI shade renderer, which tracks palette *indices*
+/// (a cell's fg/bg) rather than RGB triples. Assumes a non-empty palette.
+fn nearest_index(c: [u8; 3], palette: &[[u8; 4]]) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = u32::MAX;
+    for (i, p) in palette.iter().enumerate() {
+        let dr = c[0] as i32 - p[0] as i32;
+        let dg = c[1] as i32 - p[1] as i32;
+        let db = c[2] as i32 - p[2] as i32;
+        let d = (dr * dr + dg * dg + db * db) as u32;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// ANSI shade-block ("textmode") renderer
+// ---------------------------------------------------------------------------
+
+/// One text-mode cell: a CP437 glyph `ch` drawn in two palette colours (`fg`/`bg`
+/// are PALETTE INDICES, so the grid also round-trips to an `.ans` file).
+#[derive(Clone, Copy)]
+pub struct AnsiCell {
+    pub fg: u8,
+    pub bg: u8,
+    pub ch: u8,
+}
+
+/// A full text-mode screen: `cols`×`rows` cells over a `cell_w`×`cell_h` pixel
+/// grid, drawn from `palette`. Produced by [`ansi_shade_grid`]; rendered back into
+/// pixels by [`ansi_shade_pass`] or serialized by [`ansi_grid_to_ans`].
+pub struct AnsiGrid {
+    pub cols: usize,
+    pub rows: usize,
+    pub cell_w: usize,
+    pub cell_h: usize,
+    pub palette: Vec<[u8; 4]>,
+    pub cells: Vec<AnsiCell>,
+}
+
+/// The five shade coverages, paired with their CP437 glyphs: space ░ ▒ ▓ █. The
+/// middle three fractions are user-tunable (`f1`/`f2`/`f3`), so a palette pair can
+/// hit intermediate tones the way classic ANSI art did.
+const SHADE_GLYPHS: [u8; 5] = [32, 176, 177, 178, 219];
+
+/// Squared RGB distance between two f32 triples.
+#[inline]
+fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dr = a[0] - b[0];
+    let dg = a[1] - b[1];
+    let db = a[2] - b[2];
+    dr * dr + dg * dg + db * db
+}
+
+/// Characteristic palette spacing: the median nearest-neighbour squared distance among
+/// the palette colours. A cell sitting at the midpoint of two adjacent colours has a
+/// solid-error of about spacing/4, so this is what scales the shading-amount threshold —
+/// the whole 0..1 slider stays useful whether the palette is EGA-16 or a dense 256-set.
+fn palette_spacing(pf: &[[f32; 3]]) -> f32 {
+    if pf.len() < 2 {
+        return 20000.0;
+    }
+    let mut nn: Vec<f32> = Vec::with_capacity(pf.len());
+    for (i, a) in pf.iter().enumerate() {
+        let mut best = f32::MAX;
+        for (j, b) in pf.iter().enumerate() {
+            if i != j {
+                best = best.min(dist2(*a, *b));
+            }
+        }
+        nn.push(best);
+    }
+    nn.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    nn[nn.len() / 2]
+}
+
+/// Analyze `rgba` into an [`AnsiGrid`]: for each `cell_w`×`cell_h` block pick the
+/// two palette colours + glyph (a shade level or a half-block) that best match the
+/// block's tone(s). Edge cells are clamped to the image bounds. Fully-transparent
+/// cells become a space in palette entry 0.
+#[allow(clippy::too_many_arguments)]
+pub fn ansi_shade_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    f1: f32,
+    f2: f32,
+    f3: f32,
+    half_blocks: bool,
+    f1_on: bool,
+    f2_on: bool,
+    f3_on: bool,
+    shade_amount: f32,
+    ice: bool,
+    smooth: f32,
+) -> AnsiGrid {
+    let cw = cell_w.max(1);
+    let ch_ = cell_h.max(1);
+    let cols = w.div_ceil(cw);
+    let rows = h.div_ceil(ch_);
+    let mut cells = Vec::with_capacity(cols * rows);
+    if palette.is_empty() || w == 0 || h == 0 {
+        // Nothing to match against — emit an all-space grid so callers stay simple.
+        cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
+        return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells };
+    }
+    // The active (coverage, glyph) candidates: always the space (0.0) and full block
+    // (1.0); the ░▒▓ mid levels only when their per-shade toggle is on.
+    let mut coverages: Vec<(f32, u8)> = Vec::with_capacity(5);
+    coverages.push((0.0, SHADE_GLYPHS[0])); // space
+    if f1_on {
+        coverages.push((f1.clamp(0.0, 1.0), SHADE_GLYPHS[1])); // ░
+    }
+    if f2_on {
+        coverages.push((f2.clamp(0.0, 1.0), SHADE_GLYPHS[2])); // ▒
+    }
+    if f3_on {
+        coverages.push((f3.clamp(0.0, 1.0), SHADE_GLYPHS[3])); // ▓
+    }
+    coverages.push((1.0, SHADE_GLYPHS[4])); // █
+    // Palette as f32 triples for the joint search.
+    let pf: Vec<[f32; 3]> = palette
+        .iter()
+        .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+        .collect();
+    // "Shading amount": how far a cell's average must sit from the nearest SOLID
+    // palette colour before shade/half-block glyphs are allowed. Low amount → big
+    // threshold → flats stay a solid █, so only genuine transitions get shaded.
+    // The max threshold is scaled to the palette's spacing (≈ the solid-error of a
+    // midpoint cell = spacing/4), so the FULL 0..1 slider is useful on any palette.
+    let max_threshold = palette_spacing(&pf) * 0.25;
+    let threshold = (1.0 - shade_amount.clamp(0.0, 1.0)) * max_threshold;
+    // "Smoothness": a contrast penalty on the mid-shade glyphs (░▒▓) so the greedy
+    // pair search doesn't dither wildly-different colours (white▒black, yellow▒purple)
+    // that AVERAGE to the target but look garish. At smooth=1.0 a full-contrast pair
+    // (dist²≈195075) pays that whole cost, so it's only picked on a near-perfect match;
+    // at smooth=0.0 the penalty vanishes (the old greedy behaviour). Solids and the
+    // half-blocks are exempt — see the loop below.
+    let smooth_w = smooth.clamp(0.0, 1.0);
+    // Perf: a cell this small can't show a visible shade pattern, so it always
+    // renders as a flat colour — a constant of the effective cell size, hoisted out.
+    let tiny_cell = cw < 3 || ch_ < 3;
+    // Candidate fg/bg set for the pair search. Small palettes (EGA is 16) search
+    // ALL indices — no per-cell sort, no allocation. Big palettes fall back to the
+    // ~6 nearest, refilling a SINGLE scratch buffer each cell (never a fresh Vec).
+    let small_pal = pf.len() <= 32;
+    let all_idx: Vec<usize> = (0..pf.len()).collect();
+    let mut cand_buf: Vec<usize> = Vec::with_capacity(pf.len());
+    // Which palette entries are legal as a BACKGROUND? Standard textmode has only 8
+    // backgrounds (the non-bright ANSI slots 0–7); iCE-color mode unlocks all 16. So
+    // a palette colour that maps to a bright ANSI slot (≥8) can't be a bg unless iCE —
+    // gate the search on this so the on-screen preview matches a real non-iCE .ans.
+    let bg_ok: Vec<bool> = pf
+        .iter()
+        .map(|c| ice || nearest_ansi16([c[0] as u8, c[1] as u8, c[2] as u8]) < 8)
+        .collect();
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let x0 = cx * cw;
+            let y0 = cy * ch_;
+            let x1 = (x0 + cw).min(w);
+            let y1 = (y0 + ch_).min(h);
+            // Region means, skipping transparent pixels. Halves split by the cell's
+            // authored geometry (not the clamped region) so partial edge cells stay sane.
+            let (mut sum, mut n) = ([0f32; 3], 0u32);
+            let (mut top, mut tn) = ([0f32; 3], 0u32);
+            let (mut bot, mut bn) = ([0f32; 3], 0u32);
+            let (mut left, mut ln) = ([0f32; 3], 0u32);
+            let (mut right, mut rn) = ([0f32; 3], 0u32);
+            let midy = y0 + ch_ / 2;
+            let midx = x0 + cw / 2;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * w + x) * 4;
+                    if rgba[i + 3] == 0 {
+                        continue; // skip transparent
+                    }
+                    let c = [rgba[i] as f32, rgba[i + 1] as f32, rgba[i + 2] as f32];
+                    sum[0] += c[0]; sum[1] += c[1]; sum[2] += c[2]; n += 1;
+                    if y < midy { top[0]+=c[0]; top[1]+=c[1]; top[2]+=c[2]; tn+=1; }
+                    else { bot[0]+=c[0]; bot[1]+=c[1]; bot[2]+=c[2]; bn+=1; }
+                    if x < midx { left[0]+=c[0]; left[1]+=c[1]; left[2]+=c[2]; ln+=1; }
+                    else { right[0]+=c[0]; right[1]+=c[1]; right[2]+=c[2]; rn+=1; }
+                }
+            }
+            if n == 0 {
+                cells.push(AnsiCell { fg: 0, bg: 0, ch: 32 }); // wholly transparent
+                continue;
+            }
+            let avg = [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32];
+            let solid_idx = nearest_index([avg[0] as u8, avg[1] as u8, avg[2] as u8], palette);
+            // Tiny-cell short-circuit: a <3px cell can't render a shade pattern, so
+            // it's always a flat colour — skip the whole search (makes 1×1 instant).
+            if tiny_cell {
+                cells.push(AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 });
+                continue;
+            }
+            // Shading-amount gate: if `avg` is already close to a solid palette colour
+            // (within `threshold`), keep the cell a flat █ and skip the shade search —
+            // so large flat regions stay solid instead of being needlessly dithered.
+            let solid_err = dist2(avg, pf[solid_idx as usize]);
+            if solid_err <= threshold {
+                cells.push(AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 });
+                continue;
+            }
+            let mean = |acc: [f32; 3], cnt: u32| {
+                if cnt == 0 { avg } else { [acc[0]/cnt as f32, acc[1]/cnt as f32, acc[2]/cnt as f32] }
+            };
+            let top_avg = mean(top, tn);
+            let bot_avg = mean(bot, bn);
+            let left_avg = mean(left, ln);
+            let right_avg = mean(right, rn);
+
+            // --- SHADE candidate: joint search over (bg, fg, coverage). Small
+            // palettes search all colours; big ones restrict fg/bg to the ~6 nearest
+            // `avg`, computed into the reused `cand_buf` (no per-cell allocation). ---
+            let cand: &[usize] = if small_pal {
+                &all_idx
+            } else {
+                cand_buf.clear();
+                cand_buf.extend_from_slice(&all_idx);
+                cand_buf.sort_by(|&a, &b| {
+                    dist2(pf[a], avg).partial_cmp(&dist2(pf[b], avg)).unwrap()
+                });
+                cand_buf.truncate(6);
+                &cand_buf
+            };
+            let mut best_ch = 32u8;
+            let mut best_fg = nearest_index([avg[0] as u8, avg[1] as u8, avg[2] as u8], palette);
+            let mut best_bg = best_fg;
+            let mut best_err = f32::MAX;
+            for &bg in cand {
+                if !bg_ok[bg] {
+                    continue; // bright bg only allowed in iCE mode
+                }
+                for &fg in cand {
+                    for &(cov, glyph) in &coverages {
+                        let pred = [
+                            pf[fg][0] * cov + pf[bg][0] * (1.0 - cov),
+                            pf[fg][1] * cov + pf[bg][1] * (1.0 - cov),
+                            pf[fg][2] * cov + pf[bg][2] * (1.0 - cov),
+                        ];
+                        // Mid-shade glyphs (░▒▓, 0 < cov < 1) mix BOTH colours, so add a
+                        // contrast penalty to avoid garish complementary dithers. Solids
+                        // (space cov 0 → only bg; █ cov 1 → only fg) show one colour → no
+                        // penalty; they always win a flat/near-flat cell.
+                        let err_eff = if cov != 0.0 && cov != 1.0 {
+                            dist2(avg, pred) + smooth_w * dist2(pf[fg], pf[bg])
+                        } else {
+                            dist2(avg, pred)
+                        };
+                        if err_eff < best_err {
+                            best_err = err_eff;
+                            best_fg = fg as u8;
+                            best_bg = bg as u8;
+                            best_ch = glyph;
+                        }
+                    }
+                }
+            }
+
+            // --- HALF-BLOCK candidates (▀ upper-half, ▌ left-half). The bg half must
+            // also land in a legal background slot (non-iCE), else skip the candidate. ---
+            if half_blocks {
+                // ▀ 223: top = fg, bottom = bg.
+                let fg = nearest_index([top_avg[0] as u8, top_avg[1] as u8, top_avg[2] as u8], palette);
+                let bg = nearest_index([bot_avg[0] as u8, bot_avg[1] as u8, bot_avg[2] as u8], palette);
+                let err = 0.5 * dist2(top_avg, pf[fg as usize]) + 0.5 * dist2(bot_avg, pf[bg as usize]);
+                if bg_ok[bg as usize] && err < best_err {
+                    best_err = err;
+                    best_fg = fg;
+                    best_bg = bg;
+                    best_ch = 223;
+                }
+                // ▌ 221: left = fg, right = bg.
+                let fg = nearest_index([left_avg[0] as u8, left_avg[1] as u8, left_avg[2] as u8], palette);
+                let bg = nearest_index([right_avg[0] as u8, right_avg[1] as u8, right_avg[2] as u8], palette);
+                let err = 0.5 * dist2(left_avg, pf[fg as usize]) + 0.5 * dist2(right_avg, pf[bg as usize]);
+                if bg_ok[bg as usize] && err < best_err {
+                    best_fg = fg;
+                    best_bg = bg;
+                    best_ch = 221;
+                }
+            }
+            cells.push(AnsiCell { fg: best_fg, bg: best_bg, ch: best_ch });
+        }
+    }
+    AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells }
+}
+
+/// Is dot column `rx` of a 9-wide VGA cell lit, for glyph scanline `bits` of
+/// character `ch`? Columns 0..8 read the 8-pixel glyph; column 8 (the 9th VGA dot)
+/// is background except in the line-draw range `0xC0..=0xDF`, where it repeats the
+/// last glyph column — so box rules (and the full/half blocks 219..223) connect
+/// across cells, while the shade blocks 176..178 keep a blank 9th column (authentic).
+#[inline]
+fn ansi_dot_on(bits: u8, rx: usize, ch: u8) -> bool {
+    if rx < 8 {
+        (bits >> (7 - rx)) & 1 == 1
+    } else {
+        (0xC0u8..=0xDFu8).contains(&ch) && (bits & 1 == 1)
+    }
+}
+
+/// Render an [`AnsiGrid`] back into `rgba` in place: each cell's glyph is painted
+/// with its fg palette colour where the glyph mask is on, its bg colour where off.
+/// The authentic mask is 9×16 (VGA text cell) — or 8×8 when `font_8x8` (VGA50 mode,
+/// which has no 9th column); when the cell size differs it's nearest-sampled to
+/// `cell_w`×`cell_h`. Original alpha is preserved.
+fn ansi_render_grid(grid: &AnsiGrid, rgba: &mut [u8], w: usize, h: usize, font_8x8: bool) {
+    if grid.palette.is_empty() {
+        return;
+    }
+    let (cw, ch_) = (grid.cell_w.max(1), grid.cell_h.max(1));
+    // Font geometry: 8×8 (VGA50, plain 8-wide dot rule) or 8×16 (9-dot VGA cell).
+    let font_h = if font_8x8 { 8 } else { 16 };
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let fg = grid.palette[cell.fg as usize % grid.palette.len()];
+            let bg = grid.palette[cell.bg as usize % grid.palette.len()];
+            let x0 = cx * cw;
+            let y0 = cy * ch_;
+            for ry in 0..ch_ {
+                let y = y0 + ry;
+                if y >= h {
+                    break;
+                }
+                // Nearest-sample the authentic glyph row.
+                let frow = if ch_ == font_h { ry } else { ry * font_h / ch_ };
+                let bits = if font_8x8 {
+                    CP437_8X8[cell.ch as usize][frow.min(7)]
+                } else {
+                    CP437_8X16[cell.ch as usize][frow.min(15)]
+                };
+                for rx in 0..cw {
+                    let x = x0 + rx;
+                    if x >= w {
+                        break;
+                    }
+                    let on = if font_8x8 {
+                        // Plain 8-wide dot rule — VGA50 has no 9th column.
+                        let fcol = if cw == 8 { rx } else { rx * 8 / cw };
+                        (bits >> (7 - fcol.min(7))) & 1 == 1
+                    } else {
+                        // Nearest-sample the authentic 9-wide cell column.
+                        let fcol = if cw == 9 { rx } else { rx * 9 / cw };
+                        ansi_dot_on(bits, fcol.min(8), cell.ch)
+                    };
+                    let col = if on { fg } else { bg };
+                    let i = (y * w + x) * 4;
+                    rgba[i] = col[0];
+                    rgba[i + 1] = col[1];
+                    rgba[i + 2] = col[2];
+                    // alpha preserved
+                }
+            }
+        }
+    }
+}
+
+/// The ANSI shade dither pass: build the grid from `rgba` then paint it back in
+/// place. A no-op with an empty palette (mirrors error-diffusion, which also needs
+/// a target). The output is already palette colours, so a later Palette snap is a
+/// harmless no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn ansi_shade_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    f1: f32,
+    f2: f32,
+    f3: f32,
+    half_blocks: bool,
+    f1_on: bool,
+    f2_on: bool,
+    f3_on: bool,
+    shade_amount: f32,
+    font_8x8: bool,
+    ice: bool,
+    smooth: f32,
+) {
+    if palette.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let grid = ansi_shade_grid(
+        rgba, w, h, palette, cell_w, cell_h, f1, f2, f3, half_blocks, f1_on, f2_on, f3_on,
+        shade_amount, ice, smooth,
+    );
+    ansi_render_grid(&grid, rgba, w, h, font_8x8);
+}
+
+/// The 16 standard CGA/EGA colours (index = ANSI colour number 0..15), in RGB.
+const ANSI16: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], // 0 black
+    [0xAA, 0x00, 0x00], // 1 red
+    [0x00, 0xAA, 0x00], // 2 green
+    [0xAA, 0x55, 0x00], // 3 brown/yellow
+    [0x00, 0x00, 0xAA], // 4 blue
+    [0xAA, 0x00, 0xAA], // 5 magenta
+    [0x00, 0xAA, 0xAA], // 6 cyan
+    [0xAA, 0xAA, 0xAA], // 7 light grey
+    [0x55, 0x55, 0x55], // 8 dark grey
+    [0xFF, 0x55, 0x55], // 9 bright red
+    [0x55, 0xFF, 0x55], // 10 bright green
+    [0xFF, 0xFF, 0x55], // 11 bright yellow
+    [0x55, 0x55, 0xFF], // 12 bright blue
+    [0xFF, 0x55, 0xFF], // 13 bright magenta
+    [0x55, 0xFF, 0xFF], // 14 bright cyan
+    [0xFF, 0xFF, 0xFF], // 15 white
+];
+
+/// Nearest of the 16 ANSI/EGA colours (0..15) to an RGB triple.
+fn nearest_ansi16(c: [u8; 3]) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = u32::MAX;
+    for (i, p) in ANSI16.iter().enumerate() {
+        let dr = c[0] as i32 - p[0] as i32;
+        let dg = c[1] as i32 - p[1] as i32;
+        let db = c[2] as i32 - p[2] as i32;
+        let d = (dr * dr + dg * dg + db * db) as u32;
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// One channel of the xterm-256 6×6×6 colour cube: indices step 0,95,135,175,215,255.
+const XTERM_CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Nearest xterm-256 palette index (0..255) to an RGB triple, by squared distance.
+/// The palette is the 16 system colours ([`ANSI16`]), the 6×6×6 colour cube
+/// (16..231), then 24 greys (232..255, level 8+10·i).
+fn nearest_xterm256(c: [u8; 3]) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = u32::MAX;
+    let d2 = |p: [u8; 3]| -> u32 {
+        let dr = c[0] as i32 - p[0] as i32;
+        let dg = c[1] as i32 - p[1] as i32;
+        let db = c[2] as i32 - p[2] as i32;
+        (dr * dr + dg * dg + db * db) as u32
+    };
+    // 16 system colours.
+    for (i, p) in ANSI16.iter().enumerate() {
+        let d = d2(*p);
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    // 6×6×6 cube (16..231).
+    for r in 0..6 {
+        for g in 0..6 {
+            for b in 0..6 {
+                let d = d2([XTERM_CUBE[r], XTERM_CUBE[g], XTERM_CUBE[b]]);
+                if d < best_d {
+                    best_d = d;
+                    best = 16 + (36 * r + 6 * g + b) as u8;
+                }
+            }
+        }
+    }
+    // 24 greys (232..255).
+    for i in 0..24u8 {
+        let v = 8 + 10 * i;
+        let d = d2([v, v, v]);
+        if d < best_d {
+            best_d = d;
+            best = 232 + i;
+        }
+    }
+    best
+}
+
+/// Serialize an [`AnsiGrid`] to a CP437 `.ans` file: SGR colour escapes + the raw
+/// glyph bytes. `depth` picks the colour encoding — 1 = 16-colour (map RGB→nearest
+/// ANSI16; fg 30-37 + `1;` bold for bright, bg 40-47, aixterm 100-107 for a bright bg
+/// only when `ice`), 2 = 256-colour (`38;5;`/`48;5;` xterm indices), 3 = 24-bit
+/// truecolour (`38;2;r;g;b`/`48;2;…`, the exact palette RGB, no loss). An SGR escape
+/// is emitted only when fg/bg changes from the previous cell (reset+restate to avoid
+/// stale attrs). The file opens with `ESC[0m` and closes with `ESC[0m`; there are NO
+/// per-row newlines — every row is exactly `cols` wide, so the viewer's auto-wrap (from
+/// the SAUCE width) breaks lines. A trailing CRLF here would double-space every row.
+pub fn ansi_grid_to_ans(grid: &AnsiGrid, ice: bool, depth: u8) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"\x1b[0m");
+    // Resolve a cell's fg/bg palette indices to their actual RGB (fallback grey/black).
+    let rgb = |idx: u8, fallback: [u8; 3]| -> [u8; 3] {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or(fallback)
+    };
+    // Track the previous cell's RGB so we only re-emit an SGR on a change. The colour
+    // state flows across rows (no per-row reset) since we emit no row breaks.
+    let (mut cur_fg, mut cur_bg) = ([256i16; 3], [256i16; 3]);
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let fg = rgb(cell.fg, [170, 170, 170]);
+            let bg = rgb(cell.bg, [0, 0, 0]);
+            let fg16 = [fg[0] as i16, fg[1] as i16, fg[2] as i16];
+            let bg16 = [bg[0] as i16, bg[1] as i16, bg[2] as i16];
+            if fg16 != cur_fg || bg16 != cur_bg {
+                // Reset then re-state both attrs so we never carry stale bold/bg.
+                let mut sgr = String::from("\x1b[0");
+                match depth {
+                    2 => {
+                        sgr.push_str(&format!(";38;5;{}", nearest_xterm256(fg)));
+                        sgr.push_str(&format!(";48;5;{}", nearest_xterm256(bg)));
+                    }
+                    3 => {
+                        sgr.push_str(&format!(";38;2;{};{};{}", fg[0], fg[1], fg[2]));
+                        sgr.push_str(&format!(";48;2;{};{};{}", bg[0], bg[1], bg[2]));
+                    }
+                    _ => {
+                        // 16-colour: nearest ANSI, with the classic bold/aixterm rules.
+                        let f = nearest_ansi16(fg);
+                        let b = nearest_ansi16(bg);
+                        if f >= 8 {
+                            sgr.push_str(";1"); // bold → bright fg
+                        }
+                        sgr.push_str(&format!(";{}", 30 + (f % 8)));
+                        if b >= 8 && ice {
+                            sgr.push_str(&format!(";{}", 100 + (b % 8))); // aixterm bright bg
+                        } else {
+                            sgr.push_str(&format!(";{}", 40 + (b % 8))); // clamp to 0-7
+                        }
+                    }
+                }
+                sgr.push('m');
+                out.extend_from_slice(sgr.as_bytes());
+                cur_fg = fg16;
+                cur_bg = bg16;
+            }
+            out.push(cell.ch);
+        }
+        // NO per-row CRLF: each row is exactly `cols` wide, so the viewer's auto-wrap
+        // (guided by the SAUCE width) breaks the lines. Emitting CRLF here would
+        // double-space every row (auto-wrap + explicit newline) — the stretched output.
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    let _ = (cur_fg, cur_bg);
+    out
+}
+
+/// Serialize an [`AnsiGrid`] to a **TundraDraw** (`.tnd`) file — the scene-native
+/// binary 24-bit-truecolour format, so an RGB export keeps every colour exactly.
+/// Header `0x18 "TUNDRA24"`, then a command stream of cells in row-major order (the
+/// decoder auto-increments the column and wraps at the SAUCE width, so no explicit
+/// position commands are needed). Per cell we emit the minimal command for whatever
+/// changed vs the current fg/bg: cmd 6 (both), cmd 2 (fg), cmd 4 (bg), or a bare
+/// literal char when neither changed. Matches `crate::decode::tundra` exactly,
+/// including its `[0,0,0]` initial fg/bg. Caller appends the SAUCE trailer.
+pub fn ansi_grid_to_tundra(grid: &AnsiGrid) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.push(0x18);
+    out.extend_from_slice(b"TUNDRA24");
+    let rgb = |idx: u8, fallback: [u8; 3]| -> [u8; 3] {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or(fallback)
+    };
+    // The decoder inits current fg/bg to [0,0,0]; match it so the diff logic agrees.
+    let (mut cur_fg, mut cur_bg) = ([0u8; 3], [0u8; 3]);
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let fg = rgb(cell.fg, [0, 0, 0]);
+            let bg = rgb(cell.bg, [0, 0, 0]);
+            let ch = cell.ch;
+            let fg_diff = fg != cur_fg;
+            let bg_diff = bg != cur_bg;
+            if fg_diff && bg_diff {
+                // cmd 6: set both + draw char. Filler 0x00 at +2/+6 (decoder skips them).
+                out.extend_from_slice(&[6, ch, 0x00, fg[0], fg[1], fg[2], 0x00, bg[0], bg[1], bg[2]]);
+                cur_fg = fg;
+                cur_bg = bg;
+            } else if fg_diff {
+                out.extend_from_slice(&[2, ch, 0x00, fg[0], fg[1], fg[2]]);
+                cur_fg = fg;
+            } else if bg_diff {
+                out.extend_from_slice(&[4, ch, 0x00, bg[0], bg[1], bg[2]]);
+                cur_bg = bg;
+            } else if matches!(ch, 1 | 2 | 4 | 6) {
+                // A literal here would be read as a COMMAND byte — re-issue it as a cmd 6
+                // (fg/bg already equal cur, so state is unchanged). Our glyphs are never
+                // 1/2/4/6, but guard the stream anyway.
+                out.extend_from_slice(&[6, ch, 0x00, fg[0], fg[1], fg[2], 0x00, bg[0], bg[1], bg[2]]);
+            } else {
+                out.push(ch); // plain literal — drawn with the current fg/bg
+            }
+        }
+    }
+    out
+}
+
+/// Does `palette` equal the standard EGA/CGA-16 set ([`ANSI16`])? Count must be 16
+/// and every ANSI colour present (order-independent). Used to choose the export
+/// format: EGA-16 → a plain `.ans`, anything else → `.xbin` (embeds its palette).
+pub fn palette_is_ega16(palette: &[[u8; 4]]) -> bool {
+    palette.len() == 16
+        && ANSI16
+            .iter()
+            .all(|a| palette.iter().any(|p| [p[0], p[1], p[2]] == *a))
+}
+
+/// Serialize an [`AnsiGrid`] to an **XBIN** file (embeds the exact palette + font, so
+/// non-EGA colours survive). Header `XBIN\x1A`, `width`/`height` (u16 LE cells),
+/// `fontsize` (8/16), `flags`; then a 16-colour 6-bit-DAC palette block, the CP437
+/// font bitmap, and `width*height` `(char, attribute)` cell pairs where
+/// `attribute = bg<<4 | fg` (palette indices mapped into 0..15). No SAUCE trailer —
+/// the caller appends that (shared with the `.ans` path).
+pub fn ansi_grid_to_xbin(grid: &AnsiGrid, font_8x8: bool, ice: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"XBIN");
+    out.push(0x1A); // EOF marker inside the header
+    out.extend_from_slice(&(grid.cols as u16).to_le_bytes());
+    out.extend_from_slice(&(grid.rows as u16).to_le_bytes());
+    let fontsize: u8 = if font_8x8 { 8 } else { 16 };
+    out.push(fontsize);
+    // flags: bit0 palette present, bit1 font present, bit3 non-blink / iCE.
+    let mut flags = 0b0000_0011u8;
+    if ice {
+        flags |= 0b0000_1000;
+    }
+    out.push(flags);
+    // Palette block: 16 colours × RGB, each channel down to the 6-bit VGA DAC (v>>2).
+    for i in 0..16 {
+        let c = grid.palette.get(i).copied().unwrap_or([0, 0, 0, 255]);
+        out.push(c[0] >> 2);
+        out.push(c[1] >> 2);
+        out.push(c[2] >> 2);
+    }
+    // Font block: `fontsize` bytes per glyph × 256 glyphs (MSB-left, row-major).
+    for ch in 0..256usize {
+        if font_8x8 {
+            out.extend_from_slice(&CP437_8X8[ch]);
+        } else {
+            out.extend_from_slice(&CP437_8X16[ch]);
+        }
+    }
+    // Image data: (char, attribute) per cell. XBin attributes are 16-colour, so map
+    // any index ≥16 (palette larger than 16) to the nearest of the first 16 entries.
+    let first16 = &grid.palette[..grid.palette.len().min(16)];
+    let map16 = |idx: u8| -> u8 {
+        let i = idx as usize;
+        if i < 16 {
+            idx & 0x0F
+        } else if !first16.is_empty() {
+            let c = grid.palette[i.min(grid.palette.len().saturating_sub(1))];
+            nearest_index([c[0], c[1], c[2]], first16) & 0x0F
+        } else {
+            0
+        }
+    };
+    for cell in &grid.cells {
+        out.push(cell.ch);
+        let fg = map16(cell.fg);
+        let bg = map16(cell.bg);
+        out.push((bg << 4) | fg);
+    }
+    out
 }
 
 /// Build a thumbnail. Pixel art that already fits `max_dim` is stored at its

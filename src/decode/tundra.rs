@@ -141,4 +141,36 @@ mod tests {
         assert_eq!((img.width, img.height), (80 * 8, 16)); // default 80 cols
         assert_eq!(img.pixels[0], [255, 0, 0, 255]); // 24-bit red, not palette red
     }
+
+    #[test]
+    fn tundra_encoder_round_trips_through_decoder() {
+        // Build a 2-cell grid and prove `ansi_grid_to_tundra`'s bytes decode back to
+        // the exact 24-bit colours — the encoder is the inverse of this decoder.
+        use crate::thumb::{ansi_grid_to_tundra, AnsiCell, AnsiGrid};
+        let palette = vec![[255, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]]; // red, blue, green
+        let grid = AnsiGrid {
+            cols: 2,
+            rows: 1,
+            cell_w: 8,
+            cell_h: 16,
+            palette,
+            cells: vec![
+                AnsiCell { fg: 0, bg: 1, ch: 0xDB }, // full block, red fg / blue bg → cmd 6
+                AnsiCell { fg: 0, bg: 2, ch: 32 },   // space, fg unchanged, green bg → cmd 4
+            ],
+        };
+        let bytes = ansi_grid_to_tundra(&grid);
+        // Header is 0x18 "TUNDRA24".
+        assert_eq!(&bytes[..9], b"\x18TUNDRA24");
+        // cmd 6 (both) for cell 0, then cmd 4 (bg only) for cell 1.
+        assert_eq!(
+            &bytes[9..],
+            &[6, 0xDB, 0x00, 255, 0, 0, 0x00, 0, 0, 255, 4, 32, 0x00, 0, 255, 0]
+        );
+        let img = TundraDecoder.decode(&bytes).unwrap();
+        // Cell 0 is a full block → its top-left pixel is the red fg.
+        assert_eq!(img.pixels[0], [255, 0, 0, 255]);
+        // Cell 1 is a space (all bg) at column 1 (x=8) → the green bg shows.
+        assert_eq!(img.pixels[8], [0, 255, 0, 255]);
+    }
 }

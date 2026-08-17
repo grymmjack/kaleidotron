@@ -1571,6 +1571,22 @@ pub struct Kaleidotron {
     dither_scale_x: usize,   // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
     dither_scale_y: usize,   // ordered-dither cell HEIGHT in px (≥1)
     dither_scale_lock: bool, // lock the dither cell square (scale_x == scale_y)
+    // ANSI Shade dither params (DITHER_ANSI): the fill fractions the ░▒▓ shade
+    // blocks stand for, whether half-blocks are allowed, and whether to force the
+    // authentic 9×16 VGA text cell (overriding Cell W/H).
+    shade_f1: f32,        // ░ fill fraction (default 0.25)
+    shade_f2: f32,        // ▒ fill fraction (default 0.50)
+    shade_f3: f32,        // ▓ fill fraction (default 0.75)
+    shade_half: bool,     // allow half-block glyphs ▀▄▌▐
+    shade_snap916: bool,  // force 9×16 VGA cells (overrides Cell W/H)
+    shade_f1_on: bool,    // include ░ (176) as a shade candidate
+    shade_f2_on: bool,    // include ▒ (177) as a shade candidate
+    shade_f3_on: bool,    // include ▓ (178) as a shade candidate
+    shade_vga50: bool,    // force 8×8 VGA50 cells + the 8×8 font (overrides snap 9×16)
+    shade_amount: f32,    // 0..1: how much shading vs flat color (low = flats stay solid)
+    shade_smooth: f32,    // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
+    shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
+    shade_color_depth: u8, // textmode EXPORT color depth: 0=Auto, 1=16, 2=256, 3=RGB truecolor
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2363,6 +2379,19 @@ impl Kaleidotron {
     const DITHER_SCALE_KEY: &'static str = "dither_scale"; // legacy single value → X
     const DITHER_SCALE_Y_KEY: &'static str = "dither_scale_y";
     const DITHER_SCALE_LOCK_KEY: &'static str = "dither_scale_lock";
+    const SHADE_F1_KEY: &'static str = "shade_f1";
+    const SHADE_F2_KEY: &'static str = "shade_f2";
+    const SHADE_F3_KEY: &'static str = "shade_f3";
+    const SHADE_HALF_KEY: &'static str = "shade_half";
+    const SHADE_SNAP916_KEY: &'static str = "shade_snap916";
+    const SHADE_F1_ON_KEY: &'static str = "shade_f1_on";
+    const SHADE_F2_ON_KEY: &'static str = "shade_f2_on";
+    const SHADE_F3_ON_KEY: &'static str = "shade_f3_on";
+    const SHADE_VGA50_KEY: &'static str = "shade_vga50";
+    const SHADE_AMOUNT_KEY: &'static str = "shade_amount";
+    const SHADE_SMOOTH_KEY: &'static str = "shade_smooth";
+    const SHADE_ICE_KEY: &'static str = "shade_ice";
+    const SHADE_COLOR_DEPTH_KEY: &'static str = "shade_color_depth";
     const PIXELATE_H_KEY: &'static str = "pixelate_h";
     const PIXELATE_LOCK_KEY: &'static str = "pixelate_lock";
     const POSTFX_KEY: &'static str = "postfx"; // CRT post-filters (record)
@@ -2927,6 +2956,44 @@ impl Kaleidotron {
             .unwrap_or(dither_scale_x)
             .clamp(1, 16);
         let dither_scale_lock = get_bool(Self::DITHER_SCALE_LOCK_KEY).unwrap_or(true);
+        // ANSI Shade params (mirror the dither keys).
+        let shade_f1 = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_F1_KEY))
+            .unwrap_or(0.25)
+            .clamp(0.0, 1.0);
+        let shade_f2 = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_F2_KEY))
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0);
+        let shade_f3 = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_F3_KEY))
+            .unwrap_or(0.75)
+            .clamp(0.0, 1.0);
+        let shade_half = get_bool(Self::SHADE_HALF_KEY).unwrap_or(true);
+        let shade_snap916 = get_bool(Self::SHADE_SNAP916_KEY).unwrap_or(true);
+        let shade_f1_on = get_bool(Self::SHADE_F1_ON_KEY).unwrap_or(true);
+        let shade_f2_on = get_bool(Self::SHADE_F2_ON_KEY).unwrap_or(true);
+        let shade_f3_on = get_bool(Self::SHADE_F3_ON_KEY).unwrap_or(true);
+        let shade_vga50 = get_bool(Self::SHADE_VGA50_KEY).unwrap_or(false);
+        let shade_amount = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_AMOUNT_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let shade_smooth = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_SMOOTH_KEY))
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
+        let shade_color_depth = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_COLOR_DEPTH_KEY))
+            .unwrap_or(0)
+            .min(3);
         let pixelate_h = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::PIXELATE_H_KEY))
@@ -3366,6 +3433,19 @@ impl Kaleidotron {
             dither_scale_x,
             dither_scale_y,
             dither_scale_lock,
+            shade_f1,
+            shade_f2,
+            shade_f3,
+            shade_half,
+            shade_snap916,
+            shade_f1_on,
+            shade_f2_on,
+            shade_f3_on,
+            shade_vga50,
+            shade_amount,
+            shade_smooth,
+            shade_ice,
+            shade_color_depth,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19445,6 +19525,33 @@ impl Kaleidotron {
             dither_n: self.dither_custom_n,
             dither_scale_x: dscale_x,
             dither_scale_y: dscale_y,
+            shade_f1: self.shade_f1,
+            shade_f2: self.shade_f2,
+            shade_f3: self.shade_f3,
+            shade_half: self.shade_half,
+            shade_f1_on: self.shade_f1_on,
+            shade_f2_on: self.shade_f2_on,
+            shade_f3_on: self.shade_f3_on,
+            shade_amount: self.shade_amount,
+            shade_smooth: self.shade_smooth,
+            // Effective cell + font, in precedence order: VGA50 (8×8 cell + 8×8 font)
+            // → snap 9×16 (8×16 font) → Cell W/H (8×16 font).
+            shade_cw: if self.shade_vga50 {
+                8
+            } else if self.shade_snap916 {
+                9
+            } else {
+                dscale_x.max(1)
+            },
+            shade_ch: if self.shade_vga50 {
+                8
+            } else if self.shade_snap916 {
+                16
+            } else {
+                dscale_y.max(1)
+            },
+            font_8x8: self.shade_vga50,
+            shade_ice: self.shade_ice,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -19533,6 +19640,19 @@ impl Kaleidotron {
             dither_scale_x: self.dither_scale_x,
             dither_scale_y: self.dither_scale_y,
             dither_scale_lock: self.dither_scale_lock,
+            shade_f1: self.shade_f1,
+            shade_f2: self.shade_f2,
+            shade_f3: self.shade_f3,
+            shade_half: self.shade_half,
+            shade_snap916: self.shade_snap916,
+            shade_f1_on: self.shade_f1_on,
+            shade_f2_on: self.shade_f2_on,
+            shade_f3_on: self.shade_f3_on,
+            shade_vga50: self.shade_vga50,
+            shade_amount: self.shade_amount,
+            shade_smooth: self.shade_smooth,
+            shade_ice: self.shade_ice,
+            shade_color_depth: self.shade_color_depth,
             pixelate_h: self.pixelate_h,
             pixelate_lock: self.pixelate_lock,
             balance_color: self.balance_color,
@@ -19573,6 +19693,19 @@ impl Kaleidotron {
         self.dither_scale_x = p.dither_scale_x.clamp(1, 16);
         self.dither_scale_y = p.dither_scale_y.clamp(1, 16);
         self.dither_scale_lock = p.dither_scale_lock;
+        self.shade_f1 = p.shade_f1.clamp(0.0, 1.0);
+        self.shade_f2 = p.shade_f2.clamp(0.0, 1.0);
+        self.shade_f3 = p.shade_f3.clamp(0.0, 1.0);
+        self.shade_half = p.shade_half;
+        self.shade_snap916 = p.shade_snap916;
+        self.shade_f1_on = p.shade_f1_on;
+        self.shade_f2_on = p.shade_f2_on;
+        self.shade_f3_on = p.shade_f3_on;
+        self.shade_vga50 = p.shade_vga50;
+        self.shade_amount = p.shade_amount.clamp(0.0, 1.0);
+        self.shade_smooth = p.shade_smooth.clamp(0.0, 1.0);
+        self.shade_ice = p.shade_ice;
+        self.shade_color_depth = p.shade_color_depth.min(3);
         self.pixelate_h = p.pixelate_h.clamp(0.0, 32.0);
         self.pixelate_lock = p.pixelate_lock;
         self.balance_color = p.balance_color;
@@ -19602,7 +19735,9 @@ impl Kaleidotron {
     fn pipeline_active(&self) -> bool {
         !self.adjust.is_identity()
             || self.balance_offset() != [0, 0, 0]
-            || (self.dither_method != 0 && self.dither_amount > 0.0)
+            || (self.dither_method != 0
+                && (self.dither_amount > 0.0
+                    || self.dither_method == crate::thumb::DITHER_ANSI))
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
@@ -19655,6 +19790,27 @@ impl Kaleidotron {
         } else {
             String::new()
         };
+        // ANSI-shade params must fold into the key too, or moving F1/F2/F3 / the
+        // half-block / snap toggles won't invalidate the cached preview.
+        let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
+            format!(
+                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}",
+                self.shade_f1,
+                self.shade_f2,
+                self.shade_f3,
+                self.shade_half as u8,
+                self.shade_snap916 as u8,
+                self.shade_f1_on as u8,
+                self.shade_f2_on as u8,
+                self.shade_f3_on as u8,
+                self.shade_vga50 as u8,
+                self.shade_amount,
+                self.shade_ice as u8,
+                self.shade_smooth,
+            )
+        } else {
+            String::new()
+        };
         format!(
             "{}|D{}:{:.2}:{dsig}:S{}x{}|B{},{},{}|R{}:{:.4}:{:.4}",
             self.adjust.key(),
@@ -19673,7 +19829,7 @@ impl Kaleidotron {
             self.postfx.key(),
             self.pixelate_h,
             self.scale_algo as u8
-        )
+        ) + &ssig
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -19916,6 +20072,19 @@ impl Kaleidotron {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            shade_f1: 0.25,
+            shade_f2: 0.50,
+            shade_f3: 0.75,
+            shade_half: true,
+            shade_f1_on: true,
+            shade_f2_on: true,
+            shade_f3_on: true,
+            shade_amount: 1.0,
+            shade_smooth: 0.5,
+            shade_cw: 9,
+            shade_ch: 16,
+            font_8x8: false,
+            shade_ice: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -22189,6 +22358,7 @@ impl Kaleidotron {
         }
         let mut do_export: Option<(String, Vec<[u8; 4]>)> = None;
         let mut save_request: Option<bool> = None;
+        let mut ans_request = false; // export the recolored image as ANSI art (.ans)
         egui::ScrollArea::vertical()
             .id_salt("recolor")
             .auto_shrink([false; 2])
@@ -22344,6 +22514,21 @@ impl Kaleidotron {
                             if ui.button("Save As…").clicked() {
                                 save_request = Some(true);
                             }
+                        }
+                        // Export as textmode art — needs a palette to draw in. Format follows
+                        // the Colors selector: 16→.ans (EGA) / .xbin, 256→.ans, RGB→.tnd.
+                        if recolor.is_some()
+                            && ui
+                                .button("Export textmode")
+                                .on_hover_text(
+                                    "Write the recolored image as textmode art. Format follows \
+                                     the Colors selector: 16-color → .ans (EGA-16) or .xbin \
+                                     (embeds the palette); 256-color → .ans; RGB → .tnd \
+                                     (TundraDraw 24-bit). All carry a SAUCE record.",
+                                )
+                                .clicked()
+                        {
+                            ans_request = true;
                         }
                     });
                 }
@@ -23201,7 +23386,10 @@ impl Kaleidotron {
                         wheel_cycle(ui, &cr.response, &mut m, crate::thumb::DITHER_NAMES.len());
                         self.dither_method = m as u8;
                     });
-                    if self.dither_method != 0 {
+                    // ANSI Shade ignores "Amount" (it's a hard two-colour quantize).
+                    if self.dither_method != 0
+                        && self.dither_method != crate::thumb::DITHER_ANSI
+                    {
                         ui.horizontal(|ui| {
                             ui.label("Amount");
                             let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
@@ -23213,8 +23401,13 @@ impl Kaleidotron {
                     // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
                     // Resize panel, since art isn't always square; enlarges each cell so a
                     // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
+                    // Cell W/H apply to the ordered methods, and to ANSI Shade only
+                    // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
                     if matches!(self.dither_method, 1..=3)
                         || self.dither_method == crate::thumb::DITHER_CUSTOM
+                        || (self.dither_method == crate::thumb::DITHER_ANSI
+                            && !self.shade_snap916
+                            && !self.shade_vga50)
                     {
                         // Width (cell X); a locked cell mirrors it to height.
                         let mut sx = self.dither_scale_x;
@@ -23283,6 +23476,109 @@ impl Kaleidotron {
                                 }
                             }
                         });
+                    }
+                    // ----- ANSI Shade controls (textmode shade-block rendering) -----
+                    if self.dither_method == crate::thumb::DITHER_ANSI {
+                        // Snap 9×16 and Snap 8×8 (VGA50) are mutually exclusive — the
+                        // cell can only be one authentic text size at a time.
+                        if ui
+                            .checkbox(&mut self.shade_snap916, "Snap 9×16 (VGA cell)")
+                            .on_hover_text(
+                                "Force the authentic 9×16 VGA text cell (overrides Cell W/H)",
+                            )
+                            .clicked()
+                            && self.shade_snap916
+                        {
+                            self.shade_vga50 = false;
+                        }
+                        if ui
+                            .checkbox(&mut self.shade_vga50, "Snap 8×8 (VGA50)")
+                            .on_hover_text(
+                                "Force the 8×8 VGA50 text cell + 8×8 font (overrides Cell W/H)",
+                            )
+                            .clicked()
+                            && self.shade_vga50
+                        {
+                            self.shade_snap916 = false;
+                        }
+                        ui.checkbox(&mut self.shade_half, "Half-blocks (▀▄▌▐)")
+                            .on_hover_text("Allow half-block glyphs for sharper cell edges");
+                        ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
+                            .on_hover_text(
+                                "iCE color: allow all 16 colors as backgrounds (else 8). \
+                                 Affects both the preview and the exported file.",
+                            );
+                        // Export color depth (export only — does not affect the preview).
+                        ui.horizontal(|ui| {
+                            ui.label("Colors").on_hover_text(
+                                "Export color depth. Auto = 16-color .ans (EGA-16) or \
+                                 truecolor .ans; 16-color → .ans (EGA) / .xbin (non-EGA); \
+                                 256-color → .ans; RGB → .tnd (TundraDraw 24-bit binary).",
+                            );
+                            let mut d = self.shade_color_depth as usize;
+                            const DEPTHS: [&str; 4] = ["Auto", "16-color", "256-color", "RGB (truecolor)"];
+                            let cr = egui::ComboBox::from_id_salt("shade_color_depth")
+                                .selected_text(DEPTHS[d.min(3)])
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in DEPTHS.iter().enumerate() {
+                                        ui.selectable_value(&mut d, i, *name);
+                                    }
+                                });
+                            wheel_cycle(ui, &cr.response, &mut d, DEPTHS.len());
+                            self.shade_color_depth = d as u8;
+                        });
+                        // Shading amount: how much shade/half-blocks vs flat color.
+                        ui.horizontal(|ui| {
+                            ui.label("Shading");
+                            let resp = ui
+                                .add(egui::Slider::new(&mut self.shade_amount, 0.0..=1.0))
+                                .on_hover_text(
+                                    "How much shading vs. flat color — low = flats stay \
+                                     solid, shade only in transitions.",
+                                );
+                            middle_reset(ui, &resp, &mut self.shade_amount, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_amount, 0.05, 0.0f32, 1.0f32);
+                        });
+                        // Smoothness: contrast penalty on the shade blocks so the search
+                        // avoids garish high-contrast dithers.
+                        ui.horizontal(|ui| {
+                            ui.label("Smoothness");
+                            let resp = ui
+                                .add(egui::Slider::new(&mut self.shade_smooth, 0.0..=1.0))
+                                .on_hover_text(
+                                    "Avoid garish high-contrast dithers — higher keeps shade \
+                                     blocks between similar colors (prefers solids), lower \
+                                     allows any pair.",
+                                );
+                            middle_reset(ui, &resp, &mut self.shade_smooth, 0.5f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 1.0f32);
+                        });
+                        // The fill fractions the ░▒▓ shade blocks stand for; the leading
+                        // checkbox toggles whether that shade level is a candidate at all.
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_f1_on, "");
+                            ui.label("F1 ░");
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.0..=1.0));
+                            middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.0f32, 1.0f32);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_f2_on, "");
+                            ui.label("F2 ▒");
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.0..=1.0));
+                            middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.0f32, 1.0f32);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_f3_on, "");
+                            ui.label("F3 ▓");
+                            let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.0..=1.0));
+                            middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.0f32, 1.0f32);
+                        });
+                        if recolor.is_none() {
+                            ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
+                        }
                     }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
@@ -23443,6 +23739,9 @@ impl Kaleidotron {
         if let Some(as_dialog) = save_request {
             self.save_recolored(&entry.path, as_dialog);
         }
+        if ans_request {
+            self.export_textmode(&entry.path);
+        }
 
         // Color-edit popup (right-click → Edit color…). Live: writes into the
         // custom palette only, never the .gpl on disk.
@@ -23562,6 +23861,150 @@ impl Kaleidotron {
                 Err(e) => self.status = format!("Save failed: {e}"),
             },
             None => self.status = "Save failed (bad buffer)".into(),
+        }
+    }
+
+    /// Export the full-resolution recolored image as textmode art. Runs the same
+    /// recolor pipeline as `save_recolored`, builds the shade grid from the recolored
+    /// pixels (effective cell size + active palette + iCE gate), then picks the format
+    /// by palette: an EGA-16 palette → a plain CP437 `.ans`; anything else → `.xbin`
+    /// (which embeds the exact palette + font). Both get a SAUCE trailer. Written via a
+    /// Save-As dialog, mirroring the other exporters.
+    fn export_textmode(&mut self, path: &Path) {
+        let recolor = self.active_recolor(path);
+        let Some((_, palette)) = recolor else {
+            self.status = "Pick a palette / Reduce first (textmode needs colors)".into();
+            return;
+        };
+        let (size, rgba) = match &self.full_src {
+            Some((p, sz, px)) if p == path => (*sz, px.clone()),
+            _ => match self.registry.decode_path(&self.resolve_local(path)) {
+                Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
+                Err(e) => {
+                    self.status = format!("decode failed: {e}");
+                    return;
+                }
+            },
+        };
+        // Run the recolor pipeline exactly as displayed, then grid the result.
+        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let (tw, th) = self.resize_target(w, h);
+        let aux = self.pipe_aux(Some(palette.as_slice()), dsx, dsy);
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        // Effective cell + font, same precedence as pipe_aux: VGA50 (8×8) → snap
+        // 9×16 → Cell W/H.
+        let font_8x8 = self.shade_vga50;
+        let (cw, ch_) = if self.shade_vga50 {
+            (8, 8)
+        } else if self.shade_snap916 {
+            (9, 16)
+        } else {
+            (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
+        };
+        let grid = crate::thumb::ansi_shade_grid(
+            &rgba, w, h, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+            self.shade_amount, self.shade_ice, self.shade_smooth,
+        );
+        // Resolve the export format from the color-depth selector. `user_depth` (0=Auto,
+        // 1=16, 2=256, 3=RGB); the effective SGR `depth` for the .ans encoder resolves
+        // Auto → 16 on an EGA palette, else truecolor.
+        let ega = crate::thumb::palette_is_ega16(&palette);
+        let user_depth = self.shade_color_depth;
+        let depth = match user_depth {
+            0 => {
+                if ega {
+                    1
+                } else {
+                    3
+                }
+            }
+            d => d,
+        };
+        let mut note = String::new();
+        // Format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra):
+        // - explicit RGB (user_depth 3) → .tnd (scene-native 24-bit binary),
+        // - 16-color depth → EGA .ans / non-EGA .xbin (embeds the palette),
+        // - 256 / Auto-truecolor → portable .ans (SGR).
+        let (mut bytes, ext, sauce_fmt) = if user_depth == 3 {
+            note = " (TundraDraw 24-bit)".into();
+            (crate::thumb::ansi_grid_to_tundra(&grid), "tnd", 2u8)
+        } else if depth == 1 {
+            if ega {
+                (
+                    crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 1),
+                    "ans",
+                    0u8,
+                )
+            } else {
+                if palette.len() > 16 {
+                    note = format!(
+                        " (palette {} colors → mapped to nearest of first 16)",
+                        palette.len()
+                    );
+                }
+                (
+                    crate::thumb::ansi_grid_to_xbin(&grid, font_8x8, self.shade_ice),
+                    "xbin",
+                    1u8,
+                )
+            }
+        } else {
+            note = if depth == 2 {
+                " (256-color)".into()
+            } else {
+                " (24-bit truecolor)".into()
+            };
+            (
+                crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, depth),
+                "ans",
+                0u8,
+            )
+        };
+        // Append a SAUCE trailer to every format: EOF byte + 128-byte record. FileSize
+        // is the content length BEFORE the EOF + record.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let filesize = bytes.len() as u32;
+        let date = today_ccyymmdd();
+        let sauce = crate::sauce::sauce_record(
+            stem,
+            grid.cols as u16,
+            grid.rows as u16,
+            sauce_fmt,
+            self.shade_ice,
+            font_8x8,
+            &date,
+            filesize,
+        );
+        bytes.push(0x1A); // DOS EOF before the record
+        bytes.extend_from_slice(&sauce);
+        let name = format!("{stem}_{}.{ext}", self.recolor_tag());
+        let filter = match ext {
+            "tnd" => "TundraDraw",
+            "xbin" => "XBin",
+            _ => "ANSI art",
+        };
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .add_filter(filter, &[ext])
+            .save_file()
+        else {
+            return; // cancelled
+        };
+        match std::fs::write(&dest, &bytes) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {}: {} ({}×{} cells){}",
+                    ext.to_uppercase(),
+                    short_name(&dest),
+                    grid.cols,
+                    grid.rows,
+                    note
+                )
+            }
+            Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
 
@@ -35119,6 +35562,19 @@ impl eframe::App for Kaleidotron {
             Self::DITHER_SCALE_LOCK_KEY,
             &self.dither_scale_lock,
         );
+        eframe::set_value(storage, Self::SHADE_F1_KEY, &self.shade_f1);
+        eframe::set_value(storage, Self::SHADE_F2_KEY, &self.shade_f2);
+        eframe::set_value(storage, Self::SHADE_F3_KEY, &self.shade_f3);
+        eframe::set_value(storage, Self::SHADE_HALF_KEY, &self.shade_half);
+        eframe::set_value(storage, Self::SHADE_SNAP916_KEY, &self.shade_snap916);
+        eframe::set_value(storage, Self::SHADE_F1_ON_KEY, &self.shade_f1_on);
+        eframe::set_value(storage, Self::SHADE_F2_ON_KEY, &self.shade_f2_on);
+        eframe::set_value(storage, Self::SHADE_F3_ON_KEY, &self.shade_f3_on);
+        eframe::set_value(storage, Self::SHADE_VGA50_KEY, &self.shade_vga50);
+        eframe::set_value(storage, Self::SHADE_AMOUNT_KEY, &self.shade_amount);
+        eframe::set_value(storage, Self::SHADE_SMOOTH_KEY, &self.shade_smooth);
+        eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
+        eframe::set_value(storage, Self::SHADE_COLOR_DEPTH_KEY, &self.shade_color_depth);
         eframe::set_value(storage, Self::PIXELATE_H_KEY, &self.pixelate_h);
         eframe::set_value(storage, Self::PIXELATE_LOCK_KEY, &self.pixelate_lock);
         eframe::set_value(storage, Self::RESIZE_ON_KEY, &self.resize_on);
@@ -35177,6 +35633,27 @@ fn short_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Today's UTC date as a SAUCE `CCYYMMDD` string (e.g. "20260817"), or 8 spaces if
+/// the clock is before the epoch. No date dependency — converts the Unix day count
+/// to a civil date via Howard Hinnant's `days → y/m/d` algorithm.
+fn today_ccyymmdd() -> String {
+    let secs = match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return " ".repeat(8),
+    };
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}{:02}{:02}", y, m, d)
 }
 
 /// Paint a placeholder "audio" tile — a music-note glyph (+ a format badge on larger tiles) —
@@ -35970,6 +36447,21 @@ struct PipeAux<'a> {
     dither_n: usize,
     dither_scale_x: usize, // ordered-dither cell width in pixels (≥1)
     dither_scale_y: usize, // ordered-dither cell height in pixels (≥1)
+    // ANSI Shade params + the *effective* cell size (9×16 when snap is on, else the
+    // dither cell). Only consulted when dither_method == DITHER_ANSI.
+    shade_f1: f32,
+    shade_f2: f32,
+    shade_f3: f32,
+    shade_half: bool,
+    shade_f1_on: bool,  // include ░ as a shade candidate
+    shade_f2_on: bool,  // include ▒ as a shade candidate
+    shade_f3_on: bool,  // include ▓ as a shade candidate
+    shade_amount: f32,  // 0..1: shading vs flat color
+    shade_smooth: f32,  // 0..1: contrast penalty on shade blocks (avoid garish dithers)
+    shade_cw: usize,
+    shade_ch: usize,
+    font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
+    shade_ice: bool,    // iCE color: unlock all 16 colors as backgrounds
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -36004,18 +36496,45 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                     crate::thumb::remap_to_palette(rgba, p);
                 }
             }
-            OpKind::Dither => crate::thumb::dither_pass(
-                rgba,
-                w,
-                h,
-                aux.dither_method,
-                aux.dither_amount,
-                aux.dither_custom,
-                aux.dither_n,
-                aux.dither_scale_x,
-                aux.dither_scale_y,
-                aux.palette,
-            ),
+            OpKind::Dither => {
+                if aux.dither_method == crate::thumb::DITHER_ANSI {
+                    // ANSI shade needs a palette (like error-diffusion) — skip if none.
+                    if let Some(p) = aux.palette {
+                        crate::thumb::ansi_shade_pass(
+                            rgba,
+                            w,
+                            h,
+                            p,
+                            aux.shade_cw,
+                            aux.shade_ch,
+                            aux.shade_f1,
+                            aux.shade_f2,
+                            aux.shade_f3,
+                            aux.shade_half,
+                            aux.shade_f1_on,
+                            aux.shade_f2_on,
+                            aux.shade_f3_on,
+                            aux.shade_amount,
+                            aux.font_8x8,
+                            aux.shade_ice,
+                            aux.shade_smooth,
+                        );
+                    }
+                } else {
+                    crate::thumb::dither_pass(
+                        rgba,
+                        w,
+                        h,
+                        aux.dither_method,
+                        aux.dither_amount,
+                        aux.dither_custom,
+                        aux.dither_n,
+                        aux.dither_scale_x,
+                        aux.dither_scale_y,
+                        aux.palette,
+                    );
+                }
+            }
             OpKind::ColorBalance => color_balance(rgba, aux.balance),
             OpKind::Scanlines => apply_scanlines(rgba, w, h, &aux.fx),
             OpKind::Glow => apply_glow(rgba, w, h, &aux.fx),
@@ -36160,6 +36679,10 @@ fn default_fg() -> u8 {
 }
 fn default_true() -> bool {
     true
+}
+/// serde default for `FxPreset::shade_smooth` — matches the live App default (0.5).
+fn default_half() -> f32 {
+    0.5
 }
 fn default_ink() -> [u8; 3] {
     [235, 235, 235]
@@ -36325,6 +36848,25 @@ struct FxPreset {
     dither_scale_x: usize,
     dither_scale_y: usize,
     dither_scale_lock: bool,
+    // ANSI Shade params. Struct-level `#[serde(default)]` fills these from the
+    // Default impl when an old preset lacks them.
+    shade_f1: f32,
+    shade_f2: f32,
+    shade_f3: f32,
+    shade_half: bool,
+    shade_snap916: bool,
+    // Struct-level `#[serde(default)]` fills any of these missing from an old preset
+    // from the `Default` impl below (all-on, no VGA50, full shading).
+    shade_f1_on: bool,
+    shade_f2_on: bool,
+    shade_f3_on: bool,
+    shade_vga50: bool,
+    shade_amount: f32,
+    #[serde(default = "default_half")]
+    shade_smooth: f32,
+    shade_ice: bool,
+    #[serde(default)]
+    shade_color_depth: u8,
     pixelate_h: f32,
     pixelate_lock: bool,
     balance_color: [u8; 3],
@@ -36358,6 +36900,19 @@ impl Default for FxPreset {
             dither_scale_x: 1,
             dither_scale_y: 1,
             dither_scale_lock: true,
+            shade_f1: 0.25,
+            shade_f2: 0.50,
+            shade_f3: 0.75,
+            shade_half: true,
+            shade_snap916: true,
+            shade_f1_on: true,
+            shade_f2_on: true,
+            shade_f3_on: true,
+            shade_vga50: false,
+            shade_amount: 1.0,
+            shade_smooth: 0.5,
+            shade_ice: false,
+            shade_color_depth: 0,
             pixelate_h: 0.0,
             pixelate_lock: true,
             balance_color: [128, 128, 128],
@@ -36633,6 +37188,19 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            shade_f1: 0.25,
+            shade_f2: 0.50,
+            shade_f3: 0.75,
+            shade_half: true,
+            shade_f1_on: true,
+            shade_f2_on: true,
+            shade_f3_on: true,
+            shade_amount: 1.0,
+            shade_smooth: 0.5,
+            shade_cw: 9,
+            shade_ch: 16,
+            font_8x8: false,
+            shade_ice: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -46134,6 +46702,19 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            shade_f1: 0.25,
+            shade_f2: 0.50,
+            shade_f3: 0.75,
+            shade_half: true,
+            shade_f1_on: true,
+            shade_f2_on: true,
+            shade_f3_on: true,
+            shade_amount: 1.0,
+            shade_smooth: 0.5,
+            shade_cw: 9,
+            shade_ch: 16,
+            font_8x8: false,
+            shade_ice: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -46305,6 +46886,19 @@ mod tests {
             dither_n: 0,
             dither_scale_x: 1,
             dither_scale_y: 1,
+            shade_f1: 0.25,
+            shade_f2: 0.50,
+            shade_f3: 0.75,
+            shade_half: true,
+            shade_f1_on: true,
+            shade_f2_on: true,
+            shade_f3_on: true,
+            shade_amount: 1.0,
+            shade_smooth: 0.5,
+            shade_cw: 9,
+            shade_ch: 16,
+            font_8x8: false,
+            shade_ice: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
