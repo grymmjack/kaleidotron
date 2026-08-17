@@ -1624,6 +1624,11 @@ pub struct Kaleidotron {
     // + the remapped texture (keyed by a recolor string), so it updates live.
     preview_src: Option<(PathBuf, usize, usize, Vec<u8>)>,
     preview_tex: Option<(PathBuf, String, egui::TextureHandle)>,
+    // Cached ▓▒░ shade-glyph swatch textures (CP437 176/177/178) for the F1/F2/F3 UI
+    // rows — built from the real 8×16 glyph bitmap + NEAREST filtering so they're crisp
+    // at any UI scale. Rebuilt only when the theme fg/bg (the key) changes.
+    shade_swatch_tex: [Option<egui::TextureHandle>; 3],
+    shade_swatch_key: Option<(u32, u32)>,
     // hotkeys (round 2 #12)
     keymap: HashMap<Action, egui::Key>,
     rebinding: Option<Action>, // the action awaiting a new key, if any
@@ -3490,6 +3495,8 @@ impl Kaleidotron {
             loaded_palettes: HashMap::new(),
             preview_src: None,
             preview_tex: None,
+            shade_swatch_tex: [None, None, None],
+            shade_swatch_key: None,
             keymap,
             rebinding: None,
             full_tex: None,
@@ -19580,6 +19587,7 @@ impl Kaleidotron {
             fx: self.postfx,
             balance: self.balance_offset(),
             palette,
+            skip_dither_palette: false,
         }
     }
 
@@ -19597,42 +19605,51 @@ impl Kaleidotron {
         }
     }
 
-    /// Paint a tiny font-independent shade-density swatch (≈14×14 px) inline in a UI
-    /// row — a Bayer-4×4 dot pattern at `density` (0..1) over the theme's dark bg in
-    /// the text colour. Replaces the ░▒▓ unicode labels, whose ▓ glyph egui's font
-    /// renders as a broken box.
-    fn paint_shade_swatch(ui: &mut egui::Ui, density: f32) {
-        let sz = 14.0;
-        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::hover());
-        let (bg, fg, border) = {
+    /// Paint a crisp preview of an actual CP437 shade glyph (░ 176 / ▒ 177 / ▓ 178) for
+    /// the F1/F2/F3 rows. `gi` is 0/1/2. Built ONCE per theme as an 8×16 texture from the
+    /// real glyph bitmap (fg where the bit is set, bg where clear) and blitted with
+    /// NEAREST filtering, so it stays sharp at any UI scale (100/125/150/200%) — unlike
+    /// hand-drawn rects, which aliased — and is independent of the UI font (which lacks ▓).
+    fn paint_shade_swatch(&mut self, ui: &mut egui::Ui, gi: usize) {
+        const GLYPHS: [usize; 3] = [176, 177, 178];
+        let gi = gi.min(2);
+        let (fg, bg, border) = {
             let v = ui.visuals();
-            (v.extreme_bg_color, v.text_color(), v.weak_text_color())
+            (v.text_color(), v.extreme_bg_color, v.weak_text_color())
         };
-        let p = ui.painter();
-        p.rect_filled(rect, 2.0, bg);
-        // Bayer 4×4 ordered threshold → an authentic 25/50/75% dither look.
-        #[rustfmt::skip]
-        const BAYER4: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-        let n = 4usize;
-        let cell = (sz - 2.0) / n as f32;
-        let d = density.clamp(0.0, 1.0);
-        for gy in 0..n {
-            for gx in 0..n {
-                let thr = (BAYER4[gy * n + gx] as f32 + 0.5) / 16.0;
-                if thr < d {
-                    let x = rect.left() + 1.0 + gx as f32 * cell;
-                    let y = rect.top() + 1.0 + gy as f32 * cell;
-                    p.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell, cell)),
-                        0.0,
-                        fg,
-                    );
+        // Rebuild all three when the theme colours change (pack fg/bg into the key).
+        let pack = |c: egui::Color32| (c.r() as u32) << 16 | (c.g() as u32) << 8 | c.b() as u32;
+        let key = (pack(fg), pack(bg));
+        if self.shade_swatch_key != Some(key) {
+            self.shade_swatch_key = Some(key);
+            self.shade_swatch_tex = [None, None, None];
+        }
+        if self.shade_swatch_tex[gi].is_none() {
+            let glyph = &crate::decode::cp437_font::CP437_8X16[GLYPHS[gi]]; // [u8;16], MSB left
+            let mut bytes = Vec::with_capacity(8 * 16 * 4);
+            for &bits in glyph.iter() {
+                for rx in 0..8 {
+                    let c = if (bits >> (7 - rx)) & 1 == 1 { fg } else { bg };
+                    bytes.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
                 }
             }
+            let img = egui::ColorImage::from_rgba_unmultiplied([8, 16], &bytes);
+            let tex = ui.ctx().load_texture(
+                format!("shade_swatch_{gi}"),
+                img,
+                egui::TextureOptions::NEAREST,
+            );
+            self.shade_swatch_tex[gi] = Some(tex);
         }
-        p.rect_stroke(
+        // Blit into a ~9×16 pt rect (keeps the glyph's 1:2 aspect), + a subtle border.
+        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
+        if let Some(tex) = &self.shade_swatch_tex[gi] {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+        }
+        ui.painter().rect_stroke(
             rect,
-            2.0,
+            1.0,
             egui::Stroke::new(1.0, border),
             egui::StrokeKind::Inside,
         );
@@ -19886,7 +19903,7 @@ impl Kaleidotron {
         // half-block / snap toggles won't invalidate the cached preview.
         let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
             format!(
-                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}",
+                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}|Fit{}:{}x{}",
                 self.shade_f1,
                 self.shade_f2,
                 self.shade_f3,
@@ -19899,6 +19916,11 @@ impl Kaleidotron {
                 self.shade_amount,
                 self.shade_ice as u8,
                 self.shade_smooth,
+                // Fit-to-chars changes the working resolution, so it MUST invalidate the
+                // preview cache or toggling it does nothing on screen.
+                self.shade_fit_chars as u8,
+                self.shade_fit_cols,
+                self.shade_fit_rows,
             )
         } else {
             String::new()
@@ -20181,6 +20203,7 @@ impl Kaleidotron {
             fx: PostFx::default(),
             balance: self.balance_offset(),
             palette: palette.as_deref(),
+            skip_dither_palette: false,
         };
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
         for px in rgba.chunks_exact_mut(4) {
@@ -23702,7 +23725,7 @@ impl Kaleidotron {
                         // or degenerate into a fake solid.
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f1_on, "");
-                            Self::paint_shade_swatch(ui, self.shade_f1);
+                            self.paint_shade_swatch(ui, 0);
                             ui.label("F1");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
                             middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
@@ -23710,7 +23733,7 @@ impl Kaleidotron {
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f2_on, "");
-                            Self::paint_shade_swatch(ui, self.shade_f2);
+                            self.paint_shade_swatch(ui, 1);
                             ui.label("F2");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
                             middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
@@ -23718,7 +23741,7 @@ impl Kaleidotron {
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.shade_f3_on, "");
-                            Self::paint_shade_swatch(ui, self.shade_f3);
+                            self.paint_shade_swatch(ui, 2);
                             ui.label("F3");
                             let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
                             middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
@@ -24035,11 +24058,11 @@ impl Kaleidotron {
             },
         };
         // Run the recolor pipeline exactly as displayed, then grid the result.
-        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
+        let (w, h, rgba) = self.scale_source(size[0], size[1], rgba);
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(Some(palette.as_slice()), dsx, dsy);
+        let mut aux = self.pipe_aux(Some(palette.as_slice()), dsx, dsy);
         // Effective cell + font, same precedence as pipe_aux: VGA50 (8×8) → snap
         // 9×16 → Cell W/H.
         let font_8x8 = self.shade_vga50;
@@ -24050,31 +24073,25 @@ impl Kaleidotron {
         } else {
             (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
         };
-        // Grid size: fit-to-chars grids at the EXACT resize target (tw×th → cols×rows);
-        // otherwise keep the historical behavior of gridding at the full working size.
-        let (gw, gh, grid) = if self.shade_fit_chars {
-            let mut work = if tw == w && th == h {
-                rgba
-            } else {
-                crate::thumb::box_downscale(&rgba, w, h, tw, th)
-            };
-            apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
-            let g = crate::thumb::ansi_shade_grid(
-                &work, tw, th, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-                self.shade_amount, self.shade_ice, self.shade_smooth,
-            );
-            (tw, th, g)
+        // Bug A fix: build the PRE-SHADE image (value ops + resize, but NOT the ANSI
+        // Dither render and NOT the Palette rematch — the exact buffer the preview's
+        // internal `ansi_shade_pass` sees), then grid it ONCE with `ansi_shade_grid`.
+        // Gridding an already-rendered+snapped buffer collapsed most cells to solids,
+        // losing the shading. We grid at the pipeline target (tw×th) so the exported
+        // grid equals the preview's (same input, same cell size); fit-to-chars makes
+        // tw×th the exact cols×rows char grid.
+        aux.skip_dither_palette = true;
+        let mut work = if tw == w && th == h {
+            rgba
         } else {
-            apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
-            let g = crate::thumb::ansi_shade_grid(
-                &rgba, w, h, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-                self.shade_amount, self.shade_ice, self.shade_smooth,
-            );
-            (w, h, g)
+            crate::thumb::box_downscale(&rgba, w, h, tw, th)
         };
-        let _ = (gw, gh); // grid dims are carried on `grid.cols`/`grid.rows`
+        apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
+        let grid = crate::thumb::ansi_shade_grid(
+            &work, tw, th, &palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+            self.shade_amount, self.shade_ice, self.shade_smooth,
+        );
         // Explicit export-format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra).
         //   0 Auto  → EGA palette: ANSI 16-color .ans; else truecolor .ans
         //   1 ANSI 16-color .ans   2 ANSI 256-color .ans   3 ANSI truecolor .ans
@@ -36820,6 +36837,10 @@ struct PipeAux<'a> {
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
+    // When set, the `Dither` and `Palette` marker ops are SKIPPED — used by the ANSI
+    // textmode export to build the *pre-shade* image (adjustments + resize only) that
+    // `ansi_shade_grid` grids once, instead of re-gridding an already-rendered buffer.
+    skip_dither_palette: bool,
 }
 
 /// Run the full pipeline in `a.order`. Each value op is its own pass (point ops via a
@@ -36846,9 +36867,14 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux
                 }
             }
             OpKind::Palette => {
-                if let Some(p) = aux.palette {
-                    crate::thumb::remap_to_palette(rgba, p);
+                if !aux.skip_dither_palette {
+                    if let Some(p) = aux.palette {
+                        crate::thumb::remap_to_palette(rgba, p);
+                    }
                 }
+            }
+            OpKind::Dither if aux.skip_dither_palette => {
+                // Pre-shade export pass: leave the dither op for `ansi_shade_grid`.
             }
             OpKind::Dither => {
                 if aux.dither_method == crate::thumb::DITHER_ANSI {
@@ -37578,6 +37604,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
+            skip_dither_palette: false,
         },
     );
 }
@@ -47092,6 +47119,7 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: Some(&pal),
+            skip_dither_palette: false,
         };
         let mut last = vec![10u8, 20, 30, 255];
         apply_pipeline(&mut last, 1, 1, &a, &aux);
@@ -47276,6 +47304,7 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
+            skip_dither_palette: false,
         };
         // 4×1: black, grey, grey, light. Downsample to 2×1 (avg pairs), upscale to 4×1.
         let mut rgba = vec![
