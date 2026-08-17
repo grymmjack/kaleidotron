@@ -24293,67 +24293,18 @@ impl Kaleidotron {
         // renders that very grid's glyphs.)
         let (w, h, rgba) = self.scale_source(size[0], size[1], rgba);
         let (grid, _work, _tw, _th, font_8x8) = self.build_ansi_grid(w, h, &rgba, &palette);
-        // Explicit export-format routing (sauce_fmt: 0=ANSi, 1=XBin, 2=Tundra).
-        //   0 Auto  → EGA palette: ANSI 16-color .ans; else truecolor .ans
-        //   1 ANSI 16-color .ans   2 ANSI 256-color .ans   3 ANSI truecolor .ans
-        //   4 XBin .xb (embeds used palette + VGA50 font)   5 Tundra .tnd (24-bit)
-        let ega = crate::thumb::palette_is_ega16(&palette);
-        let note: String; // set by every match arm below
-        let (mut bytes, ext, sauce_fmt) = match self.shade_export_format {
-            5 => {
-                note = " (TundraDraw 24-bit)".into();
-                (crate::thumb::ansi_grid_to_tundra(&grid), "tnd", 2u8)
-            }
-            4 => {
-                let (xb, reduced) =
-                    crate::thumb::ansi_grid_to_xbin(&grid, font_8x8, self.shade_ice);
-                note = if reduced {
-                    " (XBin — >16 colors used → reduced to 16)".into()
-                } else {
-                    " (XBin 16-color)".into()
-                };
-                (xb, "xb", 1u8)
-            }
-            3 => {
-                note = " (ANSI 24-bit truecolor)".into();
-                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 3), "ans", 0u8)
-            }
-            2 => {
-                note = " (ANSI 256-color)".into();
-                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 2), "ans", 0u8)
-            }
-            1 => {
-                note = " (ANSI 16-color)".into();
-                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, 1), "ans", 0u8)
-            }
-            // 0 = Auto: EGA → 16-color .ans; non-EGA → truecolor .ans (portable).
-            _ => {
-                let depth = if ega { 1 } else { 3 };
-                note = if ega {
-                    " (Auto: ANSI 16-color)".into()
-                } else {
-                    " (Auto: ANSI truecolor)".into()
-                };
-                (crate::thumb::ansi_grid_to_ans(&grid, self.shade_ice, depth), "ans", 0u8)
-            }
-        };
-        // Append a SAUCE trailer to every format: EOF byte + 128-byte record. FileSize
-        // is the content length BEFORE the EOF + record.
+        // Serialize (+ SAUCE) via the SHARED routine the headless batch also uses, so a
+        // batch-exported file is byte-identical to this one.
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-        let filesize = bytes.len() as u32;
         let date = today_ccyymmdd();
-        let sauce = crate::sauce::sauce_record(
-            stem,
-            grid.cols as u16,
-            grid.rows as u16,
-            sauce_fmt,
+        let (bytes, ext, note) = serialize_textmode(
+            &grid,
+            self.shade_export_format,
             self.shade_ice,
             font_8x8,
+            stem,
             &date,
-            filesize,
         );
-        bytes.push(0x1A); // DOS EOF before the record
-        bytes.extend_from_slice(&sauce);
         let name = format!("{stem}_{}.{ext}", self.recolor_tag());
         // Filter name + accepted extensions per format (XBin accepts .xb and .xbin).
         let (filter, exts): (&str, &[&str]) = match ext {
@@ -45284,6 +45235,12 @@ pub struct CliArgs {
     pub render_scale: u32,           // --scale N: nearest-neighbor upscale (0 = unset ⇒ 1×)
     pub render_format: Option<String>, // --format png|bmp|…: force the encoder
     pub render_sheet: Option<usize>, // --sheet N: render sheet N (1-based) of a multi-sheet .xmind
+    // Headless TEXTMODE batch (`--batch`): apply a PixelFX preset to images and dump
+    // .ans/.xb/.tnd, no window. Reuses `render_outdir` (--outdir) + `render_format`
+    // (--format, mapped to a textmode code).
+    pub batch_inputs: Vec<PathBuf>,   // --batch: images/folders to convert
+    pub batch_preset: Option<String>, // --preset "NAME"
+    pub batch_list: bool,             // --list-presets: print preset names and exit
 }
 
 const USAGE: &str = "\
@@ -45292,6 +45249,7 @@ kaleidotron — a pixel-art-first media browser
 USAGE:
     kaleidotron [OPTIONS]
     kaleidotron --render <PATH>... [RENDER OPTIONS]   (headless; no window)
+    kaleidotron --batch <IMG|DIR>... --preset \"NAME\" [BATCH OPTIONS]  (headless)
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
@@ -45314,6 +45272,16 @@ RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files
                                   inferring it from the output filename's extension.
         --sheet <N>               Render sheet N (1-based) of a multi-sheet .xmind mind map.
                                   Default: the first sheet.
+
+BATCH OPTIONS (apply a PixelFX preset to images → textmode .ans/.xb/.tnd, no window):
+        --batch <IMG|DIR>...      One or more input images and/or folders (folders are
+                                  scanned). Inputs follow --batch together.
+        --preset <NAME>           The PixelFX preset to apply (must be an 'ANSI Shade'
+                                  preset). Factory + your saved presets are searched.
+        --list-presets            Print every resolvable PixelFX preset name and exit.
+        --outdir <DIR>            Output folder (created if needed). Default: beside input.
+        --format <FMT>            Textmode format override: auto | ans | ans16 | ans256 |
+                                  ansrgb | xb | tnd. Default: the preset's export format.
 
 Settings passed here override the persisted ones and are remembered afterward.
 ";
@@ -45362,6 +45330,20 @@ impl CliArgs {
                     Some(v) => out.render_outdir = Some(PathBuf::from(v)),
                     None => cli_fail("--outdir requires a path"),
                 },
+                "--batch" => {
+                    // Collect every following non-flag token as an input image/folder.
+                    while let Some(p) = args.peek() {
+                        if p.starts_with('-') && p.len() > 1 {
+                            break;
+                        }
+                        out.batch_inputs.push(PathBuf::from(args.next().unwrap()));
+                    }
+                }
+                "--preset" | "--pixelfx-preset" => match args.next() {
+                    Some(v) => out.batch_preset = Some(v),
+                    None => cli_fail("--preset requires a preset name"),
+                },
+                "--list-presets" => out.batch_list = true,
                 "--font-9px" => out.render_font_9px = true,
                 "--scale" => match args.next() {
                     Some(v) => match v.parse::<u32>() {
@@ -45390,6 +45372,12 @@ impl CliArgs {
     /// True when headless render-to-file mode was requested (`--render` given inputs).
     pub fn is_render(&self) -> bool {
         !self.render_inputs.is_empty()
+    }
+
+    /// True when headless TEXTMODE batch mode was requested (`--batch` inputs, or
+    /// `--list-presets`).
+    pub fn is_batch(&self) -> bool {
+        self.batch_list || !self.batch_inputs.is_empty()
     }
 }
 
@@ -45512,6 +45500,427 @@ fn render_one(
         image::save_buffer(&out, &bytes, w, h, color).map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+// ===========================================================================
+// Headless TEXTMODE batch: apply a PixelFX preset to images and dump .ans/.xb/
+// .tnd, with no window. The render path is shared with the GUI export so batch
+// output is byte-identical to what the app writes.
+// ===========================================================================
+
+/// Serialize an ANSI grid to a full textmode file (bytes INCLUDING the SAUCE trailer).
+/// Shared by the GUI export and the headless batch. `format` is the `shade_export_format`
+/// code (0 Auto … 5 Tundra). Returns `(bytes, extension, human note)`.
+fn serialize_textmode(
+    grid: &crate::thumb::AnsiGrid,
+    format: u8,
+    ice: bool,
+    font_8x8: bool,
+    stem: &str,
+    date: &str,
+) -> (Vec<u8>, &'static str, String) {
+    let ega = crate::thumb::palette_is_ega16(&grid.palette);
+    let note: String;
+    let (mut bytes, ext, sauce_fmt) = match format {
+        5 => {
+            note = " (TundraDraw 24-bit)".into();
+            (crate::thumb::ansi_grid_to_tundra(grid), "tnd", 2u8)
+        }
+        4 => {
+            let (xb, reduced) = crate::thumb::ansi_grid_to_xbin(grid, font_8x8, ice);
+            note = if reduced {
+                " (XBin — >16 colors used → reduced to 16)".into()
+            } else {
+                " (XBin 16-color)".into()
+            };
+            (xb, "xb", 1u8)
+        }
+        3 => {
+            note = " (ANSI 24-bit truecolor)".into();
+            (crate::thumb::ansi_grid_to_ans(grid, ice, 3), "ans", 0u8)
+        }
+        2 => {
+            note = " (ANSI 256-color)".into();
+            (crate::thumb::ansi_grid_to_ans(grid, ice, 2), "ans", 0u8)
+        }
+        1 => {
+            note = " (ANSI 16-color)".into();
+            (crate::thumb::ansi_grid_to_ans(grid, ice, 1), "ans", 0u8)
+        }
+        _ => {
+            let depth = if ega { 1 } else { 3 };
+            note = if ega {
+                " (Auto: ANSI 16-color)".into()
+            } else {
+                " (Auto: ANSI truecolor)".into()
+            };
+            (crate::thumb::ansi_grid_to_ans(grid, ice, depth), "ans", 0u8)
+        }
+    };
+    let filesize = bytes.len() as u32;
+    let sauce = crate::sauce::sauce_record(
+        stem,
+        grid.cols as u16,
+        grid.rows as u16,
+        sauce_fmt,
+        ice,
+        font_8x8,
+        date,
+        filesize,
+    );
+    bytes.push(0x1A); // DOS EOF before the record
+    bytes.extend_from_slice(&sauce);
+    (bytes, ext, note)
+}
+
+/// The ANSI cell size a preset renders at — MIRRORS [`Kaleidotron::ansi_cell_dims`]:
+/// VGA50 8×8 → snap 9×16 → the Cell W/H (`dither_scale_x`×`dither_scale_y`).
+fn preset_cell_dims(p: &FxPreset) -> (usize, usize) {
+    if p.shade_vga50 {
+        (8, 8)
+    } else if p.shade_snap916 {
+        (9, 16)
+    } else {
+        (p.dither_scale_x.max(1), p.dither_scale_y.max(1))
+    }
+}
+
+/// The working-buffer target dims for a preset — MIRRORS [`Kaleidotron::resize_target`]
+/// (only the ANSI-shade path is used here, since batch is textmode-only).
+fn preset_resize_target(p: &FxPreset, w: usize, h: usize) -> (usize, usize) {
+    if p.shade_fit_chars && p.dither_method == crate::thumb::DITHER_ANSI {
+        let (cw, ch) = preset_cell_dims(p);
+        return (p.shade_fit_cols.max(1) * cw, p.shade_fit_rows.max(1) * ch);
+    }
+    if !p.resize_on {
+        return (w, h);
+    }
+    let tw = ((w as f32 * p.resize_fx).round() as usize).clamp(1, w.max(1));
+    let th = ((h as f32 * p.resize_fy).round() as usize).clamp(1, h.max(1));
+    (tw, th)
+}
+
+/// Build a [`PipeAux`] from a preset — MIRRORS [`Kaleidotron::pipe_aux`] + `balance_offset`.
+fn preset_pipe_aux<'a>(
+    p: &'a FxPreset,
+    palette: &'a [[u8; 4]],
+    dsx: usize,
+    dsy: usize,
+) -> PipeAux<'a> {
+    let balance: [i16; 3] = {
+        let s = p.balance_strength.clamp(0.0, 1.0);
+        if s <= 0.0 {
+            [0, 0, 0]
+        } else {
+            std::array::from_fn(|k| ((p.balance_color[k] as f32 - 128.0) * 2.0 * s).round() as i16)
+        }
+    };
+    PipeAux {
+        dither_method: p.dither_method,
+        dither_amount: p.dither_amount,
+        dither_custom: &p.dither_custom,
+        dither_n: p.dither_custom_n,
+        dither_scale_x: dsx,
+        dither_scale_y: dsy,
+        shade_f1: p.shade_f1,
+        shade_f2: p.shade_f2,
+        shade_f3: p.shade_f3,
+        shade_half: p.shade_half,
+        shade_f1_on: p.shade_f1_on,
+        shade_f2_on: p.shade_f2_on,
+        shade_f3_on: p.shade_f3_on,
+        shade_half_on: p.shade_half_on,
+        shade_half_use: p.shade_half_use,
+        shade_amount: p.shade_amount,
+        shade_smooth: p.shade_smooth,
+        shade_detail: p.shade_detail,
+        shade_cw: preset_cell_dims(p).0,
+        shade_ch: preset_cell_dims(p).1,
+        font_8x8: p.shade_vga50,
+        shade_ice: p.shade_ice,
+        pixelate_h: p.pixelate_h,
+        fx: PostFx::from_record(&p.postfx),
+        balance,
+        palette: Some(palette),
+        skip_dither_palette: false,
+    }
+}
+
+/// Build the ANSI grid from a PRESET (the headless twin of [`Kaleidotron::build_ansi_grid`]
+/// — keep the two in lockstep). Runs the value ops + resize/letterbox on a black-composited
+/// pre-shade buffer, then grids once with the exact same `ansi_shade_grid` the preview uses,
+/// so a batch export is cell-identical to the GUI.
+fn build_ansi_grid_from_preset(
+    p: &FxPreset,
+    palette: &[[u8; 4]],
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+) -> (crate::thumb::AnsiGrid, Vec<u8>, usize, usize, bool) {
+    let dsx = p.dither_scale_x.max(1);
+    let dsy = p.dither_scale_y.max(1);
+    let (tw, th) = preset_resize_target(p, w, h);
+    let (cw, ch_) = preset_cell_dims(p);
+    let font_8x8 = p.shade_vga50;
+    let mut aux = preset_pipe_aux(p, palette, dsx, dsy);
+    aux.skip_dither_palette = true;
+    let adjust = Adjust::from_array(p.adjust_vals).with_order(&p.order);
+    let mut work = if tw == w && th == h {
+        rgba.to_vec()
+    } else if p.shade_fit_chars {
+        crate::thumb::letterbox(rgba, w, h, tw, th)
+    } else {
+        crate::thumb::box_downscale(rgba, w, h, tw, th)
+    };
+    for px in work.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a < 255 {
+            px[0] = (px[0] as u32 * a / 255) as u8;
+            px[1] = (px[1] as u32 * a / 255) as u8;
+            px[2] = (px[2] as u32 * a / 255) as u8;
+            px[3] = 255;
+        }
+    }
+    apply_pipeline(&mut work, tw, th, &adjust, &aux);
+    let grid = crate::thumb::ansi_shade_grid(
+        &work, tw, th, palette, cw, ch_, p.shade_f1, p.shade_f2, p.shade_f3, p.shade_half,
+        p.shade_f1_on, p.shade_f2_on, p.shade_f3_on, p.shade_half_on, p.shade_half_use,
+        p.shade_amount, p.shade_ice, p.shade_smooth, p.shade_detail,
+    );
+    (grid, work, tw, th, font_8x8)
+}
+
+/// Resolve a preset's palette headlessly (MIRRORS `active_recolor`'s custom / `.gpl`
+/// paths). Reduce-only presets return None — batch needs a fixed palette.
+fn preset_palette(p: &FxPreset) -> Option<Vec<[u8; 4]>> {
+    if let Some(cp) = &p.custom_palette {
+        if !cp.is_empty() {
+            return Some(cp.clone());
+        }
+    }
+    let path = p.selected_palette.as_ref()?;
+    let text = std::fs::read_to_string(path)
+        .ok()
+        .or_else(|| builtin_palette_contents(path).map(str::to_string))?;
+    let pal = crate::thumb::parse_gpl(&text);
+    (!pal.is_empty()).then_some(pal)
+}
+
+/// The user's saved PixelFX presets, read straight from eframe's on-disk storage
+/// (`app.ron` is a RON `String→String` map; the `pixelfx` value is itself RON). Empty on
+/// any error — the batch still has the bundled Factory set.
+fn load_user_fx_presets() -> Vec<FxPreset> {
+    let Some(path) = eframe::storage_dir("kaleidotron").map(|d| d.join("app.ron")) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(map) = ron::from_str::<std::collections::HashMap<String, String>>(&text) else {
+        return Vec::new();
+    };
+    map.get("pixelfx")
+        .and_then(|v| ron::from_str::<Vec<FxPreset>>(v).ok())
+        .unwrap_or_default()
+}
+
+/// Every PixelFX preset resolvable by name: the bundled Factory set plus the user's saved
+/// presets (a user preset only adds when its name isn't already a Factory one).
+fn load_all_fx_presets() -> Vec<FxPreset> {
+    let mut all: Vec<FxPreset> = builtin_fx_presets().to_vec();
+    let have: std::collections::HashSet<String> = all.iter().map(|p| p.name.clone()).collect();
+    for u in load_user_fx_presets() {
+        if !have.contains(&u.name) {
+            all.push(u);
+        }
+    }
+    all
+}
+
+/// Recursively collect every convertible image under `dir` (sorted, depth-first). Unlike
+/// `scan_render_dir` (flat, for `--render`) this descends into subfolders, so a batch of a
+/// pack folder mirrors its whole tree.
+fn scan_batch_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            scan_batch_dir(&p, out);
+        } else if p.is_file() && is_render_candidate(&p) {
+            out.push(p);
+        }
+    }
+}
+
+/// Convert one image to a textmode file under `preset`. `base` is the input root the file
+/// was found under, so with `--outdir` the output mirrors the input's subfolder structure
+/// (e.g. `monsters/undead/skull.png` → `<outdir>/monsters/undead/skull.ans`). Without
+/// `--outdir` the file is written beside its source. Returns `(out_path, cols, rows)`.
+#[allow(clippy::too_many_arguments)]
+fn batch_one(
+    reg: &crate::decode::Registry,
+    input: &Path,
+    base: &Path,
+    preset: &FxPreset,
+    palette: &[[u8; 4]],
+    format: u8,
+    date: &str,
+    outdir: Option<&Path>,
+) -> Result<(PathBuf, usize, usize), String> {
+    let img = reg.decode_path(input).map_err(|e| e.to_string())?;
+    let (w, h) = (img.width as usize, img.height as usize);
+    let rgba = img.rgba_bytes();
+    // Pixel-art upscaler (preset's scale_algo) runs before the pipeline, same as the GUI.
+    let scaler = crate::scale::Scaler::from_u8(preset.scale_algo);
+    let (w, h, rgba) = if scaler == crate::scale::Scaler::None {
+        (w, h, rgba)
+    } else {
+        let (out, ow, oh) = scaler.apply(&rgba, w, h);
+        (ow, oh, out)
+    };
+    let (grid, _work, _tw, _th, font_8x8) =
+        build_ansi_grid_from_preset(preset, palette, w, h, &rgba);
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let (bytes, ext, _note) =
+        serialize_textmode(&grid, format, preset.shade_ice, font_8x8, stem, date);
+    // Output path: mirror the input's path relative to `base` under `--outdir`; else beside
+    // the source. Create parent folders as needed.
+    let out = match outdir {
+        Some(d) => {
+            let rel = input.strip_prefix(base).unwrap_or(input);
+            d.join(rel).with_extension(ext)
+        }
+        None => input.with_extension(ext),
+    };
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&out, &bytes).map_err(|e| e.to_string())?;
+    Ok((out, grid.cols, grid.rows))
+}
+
+/// Map a `--format` string to a `shade_export_format` code (0 Auto … 5 Tundra).
+fn textmode_format_code(s: &str) -> Option<u8> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "auto" | "ans" => 0,
+        "ans16" | "ansi16" => 1,
+        "ans256" | "ansi256" => 2,
+        "ansrgb" | "ansi-rgb" | "ansirgb" | "truecolor" | "rgb" => 3,
+        "xb" | "xbin" => 4,
+        "tnd" | "tundra" => 5,
+        _ => return None,
+    })
+}
+
+/// Entry point for `--batch`. Applies a PixelFX preset to every input image and writes a
+/// textmode file (.ans/.xb/.tnd) for each. Returns a process exit code (0 = all ok).
+pub fn run_batch(cli: &CliArgs) -> i32 {
+    let presets = load_all_fx_presets();
+    if cli.batch_list {
+        println!("PixelFX presets ({}):", presets.len());
+        for p in &presets {
+            let kind = if p.dither_method == crate::thumb::DITHER_ANSI {
+                "ANSI"
+            } else {
+                "img"
+            };
+            println!("  [{kind}] {}", p.name);
+        }
+        return 0;
+    }
+    let Some(name) = &cli.batch_preset else {
+        eprintln!("kaleidotron: --batch needs --preset \"NAME\" (or --list-presets to see them)");
+        return 2;
+    };
+    let Some(preset) = presets.iter().find(|p| &p.name == name) else {
+        eprintln!("kaleidotron: no PixelFX preset named {name:?} (try --list-presets)");
+        return 2;
+    };
+    if preset.dither_method != crate::thumb::DITHER_ANSI {
+        eprintln!(
+            "kaleidotron: preset {name:?} isn't an ANSI Shade preset (its Dither must be 'ANSI Shade') — textmode batch needs one"
+        );
+        return 2;
+    }
+    let Some(palette) = preset_palette(preset) else {
+        eprintln!(
+            "kaleidotron: preset {name:?} has no fixed palette (batch needs a selected .gpl or a custom palette; Reduce-only presets aren't supported yet)"
+        );
+        return 2;
+    };
+    if let Some(d) = &cli.render_outdir {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            eprintln!("kaleidotron: cannot create output dir {}: {e}", d.display());
+            return 2;
+        }
+    }
+    // Expand inputs into (file, base) jobs. `base` is the input root a file was found
+    // under, so `--outdir` output mirrors the folder's subtree. Folders are scanned
+    // RECURSIVELY (packs nest — monsters/undead/…); a plain file's base is its parent.
+    let mut jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for inp in &cli.batch_inputs {
+        if inp.is_dir() {
+            let mut files = Vec::new();
+            scan_batch_dir(inp, &mut files);
+            if files.is_empty() {
+                eprintln!("kaleidotron: no images in {}", inp.display());
+            }
+            for f in files {
+                jobs.push((f, inp.clone()));
+            }
+        } else if inp.is_file() {
+            let base = inp
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            jobs.push((inp.clone(), base));
+        } else {
+            eprintln!("kaleidotron: not found: {}", inp.display());
+        }
+    }
+    if jobs.is_empty() {
+        eprintln!("kaleidotron: no input images for --batch");
+        return 1;
+    }
+    // `--format` (if given) overrides the preset's export format; else use the preset's.
+    let format = match cli.render_format.as_deref() {
+        None => preset.shade_export_format,
+        Some(s) => match textmode_format_code(s) {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "kaleidotron: --format {s:?} is not a textmode format (auto|ans|ans16|ans256|ansrgb|xb|tnd)"
+                );
+                return 2;
+            }
+        },
+    };
+    let reg = crate::decode::Registry::with_builtins();
+    let date = today_ccyymmdd();
+    let outdir = cli.render_outdir.as_deref();
+    let (mut ok, mut fail) = (0u32, 0u32);
+    for (job, base) in &jobs {
+        match batch_one(&reg, job, base, preset, &palette, format, &date, outdir) {
+            Ok((out, cols, rows)) => {
+                println!("{} → {} ({cols}×{rows} cells)", job.display(), out.display());
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("kaleidotron: {}: {e}", job.display());
+                fail += 1;
+            }
+        }
+    }
+    eprintln!(
+        "Wrote {ok} textmode file(s) with preset {name:?}{}",
+        if fail > 0 {
+            format!(", {fail} failed")
+        } else {
+            String::new()
+        }
+    );
+    i32::from(ok == 0)
 }
 
 /// Entry point for `--render`. Returns a process exit code (0 = all ok).
@@ -46458,6 +46867,35 @@ mod tests {
                 "{fav} parsed to no colors"
             );
         }
+    }
+
+    #[test]
+    fn batch_builds_grid_from_preset_and_maps_formats() {
+        // The headless batch path: a default ANSI-Shade preset (snap 9×16) on an 18×32
+        // opaque image yields a 2×2 cell grid — proving `build_ansi_grid_from_preset`
+        // (the twin of the GUI `build_ansi_grid`) runs end-to-end without an App.
+        let mut p = FxPreset::default();
+        p.dither_method = crate::thumb::DITHER_ANSI;
+        p.shade_snap916 = true;
+        p.shade_vga50 = false;
+        p.shade_fit_chars = false;
+        p.resize_on = false;
+        let palette = vec![[0, 0, 0, 255], [128, 128, 128, 255], [255, 255, 255, 255]];
+        let (w, h) = (18usize, 32usize);
+        let rgba = vec![200u8; w * h * 4];
+        let (grid, _work, tw, th, font8) = build_ansi_grid_from_preset(&p, &palette, w, h, &rgba);
+        assert_eq!((grid.cols, grid.rows), (2, 2), "9×16 cells over 18×32");
+        assert_eq!((tw, th), (18, 32));
+        assert!(!font8);
+        // The serializer produces a non-empty file with a 128-byte SAUCE trailer.
+        let (bytes, ext, _note) = serialize_textmode(&grid, 1, true, false, "t", "20260817");
+        assert_eq!(ext, "ans");
+        assert!(bytes.len() > 128 && &bytes[bytes.len() - 128..][..5] == b"SAUCE");
+        // --format name → export-code mapping.
+        assert_eq!(textmode_format_code("auto"), Some(0));
+        assert_eq!(textmode_format_code("xb"), Some(4));
+        assert_eq!(textmode_format_code("tnd"), Some(5));
+        assert_eq!(textmode_format_code("nope"), None);
     }
 
     #[test]

@@ -45,6 +45,12 @@ use eframe::egui;
 fn main() -> Result<(), eframe::Error> {
     let cli = app::CliArgs::parse();
 
+    // Headless TEXTMODE batch (`--batch`): apply a PixelFX preset to images and dump
+    // .ans/.xb/.tnd, then exit — no window (runs over SSH / in a script).
+    if cli.is_batch() {
+        std::process::exit(app::run_batch(&cli));
+    }
+
     // Headless render-to-file mode (`--render`): convert art to image files and exit,
     // without ever opening a window. Runs fine over SSH / in a batch script.
     if cli.is_render() {
