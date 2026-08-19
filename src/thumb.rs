@@ -1780,12 +1780,19 @@ fn petscii_cell_match(
     is_block: &[bool],
     penalty: f32,
     block_only: bool,
+    allowed: Option<&[bool]>,
 ) -> (u8, u8, f32) {
     let bg = pf[bg_idx as usize];
     let mut best = (32u8, bg_idx, f32::MAX);
     for code in 0u16..256 {
         if block_only && !is_block[code as usize] {
             continue;
+        }
+        // Glyph-picker mask: skip codes the user disabled (space stays the fallback).
+        if let Some(a) = allowed {
+            if !a.get(code as usize).copied().unwrap_or(true) {
+                continue;
+            }
         }
         let g = &crate::decode::C64_FONT[page * 256 + code as usize];
         let (mut set_sum, mut set_sq, mut set_n, mut clear_err) = ([0f32; 3], 0f32, 0f32, 0f32);
@@ -1845,6 +1852,7 @@ pub fn petscii_grid(
     purity: f32,
     bg_override: Option<u8>,
     pal: &[[u8; 4]; 16],
+    allowed: Option<&[bool]>,
 ) -> PetsciiGrid {
     let cols = cols.max(1);
     let rows = rows.max(1);
@@ -1881,7 +1889,9 @@ pub fn petscii_grid(
             .map(|b| {
                 let total: f32 = cells_px
                     .par_iter()
-                    .map(|cell| petscii_cell_match(cell, page, b, pal, &pf, &is_block, 0.0, true).2)
+                    .map(|cell| {
+                        petscii_cell_match(cell, page, b, pal, &pf, &is_block, 0.0, true, allowed).2
+                    })
                     .sum();
                 (b, total)
             })
@@ -1895,7 +1905,7 @@ pub fn petscii_grid(
         .par_iter()
         .map(|cell| {
             let (code, fg, _) =
-                petscii_cell_match(cell, page, bg, pal, &pf, &is_block, penalty, false);
+                petscii_cell_match(cell, page, bg, pal, &pf, &is_block, penalty, false, allowed);
             PetsciiCell { code, fg }
         })
         .collect();
@@ -1942,11 +1952,12 @@ pub fn petscii_pass(
     purity: f32,
     bg_override: Option<u8>,
     pal: &[[u8; 4]; 16],
+    allowed: Option<&[bool]>,
 ) {
     if w == 0 || h == 0 {
         return;
     }
-    let grid = petscii_grid(rgba, w, h, cols, rows, page, purity, bg_override, pal);
+    let grid = petscii_grid(rgba, w, h, cols, rows, page, purity, bg_override, pal, allowed);
     let (pw, ph, px) = petscii_render(&grid, pal);
     if pw == 0 || ph == 0 {
         return;
@@ -1983,6 +1994,7 @@ pub struct AsciiCharset {
     pub control: bool,   // 0..=31 (control-code glyphs)
     pub blocks: bool,    // the ░▒▓█ + half/quarter block set (even when High ASCII is off)
     pub box_draw: bool,  // 179..=218 (box-drawing lines)
+    pub mask: Vec<bool>, // glyph-picker mask over CP437 (256); intersects the pool. Empty = all.
 }
 
 /// Build the light→dark ASCII ramp: `(glyph, coverage)` pairs sorted by ink coverage
@@ -2000,9 +2012,20 @@ pub fn ascii_ramp(cs: &AsciiCharset, font_8x8: bool) -> Vec<(u8, f32)> {
         };
         bits as f32 / total
     };
+    // Glyph-picker mask (256): when set, only these CP437 codes are usable. Empty = all.
+    let mask_on = cs.mask.len() == 256 && cs.mask.iter().any(|b| !*b);
+    let allowed = |code: u8| -> bool {
+        !mask_on || cs.mask.get(code as usize).copied().unwrap_or(true)
+    };
     // Explicit set: use exactly the typed glyphs, sorted by coverage, no dedup.
     if !cs.only.is_empty() {
-        let mut ramp: Vec<(u8, f32)> = cs.only.iter().map(|&c| (c, cov(c))).collect();
+        let mut ramp: Vec<(u8, f32)> = cs
+            .only
+            .iter()
+            .copied()
+            .filter(|&c| allowed(c))
+            .map(|c| (c, cov(c)))
+            .collect();
         ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         return ramp;
     }
@@ -2026,6 +2049,9 @@ pub fn ascii_ramp(cs: &AsciiCharset, font_8x8: bool) -> Vec<(u8, f32)> {
     }
     let mut seen: std::collections::HashMap<u16, (u8, f32)> = std::collections::HashMap::new();
     for code in order {
+        if !allowed(code) {
+            continue;
+        }
         let c = cov(code);
         let bucket = (c * total).round() as u16; // one slot per set-pixel count
         seen.entry(bucket).or_insert((code, c));
@@ -2979,7 +3005,7 @@ mod tests {
         // A solid VIC-II colour converts + renders back to that same colour (bg auto-picks it).
         let red = crate::decode::VIC2[2];
         let rgba: Vec<u8> = std::iter::repeat(red).take(64).flatten().collect();
-        let grid = petscii_grid(&rgba, 8, 8, 1, 1, 0, 1.0, None, &crate::decode::VIC2);
+        let grid = petscii_grid(&rgba, 8, 8, 1, 1, 0, 1.0, None, &crate::decode::VIC2, None);
         let (w, h, out) = petscii_render(&grid, &crate::decode::VIC2);
         assert_eq!((w, h), (8, 8));
         for px in out.chunks_exact(4) {
@@ -3001,7 +3027,7 @@ mod tests {
                 rgba[o..o + 4].copy_from_slice(&c);
             }
         }
-        let grid = petscii_grid(&rgba, w, h, 2, 1, 0, 1.0, None, &crate::decode::VIC2);
+        let grid = petscii_grid(&rgba, w, h, 2, 1, 0, 1.0, None, &crate::decode::VIC2, None);
         let (rw, _rh, out) = petscii_render(&grid, &crate::decode::VIC2);
         let at = |x: usize, y: usize| {
             let o = (y * rw + x) * 4;

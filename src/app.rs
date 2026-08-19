@@ -1643,6 +1643,8 @@ pub struct Kaleidotron {
     petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
     petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
     petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
+    petscii_mask: Vec<bool>,   // which C64 glyphs the matcher may use (all-on = all)
+    petscii_picker: bool,      // PETSCII glyph-picker popup open
     // ASCII converter (DITHER_ASCII): brightness→glyph over a chosen character pool.
     ascii_high: bool,    // include high ASCII (128..255 — CP437 extended)
     ascii_control: bool, // include control chars (0..31)
@@ -1651,6 +1653,8 @@ pub struct Kaleidotron {
     ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
     ascii_invert: bool,  // inverse video — swap ink/paper
     ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
+    ascii_mask: Vec<bool>, // glyph-picker mask over CP437 (256); intersects the ramp pool
+    ascii_picker: bool,    // ASCII glyph-picker popup open
     // Unified foreground / background for the mono char converters (ASCII / ATASCII / Apple ][).
     tm_fg: [u8; 3],
     tm_bg: [u8; 3],
@@ -2477,10 +2481,12 @@ impl Kaleidotron {
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const ASCII_INVERT_KEY: &'static str = "ascii_invert";
+    const ASCII_MASK_KEY: &'static str = "ascii_mask";
     const TM_COLOR_KEY: &'static str = "textmode_fgbg"; // unified (fg, bg) for ASCII/ATASCII/Apple
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
+    const PETSCII_MASK_KEY: &'static str = "petscii_mask";
     const ATASCII_MASK_KEY: &'static str = "atascii_mask";
     const APPLE_MASK_KEY: &'static str = "apple_mask";
     const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert)
@@ -3165,6 +3171,10 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
             .unwrap_or((true, false, true, false, false, String::new()));
         let ascii_invert = get_bool(Self::ASCII_INVERT_KEY).unwrap_or(false);
+        let ascii_mask: Vec<bool> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::ASCII_MASK_KEY))
+            .unwrap_or_default();
         // Unified fg/bg for the mono char modes.
         let (tm_fg, tm_bg): ([u8; 3], [u8; 3]) = cc
             .storage
@@ -3705,6 +3715,8 @@ impl Kaleidotron {
             ascii_control: ascii.1,
             ascii_color: ascii.2,
             ascii_invert,
+            ascii_mask,
+            ascii_picker: false,
             tm_fg,
             tm_bg,
             ascii_blocks: ascii.3,
@@ -3715,6 +3727,11 @@ impl Kaleidotron {
             apple_invert: bitfont.2,
             apple_mousetext: bitfont.3,
             apple_col80: bitfont.4,
+            petscii_mask: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::PETSCII_MASK_KEY))
+                .unwrap_or_default(),
+            petscii_picker: false,
             atascii_mask: cc
                 .storage
                 .and_then(|s| eframe::get_value(s, Self::ATASCII_MASK_KEY))
@@ -19889,6 +19906,7 @@ impl Kaleidotron {
                 Some(self.petscii_bg & 15)
             },
             petscii_pal: self.petscii_pal(),
+            petscii_allowed: self.petscii_allowed().map(|s| s.to_vec()),
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
             ascii_invert: self.ascii_invert,
@@ -20365,7 +20383,7 @@ impl Kaleidotron {
         ) + &ssig
             + &if self.dither_method == crate::thumb::DITHER_PETSCII {
                 format!(
-                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}",
+                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}:m{:x}",
                     self.petscii_cols,
                     self.petscii_rows,
                     self.petscii_purity,
@@ -20373,6 +20391,7 @@ impl Kaleidotron {
                     self.petscii_bg_auto as u8,
                     self.petscii_bg,
                     self.petscii_palette,
+                    mask_hash(&self.petscii_mask),
                 )
             } else {
                 String::new()
@@ -20381,7 +20400,7 @@ impl Kaleidotron {
             // the range toggles + colour AND the fit/cell state that sets the working resolution.
             + &if self.dither_method == crate::thumb::DITHER_ASCII {
                 format!(
-                    "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:v{}:s{}|Fit{}:{}x{}",
+                    "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:m{:x}:v{}:s{}|Fit{}:{}x{}",
                     self.ascii_high as u8,
                     self.ascii_control as u8,
                     self.ascii_blocks as u8,
@@ -20389,6 +20408,7 @@ impl Kaleidotron {
                     self.ascii_color as u8,
                     self.ascii_invert as u8,
                     self.ascii_chars,
+                    mask_hash(&self.ascii_mask),
                     self.shade_vga50 as u8,
                     self.shade_snap916 as u8,
                     self.shade_fit_chars as u8,
@@ -20728,6 +20748,7 @@ impl Kaleidotron {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
+            petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
             tm_mono: None,
@@ -21046,7 +21067,18 @@ impl Kaleidotron {
             self.petscii_purity,
             bg,
             self.petscii_pal(),
+            self.petscii_allowed(),
         )
+    }
+
+    /// The PETSCII glyph mask as an `allowed` slice, or None when it's empty/all-on (no restriction).
+    fn petscii_allowed(&self) -> Option<&[bool]> {
+        let on = self.petscii_mask.iter().filter(|b| **b).count();
+        if self.petscii_mask.len() == 256 && on > 0 && on < 256 {
+            Some(&self.petscii_mask)
+        } else {
+            None
+        }
     }
 
     /// The 16-colour VIC-II palette the PETSCII converter renders + matches with, chosen by
@@ -21131,6 +21163,23 @@ impl Kaleidotron {
         self.rexfont_picker = open;
     }
 
+    /// PETSCII glyph picker (over the C64 ROM font page; default set = all glyphs).
+    fn ui_petscii_picker(&mut self, ctx: &egui::Context) {
+        if !self.petscii_picker || self.dither_method != crate::thumb::DITHER_PETSCII {
+            return;
+        }
+        let page = self.petscii_page.min(1);
+        let rows = &crate::decode::C64_FONT[page * 256..page * 256 + 256];
+        let font = crate::decode::rexfont::GlyphFont::from_8x8(rows);
+        let default = vec![true; 256];
+        let mut open = self.petscii_picker;
+        glyph_picker_window(
+            ctx, "PETSCII glyphs", "petscii_atlas", &font, 256, &mut self.petscii_mask, &default,
+            &mut open, &mut self.glyph_drag,
+        );
+        self.petscii_picker = open;
+    }
+
     /// ATASCII glyph picker (over the Atari ROM font; default set = all glyphs).
     fn ui_atascii_picker(&mut self, ctx: &egui::Context) {
         if !self.atascii_picker || self.dither_method != crate::thumb::DITHER_ATASCII {
@@ -21170,6 +21219,24 @@ impl Kaleidotron {
         self.apple_picker = open;
     }
 
+    /// ASCII glyph picker (over the CP437 font; default set = all glyphs — the range toggles /
+    /// "Use only chars" still narrow the pool, and the mask intersects that).
+    fn ui_ascii_picker(&mut self, ctx: &egui::Context) {
+        if !self.ascii_picker || self.dither_method != crate::thumb::DITHER_ASCII {
+            return;
+        }
+        let font = crate::decode::rexfont::GlyphFont::from_8x8(
+            &crate::decode::cp437_font_8x8::CP437_8X8,
+        );
+        let default = vec![true; 256];
+        let mut open = self.ascii_picker;
+        glyph_picker_window(
+            ctx, "ASCII / CP437 glyphs", "ascii_atlas", &font, 256, &mut self.ascii_mask, &default,
+            &mut open, &mut self.glyph_drag,
+        );
+        self.ascii_picker = open;
+    }
+
     /// The enabled-glyph pool for the REXPaint-font converter, from `rexfont_mask`. Empty means
     /// "all glyphs" — which is what an all-on OR all-off (degenerate) mask collapses to.
     fn rexfont_pool(&self) -> Vec<u16> {
@@ -21191,6 +21258,7 @@ impl Kaleidotron {
             control: self.ascii_control,
             blocks: self.ascii_blocks,
             box_draw: self.ascii_box,
+            mask: self.ascii_mask.clone(),
         }
     }
 
@@ -25577,6 +25645,9 @@ impl Kaleidotron {
                             ui.label("Charset");
                             ui.selectable_value(&mut self.petscii_page, 0, "Upper/graphics");
                             ui.selectable_value(&mut self.petscii_page, 1, "Lower");
+                            if ui.button("Chars…").on_hover_text("Pick which C64 glyphs the matcher may use").clicked() {
+                                self.petscii_picker = !self.petscii_picker;
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Export");
@@ -25672,6 +25743,9 @@ impl Kaleidotron {
                                 );
                             ui.checkbox(&mut self.ascii_invert, "Invert")
                                 .on_hover_text("Inverse video — draw the glyph in paper on an ink-coloured cell");
+                            if ui.button("Chars…").on_hover_text("Pick usable CP437 glyphs (intersects the ranges)").clicked() {
+                                self.ascii_picker = !self.ascii_picker;
+                            }
                             ui.weak("·");
                             ui.checkbox(&mut self.shade_vga50, "8×8 cell")
                                 .on_hover_text("Render in the 8×8 VGA50 font (off = 8×16)");
@@ -36919,8 +36993,10 @@ impl eframe::App for Kaleidotron {
         self.ui_select_mask_dialog(&ctx);
         self.ui_ai_generate(&ctx);
         self.ui_rexfont_picker(&ctx);
+        self.ui_petscii_picker(&ctx);
         self.ui_atascii_picker(&ctx);
         self.ui_apple_picker(&ctx);
+        self.ui_ascii_picker(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -38363,6 +38439,7 @@ impl eframe::App for Kaleidotron {
             ),
         );
         eframe::set_value(storage, Self::ASCII_INVERT_KEY, &self.ascii_invert);
+        eframe::set_value(storage, Self::ASCII_MASK_KEY, &self.ascii_mask);
         eframe::set_value(storage, Self::TM_COLOR_KEY, &(self.tm_fg, self.tm_bg));
         eframe::set_value(
             storage,
@@ -38381,6 +38458,7 @@ impl eframe::App for Kaleidotron {
             &(self.rexfont_sel, self.rexfont_invert),
         );
         eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
+        eframe::set_value(storage, Self::PETSCII_MASK_KEY, &self.petscii_mask);
         eframe::set_value(storage, Self::ATASCII_MASK_KEY, &self.atascii_mask);
         eframe::set_value(storage, Self::APPLE_MASK_KEY, &self.apple_mask);
         eframe::set_value(
@@ -38767,6 +38845,18 @@ fn glyph_picker_window(
                 *drag = None;
             }
         });
+}
+
+/// A cheap order-sensitive hash of a glyph-enable mask, for cache keys (so toggling glyphs
+/// re-renders). Empty/all-on masks hash to 0.
+fn mask_hash(mask: &[bool]) -> u64 {
+    mask.iter().enumerate().fold(0u64, |acc, (i, &b)| {
+        if b {
+            acc ^ 0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1)
+        } else {
+            acc
+        }
+    })
 }
 
 fn resolve_ascii_chars(s: &str) -> Vec<u8> {
@@ -39500,6 +39590,7 @@ struct PipeAux<'a> {
     petscii_purity: f32,
     petscii_bg: Option<u8>,
     petscii_pal: &'static [[u8; 4]; 16],
+    petscii_allowed: Option<Vec<bool>>, // glyph-picker mask (None = all)
     // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
     ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
@@ -39580,6 +39671,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                         aux.petscii_purity,
                         aux.petscii_bg,
                         aux.petscii_pal,
+                        aux.petscii_allowed.as_deref(),
                     );
                 } else if matches!(
                     aux.dither_method,
@@ -40569,6 +40661,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
+            petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
             tm_mono: None,
@@ -48869,6 +48962,7 @@ fn preset_pipe_aux<'a>(
         petscii_purity: 1.0,
         petscii_bg: None,
         petscii_pal: crate::decode::petscii_palette(0),
+        petscii_allowed: None,
         ascii_cs: crate::thumb::AsciiCharset::default(),
         ascii_invert: false,
         tm_mono: None,
@@ -51197,6 +51291,7 @@ mod tests {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
+            petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
             tm_mono: None,
@@ -51420,6 +51515,7 @@ mod tests {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
+            petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
             tm_mono: None,
