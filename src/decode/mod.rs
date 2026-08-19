@@ -11,6 +11,10 @@ mod audio;
 mod bin;
 mod builtin;
 mod c64_font;
+// Re-export the C64 ROM font + VIC-II palette so the image→PETSCII converter (in `thumb`)
+// can reach them without exposing the whole decoder modules.
+pub(crate) use c64_font::C64_FONT;
+pub(crate) use petscii::VIC2;
 mod code;
 mod eps;
 pub mod font;

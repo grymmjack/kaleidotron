@@ -1592,9 +1592,252 @@ pub fn letterbox(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     out
 }
 
+// ===================== PETSCII converter (image → C64 hi-res char art) =====================
+//
+// C64 standard hi-res char mode: ONE global background + per-cell (glyph, foreground-from-16).
+// We match each 8×8 cell against the C64 ROM font ([`crate::decode::C64_FONT`], reverse glyphs
+// baked in at codes 128..256) using the two-region-mean trick, over the VIC-II palette
+// ([`crate::decode::VIC2`]). A "purity" knob biases toward clean block glyphs; the background is
+// auto-picked (least total error over block glyphs) unless overridden.
+
+/// One PETSCII cell: a C64 screen code (0..255; ≥128 = reverse) + a VIC-II fg index (0..15).
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct PetsciiCell {
+    pub code: u8,
+    pub fg: u8,
+}
+
+/// A converted PETSCII screen: `cols`×`rows` cells over one global background `bg`, with `page`
+/// selecting the charset (0 = upper/graphics, 1 = lower).
+#[allow(dead_code)]
+pub struct PetsciiGrid {
+    pub cols: usize,
+    pub rows: usize,
+    pub bg: u8,
+    pub page: usize,
+    pub cells: Vec<PetsciiCell>,
+}
+
+/// Is C64 screen-code `code` (in font `page`) a "block" glyph — each of its four 4×4 quadrants
+/// uniformly on/off? Captures space / full / halves / quarters (the classic block set), computed
+/// from the ROM so no screen codes are hardcoded.
+#[allow(dead_code)]
+fn c64_is_block(page: usize, code: u8) -> bool {
+    let g = &crate::decode::C64_FONT[page * 256 + code as usize];
+    for &(r0, c0) in &[(0usize, 0usize), (0, 4), (4, 0), (4, 4)] {
+        let (mut any, mut all) = (false, true);
+        for row in g.iter().take(r0 + 4).skip(r0) {
+            for rx in c0..c0 + 4 {
+                let on = (row >> (7 - rx)) & 1 == 1;
+                any |= on;
+                all &= on;
+            }
+        }
+        if any && !all {
+            return false; // mixed quadrant → not a pure block glyph
+        }
+    }
+    true
+}
+
+/// Best (code, fg, error) for one 8×8 `cell` given a fixed background, searching the C64 font.
+/// `block_only` restricts to block glyphs (used for the cheap bg search); otherwise non-block
+/// glyphs pay `penalty` (the purity bias). Error = Σset(src-fg)² + Σclear(src-bg)².
+#[allow(dead_code, clippy::too_many_arguments)]
+fn petscii_cell_match(
+    cell: &[[f32; 3]; 64],
+    page: usize,
+    bg_idx: u8,
+    pf: &[[f32; 3]],
+    is_block: &[bool],
+    penalty: f32,
+    block_only: bool,
+) -> (u8, u8, f32) {
+    let bg = pf[bg_idx as usize];
+    let mut best = (32u8, bg_idx, f32::MAX);
+    for code in 0u16..256 {
+        if block_only && !is_block[code as usize] {
+            continue;
+        }
+        let g = &crate::decode::C64_FONT[page * 256 + code as usize];
+        let (mut set_sum, mut set_sq, mut set_n, mut clear_err) = ([0f32; 3], 0f32, 0f32, 0f32);
+        for (py, &bits) in g.iter().enumerate() {
+            for px in 0..8usize {
+                let s = cell[py * 8 + px];
+                if (bits >> (7 - px)) & 1 == 1 {
+                    set_sum[0] += s[0];
+                    set_sum[1] += s[1];
+                    set_sum[2] += s[2];
+                    set_sq += s[0] * s[0] + s[1] * s[1] + s[2] * s[2];
+                    set_n += 1.0;
+                } else {
+                    let (dr, dg, db) = (s[0] - bg[0], s[1] - bg[1], s[2] - bg[2]);
+                    clear_err += dr * dr + dg * dg + db * db;
+                }
+            }
+        }
+        let (fg_idx, err_set) = if set_n > 0.0 {
+            let mean = [
+                (set_sum[0] / set_n) as u8,
+                (set_sum[1] / set_n) as u8,
+                (set_sum[2] / set_n) as u8,
+            ];
+            let fi = nearest_index(mean, crate::decode::VIC2.as_slice());
+            let fc = pf[fi as usize];
+            let e = set_sq
+                - 2.0 * (fc[0] * set_sum[0] + fc[1] * set_sum[1] + fc[2] * set_sum[2])
+                + set_n * (fc[0] * fc[0] + fc[1] * fc[1] + fc[2] * fc[2]);
+            (fi, e)
+        } else {
+            (bg_idx, 0.0) // all-clear glyph (space): fg irrelevant
+        };
+        let mut err = err_set + clear_err;
+        if !block_only && !is_block[code as usize] {
+            err += penalty;
+        }
+        if err < best.2 {
+            best = (code as u8, fg_idx, err);
+        }
+    }
+    best
+}
+
+/// Convert `rgba` (`w`×`h`) into a `cols`×`rows` PETSCII grid: one global background + per-cell
+/// (C64 glyph, VIC-II fg). `page` selects the charset (0 upper/graphics, 1 lower). `purity` 0..1
+/// biases toward clean block glyphs (0) vs the full charset (1). `bg_override` forces the
+/// background colour; otherwise it's auto-picked to minimise total error.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn petscii_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    cols: usize,
+    rows: usize,
+    page: usize,
+    purity: f32,
+    bg_override: Option<u8>,
+) -> PetsciiGrid {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let page = page.min(1);
+    let (gw, gh) = (cols * 8, rows * 8);
+    let small = box_downscale(rgba, w, h, gw, gh);
+    let pf: Vec<[f32; 3]> = crate::decode::VIC2
+        .iter()
+        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
+    let is_block: Vec<bool> = (0u16..256).map(|c| c64_is_block(page, c as u8)).collect();
+    // Non-block penalty: purity 0 strongly prefers blocks, purity 1 = no penalty. Scaled to the
+    // cell's error magnitude (64 px × a few palette-steps²).
+    let penalty = (1.0 - purity.clamp(0.0, 1.0)) * 64.0 * 3000.0;
+
+    // Per-cell 8×8 pixels (as f32), reused across the bg search + final match.
+    let cells_px: Vec<[[f32; 3]; 64]> = (0..cols * rows)
+        .map(|ci| {
+            let (cy, cx) = (ci / cols, ci % cols);
+            let mut buf = [[0f32; 3]; 64];
+            for py in 0..8 {
+                for px in 0..8 {
+                    let o = ((cy * 8 + py) * gw + cx * 8 + px) * 4;
+                    buf[py * 8 + px] = [small[o] as f32, small[o + 1] as f32, small[o + 2] as f32];
+                }
+            }
+            buf
+        })
+        .collect();
+
+    // Background: override, or auto = the VIC-II colour giving least total block-match error.
+    let bg = bg_override.map(|b| b & 15).unwrap_or_else(|| {
+        (0u8..16)
+            .map(|b| {
+                let total: f32 = cells_px
+                    .par_iter()
+                    .map(|cell| petscii_cell_match(cell, page, b, &pf, &is_block, 0.0, true).2)
+                    .sum();
+                (b, total)
+            })
+            .min_by(|a, c| a.1.partial_cmp(&c.1).unwrap())
+            .map(|(b, _)| b)
+            .unwrap_or(0)
+    });
+
+    // Final match per cell, in parallel.
+    let cells: Vec<PetsciiCell> = cells_px
+        .par_iter()
+        .map(|cell| {
+            let (code, fg, _) = petscii_cell_match(cell, page, bg, &pf, &is_block, penalty, false);
+            PetsciiCell { code, fg }
+        })
+        .collect();
+
+    PetsciiGrid { cols, rows, bg, page, cells }
+}
+
+/// Render a [`PetsciiGrid`] to an RGBA buffer (`cols*8` × `rows*8`) via the C64 font + VIC-II —
+/// the same pixels the decoder produces, so the preview matches a re-opened export.
+#[allow(dead_code)]
+pub fn petscii_render(grid: &PetsciiGrid) -> (usize, usize, Vec<u8>) {
+    let (w, h) = (grid.cols * 8, grid.rows * 8);
+    let mut rgba = vec![0u8; w * h * 4];
+    let bg = crate::decode::VIC2[grid.bg as usize];
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let g = &crate::decode::C64_FONT[grid.page * 256 + cell.code as usize];
+            let fg = crate::decode::VIC2[cell.fg as usize];
+            for (py, &bits) in g.iter().enumerate() {
+                for px in 0..8usize {
+                    let c = if (bits >> (7 - px)) & 1 == 1 { fg } else { bg };
+                    let o = ((cy * 8 + py) * w + cx * 8 + px) * 4;
+                    rgba[o..o + 4].copy_from_slice(&c);
+                }
+            }
+        }
+    }
+    (w, h, rgba)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn petscii_solid_color_round_trips() {
+        // A solid VIC-II colour converts + renders back to that same colour (bg auto-picks it).
+        let red = crate::decode::VIC2[2];
+        let rgba: Vec<u8> = std::iter::repeat(red).take(64).flatten().collect();
+        let grid = petscii_grid(&rgba, 8, 8, 1, 1, 0, 1.0, None);
+        let (w, h, out) = petscii_render(&grid);
+        assert_eq!((w, h), (8, 8));
+        for px in out.chunks_exact(4) {
+            assert_eq!(&px[0..3], &red[0..3], "solid red stays red");
+        }
+    }
+
+    #[test]
+    fn petscii_captures_two_tone() {
+        // Left half red, right half blue over two 8×8 cells → the render keeps each side.
+        let red = crate::decode::VIC2[2];
+        let blue = crate::decode::VIC2[6];
+        let (w, h) = (16usize, 8usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < 8 { red } else { blue };
+                let o = (y * w + x) * 4;
+                rgba[o..o + 4].copy_from_slice(&c);
+            }
+        }
+        let grid = petscii_grid(&rgba, w, h, 2, 1, 0, 1.0, None);
+        let (rw, _rh, out) = petscii_render(&grid);
+        let at = |x: usize, y: usize| {
+            let o = (y * rw + x) * 4;
+            [out[o], out[o + 1], out[o + 2]]
+        };
+        assert_eq!(at(2, 2), [red[0], red[1], red[2]], "left cell red");
+        assert_eq!(at(10, 2), [blue[0], blue[1], blue[2]], "right cell blue");
+    }
     use crate::image_types::PixImage;
 
     #[test]
