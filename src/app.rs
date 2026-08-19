@@ -3117,7 +3117,7 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_EXPORT_FORMAT_KEY))
             .unwrap_or(0)
-            .min(5);
+            .min(6);
         let shade_fit_chars = get_bool(Self::SHADE_FIT_CHARS_KEY).unwrap_or(false);
         // PETSCII settings persisted as one tuple (cols, rows, purity, page, bg_auto, bg, palette).
         let petscii: (usize, usize, f32, u8, bool, u8, u8) = cc
@@ -20079,7 +20079,7 @@ impl Kaleidotron {
         self.shade_smooth = p.shade_smooth.clamp(0.0, 3.0);
         self.shade_detail = p.shade_detail.clamp(0.0, 5.0);
         self.shade_ice = p.shade_ice;
-        self.shade_export_format = p.shade_export_format.min(5);
+        self.shade_export_format = p.shade_export_format.min(6);
         self.shade_fit_chars = p.shade_fit_chars;
         self.shade_fit_cols = p.shade_fit_cols.clamp(1, 1000);
         self.shade_fit_rows = p.shade_fit_rows.clamp(1, 1000);
@@ -20827,7 +20827,7 @@ impl Kaleidotron {
         self.shade_vga50 = p.vga50;
         self.shade_half = p.half;
         self.shade_ice = p.ice;
-        self.shade_export_format = p.export_format.min(5);
+        self.shade_export_format = p.export_format.min(6);
         self.shade_fit_chars = p.fit_chars;
         self.shade_fit_cols = p.fit_cols.max(1);
         self.shade_fit_rows = p.fit_rows.max(1);
@@ -25069,19 +25069,21 @@ impl Kaleidotron {
                                  • ANSI 256-color (.ans) — xterm-256 SGR\n\
                                  • ANSI truecolor (.ans) — 24-bit SGR\n\
                                  • XBin 16-color (.xb) — embeds palette + font (Moebius)\n\
-                                 • Tundra 24-bit (.tnd) — binary truecolor",
+                                 • Tundra 24-bit (.tnd) — binary truecolor\n\
+                                 • REXPaint (.xp) — gzipped CP437 + 24-bit fg/bg",
                             );
                             let mut f = self.shade_export_format as usize;
-                            const FORMATS: [&str; 6] = [
+                            const FORMATS: [&str; 7] = [
                                 "Auto",
                                 "ANSI 16-color (.ans)",
                                 "ANSI 256-color (.ans)",
                                 "ANSI truecolor (.ans)",
                                 "XBin 16-color (.xb)",
                                 "Tundra 24-bit (.tnd)",
+                                "REXPaint (.xp)",
                             ];
                             let cr = egui::ComboBox::from_id_salt("shade_export_format")
-                                .selected_text(FORMATS[f.min(5)])
+                                .selected_text(FORMATS[f.min(6)])
                                 .show_ui(ui, |ui| {
                                     for (i, name) in FORMATS.iter().enumerate() {
                                         ui.selectable_value(&mut f, i, *name);
@@ -25796,6 +25798,7 @@ impl Kaleidotron {
         let (filter, exts): (&str, &[&str]) = match ext {
             "tnd" => ("TundraDraw", &["tnd"]),
             "xb" => ("XBin", &["xb", "xbin"]),
+            "xp" => ("REXPaint", &["xp"]),
             _ => ("ANSI art", &["ans"]),
         };
         let Some(dest) = rfd::FileDialog::new()
@@ -47938,6 +47941,14 @@ fn serialize_textmode(
     stem: &str,
     date: &str,
 ) -> (Vec<u8>, &'static str, String) {
+    // REXPaint .xp is a self-contained gzip — no SAUCE trailer, so it returns early.
+    if format == 6 {
+        return (
+            crate::thumb::ansi_grid_to_xp(grid),
+            "xp",
+            " (REXPaint)".to_string(),
+        );
+    }
     let ega = crate::thumb::palette_is_ega16(&grid.palette);
     let note: String;
     let (mut bytes, ext, sauce_fmt) = match format {
@@ -48262,6 +48273,7 @@ fn textmode_format_code(s: &str) -> Option<u8> {
         "ansrgb" | "ansi-rgb" | "ansirgb" | "truecolor" | "rgb" => 3,
         "xb" | "xbin" => 4,
         "tnd" | "tundra" => 5,
+        "xp" | "rexpaint" | "rex" => 6,
         _ => return None,
     })
 }

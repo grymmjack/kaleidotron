@@ -1322,6 +1322,45 @@ pub fn ansi_grid_to_ans(grid: &AnsiGrid, ice: bool, depth: u8) -> Vec<u8> {
 
 /// Serialize an [`AnsiGrid`] to a **TundraDraw** (`.tnd`) file — the scene-native
 /// binary 24-bit-truecolour format, so an RGB export keeps every colour exactly.
+/// Serialize an [`AnsiGrid`] to a REXPaint `.xp` file (gzipped). A single layer of the grid's
+/// CP437 cells with 24-bit fg/bg resolved from the palette, in the format's **column-major** order
+/// (see `crate::decode::rexpaint`). Round-trips through that decoder. No SAUCE (`.xp` is
+/// self-contained), so callers must NOT append one.
+pub fn ansi_grid_to_xp(grid: &AnsiGrid) -> Vec<u8> {
+    use std::io::Write;
+    let rgb = |idx: u8, fallback: [u8; 3]| -> [u8; 3] {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or(fallback)
+    };
+    let (w, h) = (grid.cols.max(1), grid.rows.max(1));
+    let mut raw = Vec::with_capacity(16 + w * h * 10);
+    raw.extend_from_slice(&(-1i32).to_le_bytes()); // version (negative = R9+)
+    raw.extend_from_slice(&1i32.to_le_bytes()); // one layer
+    raw.extend_from_slice(&(w as i32).to_le_bytes());
+    raw.extend_from_slice(&(h as i32).to_le_bytes());
+    // Column-major: x outer, y inner.
+    for x in 0..w {
+        for y in 0..h {
+            let cell = grid.cells[y * grid.cols + x];
+            let fg = rgb(cell.fg, [170, 170, 170]);
+            let mut bg = rgb(cell.bg, [0, 0, 0]);
+            // 255,0,255 is REXPaint's transparent marker — nudge an exact match so a real
+            // magenta bg stays opaque on re-open.
+            if bg == crate::decode::XP_TRANSPARENT {
+                bg = [254, 0, 255];
+            }
+            raw.extend_from_slice(&(cell.ch as u32).to_le_bytes());
+            raw.extend_from_slice(&fg);
+            raw.extend_from_slice(&bg);
+        }
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = enc.write_all(&raw);
+    enc.finish().unwrap_or_default()
+}
+
 /// Header `0x18 "TUNDRA24"`, then a command stream of cells in row-major order (the
 /// decoder auto-increments the column and wraps at the SAUCE width, so no explicit
 /// position commands are needed). Per cell we emit the minimal command for whatever

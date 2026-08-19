@@ -22,6 +22,7 @@ pub(crate) use apple2_font::APPLE2_FONT;
 pub(crate) use apple2_80_font::APPLE2_80_FONT;
 pub(crate) use apple2_mousetext::APPLE2_MOUSETEXT;
 pub(crate) use atascii_font::ATASCII_FONT;
+pub(crate) use rexpaint::XP_TRANSPARENT;
 #[cfg(test)]
 pub(crate) use petscii::VIC2; // only the thumb.rs PETSCII tests reference it by this path
 pub(crate) use petscii::{petscii_palette, PETSCII_PALETTES};

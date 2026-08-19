@@ -182,6 +182,30 @@ mod tests {
     }
 
     #[test]
+    fn xp_encoder_round_trips_through_decoder() {
+        // `ansi_grid_to_xp` is the inverse of this decoder: encode a 2×1 grid and prove the
+        // bytes decode back to the same 24-bit colours.
+        use crate::thumb::{ansi_grid_to_xp, AnsiCell, AnsiGrid};
+        let grid = AnsiGrid {
+            cols: 2,
+            rows: 1,
+            cell_w: 8,
+            cell_h: 16,
+            palette: vec![[255, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]],
+            cells: vec![
+                AnsiCell { fg: 0, bg: 1, ch: 0xDB }, // full block, red on blue
+                AnsiCell { fg: 2, bg: 0, ch: 32 },   // space, green on red
+            ],
+        };
+        let bytes = ansi_grid_to_xp(&grid);
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "gzip magic");
+        let img = RexPaintDecoder.decode(&bytes).unwrap();
+        assert_eq!((img.width, img.height), (16, 16));
+        assert_eq!(img.pixels[0], [255, 0, 0, 255], "cell 0 block → red fg");
+        assert_eq!(img.pixels[8], [255, 0, 0, 255], "cell 1 space → red bg");
+    }
+
+    #[test]
     fn column_major_order_is_respected() {
         // 2 wide × 1 tall: cell (0,0)=red block, (1,0)=green block. Column-major, so the
         // sequential cells are (x=0,y=0) then (x=1,y=0).
