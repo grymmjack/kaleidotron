@@ -38045,35 +38045,23 @@ fn to_gpl(name: &str, palette: &[[u8; 4]]) -> String {
 /// Virtual `PathBuf`s for the palettes baked into the binary (see
 /// `palettes_builtin`). They live under a sentinel root and never exist on disk;
 /// `load_gpl` resolves their contents from the embedded table.
-/// Resolve a user-typed "Use only chars" string into CP437 glyph bytes. Printable ASCII
-/// maps directly; the common CP437 block/shade/box Unicode glyphs are mapped so pasting
-/// ░▒▓█ etc. works too. Anything unmappable is skipped. Duplicates and whitespace-run are
-/// preserved as-is (a leading space is a valid "light" glyph the user may want).
+/// Resolve a user-typed "Use only chars" string into CP437 glyph bytes. Printable ASCII maps
+/// directly; every other character goes through the full CP437↔Unicode table (round-trip checked),
+/// so the entire box-drawing / block / shade repertoire (─│┌┐╔╗║░▒▓█ …) pastes through, not just a
+/// handful. Anything with no CP437 glyph is skipped. Order + duplicates are preserved.
 fn resolve_ascii_chars(s: &str) -> Vec<u8> {
-    let cp437 = |c: char| -> Option<u8> {
-        match c {
-            ' '..='~' => Some(c as u8), // printable ASCII
-            '░' => Some(176),
-            '▒' => Some(177),
-            '▓' => Some(178),
-            '█' => Some(219),
-            '▄' => Some(220),
-            '▌' => Some(221),
-            '▐' => Some(222),
-            '▀' => Some(223),
-            '■' => Some(254),
-            '∙' | '·' => Some(249),
-            '─' => Some(196),
-            '│' => Some(179),
-            '┌' => Some(218),
-            '┐' => Some(191),
-            '└' => Some(192),
-            '┘' => Some(217),
-            '┼' => Some(197),
-            _ => None,
-        }
-    };
-    s.chars().filter_map(cp437).collect()
+    s.chars()
+        .filter_map(|c| {
+            let u = c as u32;
+            if (0x20..0x7f).contains(&u) {
+                return Some(u as u8);
+            }
+            let b = crate::decode::tdf::unicode_to_cp437(c);
+            // The round-trip guards against the table's "unknown → solid block" fallback silently
+            // turning an unmappable character into █.
+            (retrofont::tdf::CP437_TO_UNICODE[b as usize] == c).then_some(b)
+        })
+        .collect()
 }
 
 fn builtin_palette_paths() -> Vec<PathBuf> {
@@ -50400,6 +50388,18 @@ mod tests {
             "brightness after remap lifts the red channel"
         );
         assert_ne!(last, first, "moving the palette op changes the result");
+    }
+
+    #[test]
+    fn resolve_ascii_chars_maps_box_and_blocks() {
+        // ASCII passes straight through; the full CP437 box/block/shade repertoire maps via the
+        // round-trip table (this is the "Use only chars" pool for pasted box-drawing art).
+        assert_eq!(resolve_ascii_chars(" .oOX$"), b" .oOX$".to_vec());
+        assert_eq!(resolve_ascii_chars("│─┌┐└┘┼"), vec![179, 196, 218, 191, 192, 217, 197]);
+        assert_eq!(resolve_ascii_chars("░▒▓█"), vec![176, 177, 178, 219]);
+        assert_eq!(resolve_ascii_chars("╔╗╚╝║═╬"), vec![201, 187, 200, 188, 186, 205, 206]);
+        // An unmappable glyph is dropped, not turned into a solid block.
+        assert!(resolve_ascii_chars("🍕").is_empty());
     }
 
     #[test]

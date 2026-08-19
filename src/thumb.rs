@@ -1902,15 +1902,18 @@ pub fn ascii_ramp(cs: &AsciiCharset, font_8x8: bool) -> Vec<(u8, f32)> {
         ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         return ramp;
     }
-    // Category union, in a preference order (first glyph seen for a coverage bucket wins):
-    // printable ASCII, then blocks, box-drawing, high, control.
-    let mut order: Vec<u8> = (32u8..=126).collect();
-    if cs.blocks {
-        order.extend(ASCII_BLOCK_GLYPHS);
-    }
+    // Category union. First glyph seen for a coverage bucket wins, so the EXPLICITLY enabled
+    // special categories (Box Drawing, Blocks) go FIRST — otherwise base ASCII would claim every
+    // bucket and toggling them on would change almost nothing. Base printable is the fallback,
+    // then the broad High/Control ranges.
+    let mut order: Vec<u8> = Vec::new();
     if cs.box_draw {
         order.extend(179u8..=218);
     }
+    if cs.blocks {
+        order.extend(ASCII_BLOCK_GLYPHS);
+    }
+    order.extend(32u8..=126); // base printable ASCII, always in the pool
     if cs.high {
         order.extend(127u8..=255);
     }
