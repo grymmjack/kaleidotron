@@ -2701,12 +2701,14 @@ pub fn unicode_pass(rgba: &mut [u8], w: usize, h: usize, style: u8, cols: usize,
 /// preserve the image aspect), each the ramp glyph matching that region's tone, coloured from
 /// `palette`. Shared by the pass (render) and text export (glyph→char).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn unicode_ramp_grid(
     rgba: &[u8],
     w: usize,
     h: usize,
     palette: &[[u8; 4]],
     font: &GlyphFont,
+    pool: &[u16],
     cols: usize,
     color: bool,
     invert: bool,
@@ -2723,7 +2725,7 @@ pub fn unicode_ramp_grid(
     } else {
         palette
     };
-    glyphfont_grid(&small, gw * cw, gh * ch, pal, font, &[], color, invert)
+    glyphfont_grid(&small, gw * cw, gh * ch, pal, font, pool, color, invert)
 }
 
 /// The Unicode **Ramp pipeline pass**: build the grid then render it (scaled) into `rgba` in place.
@@ -2734,6 +2736,7 @@ pub fn unicode_ramp_pass(
     h: usize,
     palette: &[[u8; 4]],
     font: &GlyphFont,
+    pool: &[u16],
     cols: usize,
     color: bool,
     invert: bool,
@@ -2742,7 +2745,7 @@ pub fn unicode_ramp_pass(
         return;
     }
     let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
-    let grid = unicode_ramp_grid(rgba, w, h, palette, font, cols, color, invert);
+    let grid = unicode_ramp_grid(rgba, w, h, palette, font, pool, cols, color, invert);
     let (pw, ph) = (grid.cols * cw, grid.rows * ch);
     if pw == 0 || ph == 0 {
         return;

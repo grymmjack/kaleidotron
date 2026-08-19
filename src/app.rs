@@ -1679,6 +1679,8 @@ pub struct Kaleidotron {
     unicode_cols: usize, // target character width
     unicode_invert: bool,
     unicode_ranges: u8,  // Ramp style: enabled Unicode ranges (crate::decode::uniart::R_*)
+    unicode_disabled: Vec<u32>, // Ramp glyph-picker: codepoints the user disabled
+    unicode_picker: bool,       // Unicode glyph-picker popup open
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2489,7 +2491,8 @@ impl Kaleidotron {
     const PETSCII_MASK_KEY: &'static str = "petscii_mask";
     const ATASCII_MASK_KEY: &'static str = "atascii_mask";
     const APPLE_MASK_KEY: &'static str = "apple_mask";
-    const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert)
+    const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert, ranges)
+    const UNI_DISABLED_KEY: &'static str = "unicode_disabled"; // Vec<u32> disabled ramp codepoints
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3751,6 +3754,11 @@ impl Kaleidotron {
             unicode_cols: unicode.1.clamp(8, 400),
             unicode_invert: unicode.2,
             unicode_ranges: unicode.3,
+            unicode_disabled: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::UNI_DISABLED_KEY))
+                .unwrap_or_default(),
+            unicode_picker: false,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19921,6 +19929,7 @@ impl Kaleidotron {
             unicode_cols: self.unicode_cols,
             unicode_invert: self.unicode_invert,
             unicode_ranges: self.unicode_ranges,
+            unicode_pool: self.unicode_pool(),
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -20456,11 +20465,12 @@ impl Kaleidotron {
             }
             + &if self.dither_method == crate::thumb::DITHER_UNICODE {
                 format!(
-                    "|UNIs{}:c{}:inv{}:r{}",
+                    "|UNIs{}:c{}:inv{}:r{}:d{}",
                     self.unicode_style,
                     self.unicode_cols,
                     self.unicode_invert as u8,
                     self.unicode_ranges,
+                    self.unicode_disabled.len(),
                 )
             } else {
                 String::new()
@@ -20762,6 +20772,7 @@ impl Kaleidotron {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -21092,6 +21103,21 @@ impl Kaleidotron {
     /// The bit-font spec for the current ATASCII / Apple ][ mode: `(font, glyph pool, invert)`.
     /// The pool selects which of the font's glyphs are candidates (Apple adds the MouseText block
     /// when enabled). Colour is `self.bitfont_color`.
+    /// The enabled-glyph pool for the Unicode Ramp: indices into the current range-mask's ramp font
+    /// whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is disabled.
+    fn unicode_pool(&self) -> Vec<u16> {
+        if self.unicode_disabled.is_empty() {
+            return Vec::new();
+        }
+        let (_, chars) = crate::decode::uniart::ramp_font(self.unicode_ranges);
+        chars
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !self.unicode_disabled.contains(&(**c as u32)))
+            .map(|(i, _)| i as u16)
+            .collect()
+    }
+
     /// The unified fg/bg for the mono char modes (ASCII / ATASCII / Apple ][), or None for the
     /// modes that colour from the palette. When set, the converter draws ink `tm_fg` on paper
     /// `tm_bg` (and colour-mode cells still sit on `tm_bg`).
@@ -21235,6 +21261,38 @@ impl Kaleidotron {
             &mut open, &mut self.glyph_drag,
         );
         self.ascii_picker = open;
+    }
+
+    /// Unicode Ramp glyph picker: the glyphs of the enabled ranges. Disabling one records its
+    /// CODEPOINT (robust to range changes), so the picker maps a per-frame mask ↔ the disabled set.
+    fn ui_unicode_picker(&mut self, ctx: &egui::Context) {
+        if !self.unicode_picker
+            || self.dither_method != crate::thumb::DITHER_UNICODE
+            || self.unicode_style != crate::thumb::UNI_RAMP
+        {
+            return;
+        }
+        let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_ranges);
+        let n = font.glyphs.len();
+        // Build the index mask for the current range set from the disabled-codepoint list.
+        let mut mask: Vec<bool> = chars
+            .iter()
+            .map(|c| !self.unicode_disabled.contains(&(*c as u32)))
+            .collect();
+        let default = vec![true; n];
+        let mut open = self.unicode_picker;
+        glyph_picker_window(
+            ctx, "Unicode glyphs", "unicode_atlas", font, n, &mut mask, &default, &mut open,
+            &mut self.glyph_drag,
+        );
+        self.unicode_picker = open;
+        // Sync the disabled-codepoint set back from the (possibly edited) mask.
+        self.unicode_disabled = chars
+            .iter()
+            .zip(&mask)
+            .filter(|(_, on)| !**on)
+            .map(|(c, _)| *c as u32)
+            .collect();
     }
 
     /// The enabled-glyph pool for the REXPaint-font converter, from `rexfont_mask`. Empty means
@@ -25902,6 +25960,9 @@ impl Kaleidotron {
                                         }
                                     }
                                 }
+                                if ui.button("Chars…").on_hover_text("Pick which glyphs the ramp may use").clicked() {
+                                    self.unicode_picker = !self.unicode_picker;
+                                }
                             });
                         }
                         ui.horizontal(|ui| {
@@ -26489,6 +26550,7 @@ impl Kaleidotron {
                 h,
                 &pal,
                 font,
+                &self.unicode_pool(),
                 self.unicode_cols,
                 true,
                 self.unicode_invert,
@@ -36997,6 +37059,7 @@ impl eframe::App for Kaleidotron {
         self.ui_atascii_picker(&ctx);
         self.ui_apple_picker(&ctx);
         self.ui_ascii_picker(&ctx);
+        self.ui_unicode_picker(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -38471,6 +38534,7 @@ impl eframe::App for Kaleidotron {
                 self.unicode_ranges,
             ),
         );
+        eframe::set_value(storage, Self::UNI_DISABLED_KEY, &self.unicode_disabled);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -39610,6 +39674,7 @@ struct PipeAux<'a> {
     unicode_cols: usize,
     unicode_invert: bool,
     unicode_ranges: u8,
+    unicode_pool: Vec<u16>,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -39720,6 +39785,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             h,
                             aux.palette.unwrap_or(&[]),
                             font,
+                            &aux.unicode_pool,
                             aux.unicode_cols,
                             true,
                             aux.unicode_invert,
@@ -40675,6 +40741,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -48976,6 +49043,7 @@ fn preset_pipe_aux<'a>(
         unicode_cols: 120,
         unicode_invert: false,
         unicode_ranges: 5,
+        unicode_pool: Vec::new(),
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
         balance,
@@ -51305,6 +51373,7 @@ mod tests {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -51529,6 +51598,7 @@ mod tests {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
