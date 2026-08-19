@@ -19837,6 +19837,18 @@ impl Kaleidotron {
         (tw, th)
     }
 
+    /// The working size for the ANSI-shade grid: the Fit-to-chars canvas if set, else the FULL
+    /// source size — deliberately WITHOUT the Resize fraction (that's applied as an in-place
+    /// detail reduction instead, so a resized image is ANSI-fied at full size, not squashed
+    /// into a few cells).
+    fn ansi_work_target(&self, w: usize, h: usize) -> (usize, usize) {
+        if self.shade_fit_chars && self.dither_method == crate::thumb::DITHER_ANSI {
+            let (cw, ch) = self.ansi_cell_dims();
+            return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
+        }
+        (w, h)
+    }
+
     /// Apply the active pixel-art **upscaler** to a source buffer, returning the
     /// (possibly enlarged) `(w, h, rgba)`. A no-op when the scaler is `None`. Runs
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
@@ -20588,7 +20600,11 @@ impl Kaleidotron {
     ) -> (crate::thumb::AnsiGrid, Vec<u8>, usize, usize, bool) {
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
-        let (tw, th) = self.resize_target(w, h);
+        // ANSI grids the FULL-resolution image (or the Fit-to-chars canvas) — Resize does NOT
+        // shrink the character grid. Instead the resize is applied as an in-place detail
+        // reduction below, so a resized-down image is "ANSI-fied" at full size looking like the
+        // blocky preview, not squashed into a handful of cells.
+        let (tw, th) = self.ansi_work_target(w, h);
         let (cw, ch_) = self.ansi_cell_dims();
         let font_8x8 = self.shade_vga50;
         let mut aux = self.pipe_aux(Some(palette), dsx, dsy);
@@ -20620,6 +20636,12 @@ impl Kaleidotron {
                 px[2] = (px[2] as u32 * a / 255) as u8;
                 px[3] = 255;
             }
+        }
+        // Resize as DETAIL reduction: box-downscale then nearest-upscale back to the same size,
+        // so the pre-shade buffer looks like the blocky preview (fewer distinct "pixels") while
+        // staying full-resolution for the shade grid.
+        if self.resize_on {
+            resize_in_place(&mut work, tw, th, self.resize_fx, self.resize_fy);
         }
         apply_pipeline(&mut work, tw, th, &self.adjust.order, &self.adjust, &aux);
         let grid = crate::thumb::ansi_shade_grid(
@@ -39263,6 +39285,30 @@ fn pick_crop_handle(pos: egui::Pos2, bx: egui::Rect, fit: egui::Rect) -> u8 {
     255
 }
 
+/// Reduce detail in place: box-downscale `buf` (`w`×`h`) to the resize fraction, then
+/// nearest-upscale back to `w`×`h`. The buffer stays full-resolution but shows fewer distinct
+/// "pixels" — the blocky look — so the ANSI grid analyzes the resized appearance at full size.
+fn resize_in_place(buf: &mut [u8], w: usize, h: usize, fx: f32, fy: f32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let tw = ((w as f32 * fx).round() as usize).clamp(1, w);
+    let th = ((h as f32 * fy).round() as usize).clamp(1, h);
+    if tw == w && th == h {
+        return;
+    }
+    let small = crate::thumb::box_downscale(buf, w, h, tw, th);
+    for y in 0..h {
+        let sy = y * th / h;
+        for x in 0..w {
+            let sx = x * tw / w;
+            let s = (sy * tw + sx) * 4;
+            let d = (y * w + x) * 4;
+            buf[d..d + 4].copy_from_slice(&small[s..s + 4]);
+        }
+    }
+}
+
 fn add_black_white(pal: &mut Vec<[u8; 4]>) {
     let black = [0, 0, 0, 255];
     let white = [255, 255, 255, 255];
@@ -46851,19 +46897,15 @@ fn preset_cell_dims(p: &FxPreset) -> (usize, usize) {
     }
 }
 
-/// The working-buffer target dims for a preset — MIRRORS [`Kaleidotron::resize_target`]
-/// (only the ANSI-shade path is used here, since batch is textmode-only).
+/// The ANSI-shade working-buffer dims for a preset — MIRRORS [`Kaleidotron::ansi_work_target`]:
+/// the Fit-to-chars canvas if set, else the full source size (Resize is applied as an in-place
+/// detail reduction, not a grid shrink).
 fn preset_resize_target(p: &FxPreset, w: usize, h: usize) -> (usize, usize) {
     if p.shade_fit_chars && p.dither_method == crate::thumb::DITHER_ANSI {
         let (cw, ch) = preset_cell_dims(p);
         return (p.shade_fit_cols.max(1) * cw, p.shade_fit_rows.max(1) * ch);
     }
-    if !p.resize_on {
-        return (w, h);
-    }
-    let tw = ((w as f32 * p.resize_fx).round() as usize).clamp(1, w.max(1));
-    let th = ((h as f32 * p.resize_fy).round() as usize).clamp(1, h.max(1));
-    (tw, th)
+    (w, h)
 }
 
 /// Build a [`PipeAux`] from a preset — MIRRORS [`Kaleidotron::pipe_aux`] + `balance_offset`.
@@ -46946,6 +46988,9 @@ fn build_ansi_grid_from_preset(
             px[2] = (px[2] as u32 * a / 255) as u8;
             px[3] = 255;
         }
+    }
+    if p.resize_on {
+        resize_in_place(&mut work, tw, th, p.resize_fx, p.resize_fy);
     }
     apply_pipeline(&mut work, tw, th, &adjust.order, &adjust, &aux);
     let grid = crate::thumb::ansi_shade_grid(
