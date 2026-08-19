@@ -20861,7 +20861,7 @@ impl Kaleidotron {
                 self.crop_zoom = 1.0;
                 self.crop_center = egui::vec2(0.5, 0.5);
             }
-            self.handle_crop_view_input(ui, &resp, fit);
+            self.handle_crop_view_input(ui, path, &resp, fit);
             let view = self.crop_view_rect();
             // Paint the (zoomed/panned) window of the image — the view rect is the UV.
             ui.painter().image(tex.id(), fit, view, egui::Color32::WHITE);
@@ -20938,10 +20938,31 @@ impl Kaleidotron {
         self.clamp_crop_center();
     }
 
+    /// Keep the crop inside the current view window, shrinking it only as needed so the red box
+    /// always stays on-screen when zoomed in. If the crop has fallen entirely outside the view
+    /// (shouldn't normally happen), snap it to the whole view.
+    fn clamp_crop_to_view(&mut self, path: &Path) {
+        let v = self.crop_view_rect();
+        let c = self.crop_of(path);
+        let x1 = c[0].max(v.min.x);
+        let y1 = c[1].max(v.min.y);
+        let x2 = (c[0] + c[2]).min(v.max.x);
+        let y2 = (c[1] + c[3]).min(v.max.y);
+        let nc = if x2 - x1 >= CROP_MIN && y2 - y1 >= CROP_MIN {
+            [x1, y1, x2 - x1, y2 - y1]
+        } else {
+            [v.min.x, v.min.y, v.width(), v.height()]
+        };
+        if nc != c {
+            self.set_crop(path, nc);
+        }
+    }
+
     /// Handle the crop-surface view gestures on the Details thumbnail: mouse-wheel zooms
-    /// (cursor-centred, and the scroll is consumed so the panel doesn't also scroll),
-    /// middle-drag pans, and a middle-click with no drag resets zoom + pan.
-    fn handle_crop_view_input(&mut self, ui: &egui::Ui, resp: &egui::Response, fit: egui::Rect) {
+    /// (cursor-centred, scroll consumed so the panel doesn't also scroll) and shrinks the crop
+    /// to fit the zoomed view; middle-drag pans (moving the crop with it); a middle-click with
+    /// no drag resets zoom + pan.
+    fn handle_crop_view_input(&mut self, ui: &egui::Ui, path: &Path, resp: &egui::Response, fit: egui::Rect) {
         // Wheel zoom (only while hovering the image).
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -20950,6 +20971,9 @@ impl Kaleidotron {
                 self.zoom_crop_view((scroll * 0.004).exp(), cursor, fit);
                 // Consume the scroll so the enclosing details ScrollArea stays put.
                 ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                // Zooming in frames the crop: shrink it to the (now smaller) view so the box
+                // stays visible and the preview follows the zoom.
+                self.clamp_crop_to_view(path);
             }
         }
         // Middle button: drag pans, a click (no real movement) resets.
@@ -20963,11 +20987,16 @@ impl Kaleidotron {
                 let d = ui.input(|i| i.pointer.delta());
                 self.crop_mid_moved += d.length();
                 let view = self.crop_view_rect();
-                self.crop_center -= egui::vec2(
+                let dn = egui::vec2(
                     d.x / fit.width().max(1.0) * view.width(),
                     d.y / fit.height().max(1.0) * view.height(),
                 );
+                self.crop_center -= dn;
                 self.clamp_crop_center();
+                // Move the crop WITH the view so panning repositions it (rather than clipping
+                // it away). A full-frame crop has nothing to move and stays put.
+                let c = self.crop_of(path);
+                self.set_crop(path, clamp_crop([c[0] - dn.x, c[1] - dn.y, c[2], c[3]]));
                 if self.crop_mid_moved > 2.0 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
@@ -21141,6 +21170,17 @@ impl Kaleidotron {
                 }
             }
         });
+        // Zoom readout + reset. Wheel-zoom shrinks the crop to the visible region (so the box
+        // stays on-screen and the zoom directly frames the crop); middle-drag pans it.
+        if self.crop_zoom > 1.001 {
+            ui.horizontal(|ui| {
+                ui.weak(format!("Zoom {:.1}× — crop follows the view", self.crop_zoom));
+                if ui.small_button("reset zoom").clicked() {
+                    self.crop_zoom = 1.0;
+                    self.crop_center = egui::vec2(0.5, 0.5);
+                }
+            });
+        }
         // Composition overlay picker.
         ui.horizontal(|ui| {
             ui.label("Guide");
