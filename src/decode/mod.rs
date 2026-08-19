@@ -11,9 +11,15 @@ mod audio;
 mod bin;
 mod builtin;
 mod c64_font;
+mod atascii_font; // Atari 8-bit ATASCII 8×8 ROM (rasterized from the bundled Atari Classic TTF)
+mod apple2_font; // Apple II text 8×8 ROM (rasterized from Apple2.ttf)
+mod apple2_mousetext; // Apple //e MouseText glyphs (from Kreative Korp PrintChar21)
 // Re-export the C64 ROM font + VIC-II palette so the image→PETSCII converter (in `thumb`)
 // can reach them without exposing the whole decoder modules.
 pub(crate) use c64_font::C64_FONT;
+pub(crate) use apple2_font::APPLE2_FONT;
+pub(crate) use apple2_mousetext::APPLE2_MOUSETEXT;
+pub(crate) use atascii_font::ATASCII_FONT;
 #[cfg(test)]
 pub(crate) use petscii::VIC2; // only the thumb.rs PETSCII tests reference it by this path
 pub(crate) use petscii::{petscii_palette, PETSCII_PALETTES};

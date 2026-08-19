@@ -1649,6 +1649,11 @@ pub struct Kaleidotron {
     ascii_box: bool,     // include box-drawing glyphs (179..218)
     ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
     ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
+    // ATASCII / Apple ][ converters (DITHER_ATASCII / DITHER_APPLE): generic 8×8 bit-font art.
+    bitfont_color: bool,   // per-cell colour from the palette (shared by both modes; else mono)
+    atascii_invert: bool,  // ATASCII inverse video (swap ink/paper)
+    apple_invert: bool,    // Apple ][ inverse video
+    apple_mousetext: bool, // include the Apple //e MouseText glyphs in the pool
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2448,6 +2453,7 @@ impl Kaleidotron {
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
+    const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3122,6 +3128,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
             .unwrap_or((true, false, true, false, false, String::new()));
+        // ATASCII / Apple ][ settings (colour, atascii invert, apple invert, apple mousetext).
+        let bitfont: (bool, bool, bool, bool) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::BITFONT_KEY))
+            .unwrap_or((true, false, false, true));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3632,6 +3643,10 @@ impl Kaleidotron {
             ascii_blocks: ascii.3,
             ascii_box: ascii.4,
             ascii_chars: ascii.5,
+            bitfont_color: bitfont.0,
+            atascii_invert: bitfont.1,
+            apple_invert: bitfont.2,
+            apple_mousetext: bitfont.3,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19723,6 +19738,17 @@ impl Kaleidotron {
         dscale_x: usize,
         dscale_y: usize,
     ) -> PipeAux<'a> {
+        // Bit-font (ATASCII / Apple ][) spec — only used when the mode is one of them; a cheap
+        // empty default otherwise so the pass is a no-op.
+        let (bf_font, bf_pool, bf_invert): (&'static [[u8; 8]], Vec<u16>, bool) =
+            if matches!(
+                self.dither_method,
+                crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+            ) {
+                self.bitfont_spec()
+            } else {
+                (&[], Vec::new(), false)
+            };
         PipeAux {
             dither_method: self.dither_method,
             dither_amount: self.dither_amount,
@@ -19772,6 +19798,10 @@ impl Kaleidotron {
             petscii_pal: self.petscii_pal(),
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
+            bitfont_font: bf_font,
+            bitfont_pool: bf_pool,
+            bitfont_color: self.bitfont_color,
+            bitfont_invert: bf_invert,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -19999,6 +20029,10 @@ impl Kaleidotron {
             ascii_box: self.ascii_box,
             ascii_color: self.ascii_color,
             ascii_chars: self.ascii_chars.clone(),
+            bitfont_color: self.bitfont_color,
+            atascii_invert: self.atascii_invert,
+            apple_invert: self.apple_invert,
+            apple_mousetext: self.apple_mousetext,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20079,6 +20113,10 @@ impl Kaleidotron {
         self.ascii_box = p.ascii_box;
         self.ascii_color = p.ascii_color;
         self.ascii_chars = p.ascii_chars.clone();
+        self.bitfont_color = p.bitfont_color;
+        self.atascii_invert = p.atascii_invert;
+        self.apple_invert = p.apple_invert;
+        self.apple_mousetext = p.apple_mousetext;
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -20093,9 +20131,14 @@ impl Kaleidotron {
             || self.balance_offset() != [0, 0, 0]
             || (self.dither_method != 0
                 && (self.dither_amount > 0.0
-                    || self.dither_method == crate::thumb::DITHER_ANSI
-                    || self.dither_method == crate::thumb::DITHER_PETSCII
-                    || self.dither_method == crate::thumb::DITHER_ASCII))
+                    || matches!(
+                        self.dither_method,
+                        crate::thumb::DITHER_ANSI
+                            | crate::thumb::DITHER_PETSCII
+                            | crate::thumb::DITHER_ASCII
+                            | crate::thumb::DITHER_ATASCII
+                            | crate::thumb::DITHER_APPLE
+                    )))
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
@@ -20228,6 +20271,20 @@ impl Kaleidotron {
                     self.shade_fit_chars as u8,
                     self.shade_fit_cols,
                     self.shade_fit_rows,
+                )
+            } else {
+                String::new()
+            }
+            + &if matches!(
+                self.dither_method,
+                crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+            ) {
+                format!(
+                    "|BFcol{}:ai{}:pi{}:mt{}",
+                    self.bitfont_color as u8,
+                    self.atascii_invert as u8,
+                    self.apple_invert as u8,
+                    self.apple_mousetext as u8,
                 )
             } else {
                 String::new()
@@ -20511,6 +20568,10 @@ impl Kaleidotron {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
+            bitfont_font: &[],
+            bitfont_pool: Vec::new(),
+            bitfont_color: true,
+            bitfont_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -20824,6 +20885,25 @@ impl Kaleidotron {
     /// buttons appear). See [`Self::petscii_sync_selected_palette`].
     fn petscii_pal(&self) -> &'static [[u8; 4]; 16] {
         crate::decode::petscii_palette(self.petscii_palette)
+    }
+
+    /// The bit-font spec for the current ATASCII / Apple ][ mode: `(font, glyph pool, invert)`.
+    /// The pool selects which of the font's glyphs are candidates (Apple adds the MouseText block
+    /// when enabled). Colour is `self.bitfont_color`.
+    fn bitfont_spec(&self) -> (&'static [[u8; 8]], Vec<u16>, bool) {
+        if self.dither_method == crate::thumb::DITHER_APPLE {
+            let font = crate::thumb::apple_font();
+            let base = crate::thumb::apple_text_len() as u16;
+            let mut pool: Vec<u16> = (0..base).collect();
+            if self.apple_mousetext {
+                pool.extend(base..font.len() as u16);
+            }
+            (font, pool, self.apple_invert)
+        } else {
+            let font: &'static [[u8; 8]] = &crate::decode::ATASCII_FONT;
+            let pool: Vec<u16> = (0..font.len() as u16).collect();
+            (font, pool, self.atascii_invert)
+        }
     }
 
     /// The ASCII glyph-pool selection (categories + the "Use only chars" set resolved to
@@ -24720,11 +24800,15 @@ impl Kaleidotron {
                         // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
                         // (an ANSI-appropriate default) so it works on the spot — they can then
                         // pick a palette or change N from there.
-                        // ANSI Shade and ASCII both colour from the active palette — auto-enable
-                        // Reduce → 16 when switching to either with nothing providing colours.
-                        if (self.dither_method == crate::thumb::DITHER_ANSI
-                            || self.dither_method == crate::thumb::DITHER_ASCII)
-                            && prev != self.dither_method
+                        // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple) auto-enable
+                        // Reduce → 16 when switched to with nothing providing colours.
+                        if matches!(
+                            self.dither_method,
+                            crate::thumb::DITHER_ANSI
+                                | crate::thumb::DITHER_ASCII
+                                | crate::thumb::DITHER_ATASCII
+                                | crate::thumb::DITHER_APPLE
+                        ) && prev != self.dither_method
                             && self.custom_palette.is_none()
                             && self.selected_palette.is_none()
                             && !self.quantize_on
@@ -25317,6 +25401,40 @@ impl Kaleidotron {
                             ui.weak("(needs a palette / Reduce for its colors)");
                         }
                     }
+                    // ----- ATASCII controls (image → Atari 8-bit character art) -----
+                    if self.dither_method == crate::thumb::DITHER_ATASCII {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("ATASCII").strong());
+                            ui.weak("Atari 8-bit character art");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.bitfont_color, "Color")
+                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
+                            ui.checkbox(&mut self.atascii_invert, "Invert")
+                                .on_hover_text("Inverse video — swap ink and paper");
+                        });
+                        if recolor.is_none() {
+                            ui.weak("(needs a palette / Reduce for its colors)");
+                        }
+                    }
+                    // ----- Apple ][ controls (image → Apple II character art) -----
+                    if self.dither_method == crate::thumb::DITHER_APPLE {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Apple ][").strong());
+                            ui.weak("Apple II character art");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.bitfont_color, "Color")
+                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
+                            ui.checkbox(&mut self.apple_invert, "Invert")
+                                .on_hover_text("Inverse video — swap ink and paper");
+                            ui.checkbox(&mut self.apple_mousetext, "MouseText")
+                                .on_hover_text("Add the Apple //e MouseText glyphs to the pool");
+                        });
+                        if recolor.is_none() {
+                            ui.weak("(needs a palette / Reduce for its colors)");
+                        }
+                    }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
                     }
@@ -25614,6 +25732,14 @@ impl Kaleidotron {
             self.export_petscii(path);
             return;
         }
+        // ATASCII / Apple ][ export as a rendered PNG (their bit-font art isn't CP437/.ans).
+        if matches!(
+            self.dither_method,
+            crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+        ) {
+            self.export_bitfont_png(path);
+            return;
+        }
         let recolor = self.active_recolor(path);
         let Some((_, palette)) = recolor else {
             self.status = "Pick a palette / Reduce first (textmode needs colors)".into();
@@ -25732,6 +25858,72 @@ impl Kaleidotron {
             ),
             Err(e) => format!("Export failed: {e}"),
         };
+    }
+
+    /// Export the current ATASCII / Apple ][ conversion as a rendered PNG. Uses the SAME grid the
+    /// preview builds (via the pipeline pass) so the file matches what's on screen.
+    fn export_bitfont_png(&mut self, path: &Path) {
+        let Some((_, palette)) = self.active_recolor(path) else {
+            self.status = "Pick a palette / Reduce first".into();
+            return;
+        };
+        let (size, rgba) = match &self.full_src {
+            Some((p, sz, px)) if p == path => (*sz, px.clone()),
+            _ => match self.registry.decode_path(&self.resolve_local(path)) {
+                Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
+                Err(e) => {
+                    self.status = format!("decode failed: {e}");
+                    return;
+                }
+            },
+        };
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
+        let (w, h, mut work) = self.scale_source(cw, ch, rgba);
+        // Run the value pipeline (skip the palette snap; the pass renders palette colours anyway).
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let mut aux = self.pipe_aux(Some(&palette), dsx, dsy);
+        aux.skip_dither_palette = true;
+        for px in work.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a < 255 {
+                px[0] = (px[0] as u32 * a / 255) as u8;
+                px[1] = (px[1] as u32 * a / 255) as u8;
+                px[2] = (px[2] as u32 * a / 255) as u8;
+                px[3] = 255;
+            }
+        }
+        apply_pipeline(&mut work, w, h, &self.adjust.order, &self.adjust, &aux);
+        let (font, pool, invert) = self.bitfont_spec();
+        let grid = crate::thumb::bitfont_grid(
+            &work, w, h, &palette, 8, 8, font, &pool, self.bitfont_color, invert,
+        );
+        crate::thumb::bitfont_render(&grid, font, &mut work, w, h, 8, 8);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let kind = if self.dither_method == crate::thumb::DITHER_APPLE {
+            "apple"
+        } else {
+            "atascii"
+        };
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_{kind}.png"))
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        match image::save_buffer(&dest, &work, w as u32, h as u32, image::ColorType::Rgba8) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {} PNG: {} ({}×{} cells)",
+                    kind.to_uppercase(),
+                    short_name(&dest),
+                    grid.cols,
+                    grid.rows
+                )
+            }
+            Err(e) => self.status = format!("Export failed: {e}"),
+        }
     }
 
     /// Any async listing/media fetch that should paint a spinner (+ the status line) in an
@@ -37588,6 +37780,16 @@ impl eframe::App for Kaleidotron {
                 self.ascii_chars.clone(),
             ),
         );
+        eframe::set_value(
+            storage,
+            Self::BITFONT_KEY,
+            &(
+                self.bitfont_color,
+                self.atascii_invert,
+                self.apple_invert,
+                self.apple_mousetext,
+            ),
+        );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38592,6 +38794,11 @@ struct PipeAux<'a> {
     // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
     ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
+    // Bit-font pass params (DITHER_ATASCII / DITHER_APPLE): the ROM font + glyph pool + toggles.
+    bitfont_font: &'a [[u8; 8]],
+    bitfont_pool: Vec<u16>,
+    bitfont_color: bool,
+    bitfont_invert: bool,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -38654,6 +38861,25 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                         aux.petscii_bg,
                         aux.petscii_pal,
                     );
+                } else if matches!(
+                    aux.dither_method,
+                    crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+                ) {
+                    // ATASCII / Apple ][ — a generic 8×8 bit-font over the mode's ROM font.
+                    if let Some(p) = aux.palette {
+                        crate::thumb::bitfont_pass(
+                            rgba,
+                            w,
+                            h,
+                            p,
+                            8,
+                            8,
+                            aux.bitfont_font,
+                            &aux.bitfont_pool,
+                            aux.bitfont_color,
+                            aux.bitfont_invert,
+                        );
+                    }
                 } else if aux.dither_method == crate::thumb::DITHER_ASCII {
                     // ASCII colours from the active palette (like ANSI) — skip if none.
                     if let Some(p) = aux.palette {
@@ -39131,6 +39357,15 @@ struct FxPreset {
     ascii_color: bool,
     #[serde(default)]
     ascii_chars: String,
+    // ATASCII / Apple ][ converter settings.
+    #[serde(default = "default_true")]
+    bitfont_color: bool,
+    #[serde(default)]
+    atascii_invert: bool,
+    #[serde(default)]
+    apple_invert: bool,
+    #[serde(default = "default_true")]
+    apple_mousetext: bool,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -39198,6 +39433,10 @@ impl Default for FxPreset {
             ascii_box: false,
             ascii_color: true,
             ascii_chars: String::new(),
+            bitfont_color: true,
+            atascii_invert: false,
+            apple_invert: false,
+            apple_mousetext: true,
             folder: None,
         }
     }
@@ -39532,6 +39771,10 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
+            bitfont_font: &[],
+            bitfont_pool: Vec::new(),
+            bitfont_color: true,
+            bitfont_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -47812,6 +48055,10 @@ fn preset_pipe_aux<'a>(
         petscii_pal: crate::decode::petscii_palette(0),
         ascii_cs: crate::thumb::AsciiCharset::default(),
         ascii_color: true,
+        bitfont_font: &[],
+        bitfont_pool: Vec::new(),
+        bitfont_color: true,
+        bitfont_invert: false,
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
         balance,
@@ -50127,6 +50374,10 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
+            bitfont_font: &[],
+            bitfont_pool: Vec::new(),
+            bitfont_color: true,
+            bitfont_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -50326,6 +50577,10 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
+            bitfont_font: &[],
+            bitfont_pool: Vec::new(),
+            bitfont_color: true,
+            bitfont_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],

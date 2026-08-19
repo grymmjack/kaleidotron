@@ -407,6 +407,8 @@ pub const DITHER_NAMES: &[&str] = &[
     "ANSI Shade",
     "PETSCII",
     "ASCII",
+    "ATASCII",
+    "Apple ][",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
@@ -431,6 +433,14 @@ pub const DITHER_PETSCII: u8 = 8;
 /// coverage-sorted ramp built from the enabled character ranges (32–126 always, + control 0–31,
 /// + high 128–255). Colour is per-cell from the active palette (or monochrome).
 pub const DITHER_ASCII: u8 = 9;
+
+/// `DITHER_NAMES` index for the image→ATASCII (Atari 8-bit character art) converter. A generic
+/// bit-font density converter ([`bitfont_pass`]) over the Atari ROM font.
+pub const DITHER_ATASCII: u8 = 10;
+
+/// `DITHER_NAMES` index for the image→Apple ][ character-art converter (Apple II text font, with
+/// optional MouseText glyphs + inverse video), via the same [`bitfont_pass`].
+pub const DITHER_APPLE: u8 = 11;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -2019,6 +2029,205 @@ pub fn ascii_pass(
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
 
+// ── Generic 8×8 bit-font density converter (ATASCII, Apple ][, …) ────────────────
+// A platform-agnostic version of the ASCII converter: given any 8×8 bitmap font and a
+// pool of glyph indices, map each cell's brightness to the glyph whose ink coverage
+// matches, colour it from the palette (or monochrome), optionally inverse-video. Used
+// by the Atari + Apple modes; each supplies its own ROM font + glyph pool + toggles.
+
+/// One cell of a generic bit-font grid: a glyph index into the mode's font + fg/bg palette indices.
+#[derive(Clone, Copy)]
+pub struct BitCell {
+    pub glyph: u16,
+    pub fg: u8,
+    pub bg: u8,
+}
+
+/// A converted bit-font screen (`cols`×`rows` 8×8 cells over `palette`).
+pub struct BitGrid {
+    pub cols: usize,
+    pub rows: usize,
+    pub cells: Vec<BitCell>,
+    pub palette: Vec<[u8; 4]>,
+}
+
+/// Ink coverage (0..1) of an 8×8 glyph.
+fn bit_cov(g: &[u8; 8]) -> f32 {
+    g.iter().map(|b| b.count_ones()).sum::<u32>() as f32 / 64.0
+}
+
+/// The light→dark ramp for a bit-font: `(glyph_index, coverage)` sorted by coverage, one
+/// representative per distinct coverage bucket (first in `pool` order wins). Always starts with a
+/// blank (a zero-coverage glyph if the font has one, else a synthetic space at index 0).
+pub fn bitfont_ramp(font: &[[u8; 8]], pool: &[u16]) -> Vec<(u16, f32)> {
+    let mut seen: std::collections::HashMap<u16, (u16, f32)> = std::collections::HashMap::new();
+    for &gi in pool {
+        if let Some(g) = font.get(gi as usize) {
+            let c = bit_cov(g);
+            let bucket = (c * 64.0).round() as u16;
+            seen.entry(bucket).or_insert((gi, c));
+        }
+    }
+    let mut ramp: Vec<(u16, f32)> = seen.into_values().collect();
+    ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    if ramp.first().map(|(_, c)| *c > 0.0).unwrap_or(true) {
+        // Prefer a real blank glyph from the pool; else fall back to index 0.
+        let blank = pool
+            .iter()
+            .copied()
+            .find(|&gi| font.get(gi as usize).map(|g| bit_cov(g) == 0.0).unwrap_or(false))
+            .unwrap_or(0);
+        ramp.insert(0, (blank, 0.0));
+    }
+    ramp
+}
+
+/// Analyse `rgba` (w×h) into a [`BitGrid`] over `font`/`pool`: per `cell_w`×`cell_h` cell, pick the
+/// ramp glyph matching the cell's darkness; colour per-cell from `palette` when `color` (else a
+/// fixed ink-on-paper monochrome). `invert` swaps ink/paper (inverse video).
+#[allow(clippy::too_many_arguments)]
+pub fn bitfont_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    font: &[[u8; 8]],
+    pool: &[u16],
+    color: bool,
+    invert: bool,
+) -> BitGrid {
+    let cw = cell_w.max(1);
+    let ch_ = cell_h.max(1);
+    let cols = w.div_ceil(cw);
+    let rows = h.div_ceil(ch_);
+    let mut cells = Vec::with_capacity(cols * rows);
+    let paper = nearest_index([0, 0, 0], palette);
+    let ink = nearest_index([255, 255, 255], palette);
+    if palette.is_empty() || w == 0 || h == 0 {
+        cells.resize(cols * rows, BitCell { glyph: 0, fg: 0, bg: 0 });
+        return BitGrid { cols, rows, cells, palette: palette.to_vec() };
+    }
+    let mut ramp = bitfont_ramp(font, pool);
+    if ramp.is_empty() {
+        ramp.push((0, 0.0));
+    }
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for y in cy * ch_..((cy + 1) * ch_).min(h) {
+                for x in cx * cw..((cx + 1) * cw).min(w) {
+                    let o = (y * w + x) * 4;
+                    let a = rgba[o + 3] as u32;
+                    sr += rgba[o] as u32 * a;
+                    sg += rgba[o + 1] as u32 * a;
+                    sb += rgba[o + 2] as u32 * a;
+                    sa += a;
+                    n += 1;
+                }
+            }
+            let (glyph, fg) = if n == 0 || sa == 0 {
+                (ramp[0].0, ink)
+            } else {
+                let avg = [(sr / sa) as u8, (sg / sa) as u8, (sb / sa) as u8];
+                let lum = (0.299 * avg[0] as f32 + 0.587 * avg[1] as f32 + 0.114 * avg[2] as f32)
+                    / 255.0;
+                let cover = (sa as f32 / (n as f32 * 255.0)) * (1.0 - lum);
+                let g = ramp
+                    .iter()
+                    .min_by(|a, b| (a.1 - cover).abs().partial_cmp(&(b.1 - cover).abs()).unwrap())
+                    .map(|(g, _)| *g)
+                    .unwrap_or(0);
+                (g, if color { nearest_index(avg, palette) } else { ink })
+            };
+            let (fg, bg) = if invert { (paper, fg) } else { (fg, paper) };
+            cells.push(BitCell { glyph, fg, bg });
+        }
+    }
+    BitGrid { cols, rows, cells, palette: palette.to_vec() }
+}
+
+/// Render a [`BitGrid`] back into `rgba` in place using `font`'s 8×8 glyphs, each nearest-scaled to
+/// `cell_w`×`cell_h`.
+pub fn bitfont_render(
+    grid: &BitGrid,
+    font: &[[u8; 8]],
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    cell_w: usize,
+    cell_h: usize,
+) {
+    if grid.palette.is_empty() {
+        return;
+    }
+    let (cw, ch_) = (cell_w.max(1), cell_h.max(1));
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let g = font.get(cell.glyph as usize).copied().unwrap_or([0; 8]);
+            let fg = grid.palette[cell.fg as usize % grid.palette.len()];
+            let bg = grid.palette[cell.bg as usize % grid.palette.len()];
+            for ry in 0..ch_ {
+                let y = cy * ch_ + ry;
+                if y >= h {
+                    break;
+                }
+                let bits = g[(ry * 8 / ch_).min(7)];
+                for rx in 0..cw {
+                    let x = cx * cw + rx;
+                    if x >= w {
+                        break;
+                    }
+                    let on = (bits >> (7 - (rx * 8 / cw).min(7))) & 1 == 1;
+                    let col = if on { fg } else { bg };
+                    let o = (y * w + x) * 4;
+                    rgba[o..o + 4].copy_from_slice(&col);
+                }
+            }
+        }
+    }
+}
+
+/// The Apple ][ render font: the text set (`APPLE2_FONT`, indices 0..95) followed by the MouseText
+/// glyphs (95..127), so a single font+index space covers both. Built once.
+pub fn apple_font() -> &'static [[u8; 8]] {
+    static F: std::sync::OnceLock<Vec<[u8; 8]>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut v = crate::decode::APPLE2_FONT.to_vec();
+        v.extend_from_slice(&crate::decode::APPLE2_MOUSETEXT);
+        v
+    })
+}
+
+/// Number of text glyphs in [`apple_font`] before the MouseText block begins.
+pub fn apple_text_len() -> usize {
+    crate::decode::APPLE2_FONT.len()
+}
+
+/// The bit-font **pipeline pass**: build the grid then paint it back in place — the twin of
+/// [`ascii_pass`], so ATASCII / Apple ][ apply everywhere the pipeline runs.
+#[allow(clippy::too_many_arguments)]
+pub fn bitfont_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    font: &[[u8; 8]],
+    pool: &[u16],
+    color: bool,
+    invert: bool,
+) {
+    if palette.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let grid = bitfont_grid(rgba, w, h, palette, cell_w, cell_h, font, pool, color, invert);
+    bitfont_render(&grid, font, rgba, w, h, cell_w, cell_h);
+}
+
 /// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
 /// reverse bit is handled by the caller (RVS ON/OFF), so this maps the base glyph.
 fn screencode_to_petscii(c: u8) -> u8 {
@@ -2179,6 +2388,31 @@ mod tests {
         assert_eq!(left.ch, 32, "white cell is a space");
         let cov = |c: u8| CP437_8X8[c as usize].iter().map(|b| b.count_ones()).sum::<u32>();
         assert!(cov(right.ch) > cov(left.ch), "black cell is denser than white");
+    }
+
+    #[test]
+    fn bitfont_maps_brightness_and_inverts() {
+        // A tiny 2-glyph font: index 0 blank, index 1 full block.
+        let font: [[u8; 8]; 2] = [[0; 8], [0xff; 8]];
+        let pal = [[0u8, 0, 0, 255], [255, 255, 255, 255]];
+        let (w, h) = (16usize, 8usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < 8 { 255u8 } else { 0u8 }; // left white, right black
+                let o = (y * w + x) * 4;
+                rgba[o..o + 4].copy_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let pool = [0u16, 1];
+        let g = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, false);
+        assert_eq!(g.cols, 2);
+        assert_eq!(g.cells[0].glyph, 0, "white cell -> blank glyph");
+        assert_eq!(g.cells[1].glyph, 1, "black cell -> full block");
+        // Invert swaps ink/paper: the fg becomes paper (nearest-black index).
+        let paper = nearest_index([0, 0, 0], &pal);
+        let gi = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, true);
+        assert_eq!(gi.cells[1].fg, paper, "inverse video swaps ink to paper");
     }
 
     #[test]
