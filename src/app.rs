@@ -23093,10 +23093,20 @@ impl Kaleidotron {
                                     }
                                     // Left: label (+ slider for value ops). The control
                                     // cluster is added afterwards, right-anchored.
-                                    if op.is_marker() {
-                                        // Marker ops (Palette / Color balance / Dither) have
-                                        // no slider — the label shows active state; the real
-                                        // controls live in a section lower in the pane.
+                                    if op == OpKind::ColorBalance {
+                                        // Color balance is a marker (its R/G/B picker lives in the
+                                        // Color balance section below), but its STRENGTH is the
+                                        // master amount — surface it inline so the lane row has a
+                                        // real slider like every other op. An empty label row made
+                                        // the op look inert and hid that Strength was sitting at 0.
+                                        value_slider(
+                                            ui, label, label_col, slider_w, VALUE_W,
+                                            &mut self.balance_strength, 0.0f32, 1.0, 0.0, 0.0, 2,
+                                        );
+                                    } else if op.is_marker() {
+                                        // Marker ops (Palette / Dither) have no slider — the label
+                                        // shows active state; the real controls live in a section
+                                        // lower in the pane.
                                         let active = ui.visuals().selection.bg_fill;
                                         let (txt, hover) = match op {
                                             OpKind::Pixelate => {
@@ -23214,7 +23224,17 @@ impl Kaleidotron {
                                             {
                                                 mv = Some((i, i - 1));
                                             }
-                                            if op.is_marker() {
+                                            if op == OpKind::ColorBalance {
+                                                // Reset the inline Strength (its R/G/B keep their
+                                                // own resets in the Color balance section).
+                                                if ui
+                                                    .add(btn("⟲"))
+                                                    .on_hover_text("reset strength to 0")
+                                                    .clicked()
+                                                {
+                                                    self.balance_strength = 0.0;
+                                                }
+                                            } else if op.is_marker() {
                                                 ui.add_space(BTN_W); // align with the ⟲ column
                                             } else if ui
                                                 .add(btn("⟲"))
@@ -31885,6 +31905,29 @@ impl Kaleidotron {
             Self::menu_bar_button(ui, &mut menu_resps, "Edit", |ui| {
                 let has_sel = !self.selection.is_empty() || self.hovered.is_some();
                 let can_paste = self.clipboard.is_some();
+                // Copy Path targets. "Current file"/"Entire path" apply to the file being
+                // VIEWED in single view (not a grid selection) — so they're gated on that.
+                // "Current directory" falls back to the open folder, so it works in the grid.
+                let cur_file: Option<PathBuf> = if matches!(self.mode, Mode::Single) {
+                    self.full_tex
+                        .as_ref()
+                        .map(|(p, _)| p.clone())
+                        .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone()))
+                } else {
+                    None
+                };
+                let cur_dir: Option<PathBuf> = cur_file
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+                    .or_else(|| self.folder.clone());
+                let copy_dir = cur_dir.map(|d| self.to_display(&d).display().to_string());
+                let copy_full = cur_file
+                    .as_ref()
+                    .map(|f| self.to_display(f).display().to_string());
+                let copy_name = cur_file
+                    .as_ref()
+                    .and_then(|f| f.file_name())
+                    .map(|n| n.to_string_lossy().into_owned());
                 if ui
                     .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↩ Undo"))
                     .clicked()
@@ -31917,6 +31960,43 @@ impl Kaleidotron {
                     action = Some(MenuAction::File(FileAction::Paste));
                     ui.close();
                 }
+                ui.separator();
+                ui.menu_button("Copy Path", |ui| {
+                    // Copy filesystem paths to the clipboard as text. Directory works in the
+                    // grid (the open folder); file/full-path need a viewed file.
+                    if ui
+                        .add_enabled(copy_dir.is_some(), egui::Button::new("Current directory"))
+                        .clicked()
+                    {
+                        if let Some(s) = &copy_dir {
+                            ui.ctx().copy_text(s.clone());
+                            self.status = format!("Copied path: {s}");
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(copy_name.is_some(), egui::Button::new("Current file"))
+                        .on_hover_text("The file name of the image being viewed")
+                        .clicked()
+                    {
+                        if let Some(s) = &copy_name {
+                            ui.ctx().copy_text(s.clone());
+                            self.status = format!("Copied file name: {s}");
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(copy_full.is_some(), egui::Button::new("Entire path of file"))
+                        .on_hover_text("The full path of the image being viewed")
+                        .clicked()
+                    {
+                        if let Some(s) = &copy_full {
+                            ui.ctx().copy_text(s.clone());
+                            self.status = format!("Copied path: {s}");
+                        }
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 if ui.button("New folder").clicked() {
                     action = Some(MenuAction::File(FileAction::NewFolder));
@@ -44374,6 +44454,36 @@ fn entry_context_menu(
     file(ui, "Move to trash", true, FileAction::Delete);
     ui.separator();
     file(ui, "New folder", true, FileAction::NewFolder);
+    ui.separator();
+    // Copy filesystem paths of THIS tile to the clipboard as text (mirrors Edit ▸ Copy Path,
+    // which targets the file being viewed in single view).
+    ui.menu_button("Copy Path", |ui| {
+        let p = &entry.path;
+        let dir = p.parent().map(|d| d.display().to_string());
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+        if ui
+            .add_enabled(dir.is_some(), egui::Button::new("Current directory"))
+            .clicked()
+        {
+            if let Some(d) = &dir {
+                ui.ctx().copy_text(d.clone());
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(name.is_some(), egui::Button::new("Current file"))
+            .clicked()
+        {
+            if let Some(n) = &name {
+                ui.ctx().copy_text(n.clone());
+            }
+            ui.close();
+        }
+        if ui.button("Entire path of file").clicked() {
+            ui.ctx().copy_text(p.display().to_string());
+            ui.close();
+        }
+    });
     pick
 }
 
