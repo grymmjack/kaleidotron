@@ -1624,6 +1624,7 @@ pub struct Kaleidotron {
     shade_smooth: f32,    // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
     shade_detail: f32,    // 0..1: half-block detail weight (high = keep edges crisp when shrunk)
     shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
+    shade_invert: bool,   // ANSI Shade inverse video — swap fg/bg per cell (default off)
     // Textmode EXPORT format (explicit): 0=Auto, 1=ANSI16 .ans, 2=ANSI256 .ans,
     // 3=ANSI truecolor .ans, 4=XBin .xb, 5=Tundra .tnd.
     shade_export_format: u8,
@@ -2494,6 +2495,7 @@ impl Kaleidotron {
     const SHADE_SMOOTH_KEY: &'static str = "shade_smooth";
     const SHADE_DETAIL_KEY: &'static str = "shade_detail";
     const SHADE_ICE_KEY: &'static str = "shade_ice";
+    const SHADE_INVERT_KEY: &'static str = "shade_invert";
     const SHADE_EXPORT_FORMAT_KEY: &'static str = "shade_export_format";
     const SHADE_FIT_CHARS_KEY: &'static str = "shade_fit_chars";
     const SHADE_FIT_COLS_KEY: &'static str = "shade_fit_cols";
@@ -3134,6 +3136,7 @@ impl Kaleidotron {
             .unwrap_or(0.30)
             .clamp(0.0, 5.0);
         let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
+        let shade_invert = get_bool(Self::SHADE_INVERT_KEY).unwrap_or(false);
         let shade_export_format = cc
             .storage
             .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_EXPORT_FORMAT_KEY))
@@ -3669,6 +3672,7 @@ impl Kaleidotron {
             shade_smooth,
             shade_detail,
             shade_ice,
+            shade_invert,
             shade_export_format,
             shade_fit_chars,
             shade_fit_cols,
@@ -19845,6 +19849,7 @@ impl Kaleidotron {
             },
             font_8x8: self.shade_vga50,
             shade_ice: self.shade_ice,
+            shade_invert: self.shade_invert,
             petscii_cols: self.petscii_cols.max(1),
             petscii_rows: self.petscii_rows.max(1),
             petscii_page: self.petscii_page.min(1),
@@ -20063,6 +20068,7 @@ impl Kaleidotron {
             shade_smooth: self.shade_smooth,
             shade_detail: self.shade_detail,
             shade_ice: self.shade_ice,
+            shade_invert: self.shade_invert,
             shade_export_format: self.shade_export_format,
             shade_fit_chars: self.shade_fit_chars,
             shade_fit_cols: self.shade_fit_cols,
@@ -20149,6 +20155,7 @@ impl Kaleidotron {
         self.shade_smooth = p.shade_smooth.clamp(0.0, 3.0);
         self.shade_detail = p.shade_detail.clamp(0.0, 5.0);
         self.shade_ice = p.shade_ice;
+        self.shade_invert = p.shade_invert;
         self.shade_export_format = p.shade_export_format.min(6);
         self.shade_fit_chars = p.shade_fit_chars;
         self.shade_fit_cols = p.shade_fit_cols.clamp(1, 1000);
@@ -20278,7 +20285,7 @@ impl Kaleidotron {
         // half-block / snap toggles won't invalidate the cached preview.
         let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
             format!(
-                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}|H{:?}:{:?}|Fit{}:{}x{}",
+                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}:iv{}|H{:?}:{:?}|Fit{}:{}x{}",
                 self.shade_f1,
                 self.shade_f2,
                 self.shade_f3,
@@ -20292,6 +20299,7 @@ impl Kaleidotron {
                 self.shade_ice as u8,
                 self.shade_smooth,
                 self.shade_detail,
+                self.shade_invert as u8,
                 // Per half-block toggles + usage — moving an F5–F8 slider/checkbox must
                 // invalidate the cached preview too.
                 self.shade_half_on,
@@ -20668,6 +20676,7 @@ impl Kaleidotron {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            shade_invert: false,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -20900,6 +20909,7 @@ impl Kaleidotron {
         self.shade_snap916 = true;
         self.shade_vga50 = false;
         self.shade_ice = false;
+        self.shade_invert = false;
         self.shade_fit_chars = false;
     }
 
@@ -21225,6 +21235,13 @@ impl Kaleidotron {
                 self.shade_smooth, self.shade_detail,
             )
         };
+        let mut grid = grid;
+        // ANSI Shade inverse video: swap each cell's fg/bg. (ASCII does its own invert internally.)
+        if self.dither_method == crate::thumb::DITHER_ANSI && self.shade_invert {
+            for c in &mut grid.cells {
+                std::mem::swap(&mut c.fg, &mut c.bg);
+            }
+        }
         (grid, work, tw, th, font_8x8)
     }
 
@@ -25259,11 +25276,15 @@ impl Kaleidotron {
                                 "Master toggle for the half-block glyphs (sharper cell edges). \
                                  Tune each one's usage with the F5–F8 sliders below.",
                             );
-                        ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
-                            .on_hover_text(
-                                "iCE color: allow all 16 colors as backgrounds (else 8). \
-                                 Affects both the preview and the exported file.",
-                            );
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
+                                .on_hover_text(
+                                    "iCE color: allow all 16 colors as backgrounds (else 8). \
+                                     Affects both the preview and the exported file.",
+                                );
+                            ui.checkbox(&mut self.shade_invert, "Invert")
+                                .on_hover_text("Inverse video — swap fg/bg per cell (default off)");
+                        });
                         // Explicit EXPORT format (export only — does not affect the preview).
                         // Each entry names the actual output file `export_textmode` writes.
                         ui.horizontal(|ui| {
@@ -38316,6 +38337,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SHADE_SMOOTH_KEY, &self.shade_smooth);
         eframe::set_value(storage, Self::SHADE_DETAIL_KEY, &self.shade_detail);
         eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
+        eframe::set_value(storage, Self::SHADE_INVERT_KEY, &self.shade_invert);
         eframe::set_value(storage, Self::SHADE_EXPORT_FORMAT_KEY, &self.shade_export_format);
         eframe::set_value(storage, Self::SHADE_FIT_CHARS_KEY, &self.shade_fit_chars);
         eframe::set_value(storage, Self::SHADE_FIT_COLS_KEY, &self.shade_fit_cols);
@@ -39271,6 +39293,7 @@ struct PipeAux<'a> {
     shade_ch: usize,
     font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
     shade_ice: bool,    // iCE color: unlock all 16 colors as backgrounds
+    shade_invert: bool, // ANSI Shade inverse video
     // PETSCII pass params (only consulted when dither_method == DITHER_PETSCII). Lets
     // PETSCII apply through the pipeline — grid tiles, details preview, "Apply to grid".
     petscii_cols: usize,
@@ -39459,6 +39482,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.shade_ice,
                             aux.shade_smooth,
                             aux.shade_detail,
+                            aux.shade_invert,
                         );
                     }
                 } else {
@@ -39852,6 +39876,8 @@ struct FxPreset {
     shade_detail: f32,
     shade_ice: bool,
     #[serde(default)]
+    shade_invert: bool,
+    #[serde(default)]
     shade_export_format: u8,
     #[serde(default)]
     shade_fit_chars: bool,
@@ -39964,6 +39990,7 @@ impl Default for FxPreset {
             shade_smooth: 0.5,
             shade_detail: 0.30,
             shade_ice: false,
+            shade_invert: false,
             shade_export_format: 0,
             shade_fit_chars: false,
             shade_fit_cols: 80,
@@ -40333,6 +40360,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            shade_invert: false,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -48629,6 +48657,7 @@ fn preset_pipe_aux<'a>(
         shade_ch: preset_cell_dims(p).1,
         font_8x8: p.shade_vga50,
         shade_ice: p.shade_ice,
+        shade_invert: p.shade_invert,
         // Presets don't carry PETSCII/ASCII params (those modes aren't preset-driven yet) —
         // safe defaults keep the pipeline pass a no-op unless the preset's dither_method is one.
         petscii_cols: 40,
@@ -50957,6 +50986,7 @@ mod tests {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            shade_invert: false,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -51178,6 +51208,7 @@ mod tests {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            shade_invert: false,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,

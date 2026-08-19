@@ -1182,14 +1182,20 @@ pub fn ansi_shade_pass(
     ice: bool,
     smooth: f32,
     detail: f32,
+    invert: bool,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = ansi_shade_grid(
+    let mut grid = ansi_shade_grid(
         rgba, w, h, palette, cell_w, cell_h, f1, f2, f3, half_blocks, f1_on, f2_on, f3_on,
         half_on, half_use, shade_amount, ice, smooth, detail,
     );
+    if invert {
+        for c in &mut grid.cells {
+            std::mem::swap(&mut c.fg, &mut c.bg);
+        }
+    }
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
 
