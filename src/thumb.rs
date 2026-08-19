@@ -1798,6 +1798,123 @@ pub fn petscii_render(grid: &PetsciiGrid) -> (usize, usize, Vec<u8>) {
     (w, h, rgba)
 }
 
+/// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
+/// reverse bit is handled by the caller (RVS ON/OFF), so this maps the base glyph.
+#[allow(dead_code)]
+fn screencode_to_petscii(c: u8) -> u8 {
+    match c {
+        0x00..=0x1f => c + 0x40,
+        0x40..=0x5d => c + 0x80,
+        0x5e => 0xff,
+        0x5f => 0xdf,
+        0x60..=0x7f => c + 0x40,
+        0x95 => 0xdf,
+        0x80..=0xbf => c - 0x80,
+        0xc0..=0xff => c - 0x40,
+        _ => c, // 0x20..=0x3f pass through
+    }
+}
+
+/// petmate's "upper"/"lower" charset name for a font page (0 = upper/graphics, 1 = lower).
+#[allow(dead_code)]
+fn petscii_charset_name(page: usize) -> &'static str {
+    if page == 1 {
+        "lower"
+    } else {
+        "upper"
+    }
+}
+
+/// Serialize a [`PetsciiGrid`] to a C64 `.seq` stream: PETSCII glyph bytes with colour-control
+/// bytes on each colour change, RVS on/off (`0x12`/`0x92`) around reverse glyphs, a charset-set
+/// prefix, an optional clear-screen, and a CR (`0x0d`) per row. Displayable on a real C64.
+#[allow(dead_code)]
+pub fn petscii_grid_to_seq(grid: &PetsciiGrid, clear: bool) -> Vec<u8> {
+    // idx = VIC-II colour, value = the PETSCII colour-control byte (petmate's `seq_colors`).
+    const COLORS: [u8; 16] = [
+        0x90, 0x05, 0x1c, 0x9f, 0x9c, 0x1e, 0x1f, 0x9e, 0x81, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
+        0x9b,
+    ];
+    let mut out = Vec::new();
+    if clear {
+        out.push(0x93); // clear screen
+    }
+    out.push(if grid.page == 1 { 0x0e } else { 0x8e }); // lower / upper+graphics charset
+    let mut cur_fg: Option<u8> = None;
+    let mut rvs = false;
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            if cur_fg != Some(cell.fg) {
+                out.push(COLORS[(cell.fg & 15) as usize]);
+                cur_fg = Some(cell.fg);
+            }
+            let want_rvs = cell.code & 0x80 != 0;
+            if want_rvs != rvs {
+                out.push(if want_rvs { 0x12 } else { 0x92 });
+                rvs = want_rvs;
+            }
+            out.push(screencode_to_petscii(cell.code));
+        }
+        out.push(0x0d); // CR
+    }
+    if rvs {
+        out.push(0x92); // leave RVS off
+    }
+    out
+}
+
+/// Serialize to petmate's **native `.petmate`** JSON (opens for editing in petmate): one framebuf
+/// whose `framebuf` is a 2-D array (rows) of `{code, color}` cells over a global background.
+#[allow(dead_code)]
+pub fn petscii_grid_to_petmate(grid: &PetsciiGrid) -> Vec<u8> {
+    let mut s = String::from("{\"version\":2,\"screens\":[0],\"framebufs\":[{");
+    s.push_str(&format!("\"width\":{},\"height\":{},", grid.cols, grid.rows));
+    s.push_str(&format!(
+        "\"backgroundColor\":{},\"borderColor\":{},",
+        grid.bg, grid.bg
+    ));
+    s.push_str(&format!(
+        "\"charset\":\"{}\",\"name\":\"kaleidotron\",\"framebuf\":[",
+        petscii_charset_name(grid.page)
+    ));
+    for cy in 0..grid.rows {
+        if cy > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        for cx in 0..grid.cols {
+            if cx > 0 {
+                s.push(',');
+            }
+            let c = grid.cells[cy * grid.cols + cx];
+            s.push_str(&format!("{{\"code\":{},\"color\":{}}}", c.code, c.fg));
+        }
+        s.push(']');
+    }
+    s.push_str("]}]}");
+    s.into_bytes()
+}
+
+/// Serialize to petmate's flat **`.json`** interchange format: `screencodes[]` + `colors[]` flat
+/// arrays (width×height), easiest to script against.
+#[allow(dead_code)]
+pub fn petscii_grid_to_json(grid: &PetsciiGrid) -> Vec<u8> {
+    let codes: Vec<String> = grid.cells.iter().map(|c| c.code.to_string()).collect();
+    let colors: Vec<String> = grid.cells.iter().map(|c| c.fg.to_string()).collect();
+    let s = format!(
+        "{{\"version\":1,\"framebufs\":[{{\"width\":{},\"height\":{},\"backgroundColor\":{},\"borderColor\":{},\"charset\":\"{}\",\"name\":\"kaleidotron\",\"screencodes\":[{}],\"colors\":[{}]}}]}}",
+        grid.cols,
+        grid.rows,
+        grid.bg,
+        grid.bg,
+        petscii_charset_name(grid.page),
+        codes.join(","),
+        colors.join(",")
+    );
+    s.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1837,6 +1954,43 @@ mod tests {
         };
         assert_eq!(at(2, 2), [red[0], red[1], red[2]], "left cell red");
         assert_eq!(at(10, 2), [blue[0], blue[1], blue[2]], "right cell blue");
+    }
+
+    #[test]
+    fn petscii_serializers_emit_expected_bytes() {
+        // 2×1: space (code 32, white) then reverse-space solid (code 160, red), bg black.
+        let grid = PetsciiGrid {
+            cols: 2,
+            rows: 1,
+            bg: 0,
+            page: 0,
+            cells: vec![
+                PetsciiCell { code: 32, fg: 1 },
+                PetsciiCell { code: 160, fg: 2 },
+            ],
+        };
+        let seq = petscii_grid_to_seq(&grid, false);
+        assert_eq!(seq[0], 0x8e, "upper/graphics charset prefix");
+        assert!(seq.contains(&0x05), "white colour code");
+        assert!(seq.contains(&0x1c), "red colour code");
+        assert!(
+            seq.contains(&0x12) && seq.contains(&0x92),
+            "RVS on/off around the reverse glyph"
+        );
+        assert!(seq.contains(&0x0d), "CR at row end");
+        assert_eq!(*seq.last().unwrap(), 0x92, "leaves RVS off at the end");
+
+        let json = String::from_utf8(petscii_grid_to_json(&grid)).unwrap();
+        assert!(json.contains("\"screencodes\":[32,160]"), "json codes: {json}");
+        assert!(json.contains("\"colors\":[1,2]"), "json colors: {json}");
+        assert!(json.contains("\"backgroundColor\":0"));
+
+        let pm = String::from_utf8(petscii_grid_to_petmate(&grid)).unwrap();
+        assert!(
+            pm.contains("\"framebuf\":[[{\"code\":32,\"color\":1},{\"code\":160,\"color\":2}]]"),
+            "petmate framebuf: {pm}"
+        );
+        assert!(pm.contains("\"charset\":\"upper\""));
     }
     use crate::image_types::PixImage;
 
