@@ -140,6 +140,32 @@ pub fn rexfont_name(i: usize) -> &'static str {
     REXFONTS.get(i).map(|m| m.name).unwrap_or("?")
 }
 
+// ── Viewer render font ──────────────────────────────────────────────────────────
+// A process-global choice for the font the TEXTMODE VIEWER renders `.xp` cells in:
+// 0 = the built-in VGA CP437 font (the decoder's default), 1..=REXFONTS.len() = a
+// bundled font (index-1). Decoders are stateless (constructed once in the Registry),
+// so this global is how the app hands them the user's pick; the app clears its decode
+// caches when it changes so the file re-renders.
+static VIEWER_FONT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the viewer render font: 0 = default VGA, else `rexfont` index + 1.
+pub fn set_viewer_font(code: usize) {
+    VIEWER_FONT.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current viewer-font code (0 = default VGA).
+pub fn viewer_font_code() -> usize {
+    VIEWER_FONT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The current viewer [`GlyphFont`], or `None` when the default VGA font is selected.
+pub fn viewer_font() -> Option<&'static GlyphFont> {
+    match viewer_font_code() {
+        0 => None,
+        n => rexfont(n - 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

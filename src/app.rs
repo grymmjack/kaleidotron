@@ -1877,6 +1877,7 @@ pub struct Kaleidotron {
     viewing_textmode: bool, // is the currently-loaded viewer image text-mode art?
     crt_aspect: bool,       // stretch text-mode art ~1.2× vertically (4:3 CRT look)
     font_9px: bool,         // render the VGA font in a 9-dot cell (true DOS width)
+    xp_view_font: usize,    // REXPaint .xp viewer render font: 0 = default VGA, else rexfont idx+1
     baud_ansi: Baud,        // simulated modem speed for ANSImation playback (persisted)
     baud_rip: Baud,         // simulated modem speed for RIP playback — independent (persisted)
     crt_scanline_dark: f32, // retro-monitor scanline darkness, 0 = off (persisted)
@@ -2400,6 +2401,7 @@ impl Kaleidotron {
     const TEXTMODE_ZOOM_KEY: &'static str = "textmode_zoom";
     const CRT_ASPECT_KEY: &'static str = "crt_aspect";
     const FONT_9PX_KEY: &'static str = "font_9px";
+    const XP_VIEW_FONT_KEY: &'static str = "xp_view_font";
     const BAUD_ANSI_KEY: &'static str = "baud_ansi";
     const BAUD_RIP_KEY: &'static str = "baud_rip";
     const CRT_SCANLINE_DARK_KEY: &'static str = "crt_scanline_dark";
@@ -2887,6 +2889,10 @@ impl Kaleidotron {
         // which would leak into (parallel) decode tests via Kaleidotron::new; the user's
         // persisted choice still applies. The other look defaults are per-instance + safe.
         let font_9px = get_bool(Self::FONT_9PX_KEY).unwrap_or(false);
+        // REXPaint .xp viewer font (0 = VGA). Like font_9px it drives a process-global the
+        // decoder reads, set here so a persisted choice applies on launch.
+        let xp_view_font = get_u8(Self::XP_VIEW_FONT_KEY).unwrap_or(0) as usize;
+        crate::decode::rexfont::set_viewer_font(xp_view_font);
         let baud_ansi = get_u8(Self::BAUD_ANSI_KEY)
             .map(Baud::from_u8)
             .unwrap_or(Baud::B4800);
@@ -3931,6 +3937,7 @@ impl Kaleidotron {
             viewing_textmode: false,
             crt_aspect,
             font_9px,
+            xp_view_font,
             baud_ansi,
             baud_rip,
             crt_scanline_dark,
@@ -33223,6 +33230,49 @@ impl Kaleidotron {
                                         p.tex = None; // re-render the frame at the new cell width
                                     }
                                 }
+                                // REXPaint .xp: render its CP437 cells in a chosen bundled font
+                                // (a viewer choice, like REXPaint itself). Gated to .xp files.
+                                let is_xp = self
+                                    .full_tex
+                                    .as_ref()
+                                    .map(|(p, _)| p.clone())
+                                    .or_else(|| self.full_src.as_ref().map(|(p, ..)| p.clone()))
+                                    .map(|p| {
+                                        p.extension()
+                                            .and_then(|e| e.to_str())
+                                            .map(|e| e.eq_ignore_ascii_case("xp"))
+                                            .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false);
+                                if is_xp {
+                                    ui.separator();
+                                    let mut sel = self.xp_view_font;
+                                    let cur_name = if sel == 0 {
+                                        "VGA (default)".to_string()
+                                    } else {
+                                        crate::decode::rexfont::rexfont_name(sel - 1).to_string()
+                                    };
+                                    egui::ComboBox::from_id_salt("xp_view_font")
+                                        .selected_text(cur_name)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut sel, 0, "VGA (default)");
+                                            for i in 0..crate::decode::rexfont::rexfont_count() {
+                                                ui.selectable_value(
+                                                    &mut sel,
+                                                    i + 1,
+                                                    crate::decode::rexfont::rexfont_name(i),
+                                                );
+                                            }
+                                        });
+                                    ui.label("view font")
+                                        .on_hover_text("Render this .xp in a bundled REXPaint font");
+                                    if sel != self.xp_view_font {
+                                        self.xp_view_font = sel;
+                                        crate::decode::rexfont::set_viewer_font(sel);
+                                        let ctx = ui.ctx().clone();
+                                        self.redecode_full(&ctx);
+                                    }
+                                }
                                 ui.separator();
                             }
                             ui.add(
@@ -37786,6 +37836,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TEXTMODE_ZOOM_KEY, &self.textmode_zoom);
         eframe::set_value(storage, Self::CRT_ASPECT_KEY, &self.crt_aspect);
         eframe::set_value(storage, Self::FONT_9PX_KEY, &self.font_9px);
+        eframe::set_value(storage, Self::XP_VIEW_FONT_KEY, &(self.xp_view_font as u8));
         eframe::set_value(storage, Self::BAUD_ANSI_KEY, &self.baud_ansi.to_u8());
         eframe::set_value(storage, Self::BAUD_RIP_KEY, &self.baud_rip.to_u8());
         eframe::set_value(

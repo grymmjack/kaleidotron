@@ -116,6 +116,27 @@ impl Decoder for RexPaintDecoder {
 
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
         let (w, h, cells) = parse_xp(bytes)?;
+        // The viewer may pick a bundled REXPaint font to render in (its cell size differs from
+        // the default 8×16 VGA); the app clears its decode caches when the choice changes.
+        if let Some(font) = super::rexfont::viewer_font() {
+            let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
+            let (pw, ph) = (w * cw, h * ch);
+            let mut pixels = vec![[0u8, 0, 0, 255]; pw * ph];
+            for cy in 0..h {
+                for cx in 0..w {
+                    let cell = cells[cy * w + cx];
+                    let bg = if cell.bg == XP_TRANSPARENT { [0, 0, 0] } else { cell.bg };
+                    for ry in 0..ch {
+                        for rx in 0..cw {
+                            let on = font.on(cell.glyph as usize, rx, ry);
+                            let c = if on { cell.fg } else { bg };
+                            pixels[(cy * ch + ry) * pw + (cx * cw + rx)] = [c[0], c[1], c[2], 255];
+                        }
+                    }
+                }
+            }
+            return Ok(PixImage::from_rgba(pw as u32, ph as u32, pixels));
+        }
         let (pw, ph) = (w * 8, h * 16);
         let mut pixels = vec![[0u8, 0, 0, 255]; pw * ph];
         for cy in 0..h {
