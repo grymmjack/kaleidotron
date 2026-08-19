@@ -1651,6 +1651,9 @@ pub struct Kaleidotron {
     ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
     ascii_invert: bool,  // inverse video — swap ink/paper
     ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
+    // Unified foreground / background for the mono char converters (ASCII / ATASCII / Apple ][).
+    tm_fg: [u8; 3],
+    tm_bg: [u8; 3],
     // ATASCII / Apple ][ converters (DITHER_ATASCII / DITHER_APPLE): generic 8×8 bit-font art.
     bitfont_color: bool,   // per-cell colour from the palette (shared by both modes; else mono)
     atascii_invert: bool,  // ATASCII inverse video (swap ink/paper)
@@ -2474,6 +2477,7 @@ impl Kaleidotron {
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const ASCII_INVERT_KEY: &'static str = "ascii_invert";
+    const TM_COLOR_KEY: &'static str = "textmode_fgbg"; // unified (fg, bg) for ASCII/ATASCII/Apple
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
@@ -3161,6 +3165,11 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
             .unwrap_or((true, false, true, false, false, String::new()));
         let ascii_invert = get_bool(Self::ASCII_INVERT_KEY).unwrap_or(false);
+        // Unified fg/bg for the mono char modes.
+        let (tm_fg, tm_bg): ([u8; 3], [u8; 3]) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::TM_COLOR_KEY))
+            .unwrap_or(([235, 235, 235], [0, 0, 0]));
         // ATASCII / Apple ][ settings (colour, atascii invert, apple invert, mousetext, 80-col).
         let bitfont: (bool, bool, bool, bool, bool) = cc
             .storage
@@ -3696,6 +3705,8 @@ impl Kaleidotron {
             ascii_control: ascii.1,
             ascii_color: ascii.2,
             ascii_invert,
+            tm_fg,
+            tm_bg,
             ascii_blocks: ascii.3,
             ascii_box: ascii.4,
             ascii_chars: ascii.5,
@@ -19881,9 +19892,11 @@ impl Kaleidotron {
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
             ascii_invert: self.ascii_invert,
+            tm_mono: self.textmode_mono(),
             bitfont_font: bf_font,
             bitfont_pool: bf_pool,
-            bitfont_color: self.bitfont_color,
+            // Apple II text was monochrome — force per-cell colour off there (uses the fg/bg chips).
+            bitfont_color: self.bitfont_color && self.dither_method != crate::thumb::DITHER_APPLE,
             bitfont_invert: bf_invert,
             rexfont_sel: self.rexfont_sel,
             unicode_style: self.unicode_style,
@@ -20432,6 +20445,11 @@ impl Kaleidotron {
             } else {
                 String::new()
             }
+            + &if self.textmode_mono().is_some() {
+                format!("|FG{:?}BG{:?}", self.tm_fg, self.tm_bg)
+            } else {
+                String::new()
+            }
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -20712,6 +20730,7 @@ impl Kaleidotron {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
+            tm_mono: None,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -21041,6 +21060,17 @@ impl Kaleidotron {
     /// The bit-font spec for the current ATASCII / Apple ][ mode: `(font, glyph pool, invert)`.
     /// The pool selects which of the font's glyphs are candidates (Apple adds the MouseText block
     /// when enabled). Colour is `self.bitfont_color`.
+    /// The unified fg/bg for the mono char modes (ASCII / ATASCII / Apple ][), or None for the
+    /// modes that colour from the palette. When set, the converter draws ink `tm_fg` on paper
+    /// `tm_bg` (and colour-mode cells still sit on `tm_bg`).
+    fn textmode_mono(&self) -> Option<([u8; 3], [u8; 3])> {
+        matches!(
+            self.dither_method,
+            crate::thumb::DITHER_ASCII | crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+        )
+        .then_some((self.tm_fg, self.tm_bg))
+    }
+
     fn bitfont_spec(&self) -> (&'static [[u8; 8]], Vec<u16>, bool) {
         let (font, pool, invert, mask): (&'static [[u8; 8]], Vec<u16>, bool, &Vec<bool>) =
             if self.dither_method == crate::thumb::DITHER_APPLE {
@@ -21250,7 +21280,7 @@ impl Kaleidotron {
         let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
             crate::thumb::ascii_grid(
                 &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color,
-                self.ascii_invert, font_8x8,
+                self.ascii_invert, font_8x8, self.textmode_mono(),
             )
         } else {
             crate::thumb::ansi_shade_grid(
@@ -25697,9 +25727,9 @@ impl Kaleidotron {
                             ui.selectable_value(&mut self.apple_col80, true, "PR#3 (80 col)")
                                 .on_hover_text("The 80-column card font (narrower PRNumber3 style)");
                         });
+                        // Apple II text was monochrome (no per-cell colour) — use the unified
+                        // fg/bg chips below instead.
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.bitfont_color, "Color")
-                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
                             ui.checkbox(&mut self.apple_invert, "Invert")
                                 .on_hover_text("Inverse video — swap ink and paper");
                             ui.checkbox(&mut self.apple_mousetext, "MouseText")
@@ -25807,6 +25837,21 @@ impl Kaleidotron {
                                 .on_hover_text("Flip the dot/tone on-off test");
                         });
                         ui.weak("Export writes .txt (xterm-256 colour for half-block / ramp).");
+                    }
+                    // Unified foreground / background for the mono char modes (ASCII/ATASCII/Apple).
+                    if self.textmode_mono().is_some() {
+                        ui.horizontal(|ui| {
+                            ui.label("Ink");
+                            ui.color_edit_button_srgb(&mut self.tm_fg)
+                                .on_hover_text("Foreground (glyph) colour");
+                            ui.label("Paper");
+                            ui.color_edit_button_srgb(&mut self.tm_bg)
+                                .on_hover_text("Background colour");
+                            if ui.small_button("↺").on_hover_text("White on black").clicked() {
+                                self.tm_fg = [235, 235, 235];
+                                self.tm_bg = [0, 0, 0];
+                            }
+                        });
                     }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
@@ -26299,8 +26344,9 @@ impl Kaleidotron {
             (c, r)
         } else {
             let (font, pool, invert) = self.bitfont_spec();
+            let color = self.bitfont_color && self.dither_method != crate::thumb::DITHER_APPLE;
             let grid = crate::thumb::bitfont_grid(
-                &work, w, h, &palette, 8, 8, font, &pool, self.bitfont_color, invert,
+                &work, w, h, &palette, 8, 8, font, &pool, color, invert, self.textmode_mono(),
             );
             let (c, r) = (grid.cols, grid.rows);
             crate::thumb::bitfont_render(&grid, font, &mut work, w, h, 8, 8);
@@ -38317,6 +38363,7 @@ impl eframe::App for Kaleidotron {
             ),
         );
         eframe::set_value(storage, Self::ASCII_INVERT_KEY, &self.ascii_invert);
+        eframe::set_value(storage, Self::TM_COLOR_KEY, &(self.tm_fg, self.tm_bg));
         eframe::set_value(
             storage,
             Self::BITFONT_KEY,
@@ -39457,6 +39504,8 @@ struct PipeAux<'a> {
     ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
     ascii_invert: bool,
+    // Unified fg/bg for the mono char modes (ASCII / ATASCII / Apple ][), or None.
+    tm_mono: Option<([u8; 3], [u8; 3])>,
     // Bit-font pass params (DITHER_ATASCII / DITHER_APPLE): the ROM font + glyph pool + toggles.
     bitfont_font: &'a [[u8; 8]],
     bitfont_pool: Vec<u16>,
@@ -39549,6 +39598,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             &aux.bitfont_pool,
                             aux.bitfont_color,
                             aux.bitfont_invert,
+                            aux.tm_mono,
                         );
                     }
                 } else if aux.dither_method == crate::thumb::DITHER_REXFONT {
@@ -39607,6 +39657,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.ascii_color,
                             aux.ascii_invert,
                             aux.font_8x8,
+                            aux.tm_mono,
                         );
                     }
                 } else if aux.dither_method == crate::thumb::DITHER_ANSI {
@@ -40520,6 +40571,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
+            tm_mono: None,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -48819,6 +48871,7 @@ fn preset_pipe_aux<'a>(
         petscii_pal: crate::decode::petscii_palette(0),
         ascii_cs: crate::thumb::AsciiCharset::default(),
         ascii_invert: false,
+        tm_mono: None,
         ascii_color: true,
         bitfont_font: &[],
         bitfont_pool: Vec::new(),
@@ -51146,6 +51199,7 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
+            tm_mono: None,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -51368,6 +51422,7 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_invert: false,
+            tm_mono: None,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),

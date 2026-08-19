@@ -2055,23 +2055,23 @@ pub fn ascii_grid(
     color: bool,
     invert: bool,
     font_8x8: bool,
+    mono: Option<([u8; 3], [u8; 3])>,
 ) -> AnsiGrid {
     let cw = cell_w.max(1);
     let ch_ = cell_h.max(1);
     let cols = w.div_ceil(cw);
     let rows = h.div_ceil(ch_);
     let mut cells = Vec::with_capacity(cols * rows);
+    // Working palette + ink/paper (the unified fg/bg chips override when set).
+    let (out_pal, ink, paper) = build_mono_palette(palette, mono);
     if palette.is_empty() || w == 0 || h == 0 {
         cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
-        return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells };
+        return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: out_pal, cells };
     }
     let mut ramp = ascii_ramp(cs, font_8x8);
     if ramp.is_empty() {
         ramp.push((32, 0.0)); // a stray empty "only" set → all blank rather than a panic
     }
-    // Fixed monochrome ink/paper: brightest + darkest palette entries.
-    let paper = nearest_index([0, 0, 0], palette);
-    let ink = nearest_index([255, 255, 255], palette);
     for cy in 0..rows {
         for cx in 0..cols {
             // Average the cell block (clamped to the image bounds), tracking alpha so a
@@ -2115,7 +2115,7 @@ pub fn ascii_grid(
             cells.push(AnsiCell { fg, bg, ch });
         }
     }
-    AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells }
+    AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: out_pal, cells }
 }
 
 /// The ASCII **pipeline pass**: build the ASCII grid from `rgba` then paint it back in
@@ -2133,11 +2133,12 @@ pub fn ascii_pass(
     color: bool,
     invert: bool,
     font_8x8: bool,
+    mono: Option<([u8; 3], [u8; 3])>,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, invert, font_8x8);
+    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, invert, font_8x8, mono);
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
 
@@ -2209,17 +2210,19 @@ pub fn bitfont_grid(
     pool: &[u16],
     color: bool,
     invert: bool,
+    mono: Option<([u8; 3], [u8; 3])>,
 ) -> BitGrid {
     let cw = cell_w.max(1);
     let ch_ = cell_h.max(1);
     let cols = w.div_ceil(cw);
     let rows = h.div_ceil(ch_);
     let mut cells = Vec::with_capacity(cols * rows);
-    let paper = nearest_index([0, 0, 0], palette);
-    let ink = nearest_index([255, 255, 255], palette);
+    // Working palette + ink/paper. When `mono` overrides (the unified fg/bg chips), append the
+    // chosen bg + fg and use them; else fall back to the palette's darkest/brightest.
+    let (out_pal, ink, paper) = build_mono_palette(palette, mono);
     if palette.is_empty() || w == 0 || h == 0 {
         cells.resize(cols * rows, BitCell { glyph: 0, fg: 0, bg: 0 });
-        return BitGrid { cols, rows, cells, palette: palette.to_vec() };
+        return BitGrid { cols, rows, cells, palette: out_pal };
     }
     let mut ramp = bitfont_ramp(font, pool);
     if ramp.is_empty() {
@@ -2257,7 +2260,28 @@ pub fn bitfont_grid(
             cells.push(BitCell { glyph, fg, bg });
         }
     }
-    BitGrid { cols, rows, cells, palette: palette.to_vec() }
+    BitGrid { cols, rows, cells, palette: out_pal }
+}
+
+/// The working palette + `(ink, paper)` indices for a mono char converter. `mono` = the unified
+/// (fg, bg) chip colours: when set they're appended and used verbatim; else ink/paper are the
+/// palette's nearest-to-white / nearest-to-black.
+fn build_mono_palette(
+    palette: &[[u8; 4]],
+    mono: Option<([u8; 3], [u8; 3])>,
+) -> (Vec<[u8; 4]>, u8, u8) {
+    let mut pal = palette.to_vec();
+    if let Some((fg, bg)) = mono {
+        pal.push([bg[0], bg[1], bg[2], 255]);
+        let paper = (pal.len() - 1) as u8;
+        pal.push([fg[0], fg[1], fg[2], 255]);
+        let ink = (pal.len() - 1) as u8;
+        (pal, ink, paper)
+    } else {
+        let ink = nearest_index([255, 255, 255], palette);
+        let paper = nearest_index([0, 0, 0], palette);
+        (pal, ink, paper)
+    }
 }
 
 /// Render a [`BitGrid`] back into `rgba` in place using `font`'s 8×8 glyphs, each nearest-scaled to
@@ -2344,11 +2368,12 @@ pub fn bitfont_pass(
     pool: &[u16],
     color: bool,
     invert: bool,
+    mono: Option<([u8; 3], [u8; 3])>,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = bitfont_grid(rgba, w, h, palette, cell_w, cell_h, font, pool, color, invert);
+    let grid = bitfont_grid(rgba, w, h, palette, cell_w, cell_h, font, pool, color, invert, mono);
     bitfont_render(&grid, font, rgba, w, h, cell_w, cell_h);
 }
 
@@ -2891,7 +2916,7 @@ mod tests {
             }
         }
         let cs = AsciiCharset { high: true, ..Default::default() };
-        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, false, true);
+        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, false, true, None);
         assert_eq!(grid.cols, 2);
         let left = grid.cells[0];
         let right = grid.cells[1];
@@ -2939,13 +2964,13 @@ mod tests {
             }
         }
         let pool = [0u16, 1];
-        let g = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, false);
+        let g = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, false, None);
         assert_eq!(g.cols, 2);
         assert_eq!(g.cells[0].glyph, 0, "white cell -> blank glyph");
         assert_eq!(g.cells[1].glyph, 1, "black cell -> full block");
         // Invert swaps ink/paper: the fg becomes paper (nearest-black index).
         let paper = nearest_index([0, 0, 0], &pal);
-        let gi = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, true);
+        let gi = bitfont_grid(&rgba, w, h, &pal, 8, 8, &font, &pool, false, true, None);
         assert_eq!(gi.cells[1].fg, paper, "inverse video swaps ink to paper");
     }
 
