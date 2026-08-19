@@ -49,6 +49,7 @@ pub mod rad; // Reality Adlib Tracker replayer (RADPlayer port) — .rad → OPL
 mod rip;
 mod rexpaint; // REXPaint .xp (gzipped layered CP437 art)
 pub(crate) mod rexfont; // REXPaint bitmap fonts pack (16×16 glyph-grid PNGs → GlyphFont)
+pub(crate) mod uniart; // Unicode-range glyphs (DejaVu → GlyphFont) for the Unicode ramp style
 mod rip_chr;
 mod svg;
 mod tundra;

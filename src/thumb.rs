@@ -456,6 +456,28 @@ pub const DITHER_UNICODE: u8 = 13;
 pub const UNI_HALFBLOCK: u8 = 0;
 /// Unicode-art style: Braille (U+2800..) — each character is a 2×4 dot cell, hi-res mono-ish.
 pub const UNI_BRAILLE: u8 = 1;
+/// Unicode-art style: density **ramp** over the enabled Unicode ranges (Box Drawing / Block
+/// Elements / Geometric Shapes / Braille / ASCII), rendered via the bundled DejaVu font.
+pub const UNI_RAMP: u8 = 2;
+
+/// Build a UTF-8 [`UniGrid`] from a density [`BitGrid`] (glyph indices into a ramp font) + the
+/// parallel codepoint list `chars`. Colours come from the grid's palette. Used by the Ramp style
+/// so it shares the render ([`glyphfont_render`]) and text serializer ([`unicode_to_text`]).
+pub fn bitgrid_to_unigrid(grid: &BitGrid, chars: &[char]) -> UniGrid {
+    let rgb = |idx: u8| -> [u8; 3] {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or([0, 0, 0])
+    };
+    let (mut chs, mut fg, mut bg) = (Vec::new(), Vec::new(), Vec::new());
+    for c in &grid.cells {
+        chs.push(chars.get(c.glyph as usize).copied().unwrap_or(' '));
+        fg.push(rgb(c.fg));
+        bg.push(rgb(c.bg));
+    }
+    UniGrid { cols: grid.cols, rows: grid.rows, style: UNI_RAMP, chars: chs, fg, bg }
+}
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -1210,6 +1232,28 @@ fn nearest_ansi16(c: [u8; 3]) -> u8 {
 
 /// One channel of the xterm-256 6×6×6 colour cube: indices step 0,95,135,175,215,255.
 const XTERM_CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The full 256-colour xterm palette (16 system + 6×6×6 cube + 24 greys), as RGBA. Used as the
+/// Unicode Ramp's default colour set when no Reduce/palette is active, so it colours richly and
+/// exports cleanly to xterm-256.
+pub fn xterm256_palette() -> Vec<[u8; 4]> {
+    let mut v = Vec::with_capacity(256);
+    for c in ANSI16 {
+        v.push([c[0], c[1], c[2], 255]);
+    }
+    for &r in &XTERM_CUBE {
+        for &g in &XTERM_CUBE {
+            for &b in &XTERM_CUBE {
+                v.push([r, g, b, 255]);
+            }
+        }
+    }
+    for i in 0..24u8 {
+        let l = 8 + 10 * i;
+        v.push([l, l, l, 255]);
+    }
+    v
+}
 
 /// Nearest xterm-256 palette index (0..255) to an RGB triple, by squared distance.
 /// The palette is the 16 system colours ([`ANSI16`]), the 6×6×6 colour cube
@@ -2589,6 +2633,69 @@ pub fn unicode_pass(rgba: &mut [u8], w: usize, h: usize, style: u8, cols: usize,
         px.copy_from_slice(&[0, 0, 0, 255]);
     }
     unicode_render(&grid, rgba, w, h);
+}
+
+/// Build the density [`BitGrid`] for the Unicode **Ramp** style: exactly `cols` glyphs wide (rows
+/// preserve the image aspect), each the ramp glyph matching that region's tone, coloured from
+/// `palette`. Shared by the pass (render) and text export (glyph→char).
+#[allow(clippy::too_many_arguments)]
+pub fn unicode_ramp_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    font: &GlyphFont,
+    cols: usize,
+    color: bool,
+    invert: bool,
+) -> BitGrid {
+    let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
+    let gw = cols.max(1);
+    let gh = ((((gw * cw) as f32 * h as f32 / w.max(1) as f32).round() as usize) / ch).max(1);
+    let small = box_downscale(rgba, w, h, gw * cw, gh * ch);
+    // No active Reduce/palette → colour from the full xterm-256 set (rich + exports cleanly).
+    let default_pal;
+    let pal: &[[u8; 4]] = if palette.is_empty() {
+        default_pal = xterm256_palette();
+        &default_pal
+    } else {
+        palette
+    };
+    glyphfont_grid(&small, gw * cw, gh * ch, pal, font, &[], color, invert)
+}
+
+/// The Unicode **Ramp pipeline pass**: build the grid then render it (scaled) into `rgba` in place.
+#[allow(clippy::too_many_arguments)]
+pub fn unicode_ramp_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    font: &GlyphFont,
+    cols: usize,
+    color: bool,
+    invert: bool,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
+    let grid = unicode_ramp_grid(rgba, w, h, palette, font, cols, color, invert);
+    let (pw, ph) = (grid.cols * cw, grid.rows * ch);
+    if pw == 0 || ph == 0 {
+        return;
+    }
+    let mut px = vec![0u8; pw * ph * 4];
+    glyphfont_render(&grid, font, &mut px, pw, ph);
+    for y in 0..h {
+        let sy = (y * ph / h).min(ph - 1);
+        for x in 0..w {
+            let sx = (x * pw / w).min(pw - 1);
+            let so = (sy * pw + sx) * 4;
+            let d = (y * w + x) * 4;
+            rgba[d..d + 4].copy_from_slice(&px[so..so + 4]);
+        }
+    }
 }
 
 /// Serialize a [`UniGrid`] to text. `ansi_color` emits **xterm-256** SGR fg/bg per cell (the
