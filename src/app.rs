@@ -23528,8 +23528,19 @@ impl Kaleidotron {
                             ui.horizontal(|ui| {
                                 ui.label("Spacing");
                                 let r = ui.add(egui::Slider::new(&mut fx.scan_period, 2..=16).suffix("px"));
-                                middle_reset(ui, &r, &mut fx.scan_period, 3u32);
+                                middle_reset(ui, &r, &mut fx.scan_period, 2u32);
                                 wheel_adjust(ui, &r, &mut fx.scan_period, 1.0, 2u32, 16u32);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Thickness");
+                                // Cap at spacing−1 so at least one bright line always remains.
+                                let tmax = fx.scan_period.saturating_sub(1).max(1);
+                                let r = ui
+                                    .add(egui::Slider::new(&mut fx.scan_thick, 1..=tmax).suffix("px"))
+                                    .on_hover_text("How many px thick each scanline is (kept below the spacing)");
+                                middle_reset(ui, &r, &mut fx.scan_thick, 1u32);
+                                wheel_adjust(ui, &r, &mut fx.scan_thick, 1.0, 1u32, tmax);
+                                fx.scan_thick = fx.scan_thick.clamp(1, tmax);
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Dir");
@@ -37251,6 +37262,7 @@ struct PostFx {
     scan_period: u32,    // line spacing in px (≥2)
     scan_dir: u8,        // 0 == horizontal, 1 || vertical, 2 \\ diag, 3 // diag
     scan_color: [u8; 3], // scanline tint (default black)
+    scan_thick: u32,     // scanline THICKNESS in px (≥1; clamped below the spacing)
     glow_amt: f32,       // phosphor bloom strength 0..2
     glow_radius: f32,    // bloom radius in px (≥1)
     vig_amt: f32,        // vignette darkness 0..1
@@ -37263,9 +37275,10 @@ impl Default for PostFx {
     fn default() -> Self {
         Self {
             scan_amt: 0.0,
-            scan_period: 3,
+            scan_period: 2,
             scan_dir: 0,
             scan_color: [0, 0, 0],
+            scan_thick: 1,
             glow_amt: 0.0,
             glow_radius: 3.0,
             vig_amt: 0.0,
@@ -37284,13 +37297,14 @@ impl PostFx {
     /// A compact cache key: fold every parameter in so any change invalidates the caches.
     fn key(&self) -> String {
         format!(
-            "S{:.2}:{}:{}:{},{},{}|G{:.2}:{:.1}|V{:.2}:{:.2}|P{:.2}:{}",
+            "S{:.2}:{}:{}:{},{},{}:t{}|G{:.2}:{:.1}|V{:.2}:{:.2}|P{:.2}:{}",
             self.scan_amt,
             self.scan_period,
             self.scan_dir,
             self.scan_color[0],
             self.scan_color[1],
             self.scan_color[2],
+            self.scan_thick,
             self.glow_amt,
             self.glow_radius,
             self.vig_amt,
@@ -37315,6 +37329,7 @@ impl PostFx {
             self.vig_feather,
             self.phos_amt,
             self.phos_size as f32,
+            self.scan_thick as f32,
         ]
     }
     fn from_record(v: &[f32]) -> Self {
@@ -37332,6 +37347,7 @@ impl PostFx {
             vig_feather: g(9, d.vig_feather),
             phos_amt: g(10, d.phos_amt),
             phos_size: g(11, d.phos_size as f32).max(1.0) as u32,
+            scan_thick: g(12, d.scan_thick as f32).max(1.0) as u32,
         }
     }
 }
@@ -37678,6 +37694,9 @@ fn apply_scanlines(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
         return;
     }
     let period = fx.scan_period.max(2) as i32;
+    // Thickness: darken this many consecutive lines each period, always leaving at least
+    // one bright line (clamp below the spacing) so it stays a scanline, not a solid fill.
+    let thick = (fx.scan_thick.max(1) as i32).min(period - 1);
     let a = fx.scan_amt.clamp(0.0, 1.0);
     let c = fx.scan_color;
     for y in 0..h {
@@ -37688,7 +37707,7 @@ fn apply_scanlines(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
                 3 => x as i32 - y as i32,
                 _ => y as i32,
             };
-            if line.rem_euclid(period) == 0 {
+            if line.rem_euclid(period) < thick {
                 let i = (y * w + x) * 4;
                 if rgba[i + 3] == 0 {
                     continue;
