@@ -54,6 +54,15 @@ impl GlyphFont {
             .collect();
         GlyphFont { cell_w: 8, cell_h: 8, glyphs }
     }
+
+    /// Wrap an 8-wide × 16-tall byte-row font (the CP437 VGA font) as a [`GlyphFont`].
+    pub fn from_8x16(rows: &[[u8; 16]]) -> GlyphFont {
+        let glyphs = rows
+            .iter()
+            .map(|g| g.iter().map(|&b| b as u32).collect())
+            .collect();
+        GlyphFont { cell_w: 8, cell_h: 16, glyphs }
+    }
 }
 
 /// Parse a REXPaint font PNG (16×16 glyph grid) into a [`GlyphFont`]. `None` if the image

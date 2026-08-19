@@ -21277,9 +21277,12 @@ impl Kaleidotron {
         if !self.ascii_picker || self.dither_method != crate::thumb::DITHER_ASCII {
             return;
         }
-        let font = crate::decode::rexfont::GlyphFont::from_8x8(
-            &crate::decode::cp437_font_8x8::CP437_8X8,
-        );
+        // Match the render cell: VGA50 → 8×8 font, else the 8×16 VGA font.
+        let font = if self.shade_vga50 {
+            crate::decode::rexfont::GlyphFont::from_8x8(&crate::decode::cp437_font_8x8::CP437_8X8)
+        } else {
+            crate::decode::rexfont::GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16)
+        };
         let default = vec![true; 256];
         let mut open = self.ascii_picker;
         glyph_picker_window(
@@ -21337,9 +21340,12 @@ impl Kaleidotron {
         if self.ansi_mask.len() != 256 {
             self.ansi_mask = default.clone();
         }
-        let font = crate::decode::rexfont::GlyphFont::from_8x8(
-            &crate::decode::cp437_font_8x8::CP437_8X8,
-        );
+        // Match the cell: VGA50 → the 8×8 font, else the 8×16 VGA font.
+        let font = if self.shade_vga50 {
+            crate::decode::rexfont::GlyphFont::from_8x8(&crate::decode::cp437_font_8x8::CP437_8X8)
+        } else {
+            crate::decode::rexfont::GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16)
+        };
         let mut open = self.ansi_picker;
         glyph_picker_window(
             ctx, "ANSI Shade glyphs (block set)", "ansi_atlas", &font, 256, &mut self.ansi_mask,
