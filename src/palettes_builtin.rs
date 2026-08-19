@@ -177,6 +177,14 @@ pub const BUILTIN_PALETTES: &[(&str, &str)] = &[
         include_str!("../assets/palettes/NES (55).GPL"),
     ),
     (
+        "PEPTO (16).GPL",
+        include_str!("../assets/palettes/PEPTO (16).GPL"),
+    ),
+    (
+        "PETMATE (16).GPL",
+        include_str!("../assets/palettes/PETMATE (16).GPL"),
+    ),
+    (
         "PICO-8 (16).GPL",
         include_str!("../assets/palettes/PICO-8 (16).GPL"),
     ),
@@ -219,6 +227,10 @@ pub const BUILTIN_PALETTES: &[(&str, &str)] = &[
     (
         "VGA (256).GPL",
         include_str!("../assets/palettes/VGA (256).GPL"),
+    ),
+    (
+        "VICE (16).GPL",
+        include_str!("../assets/palettes/VICE (16).GPL"),
     ),
     (
         "VINES-FLEXIBLE-LINEAR-RAMPS (38).GPL",

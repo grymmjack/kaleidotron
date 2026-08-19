@@ -1653,6 +1653,7 @@ fn petscii_cell_match(
     cell: &[[f32; 3]; 64],
     page: usize,
     bg_idx: u8,
+    pal: &[[u8; 4]; 16],
     pf: &[[f32; 3]],
     is_block: &[bool],
     penalty: f32,
@@ -1687,7 +1688,7 @@ fn petscii_cell_match(
                 (set_sum[1] / set_n) as u8,
                 (set_sum[2] / set_n) as u8,
             ];
-            let fi = nearest_index(mean, crate::decode::VIC2.as_slice());
+            let fi = nearest_index(mean, pal.as_slice());
             let fc = pf[fi as usize];
             let e = set_sq
                 - 2.0 * (fc[0] * set_sum[0] + fc[1] * set_sum[1] + fc[2] * set_sum[2])
@@ -1721,13 +1722,14 @@ pub fn petscii_grid(
     page: usize,
     purity: f32,
     bg_override: Option<u8>,
+    pal: &[[u8; 4]; 16],
 ) -> PetsciiGrid {
     let cols = cols.max(1);
     let rows = rows.max(1);
     let page = page.min(1);
     let (gw, gh) = (cols * 8, rows * 8);
     let small = box_downscale(rgba, w, h, gw, gh);
-    let pf: Vec<[f32; 3]> = crate::decode::VIC2
+    let pf: Vec<[f32; 3]> = pal
         .iter()
         .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
         .collect();
@@ -1757,7 +1759,7 @@ pub fn petscii_grid(
             .map(|b| {
                 let total: f32 = cells_px
                     .par_iter()
-                    .map(|cell| petscii_cell_match(cell, page, b, &pf, &is_block, 0.0, true).2)
+                    .map(|cell| petscii_cell_match(cell, page, b, pal, &pf, &is_block, 0.0, true).2)
                     .sum();
                 (b, total)
             })
@@ -1770,7 +1772,8 @@ pub fn petscii_grid(
     let cells: Vec<PetsciiCell> = cells_px
         .par_iter()
         .map(|cell| {
-            let (code, fg, _) = petscii_cell_match(cell, page, bg, &pf, &is_block, penalty, false);
+            let (code, fg, _) =
+                petscii_cell_match(cell, page, bg, pal, &pf, &is_block, penalty, false);
             PetsciiCell { code, fg }
         })
         .collect();
@@ -1780,15 +1783,15 @@ pub fn petscii_grid(
 
 /// Render a [`PetsciiGrid`] to an RGBA buffer (`cols*8` × `rows*8`) via the C64 font + VIC-II —
 /// the same pixels the decoder produces, so the preview matches a re-opened export.
-pub fn petscii_render(grid: &PetsciiGrid) -> (usize, usize, Vec<u8>) {
+pub fn petscii_render(grid: &PetsciiGrid, pal: &[[u8; 4]; 16]) -> (usize, usize, Vec<u8>) {
     let (w, h) = (grid.cols * 8, grid.rows * 8);
     let mut rgba = vec![0u8; w * h * 4];
-    let bg = crate::decode::VIC2[grid.bg as usize];
+    let bg = pal[grid.bg as usize];
     for cy in 0..grid.rows {
         for cx in 0..grid.cols {
             let cell = grid.cells[cy * grid.cols + cx];
             let g = &crate::decode::C64_FONT[grid.page * 256 + cell.code as usize];
-            let fg = crate::decode::VIC2[cell.fg as usize];
+            let fg = pal[cell.fg as usize];
             for (py, &bits) in g.iter().enumerate() {
                 for px in 0..8usize {
                     let c = if (bits >> (7 - px)) & 1 == 1 { fg } else { bg };
@@ -1922,8 +1925,8 @@ mod tests {
         // A solid VIC-II colour converts + renders back to that same colour (bg auto-picks it).
         let red = crate::decode::VIC2[2];
         let rgba: Vec<u8> = std::iter::repeat(red).take(64).flatten().collect();
-        let grid = petscii_grid(&rgba, 8, 8, 1, 1, 0, 1.0, None);
-        let (w, h, out) = petscii_render(&grid);
+        let grid = petscii_grid(&rgba, 8, 8, 1, 1, 0, 1.0, None, &crate::decode::VIC2);
+        let (w, h, out) = petscii_render(&grid, &crate::decode::VIC2);
         assert_eq!((w, h), (8, 8));
         for px in out.chunks_exact(4) {
             assert_eq!(&px[0..3], &red[0..3], "solid red stays red");
@@ -1944,8 +1947,8 @@ mod tests {
                 rgba[o..o + 4].copy_from_slice(&c);
             }
         }
-        let grid = petscii_grid(&rgba, w, h, 2, 1, 0, 1.0, None);
-        let (rw, _rh, out) = petscii_render(&grid);
+        let grid = petscii_grid(&rgba, w, h, 2, 1, 0, 1.0, None, &crate::decode::VIC2);
+        let (rw, _rh, out) = petscii_render(&grid, &crate::decode::VIC2);
         let at = |x: usize, y: usize| {
             let o = (y * rw + x) * 4;
             [out[o], out[o + 1], out[o + 2]]

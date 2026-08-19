@@ -1641,6 +1641,7 @@ pub struct Kaleidotron {
     petscii_bg_auto: bool,
     petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
     petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
+    petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2438,7 +2439,7 @@ impl Kaleidotron {
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
-    const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg)
+    const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3103,11 +3104,11 @@ impl Kaleidotron {
             .unwrap_or(0)
             .min(5);
         let shade_fit_chars = get_bool(Self::SHADE_FIT_CHARS_KEY).unwrap_or(false);
-        // PETSCII settings persisted as one tuple (cols, rows, purity, page, bg_auto, bg).
-        let petscii: (usize, usize, f32, u8, bool, u8) = cc
+        // PETSCII settings persisted as one tuple (cols, rows, purity, page, bg_auto, bg, palette).
+        let petscii: (usize, usize, f32, u8, bool, u8, u8) = cc
             .storage
             .and_then(|s| eframe::get_value(s, Self::PETSCII_KEY))
-            .unwrap_or((40, 25, 1.0, 0, true, 0));
+            .unwrap_or((40, 25, 1.0, 0, true, 0, 0));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3611,6 +3612,7 @@ impl Kaleidotron {
             petscii_bg_auto: petscii.4,
             petscii_bg: petscii.5,
             petscii_export_format: 0,
+            petscii_palette: petscii.6,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -20130,13 +20132,14 @@ impl Kaleidotron {
         ) + &ssig
             + &if self.dither_method == crate::thumb::DITHER_PETSCII {
                 format!(
-                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}",
+                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}",
                     self.petscii_cols,
                     self.petscii_rows,
                     self.petscii_purity,
                     self.petscii_page,
                     self.petscii_bg_auto as u8,
                     self.petscii_bg,
+                    self.petscii_palette,
                 )
             } else {
                 String::new()
@@ -20715,7 +20718,35 @@ impl Kaleidotron {
             self.petscii_page.min(1),
             self.petscii_purity,
             bg,
+            self.petscii_pal(),
         )
+    }
+
+    /// The 16-colour VIC-II palette the PETSCII converter renders + matches with, chosen by
+    /// `petscii_palette` (petmate / colodore / pepto / vice). Kept in sync with the quantize
+    /// palette selection so the on-screen colours match what petmate paints (and the export
+    /// buttons appear). See [`Self::petscii_sync_selected_palette`].
+    fn petscii_pal(&self) -> &'static [[u8; 4]; 16] {
+        crate::decode::petscii_palette(self.petscii_palette)
+    }
+
+    /// Point the quantize palette selection at the bundled `.GPL` matching the current PETSCII
+    /// palette (petmate/colodore/pepto/vice). The converter brings its own colours, but selecting
+    /// the matching palette here (a) makes the "Export textmode"/Save buttons appear — they're
+    /// gated on a palette being active — and (b) keeps the Colors swatches showing the same C64
+    /// set. Called when switching TO PETSCII and whenever the PETSCII palette dropdown changes.
+    fn petscii_sync_selected_palette(&mut self) {
+        let stem = crate::decode::PETSCII_PALETTES[(self.petscii_palette as usize)
+            .min(crate::decode::PETSCII_PALETTES.len() - 1)]
+        .0;
+        // "colodore" ships as COLODORE (16).GPL; the others as UPPERCASE (16).GPL.
+        let file = format!("{} (16).GPL", stem.to_uppercase());
+        let path = std::path::Path::new(crate::palettes_builtin::BUILTIN_ROOT).join(file);
+        if self.palette_files.contains(&path) {
+            self.selected_palette = Some(path);
+            self.custom_palette = None;
+            self.quantize_on = false;
+        }
     }
 
     /// THE single source of truth for the ANSI-shade grid. Both the on-screen preview
@@ -20817,7 +20848,7 @@ impl Kaleidotron {
         // PETSCII preview: build the C64 char grid + render it (its own converter/palette).
         if self.dither_method == crate::thumb::DITHER_PETSCII {
             let grid = self.build_petscii_grid(w, h, &rgba);
-            let (pw, ph, px) = crate::thumb::petscii_render(&grid);
+            let (pw, ph, px) = crate::thumb::petscii_render(&grid, self.petscii_pal());
             let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [pw, ph], &px, view_tex_opts());
             self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
             return Some(tt);
@@ -24582,6 +24613,14 @@ impl Kaleidotron {
                             self.quantize_cache = None;
                             self.reduce_src = None;
                         }
+                        // Switching TO PETSCII: auto-select the matching C64 palette so the
+                        // export/save buttons appear (they need an active palette) and the
+                        // Colors swatches match the converter's colours.
+                        if self.dither_method == crate::thumb::DITHER_PETSCII
+                            && prev != crate::thumb::DITHER_PETSCII
+                        {
+                            self.petscii_sync_selected_palette();
+                        }
                     });
                     // ANSI Shade ignores "Amount" (it's a hard two-colour quantize).
                     if self.dither_method != 0
@@ -24992,7 +25031,32 @@ impl Kaleidotron {
                     if self.dither_method == crate::thumb::DITHER_PETSCII {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("PETSCII").strong());
-                            ui.weak("C64 char art · VIC-II palette");
+                            ui.weak("C64 hi-res char art");
+                        });
+                        // Palette: petmate / colodore / pepto / vice. Picking one sets the
+                        // converter colours AND the matching quantize palette so exported art
+                        // matches whatever palette petmate is set to (Preferences → C64 palette).
+                        ui.horizontal(|ui| {
+                            ui.label("Palette")
+                                .on_hover_text("Match this to petmate's Preferences → “Select C64 color palette”");
+                            let names = crate::decode::PETSCII_PALETTES;
+                            let cur = (self.petscii_palette as usize).min(names.len() - 1);
+                            let mut changed = false;
+                            egui::ComboBox::from_id_salt("petscii_pal")
+                                .selected_text(names[cur].0)
+                                .show_ui(ui, |ui| {
+                                    for (i, (n, _)) in names.iter().enumerate() {
+                                        if ui
+                                            .selectable_value(&mut self.petscii_palette, i as u8, *n)
+                                            .clicked()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            if changed {
+                                self.petscii_sync_selected_palette();
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Cols");
@@ -25038,8 +25102,9 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.petscii_bg_auto, "Auto background");
                             if !self.petscii_bg_auto {
+                                let pal = self.petscii_pal();
                                 for c in 0u8..16 {
-                                    let col = crate::decode::VIC2[c as usize];
+                                    let col = pal[c as usize];
                                     let (rect, resp) = ui.allocate_exact_size(
                                         egui::vec2(15.0, 15.0),
                                         egui::Sense::click(),
@@ -25462,7 +25527,7 @@ impl Kaleidotron {
             2 => std::fs::write(&dest, crate::thumb::petscii_grid_to_json(&grid))
                 .map_err(|e| e.to_string()),
             3 => {
-                let (pw, ph, px) = crate::thumb::petscii_render(&grid);
+                let (pw, ph, px) = crate::thumb::petscii_render(&grid, self.petscii_pal());
                 image::save_buffer(&dest, &px, pw as u32, ph as u32, image::ColorType::Rgba8)
                     .map_err(|e| e.to_string())
             }
@@ -37320,6 +37385,7 @@ impl eframe::App for Kaleidotron {
                 self.petscii_page as u8,
                 self.petscii_bg_auto,
                 self.petscii_bg,
+                self.petscii_palette,
             ),
         );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);

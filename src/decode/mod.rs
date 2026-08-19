@@ -14,7 +14,9 @@ mod c64_font;
 // Re-export the C64 ROM font + VIC-II palette so the image→PETSCII converter (in `thumb`)
 // can reach them without exposing the whole decoder modules.
 pub(crate) use c64_font::C64_FONT;
-pub(crate) use petscii::VIC2;
+#[cfg(test)]
+pub(crate) use petscii::VIC2; // only the thumb.rs PETSCII tests reference it by this path
+pub(crate) use petscii::{petscii_palette, PETSCII_PALETTES};
 mod code;
 mod eps;
 pub mod font;
