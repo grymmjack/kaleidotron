@@ -44,6 +44,18 @@ impl GlyphFont {
     }
 }
 
+impl GlyphFont {
+    /// Wrap an 8×8 byte-row font (bit 7 = leftmost pixel), e.g. the C64 / ATASCII / Apple / CP437
+    /// ROMs, as a [`GlyphFont`] so it can drive the shared glyph picker + coverage ramp.
+    pub fn from_8x8(rows: &[[u8; 8]]) -> GlyphFont {
+        let glyphs = rows
+            .iter()
+            .map(|g| g.iter().map(|&b| b as u32).collect())
+            .collect();
+        GlyphFont { cell_w: 8, cell_h: 8, glyphs }
+    }
+}
+
 /// Parse a REXPaint font PNG (16×16 glyph grid) into a [`GlyphFont`]. `None` if the image
 /// isn't decodable or its dimensions aren't a clean 16×16 grid.
 pub fn parse_rexpaint(bytes: &[u8]) -> Option<GlyphFont> {

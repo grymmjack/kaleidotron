@@ -1655,6 +1655,10 @@ pub struct Kaleidotron {
     bitfont_color: bool,   // per-cell colour from the palette (shared by both modes; else mono)
     atascii_invert: bool,  // ATASCII inverse video (swap ink/paper)
     apple_invert: bool,    // Apple ][ inverse video
+    atascii_mask: Vec<bool>, // which ATASCII glyphs the converter may use (all-on = all)
+    apple_mask: Vec<bool>,   // which Apple ][ glyphs the converter may use
+    atascii_picker: bool,    // ATASCII glyph-picker popup open
+    apple_picker: bool,      // Apple ][ glyph-picker popup open
     apple_mousetext: bool, // include the Apple //e MouseText glyphs in the pool
     apple_col80: bool,     // false = PR#0 (40-column font), true = PR#3 (80-column font)
     // REXPaint-font converter (DITHER_REXFONT): image→art over a bundled REXPaint font.
@@ -1662,6 +1666,7 @@ pub struct Kaleidotron {
     rexfont_invert: bool,  // inverse video for the REXPaint-font converter
     rexfont_mask: Vec<bool>, // 256 flags: which glyphs the converter may use (all-on = all)
     rexfont_picker: bool,  // the glyph-picker popup is open
+    glyph_drag: Option<bool>, // shared: value being painted during a glyph-picker drag
     // Unicode text-art converter (DITHER_UNICODE): half-block / Braille → real UTF-8.
     unicode_style: u8,   // thumb::UNI_HALFBLOCK / UNI_BRAILLE / UNI_RAMP
     unicode_cols: usize, // target character width
@@ -2472,6 +2477,8 @@ impl Kaleidotron {
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
+    const ATASCII_MASK_KEY: &'static str = "atascii_mask";
+    const APPLE_MASK_KEY: &'static str = "apple_mask";
     const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
@@ -3697,10 +3704,21 @@ impl Kaleidotron {
             apple_invert: bitfont.2,
             apple_mousetext: bitfont.3,
             apple_col80: bitfont.4,
+            atascii_mask: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::ATASCII_MASK_KEY))
+                .unwrap_or_default(),
+            apple_mask: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::APPLE_MASK_KEY))
+                .unwrap_or_default(),
+            atascii_picker: false,
+            apple_picker: false,
             rexfont_sel: rexfont.0,
             rexfont_invert: rexfont.1,
             rexfont_mask,
             rexfont_picker: false,
+            glyph_drag: None,
             unicode_style: unicode.0.min(2),
             unicode_cols: unicode.1.clamp(8, 400),
             unicode_invert: unicode.2,
@@ -20371,13 +20389,22 @@ impl Kaleidotron {
                 self.dither_method,
                 crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
             ) {
+                let mask = if self.dither_method == crate::thumb::DITHER_APPLE {
+                    &self.apple_mask
+                } else {
+                    &self.atascii_mask
+                };
+                let mh = mask.iter().enumerate().fold(0u64, |acc, (i, &b)| {
+                    if b { acc ^ 0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1) } else { acc }
+                });
                 format!(
-                    "|BFcol{}:ai{}:pi{}:mt{}:c80{}",
+                    "|BFcol{}:ai{}:pi{}:mt{}:c80{}:m{:x}",
                     self.bitfont_color as u8,
                     self.atascii_invert as u8,
                     self.apple_invert as u8,
                     self.apple_mousetext as u8,
                     self.apple_col80 as u8,
+                    mh,
                 )
             } else {
                 String::new()
@@ -21015,28 +21042,38 @@ impl Kaleidotron {
     /// The pool selects which of the font's glyphs are candidates (Apple adds the MouseText block
     /// when enabled). Colour is `self.bitfont_color`.
     fn bitfont_spec(&self) -> (&'static [[u8; 8]], Vec<u16>, bool) {
-        if self.dither_method == crate::thumb::DITHER_APPLE {
-            let font = if self.apple_col80 {
-                crate::thumb::apple_font_80() // PR#3
+        let (font, pool, invert, mask): (&'static [[u8; 8]], Vec<u16>, bool, &Vec<bool>) =
+            if self.dither_method == crate::thumb::DITHER_APPLE {
+                let font = if self.apple_col80 {
+                    crate::thumb::apple_font_80() // PR#3
+                } else {
+                    crate::thumb::apple_font() // PR#0
+                };
+                let base = crate::thumb::apple_text_len() as u16;
+                let mut pool: Vec<u16> = (0..base).collect();
+                if self.apple_mousetext {
+                    pool.extend(base..font.len() as u16);
+                }
+                (font, pool, self.apple_invert, &self.apple_mask)
             } else {
-                crate::thumb::apple_font() // PR#0
+                let font: &'static [[u8; 8]] = &crate::decode::ATASCII_FONT;
+                let pool: Vec<u16> = (0..font.len() as u16).collect();
+                (font, pool, self.atascii_invert, &self.atascii_mask)
             };
-            let base = crate::thumb::apple_text_len() as u16;
-            let mut pool: Vec<u16> = (0..base).collect();
-            if self.apple_mousetext {
-                pool.extend(base..font.len() as u16);
-            }
-            (font, pool, self.apple_invert)
+        // Restrict to the glyph-picker mask, unless it's empty/all-on (no restriction).
+        let on = mask.iter().filter(|b| **b).count();
+        let pool = if on == 0 || on >= font.len() {
+            pool
         } else {
-            let font: &'static [[u8; 8]] = &crate::decode::ATASCII_FONT;
-            let pool: Vec<u16> = (0..font.len() as u16).collect();
-            (font, pool, self.atascii_invert)
-        }
+            pool.into_iter()
+                .filter(|&g| mask.get(g as usize).copied().unwrap_or(true))
+                .collect()
+        };
+        (font, pool, invert)
     }
 
-    /// The glyph-picker popup for the REXPaint-font converter: a 16×16 grid of the selected font's
-    /// glyphs, click to enable/disable which ones the converter may use. Enabled glyphs render
-    /// bright, disabled are dimmed. Changing the mask re-renders the preview (folded into the key).
+    /// The glyph-picker popup for the REXPaint-font converter (the shared picker over the selected
+    /// font; default set = all glyphs).
     fn ui_rexfont_picker(&mut self, ctx: &egui::Context) {
         if !self.rexfont_picker || self.dither_method != crate::thumb::DITHER_REXFONT {
             return;
@@ -21044,75 +21081,63 @@ impl Kaleidotron {
         let Some(font) = crate::decode::rexfont::rexfont(self.rexfont_sel) else {
             return;
         };
+        let n = 256.min(font.glyphs.len());
         if self.rexfont_mask.len() < 256 {
             self.rexfont_mask.resize(256, true);
         }
-        let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
-        // Zoom each glyph up to a legible size.
-        let s = (24 / cw.max(ch)).max(2);
-        let (aw, ah) = (16 * cw * s, 16 * ch * s);
-        let mut px = vec![0u8; aw * ah * 4];
-        for gi in 0..256usize {
-            let (gc, gr) = (gi % 16, gi / 16);
-            let enabled = self.rexfont_mask[gi];
-            for y in 0..ch {
-                for x in 0..cw {
-                    let on = font.on(gi, x, y);
-                    let col: [u8; 4] = match (enabled, on) {
-                        (true, true) => [235, 235, 240, 255],
-                        (true, false) => [34, 34, 42, 255],
-                        (false, true) => [96, 74, 74, 255],
-                        (false, false) => [20, 16, 18, 255],
-                    };
-                    for sy in 0..s {
-                        for sx in 0..s {
-                            let ax = (gc * cw + x) * s + sx;
-                            let ay = (gr * ch + y) * s + sy;
-                            let o = (ay * aw + ax) * 4;
-                            px[o..o + 4].copy_from_slice(&col);
-                        }
-                    }
-                }
-            }
-        }
-        let color = egui::ColorImage::from_rgba_unmultiplied([aw, ah], &px);
-        let tex = ctx.load_texture("rexfont_atlas", color, egui::TextureOptions::NEAREST);
+        let default = vec![true; n];
         let mut open = self.rexfont_picker;
-        egui::Window::new("REXPaint glyphs — pick usable chars")
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("All").clicked() {
-                        self.rexfont_mask.iter_mut().for_each(|b| *b = true);
-                    }
-                    if ui.button("None").clicked() {
-                        self.rexfont_mask.iter_mut().for_each(|b| *b = false);
-                    }
-                    if ui.button("Invert").clicked() {
-                        self.rexfont_mask.iter_mut().for_each(|b| *b = !*b);
-                    }
-                    let on = self.rexfont_mask.iter().filter(|b| **b).count();
-                    ui.weak(format!("{on}/256 enabled"));
-                });
-                ui.weak("Click a glyph to toggle it. Bright = used, dim = skipped.");
-                let img = egui::Image::new(&tex)
-                    .fit_to_exact_size(egui::vec2(aw as f32, ah as f32))
-                    .sense(egui::Sense::click());
-                let resp = ui.add(img);
-                if resp.clicked() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let rel = pos - resp.rect.min;
-                        let gc = (rel.x as usize) / (cw * s);
-                        let gr = (rel.y as usize) / (ch * s);
-                        if gc < 16 && gr < 16 {
-                            let gi = gr * 16 + gc;
-                            self.rexfont_mask[gi] = !self.rexfont_mask[gi];
-                        }
-                    }
-                }
-            });
+        glyph_picker_window(
+            ctx,
+            "REXPaint glyphs — pick usable chars",
+            "rexfont_atlas",
+            font,
+            n,
+            &mut self.rexfont_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+        );
         self.rexfont_picker = open;
+    }
+
+    /// ATASCII glyph picker (over the Atari ROM font; default set = all glyphs).
+    fn ui_atascii_picker(&mut self, ctx: &egui::Context) {
+        if !self.atascii_picker || self.dither_method != crate::thumb::DITHER_ATASCII {
+            return;
+        }
+        let font = crate::decode::rexfont::GlyphFont::from_8x8(&crate::decode::ATASCII_FONT);
+        let n = font.glyphs.len();
+        let default = vec![true; n];
+        let mut open = self.atascii_picker;
+        glyph_picker_window(
+            ctx, "ATASCII glyphs", "atascii_atlas", &font, n, &mut self.atascii_mask, &default,
+            &mut open, &mut self.glyph_drag,
+        );
+        self.atascii_picker = open;
+    }
+
+    /// Apple ][ glyph picker (text + MouseText; default = all text glyphs, MouseText per its toggle).
+    fn ui_apple_picker(&mut self, ctx: &egui::Context) {
+        if !self.apple_picker || self.dither_method != crate::thumb::DITHER_APPLE {
+            return;
+        }
+        let src = if self.apple_col80 {
+            crate::thumb::apple_font_80()
+        } else {
+            crate::thumb::apple_font()
+        };
+        let font = crate::decode::rexfont::GlyphFont::from_8x8(src);
+        let n = font.glyphs.len();
+        let base = crate::thumb::apple_text_len();
+        // Default: all text glyphs on; MouseText on only when its toggle is enabled.
+        let default: Vec<bool> = (0..n).map(|i| i < base || self.apple_mousetext).collect();
+        let mut open = self.apple_picker;
+        glyph_picker_window(
+            ctx, "Apple ][ glyphs", "apple_atlas", &font, n, &mut self.apple_mask, &default,
+            &mut open, &mut self.glyph_drag,
+        );
+        self.apple_picker = open;
     }
 
     /// The enabled-glyph pool for the REXPaint-font converter, from `rexfont_mask`. Empty means
@@ -25651,6 +25676,9 @@ impl Kaleidotron {
                                 .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
                             ui.checkbox(&mut self.atascii_invert, "Invert")
                                 .on_hover_text("Inverse video — swap ink and paper");
+                            if ui.button("Chars…").on_hover_text("Pick which glyphs to use").clicked() {
+                                self.atascii_picker = !self.atascii_picker;
+                            }
                         });
                         if recolor.is_none() {
                             ui.weak("(needs a palette / Reduce for its colors)");
@@ -25676,6 +25704,9 @@ impl Kaleidotron {
                                 .on_hover_text("Inverse video — swap ink and paper");
                             ui.checkbox(&mut self.apple_mousetext, "MouseText")
                                 .on_hover_text("Add the Apple //e MouseText glyphs to the pool");
+                            if ui.button("Chars…").on_hover_text("Pick which glyphs to use").clicked() {
+                                self.apple_picker = !self.apple_picker;
+                            }
                         });
                         if recolor.is_none() {
                             ui.weak("(needs a palette / Reduce for its colors)");
@@ -36842,6 +36873,8 @@ impl eframe::App for Kaleidotron {
         self.ui_select_mask_dialog(&ctx);
         self.ui_ai_generate(&ctx);
         self.ui_rexfont_picker(&ctx);
+        self.ui_atascii_picker(&ctx);
+        self.ui_apple_picker(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -38301,6 +38334,8 @@ impl eframe::App for Kaleidotron {
             &(self.rexfont_sel, self.rexfont_invert),
         );
         eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
+        eframe::set_value(storage, Self::ATASCII_MASK_KEY, &self.atascii_mask);
+        eframe::set_value(storage, Self::APPLE_MASK_KEY, &self.apple_mask);
         eframe::set_value(
             storage,
             Self::UNICODE_KEY,
@@ -38571,6 +38606,122 @@ fn to_gpl(name: &str, palette: &[[u8; 4]]) -> String {
 /// directly; every other character goes through the full CP437↔Unicode table (round-trip checked),
 /// so the entire box-drawing / block / shade repertoire (─│┌┐╔╗║░▒▓█ …) pastes through, not just a
 /// handful. Anything with no CP437 glyph is skipped. Order + duplicates are preserved.
+/// Shared glyph-picker window: a 16-column grid of `font`'s first `count` glyphs with 1px grid
+/// lines, click to toggle and **drag to paint** a run, plus All / None / Invert / Restore (to
+/// `default`). Enabled glyphs render bright, disabled dim. `mask` (length ≥ count) is mutated in
+/// place; `drag` carries the paint value across frames. `tex_id` names the atlas texture.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn glyph_picker_window(
+    ctx: &egui::Context,
+    title: &str,
+    tex_id: &str,
+    font: &crate::decode::rexfont::GlyphFont,
+    count: usize,
+    mask: &mut Vec<bool>,
+    default: &[bool],
+    open: &mut bool,
+    drag: &mut Option<bool>,
+) {
+    if mask.len() < count {
+        mask.resize(count, true);
+    }
+    let ncols = 16usize;
+    let nrows = count.div_ceil(ncols);
+    let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
+    let s = (24 / cw.max(ch)).max(2); // per-pixel zoom
+    let (gcw, gch) = (cw * s + 1, ch * s + 1); // cell + 1px grid line
+    let (aw, ah) = (ncols * gcw + 1, nrows * gch + 1);
+    let grid_col = [60u8, 60, 68, 255];
+    let mut px = vec![grid_col[0]; aw * ah * 4];
+    for p in px.chunks_exact_mut(4) {
+        p.copy_from_slice(&grid_col);
+    }
+    for gi in 0..count {
+        let (gc, gr) = (gi % ncols, gi / ncols);
+        let enabled = mask[gi];
+        for y in 0..ch {
+            for x in 0..cw {
+                let on = font.on(gi, x, y);
+                let col: [u8; 4] = match (enabled, on) {
+                    (true, true) => [235, 235, 240, 255],
+                    (true, false) => [30, 30, 38, 255],
+                    (false, true) => [96, 74, 74, 255],
+                    (false, false) => [18, 15, 17, 255],
+                };
+                for sy in 0..s {
+                    for sx in 0..s {
+                        let ax = gc * gcw + 1 + x * s + sx;
+                        let ay = gr * gch + 1 + y * s + sy;
+                        let o = (ay * aw + ax) * 4;
+                        px[o..o + 4].copy_from_slice(&col);
+                    }
+                }
+            }
+        }
+    }
+    let color = egui::ColorImage::from_rgba_unmultiplied([aw, ah], &px);
+    let tex = ctx.load_texture(tex_id, color, egui::TextureOptions::NEAREST);
+    egui::Window::new(title)
+        .open(open)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("All").clicked() {
+                    mask.iter_mut().for_each(|b| *b = true);
+                }
+                if ui.button("None").clicked() {
+                    mask.iter_mut().for_each(|b| *b = false);
+                }
+                if ui.button("Invert").clicked() {
+                    mask.iter_mut().for_each(|b| *b = !*b);
+                }
+                if ui
+                    .button("↺ Restore")
+                    .on_hover_text("Reset to this mode's default glyph set")
+                    .clicked()
+                {
+                    for (i, b) in mask.iter_mut().enumerate() {
+                        *b = default.get(i).copied().unwrap_or(true);
+                    }
+                }
+                let on = mask.iter().take(count).filter(|b| **b).count();
+                ui.weak(format!("{on}/{count} enabled"));
+            });
+            ui.weak("Click to toggle · drag to paint a run. Bright = used, dim = skipped.");
+            let img = egui::Image::new(&tex)
+                .fit_to_exact_size(egui::vec2(aw as f32, ah as f32))
+                .sense(egui::Sense::click_and_drag());
+            let resp = ui.add(img);
+            // Cell under the pointer, if any.
+            let cell_at = |pos: egui::Pos2| -> Option<usize> {
+                let rel = pos - resp.rect.min;
+                if rel.x < 0.0 || rel.y < 0.0 {
+                    return None;
+                }
+                let gc = (rel.x as usize) / gcw;
+                let gr = (rel.y as usize) / gch;
+                let gi = gr * ncols + gc;
+                (gc < ncols && gi < count).then_some(gi)
+            };
+            if resp.drag_started() || resp.clicked() {
+                if let Some(gi) = resp.interact_pointer_pos().and_then(cell_at) {
+                    let paint = !mask[gi]; // toggle the first cell; paint that value onward
+                    mask[gi] = paint;
+                    *drag = Some(paint);
+                }
+            } else if resp.dragged() {
+                if let (Some(paint), Some(gi)) =
+                    (*drag, resp.interact_pointer_pos().and_then(cell_at))
+                {
+                    mask[gi] = paint;
+                }
+            }
+            if resp.drag_stopped() || !resp.dragged() {
+                *drag = None;
+            }
+        });
+}
+
 fn resolve_ascii_chars(s: &str) -> Vec<u8> {
     s.chars()
         .filter_map(|c| {
