@@ -1588,6 +1588,7 @@ pub struct Kaleidotron {
     crop_presets: Vec<CropPreset>,  // named reusable crop rects (persisted)
     crop_preset_new: String,        // name buffer for "Save current crop"
     crop_preset_rename: Option<usize>, // preset being renamed inline
+    crop_presets_open: bool,        // show the inline presets panel (not a menu — text edits work)
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
@@ -2799,14 +2800,17 @@ impl Kaleidotron {
                     })
             })
             .unwrap_or_default();
-        // Apply order: current = [u8; 19]; fall back to the legacy [u8; 15] / [u8; 12]
-        // orders (with_order appends any ops that didn't exist when it was saved, so
-        // the 4 post-FX ops land at the end for an older config).
+        // Apply order: current = [u8; 21]; fall back to the legacy [u8; 20]/[19]/[15]/[12]
+        // orders (with_order appends any ops that didn't exist when it was saved, so a newer
+        // op like Resize lands in its default place for an older config).
         let mut adjust = cc
             .storage
             .and_then(|s| {
-                eframe::get_value::<[u8; 20]>(s, Self::ADJUST_ORDER_KEY)
+                eframe::get_value::<[u8; 21]>(s, Self::ADJUST_ORDER_KEY)
                     .map(|o| o.to_vec())
+                    .or_else(|| {
+                        eframe::get_value::<[u8; 20]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
+                    })
                     .or_else(|| {
                         eframe::get_value::<[u8; 19]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
                     })
@@ -3547,6 +3551,7 @@ impl Kaleidotron {
                 .unwrap_or_default(),
             crop_preset_new: String::new(),
             crop_preset_rename: None,
+            crop_presets_open: false,
             dither_method,
             dither_amount,
             dither_custom,
@@ -20616,7 +20621,7 @@ impl Kaleidotron {
                 px[3] = 255;
             }
         }
-        apply_pipeline(&mut work, tw, th, &self.adjust, &aux);
+        apply_pipeline(&mut work, tw, th, &self.adjust.order, &self.adjust, &aux);
         let grid = crate::thumb::ansi_shade_grid(
             &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
             self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
@@ -21124,12 +21129,22 @@ impl Kaleidotron {
             }
         });
         // Named crop presets (normalized → apply to any image): recall / save / rename / delete.
+        // Rendered INLINE (an egui menu closes when a TextEdit takes focus, so naming a preset
+        // was impossible in a flyout) behind a ▸/▾ toggle.
         let mut apply_rect: Option<[f32; 4]> = None;
         let mut delete_i: Option<usize> = None;
         let mut save_now = false;
         ui.horizontal(|ui| {
-            ui.label("Presets");
-            ui.menu_button("▾", |ui| {
+            let arrow = if self.crop_presets_open { "▾" } else { "▸" };
+            if ui
+                .button(format!("{arrow} Presets ({})", self.crop_presets.len()))
+                .clicked()
+            {
+                self.crop_presets_open = !self.crop_presets_open;
+            }
+        });
+        if self.crop_presets_open {
+            ui.indent("crop_presets", |ui| {
                 if self.crop_presets.is_empty() {
                     ui.weak("No saved crops yet");
                 }
@@ -21138,9 +21153,11 @@ impl Kaleidotron {
                         if self.crop_preset_rename == Some(i) {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.crop_presets[i].name)
-                                    .desired_width(110.0),
+                                    .desired_width(120.0),
                             );
-                            if ui.button("✓").clicked() || r.lost_focus() {
+                            if ui.button("✓").clicked()
+                                || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
                                 self.crop_preset_rename = None;
                             }
                         } else {
@@ -21150,7 +21167,6 @@ impl Kaleidotron {
                                 .clicked()
                             {
                                 apply_rect = Some(self.crop_presets[i].rect);
-                                ui.close();
                             }
                             if ui.small_button("✎").on_hover_text("Rename").clicked() {
                                 self.crop_preset_rename = Some(i);
@@ -21161,12 +21177,11 @@ impl Kaleidotron {
                         }
                     });
                 }
-                ui.separator();
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.crop_preset_new)
                             .hint_text("name")
-                            .desired_width(110.0),
+                            .desired_width(120.0),
                     );
                     if ui
                         .add_enabled(cropped, egui::Button::new("Save current"))
@@ -21174,11 +21189,10 @@ impl Kaleidotron {
                         .clicked()
                     {
                         save_now = true;
-                        ui.close();
                     }
                 });
             });
-        });
+        }
         if let Some(rect) = apply_rect {
             self.set_crop(path, clamp_crop(rect));
         }
@@ -23769,6 +23783,19 @@ impl Kaleidotron {
                                                 },
                                                 "RGB phosphor mask — set amount/size in the Post FX section; drag to reorder",
                                             ),
+                                            OpKind::Resize => (
+                                                if self.resize_active() {
+                                                    egui::RichText::new(format!(
+                                                        "Resize · {:.0}%",
+                                                        self.resize_fx * 100.0
+                                                    ))
+                                                    .strong()
+                                                    .color(active)
+                                                } else {
+                                                    egui::RichText::new("Resize (off)").weak()
+                                                },
+                                                "Resample split point — set width/height in the Resize section. Ops ABOVE run full-res; ops BELOW run at the reduced size. Drag to reorder.",
+                                            ),
                                             _ => unreachable!("non-marker in marker branch"),
                                         };
                                         ui.add_sized(
@@ -23879,7 +23906,7 @@ impl Kaleidotron {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 20]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 21]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -37456,12 +37483,18 @@ enum OpKind {
     /// Sharpen (blur → sharpen) it melts pixel-art jaggies into smooth solid islands — a
     /// no-scale XBR-ish "vectorize". Appended last so persisted op indices stay valid.
     Blur,
+    /// The Resize/resample SPLIT point. A marker op — the width/height/fraction live in the
+    /// Resize section, not on a slider. Ops BEFORE it in the order run at full resolution;
+    /// then the buffer is downscaled and ops AFTER it run at the reduced resolution. Placed
+    /// first by default (whole pipeline at low res, the legacy behavior); drag it later to run
+    /// some adjustments full-res before the downscale. Appended so persisted indices stay valid.
+    Resize,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
     /// so persisted order indices stay valid across upgrades.
-    const ALL: [OpKind; 20] = [
+    const ALL: [OpKind; 21] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -37482,6 +37515,7 @@ impl OpKind {
         OpKind::Vignette,
         OpKind::Phosphor,
         OpKind::Blur,
+        OpKind::Resize,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -37501,6 +37535,7 @@ impl OpKind {
                 | OpKind::Glow
                 | OpKind::Vignette
                 | OpKind::Phosphor
+                | OpKind::Resize
         )
     }
 
@@ -37529,6 +37564,7 @@ impl OpKind {
             OpKind::Vignette => ("Vignette", 0.0, 0.0, 0.0, 0.0),
             OpKind::Phosphor => ("Phosphor", 0.0, 0.0, 0.0, 0.0),
             OpKind::Blur => ("Blur", 0.0, 8.0, 0.0, 0.0),
+            OpKind::Resize => ("Resize", 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -37564,7 +37600,7 @@ struct Adjust {
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 20],
+    order: [OpKind; 21],
 }
 
 impl Default for Adjust {
@@ -37592,7 +37628,10 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 20] = [
+    const DEFAULT_ORDER: [OpKind; 21] = [
+        // Resize first by default: the whole pipeline runs at the reduced resolution (the
+        // legacy behavior). Drag it later to run earlier ops at full res before the downscale.
+        OpKind::Resize,
         OpKind::Pixelate,
         OpKind::Brightness,
         OpKind::Contrast,
@@ -37658,7 +37697,7 @@ impl Adjust {
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 20] {
+    fn order_to_u8(&self) -> [u8; 21] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -37684,7 +37723,19 @@ impl Adjust {
                 ops.push(op);
             }
         }
-        if let Ok(order) = <[OpKind; 20]>::try_from(ops) {
+        // An order saved before Resize existed gets it at the FRONT, preserving the legacy
+        // "resize wraps the whole pipeline" behavior; a saved order that already includes
+        // Resize keeps the user's chosen position.
+        if !arr
+            .iter()
+            .any(|&b| OpKind::from_u8(b) == Some(OpKind::Resize))
+        {
+            if let Some(i) = ops.iter().position(|o| *o == OpKind::Resize) {
+                let r = ops.remove(i);
+                ops.insert(0, r);
+            }
+        }
+        if let Ok(order) = <[OpKind; 21]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -37700,7 +37751,8 @@ impl Adjust {
             | OpKind::Scanlines
             | OpKind::Glow
             | OpKind::Vignette
-            | OpKind::Phosphor => {
+            | OpKind::Phosphor
+            | OpKind::Resize => {
                 unreachable!("marker ops have no slider value")
             }
             OpKind::Invert => &mut self.invert,
@@ -37803,9 +37855,12 @@ struct PipeAux<'a> {
 /// shifts channels, and `Palette` snaps to the active palette — each *wherever the
 /// user dragged it*. Transparent pixels are untouched; inactive ops are skipped, so
 /// order only matters among active ops.
-fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, a: &Adjust, aux: &PipeAux) {
-    for op in a.order {
+fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjust, aux: &PipeAux) {
+    for op in ops.iter().copied() {
         match op {
+            // The Resize marker is handled by the wrappers (they split the order around it and
+            // downscale between the halves) — here it's a no-op.
+            OpKind::Resize => {}
             OpKind::Pixelate => {
                 // Mosaic: average each bw×bh block (alpha untouched, so the sprite's
                 // silhouette stays crisp). Width = a.pixelate, height = aux.pixelate_h,
@@ -38533,11 +38588,22 @@ fn apply_pipeline_resized(
     // up-scales, so `tw>=w && th>=h` used to imply equality; fit-to-chars can now
     // exceed the source, so an exact-equality check is needed to still resample then.)
     if (tw == w && th == h) || tw == 0 || th == 0 || w == 0 || h == 0 {
-        apply_pipeline(rgba, w, h, a, aux);
+        apply_pipeline(rgba, w, h, &a.order, a, aux);
         return;
     }
+    // Split the order at the Resize marker: ops up to & including it run at FULL res, then the
+    // buffer is downscaled and the rest run at the reduced res. No marker → split at the front
+    // (downscale first, whole pipeline at low res — the legacy behavior).
+    let split = a
+        .order
+        .iter()
+        .position(|o| *o == OpKind::Resize)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let (pre, post) = a.order.split_at(split);
+    apply_pipeline(rgba, w, h, pre, a, aux);
     let mut small = crate::thumb::box_downscale(rgba, w, h, tw, th);
-    apply_pipeline(&mut small, tw, th, a, aux);
+    apply_pipeline(&mut small, tw, th, post, a, aux);
     // Nearest-neighbor upscale small (tw×th) back into rgba (w×h): each dest pixel
     // samples the source cell it falls in, so reduced pixels become solid blocks.
     for y in 0..h {
@@ -38599,6 +38665,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
         rgba,
         w,
         h,
+        &a.order,
         a,
         &PipeAux {
             dither_method: 0,
@@ -38750,7 +38817,8 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
         | OpKind::Scanlines
         | OpKind::Glow
         | OpKind::Vignette
-        | OpKind::Phosphor => {}
+        | OpKind::Phosphor
+        | OpKind::Resize => {}
     }
 }
 
@@ -46879,7 +46947,7 @@ fn build_ansi_grid_from_preset(
             px[3] = 255;
         }
     }
-    apply_pipeline(&mut work, tw, th, &adjust, &aux);
+    apply_pipeline(&mut work, tw, th, &adjust.order, &adjust, &aux);
     let grid = crate::thumb::ansi_shade_grid(
         &work, tw, th, palette, cw, ch_, p.shade_f1, p.shade_f2, p.shade_f3, p.shade_half,
         p.shade_f1_on, p.shade_f2_on, p.shade_f3_on, p.shade_half_on, p.shade_half_use,
@@ -49057,6 +49125,7 @@ mod tests {
             OpKind::Vignette,
             OpKind::Phosphor,
             OpKind::Blur,
+            OpKind::Resize,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -49109,6 +49178,7 @@ mod tests {
                 OpKind::Vignette,
                 OpKind::Phosphor,
                 OpKind::Blur,
+                OpKind::Resize,
             ],
             ..Default::default()
         };
@@ -49145,7 +49215,7 @@ mod tests {
             skip_dither_palette: false,
         };
         let mut last = vec![10u8, 20, 30, 255];
-        apply_pipeline(&mut last, 1, 1, &a, &aux);
+        apply_pipeline(&mut last, 1, 1, &a.order, &a, &aux);
         assert_eq!(&last[0..3], &[100, 0, 0], "remap last wins outright");
         // Palette FIRST: remap to red=100, THEN brightness lifts it above 100.
         // (Palette is no longer last — 4 inactive post-FX ops trail it — so rotate the
@@ -49154,7 +49224,7 @@ mod tests {
         let pos = b.order.iter().position(|o| *o == OpKind::Palette).unwrap();
         b.order.rotate_left(pos);
         let mut first = vec![10u8, 20, 30, 255];
-        apply_pipeline(&mut first, 1, 1, &b, &aux);
+        apply_pipeline(&mut first, 1, 1, &b.order, &b, &aux);
         assert!(
             first[0] > 100,
             "brightness after remap lifts the red channel"
@@ -49354,6 +49424,27 @@ mod tests {
         let copy = same.clone();
         apply_pipeline_resized(&mut same, 2, 1, 2, 1, &a, &aux);
         assert_eq!(same, copy, "tw==w ⇒ plain pipeline, no resample");
+
+        // The Resize MARKER's position moves the split: a spatial op (Sharpen) run before the
+        // downscale (marker later) differs from running it after (marker first) — proving ops
+        // above the marker are full-res and ops below are reduced-res.
+        let base = Adjust { sharpen: 4.0, ..Default::default() };
+        let src = [0u8, 0, 0, 255, 80, 80, 80, 255, 160, 160, 160, 255, 240, 240, 240, 255];
+        // Marker first (default) → Sharpen runs at the reduced 2×1 res.
+        let mut r_first = src.to_vec();
+        apply_pipeline_resized(&mut r_first, 4, 1, 2, 1, &base, &aux);
+        // Marker moved to the end → Sharpen runs at full 4×1 res, then downscale.
+        let mut ops: Vec<u8> = base
+            .order
+            .iter()
+            .map(|o| *o as u8)
+            .filter(|&b| b != OpKind::Resize as u8)
+            .collect();
+        ops.push(OpKind::Resize as u8);
+        let sharp_full = base.with_order(&ops);
+        let mut r_last = src.to_vec();
+        apply_pipeline_resized(&mut r_last, 4, 1, 2, 1, &sharp_full, &aux);
+        assert_ne!(r_first, r_last, "the Resize marker's position changes the result");
     }
 
     #[test]
