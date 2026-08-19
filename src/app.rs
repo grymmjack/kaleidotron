@@ -24158,6 +24158,23 @@ impl Kaleidotron {
                                 middle_reset(ui, &r, &mut fx.glow_radius, 3.0f32);
                                 wheel_adjust(ui, &r, &mut fx.glow_radius, 1.0, 1.0f32, 16.0f32);
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("Contour");
+                                const NAMES: [&str; 8] = [
+                                    "Linear", "Cone", "Cone inv", "Gaussian", "Half round",
+                                    "Ring", "Ring ×2", "Sawtooth",
+                                ];
+                                let cur = fx.glow_contour.min(7) as usize;
+                                egui::ComboBox::from_id_salt("glow_contour")
+                                    .selected_text(NAMES[cur])
+                                    .show_ui(ui, |ui| {
+                                        for (i, n) in NAMES.iter().enumerate() {
+                                            ui.selectable_value(&mut fx.glow_contour, i as u8, *n);
+                                        }
+                                    });
+                            })
+                            .response
+                            .on_hover_text("Reshape the bloom falloff (Photoshop-style contour)");
 
                             // --- Vignette ---
                             ui.add_space(4.0);
@@ -37877,6 +37894,7 @@ struct PostFx {
     scan_thick: u32,     // scanline THICKNESS in px (≥1; clamped below the spacing)
     glow_amt: f32,       // phosphor bloom strength 0..2
     glow_radius: f32,    // bloom radius in px (≥1)
+    glow_contour: u8,    // bloom falloff profile (Photoshop-style contour): 0 linear … 7 sawtooth
     vig_amt: f32,        // vignette darkness 0..1
     vig_feather: f32,    // where the darkening starts (0 = center, 1 = only corners)
     phos_amt: f32,       // phosphor RGB-mask strength 0..1
@@ -37893,6 +37911,7 @@ impl Default for PostFx {
             scan_thick: 1,
             glow_amt: 0.0,
             glow_radius: 3.0,
+            glow_contour: 0,
             vig_amt: 0.0,
             vig_feather: 0.35,
             phos_amt: 0.0,
@@ -37909,7 +37928,7 @@ impl PostFx {
     /// A compact cache key: fold every parameter in so any change invalidates the caches.
     fn key(&self) -> String {
         format!(
-            "S{:.2}:{}:{}:{},{},{}:t{}|G{:.2}:{:.1}|V{:.2}:{:.2}|P{:.2}:{}",
+            "S{:.2}:{}:{}:{},{},{}:t{}|G{:.2}:{:.1}:c{}|V{:.2}:{:.2}|P{:.2}:{}",
             self.scan_amt,
             self.scan_period,
             self.scan_dir,
@@ -37919,6 +37938,7 @@ impl PostFx {
             self.scan_thick,
             self.glow_amt,
             self.glow_radius,
+            self.glow_contour,
             self.vig_amt,
             self.vig_feather,
             self.phos_amt,
@@ -37942,6 +37962,7 @@ impl PostFx {
             self.phos_amt,
             self.phos_size as f32,
             self.scan_thick as f32,
+            self.glow_contour as f32,
         ]
     }
     fn from_record(v: &[f32]) -> Self {
@@ -37960,6 +37981,7 @@ impl PostFx {
             phos_amt: g(10, d.phos_amt),
             phos_size: g(11, d.phos_size as f32).max(1.0) as u32,
             scan_thick: g(12, d.scan_thick as f32).max(1.0) as u32,
+            glow_contour: g(13, d.glow_contour as f32) as u8,
         }
     }
 }
@@ -38385,14 +38407,44 @@ fn apply_glow(rgba: &mut [u8], w: usize, h: usize, fx: &PostFx) {
     box_blur_rgb(&mut bright, w, h, radius);
     box_blur_rgb(&mut bright, w, h, radius); // twice ≈ a smoother (gaussian-ish) bloom
     let amt = fx.glow_amt.clamp(0.0, 2.0);
+    let contour = fx.glow_contour;
     for p in 0..w * h {
         if rgba[p * 4 + 3] == 0 {
             continue;
         }
+        // Reshape the bloom's falloff by the selected contour (Linear = no change). `t` is the
+        // blurred bloom's intensity (0..1); the contour remaps it, and the colour is rescaled
+        // to that new envelope while keeping its hue.
+        let bloom = bright[p];
+        let inten = (0.299 * bloom[0] + 0.587 * bloom[1] + 0.114 * bloom[2]) / 255.0;
+        let t = inten.clamp(0.0, 1.0);
+        let scale = if contour == 0 {
+            1.0
+        } else {
+            glow_contour_map(contour, t) / t.max(1e-3)
+        };
         for c in 0..3 {
-            let v = rgba[p * 4 + c] as f32 + bright[p][c] * amt;
+            let v = rgba[p * 4 + c] as f32 + bloom[c] * scale * amt;
             rgba[p * 4 + c] = v.clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+/// Photoshop-style Glow "contour": remap the bloom intensity `t` (0..1) → shaped 0..1 to
+/// reshape the falloff. 0 Linear, 1 Cone, 2 Cone inverted, 3 Gaussian, 4 Half round, 5 Ring,
+/// 6 Ring double, 7 Sawtooth (concentric bands).
+fn glow_contour_map(kind: u8, t: f32) -> f32 {
+    use std::f32::consts::PI;
+    let t = t.clamp(0.0, 1.0);
+    match kind {
+        1 => t * t,                                   // Cone — sharp core, fast falloff
+        2 => t.sqrt(),                                // Cone inverted — soft, wide
+        3 => (-((t - 0.5) * (t - 0.5)) / 0.045).exp(), // Gaussian — mid-weighted halo
+        4 => (1.0 - (1.0 - t) * (1.0 - t)).sqrt(),    // Half round — rounded rise
+        5 => (PI * t).sin(),                          // Ring — a single band
+        6 => (2.0 * PI * t).sin().abs(),              // Ring double — two bands
+        7 => (t * 4.0).fract(),                       // Sawtooth — concentric rings
+        _ => t,                                       // Linear
     }
 }
 
@@ -49147,6 +49199,7 @@ mod tests {
             scan_thick: 2,
             glow_amt: 1.2,
             glow_radius: 5.0,
+            glow_contour: 5,
             vig_amt: 0.6,
             vig_feather: 0.4,
             phos_amt: 0.3,
