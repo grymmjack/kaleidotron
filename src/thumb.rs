@@ -1849,18 +1849,34 @@ pub fn petscii_pass(
 }
 
 // ── ASCII (character-density) converter ─────────────────────────────────────────
-// Maps image brightness to CP437 glyphs on a coverage-sorted ramp. The ramp is built
-// from whichever character ranges the user enables — printable 32–126 is always in,
-// control 0–31 and high 128–255 are optional (the high range brings the ░▒▓█ shade
-// blocks, which fill out the dark end of the ramp). Produces an `AnsiGrid`, so it
-// rides the same render + `.ans`/`.xb`/`.tnd` export as ANSI Shade.
+// Maps image brightness to CP437 glyphs on a coverage-sorted ramp. The glyph pool is
+// chosen by the user: either an EXPLICIT set typed into "Use only chars" (e.g. .oOX$),
+// or a union of character categories — printable 32–126 is always in, plus optional
+// High ASCII 128–255, Control 0–31, Blocks (░▒▓█ + half/quarter blocks) and Box drawing.
+// Produces an `AnsiGrid`, so it rides the same render + `.ans`/`.xb`/`.tnd` export as
+// ANSI Shade.
+
+/// The CP437 block / shade glyphs (space handled separately): light/medium/dark shades,
+/// the full block, and the half/quarter blocks + solid square.
+const ASCII_BLOCK_GLYPHS: [u8; 9] = [176, 177, 178, 219, 220, 221, 222, 223, 254];
+
+/// The glyph pool selection for the ASCII converter. When `only` is non-empty it is used
+/// verbatim (the typed characters); otherwise the enabled category ranges are unioned.
+#[derive(Clone, Default)]
+pub struct AsciiCharset {
+    pub only: Vec<u8>,   // explicit CP437 glyph pool ("Use only chars"); overrides the ranges
+    pub high: bool,      // 128..=255 (CP437 extended)
+    pub control: bool,   // 0..=31 (control-code glyphs)
+    pub blocks: bool,    // the ░▒▓█ + half/quarter block set (even when High ASCII is off)
+    pub box_draw: bool,  // 179..=218 (box-drawing lines)
+}
 
 /// Build the light→dark ASCII ramp: `(glyph, coverage)` pairs sorted by ink coverage
-/// (fraction of set pixels in the render font), one representative glyph per distinct
-/// coverage level. Printable ASCII wins ties (so classic glyphs are preferred over a
-/// control/high glyph of equal density). `font_8x8` selects which CP437 font the
-/// coverage is measured from, so it matches the renderer.
-pub fn ascii_ramp(high: bool, control: bool, font_8x8: bool) -> Vec<(u8, f32)> {
+/// (fraction of set pixels in the render font). For the category-based pool one
+/// representative glyph is kept per distinct coverage level (printable ASCII wins ties);
+/// an explicit "only" set keeps every typed glyph. `font_8x8` selects which CP437 font
+/// the coverage is measured from, so it matches the renderer.
+pub fn ascii_ramp(cs: &AsciiCharset, font_8x8: bool) -> Vec<(u8, f32)> {
     let total = if font_8x8 { 64.0 } else { 8.0 * 16.0 };
     let cov = |code: u8| -> f32 {
         let bits: u32 = if font_8x8 {
@@ -1870,13 +1886,25 @@ pub fn ascii_ramp(high: bool, control: bool, font_8x8: bool) -> Vec<(u8, f32)> {
         };
         bits as f32 / total
     };
-    // Preference order: printable ASCII first, then high, then control — first glyph
-    // seen for a given (quantized) coverage wins.
+    // Explicit set: use exactly the typed glyphs, sorted by coverage, no dedup.
+    if !cs.only.is_empty() {
+        let mut ramp: Vec<(u8, f32)> = cs.only.iter().map(|&c| (c, cov(c))).collect();
+        ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        return ramp;
+    }
+    // Category union, in a preference order (first glyph seen for a coverage bucket wins):
+    // printable ASCII, then blocks, box-drawing, high, control.
     let mut order: Vec<u8> = (32u8..=126).collect();
-    if high {
+    if cs.blocks {
+        order.extend(ASCII_BLOCK_GLYPHS);
+    }
+    if cs.box_draw {
+        order.extend(179u8..=218);
+    }
+    if cs.high {
         order.extend(127u8..=255);
     }
-    if control {
+    if cs.control {
         order.extend(0u8..=31);
     }
     let mut seen: std::collections::HashMap<u16, (u8, f32)> = std::collections::HashMap::new();
@@ -1897,7 +1925,7 @@ pub fn ascii_ramp(high: bool, control: bool, font_8x8: bool) -> Vec<(u8, f32)> {
 /// Analyse `rgba` (w×h) into an ASCII [`AnsiGrid`]: per `cell_w`×`cell_h` cell, pick the
 /// ramp glyph whose coverage matches the cell's darkness, and colour it from `palette`
 /// (per-cell nearest when `color`, else a fixed brightest-on-darkest monochrome). The
-/// glyph pool follows `high`/`control` (see [`ascii_ramp`]).
+/// glyph pool follows `cs` (see [`ascii_ramp`]).
 #[allow(clippy::too_many_arguments)]
 pub fn ascii_grid(
     rgba: &[u8],
@@ -1906,8 +1934,7 @@ pub fn ascii_grid(
     palette: &[[u8; 4]],
     cell_w: usize,
     cell_h: usize,
-    high: bool,
-    control: bool,
+    cs: &AsciiCharset,
     color: bool,
     font_8x8: bool,
 ) -> AnsiGrid {
@@ -1920,7 +1947,10 @@ pub fn ascii_grid(
         cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
         return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells };
     }
-    let ramp = ascii_ramp(high, control, font_8x8);
+    let mut ramp = ascii_ramp(cs, font_8x8);
+    if ramp.is_empty() {
+        ramp.push((32, 0.0)); // a stray empty "only" set → all blank rather than a panic
+    }
     // Fixed monochrome ink/paper: brightest + darkest palette entries.
     let paper = nearest_index([0, 0, 0], palette);
     let ink = nearest_index([255, 255, 255], palette);
@@ -1978,15 +2008,14 @@ pub fn ascii_pass(
     palette: &[[u8; 4]],
     cell_w: usize,
     cell_h: usize,
-    high: bool,
-    control: bool,
+    cs: &AsciiCharset,
     color: bool,
     font_8x8: bool,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, high, control, color, font_8x8);
+    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, font_8x8);
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
 
@@ -2110,14 +2139,23 @@ mod tests {
     fn ascii_ramp_spans_blank_to_full() {
         // The ramp is coverage-sorted: lightest (space, 0.0) first. With High ASCII on it
         // reaches the full block █ (CP437 219, coverage 1.0) at the dark end.
-        let ramp = ascii_ramp(true, false, true);
+        let hi = AsciiCharset { high: true, ..Default::default() };
+        let ramp = ascii_ramp(&hi, true);
         assert_eq!(ramp.first().unwrap().1, 0.0, "lightest is a blank");
         let (dark_glyph, dark_cov) = *ramp.last().unwrap();
         assert!(dark_cov > 0.9, "darkest ramp entry is nearly full ink");
         assert_eq!(dark_glyph, 219, "the full block anchors the dark end");
         // Without High ASCII the block glyphs are gone, so the dark end is lighter.
-        let low = ascii_ramp(false, false, true);
+        let low = ascii_ramp(&AsciiCharset::default(), true);
         assert!(low.last().unwrap().1 < 0.9, "printable-only ramp can't reach solid");
+        // Blocks category brings the full block back even with High ASCII off.
+        let blk = AsciiCharset { blocks: true, ..Default::default() };
+        assert_eq!(ascii_ramp(&blk, true).last().unwrap().0, 219, "Blocks adds the full block");
+        // "Use only chars" uses exactly the typed set, coverage-sorted.
+        let only = AsciiCharset { only: b" .oOX".to_vec(), ..Default::default() };
+        let r = ascii_ramp(&only, true);
+        assert_eq!(r.len(), 5, "every typed glyph kept");
+        assert_eq!(r.first().unwrap().0, b' ', "space is lightest");
     }
 
     #[test]
@@ -2133,7 +2171,8 @@ mod tests {
                 rgba[o..o + 4].copy_from_slice(&[c, c, c, 255]);
             }
         }
-        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, true, false, false, true);
+        let cs = AsciiCharset { high: true, ..Default::default() };
+        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, true);
         assert_eq!(grid.cols, 2);
         let left = grid.cells[0];
         let right = grid.cells[1];

@@ -1642,10 +1642,13 @@ pub struct Kaleidotron {
     petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
     petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
     petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
-    // ASCII converter (DITHER_ASCII): brightness→glyph over an enabled character range.
-    ascii_high: bool,    // include high ASCII (128..255 — brings the ░▒▓█ blocks)
+    // ASCII converter (DITHER_ASCII): brightness→glyph over a chosen character pool.
+    ascii_high: bool,    // include high ASCII (128..255 — CP437 extended)
     ascii_control: bool, // include control chars (0..31)
+    ascii_blocks: bool,  // include the ░▒▓█ + half/quarter block glyphs
+    ascii_box: bool,     // include box-drawing glyphs (179..218)
     ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
+    ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2444,7 +2447,7 @@ impl Kaleidotron {
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
-    const ASCII_KEY: &'static str = "ascii"; // (high, control, color)
+    const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3114,11 +3117,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::PETSCII_KEY))
             .unwrap_or((40, 25, 1.0, 0, true, 0, 0));
-        // ASCII settings (high-range, control-range, per-cell colour).
-        let ascii: (bool, bool, bool) = cc
+        // ASCII settings (high, control, colour, blocks, box-draw, "use only" chars).
+        let ascii: (bool, bool, bool, bool, bool, String) = cc
             .storage
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
-            .unwrap_or((true, false, true));
+            .unwrap_or((true, false, true, false, false, String::new()));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3626,6 +3629,9 @@ impl Kaleidotron {
             ascii_high: ascii.0,
             ascii_control: ascii.1,
             ascii_color: ascii.2,
+            ascii_blocks: ascii.3,
+            ascii_box: ascii.4,
+            ascii_chars: ascii.5,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19764,8 +19770,7 @@ impl Kaleidotron {
                 Some(self.petscii_bg & 15)
             },
             petscii_pal: self.petscii_pal(),
-            ascii_high: self.ascii_high,
-            ascii_control: self.ascii_control,
+            ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
@@ -20183,10 +20188,13 @@ impl Kaleidotron {
             // the range toggles + colour AND the fit/cell state that sets the working resolution.
             + &if self.dither_method == crate::thumb::DITHER_ASCII {
                 format!(
-                    "|Ah{}:c{}:col{}:v{}:s{}|Fit{}:{}x{}",
+                    "|Ah{}:c{}:bl{}:bx{}:col{}:only{}:v{}:s{}|Fit{}:{}x{}",
                     self.ascii_high as u8,
                     self.ascii_control as u8,
+                    self.ascii_blocks as u8,
+                    self.ascii_box as u8,
                     self.ascii_color as u8,
+                    self.ascii_chars,
                     self.shade_vga50 as u8,
                     self.shade_snap916 as u8,
                     self.shade_fit_chars as u8,
@@ -20473,8 +20481,7 @@ impl Kaleidotron {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
-            ascii_high: true,
-            ascii_control: false,
+            ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -20791,6 +20798,18 @@ impl Kaleidotron {
         crate::decode::petscii_palette(self.petscii_palette)
     }
 
+    /// The ASCII glyph-pool selection (categories + the "Use only chars" set resolved to
+    /// CP437 bytes). Shared by the preview, the pipeline pass, and export.
+    fn ascii_charset(&self) -> crate::thumb::AsciiCharset {
+        crate::thumb::AsciiCharset {
+            only: resolve_ascii_chars(&self.ascii_chars),
+            high: self.ascii_high,
+            control: self.ascii_control,
+            blocks: self.ascii_blocks,
+            box_draw: self.ascii_box,
+        }
+    }
+
     /// Point the quantize palette selection at the bundled `.GPL` matching the current PETSCII
     /// palette (petmate/colodore/pepto/vice). The converter brings its own colours, but selecting
     /// the matching palette here (a) makes the "Export textmode"/Save buttons appear — they're
@@ -20876,8 +20895,7 @@ impl Kaleidotron {
         // render/export path); they differ only in the cell→glyph decision.
         let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
             crate::thumb::ascii_grid(
-                &work, tw, th, palette, cw, ch_, self.ascii_high, self.ascii_control,
-                self.ascii_color, font_8x8,
+                &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color, font_8x8,
             )
         } else {
             crate::thumb::ansi_shade_grid(
@@ -25209,15 +25227,39 @@ impl Kaleidotron {
                             ui.label(egui::RichText::new("ASCII").strong());
                             ui.weak("brightness → character density");
                         });
-                        // Character ranges. Printable 32–126 is always in the pool; High ASCII
-                        // adds 128–255 (the ░▒▓█ blocks fill out the dark end) and Control adds 0–31.
+                        // "Use only chars": type an exact glyph set (e.g. " .oOX$") — when it has
+                        // any resolvable glyphs it OVERRIDES the category toggles below.
+                        let only_active = !resolve_ascii_chars(&self.ascii_chars).is_empty();
                         ui.horizontal(|ui| {
-                            ui.label("Chars");
-                            ui.weak("32–126");
-                            ui.checkbox(&mut self.ascii_high, "High ASCII")
-                                .on_hover_text("Include 128–255 (CP437 extended — brings the ░▒▓█ shade blocks)");
-                            ui.checkbox(&mut self.ascii_control, "Control")
-                                .on_hover_text("Include control chars 0–31 (their CP437 glyphs)");
+                            ui.label("Use only chars")
+                                .on_hover_text("Build the ramp from exactly these characters (light→dark by ink). Overrides the ranges. Leave empty to use the categories.");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ascii_chars)
+                                    .hint_text(" .:oO0X$#@")
+                                    .desired_width(150.0),
+                            );
+                            if !self.ascii_chars.is_empty() && ui.small_button("✖").clicked() {
+                                self.ascii_chars.clear();
+                            }
+                        });
+                        // Character categories (ignored while "Use only chars" is active). Printable
+                        // 32–126 is always in the pool; the toggles union in more glyphs.
+                        ui.add_enabled_ui(!only_active, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Chars");
+                                ui.weak("32–126");
+                                ui.checkbox(&mut self.ascii_high, "High")
+                                    .on_hover_text("Include 128–255 (all CP437 extended)");
+                                ui.checkbox(&mut self.ascii_control, "Control")
+                                    .on_hover_text("Include control chars 0–31 (their CP437 glyphs)");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("     ");
+                                ui.checkbox(&mut self.ascii_blocks, "Blocks")
+                                    .on_hover_text("Include the ░▒▓█ shade + half/quarter block glyphs");
+                                ui.checkbox(&mut self.ascii_box, "Box Drawing")
+                                    .on_hover_text("Include the ─│┌┐└┘├┤┬┴┼ box-drawing glyphs");
+                            });
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.ascii_color, "Color")
@@ -37509,7 +37551,14 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(
             storage,
             Self::ASCII_KEY,
-            &(self.ascii_high, self.ascii_control, self.ascii_color),
+            &(
+                self.ascii_high,
+                self.ascii_control,
+                self.ascii_color,
+                self.ascii_blocks,
+                self.ascii_box,
+                self.ascii_chars.clone(),
+            ),
         );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
@@ -37766,6 +37815,37 @@ fn to_gpl(name: &str, palette: &[[u8; 4]]) -> String {
 /// Virtual `PathBuf`s for the palettes baked into the binary (see
 /// `palettes_builtin`). They live under a sentinel root and never exist on disk;
 /// `load_gpl` resolves their contents from the embedded table.
+/// Resolve a user-typed "Use only chars" string into CP437 glyph bytes. Printable ASCII
+/// maps directly; the common CP437 block/shade/box Unicode glyphs are mapped so pasting
+/// ░▒▓█ etc. works too. Anything unmappable is skipped. Duplicates and whitespace-run are
+/// preserved as-is (a leading space is a valid "light" glyph the user may want).
+fn resolve_ascii_chars(s: &str) -> Vec<u8> {
+    let cp437 = |c: char| -> Option<u8> {
+        match c {
+            ' '..='~' => Some(c as u8), // printable ASCII
+            '░' => Some(176),
+            '▒' => Some(177),
+            '▓' => Some(178),
+            '█' => Some(219),
+            '▄' => Some(220),
+            '▌' => Some(221),
+            '▐' => Some(222),
+            '▀' => Some(223),
+            '■' => Some(254),
+            '∙' | '·' => Some(249),
+            '─' => Some(196),
+            '│' => Some(179),
+            '┌' => Some(218),
+            '┐' => Some(191),
+            '└' => Some(192),
+            '┘' => Some(217),
+            '┼' => Some(197),
+            _ => None,
+        }
+    };
+    s.chars().filter_map(cp437).collect()
+}
+
 fn builtin_palette_paths() -> Vec<PathBuf> {
     let root = Path::new(crate::palettes_builtin::BUILTIN_ROOT);
     crate::palettes_builtin::BUILTIN_PALETTES
@@ -38482,8 +38562,7 @@ struct PipeAux<'a> {
     petscii_bg: Option<u8>,
     petscii_pal: &'static [[u8; 4]; 16],
     // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
-    ascii_high: bool,
-    ascii_control: bool,
+    ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
@@ -38557,8 +38636,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             p,
                             aux.shade_cw,
                             aux.shade_ch,
-                            aux.ascii_high,
-                            aux.ascii_control,
+                            &aux.ascii_cs,
                             aux.ascii_color,
                             aux.font_8x8,
                         );
@@ -39373,8 +39451,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
-            ascii_high: true,
-            ascii_control: false,
+            ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -47654,8 +47731,7 @@ fn preset_pipe_aux<'a>(
         petscii_purity: 1.0,
         petscii_bg: None,
         petscii_pal: crate::decode::petscii_palette(0),
-        ascii_high: true,
-        ascii_control: false,
+        ascii_cs: crate::thumb::AsciiCharset::default(),
         ascii_color: true,
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
@@ -49970,8 +50046,7 @@ mod tests {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
-            ascii_high: true,
-            ascii_control: false,
+            ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -50170,8 +50245,7 @@ mod tests {
             petscii_purity: 1.0,
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
-            ascii_high: true,
-            ascii_control: false,
+            ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
