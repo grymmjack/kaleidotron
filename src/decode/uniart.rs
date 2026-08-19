@@ -9,7 +9,7 @@ use ab_glyph::{Font, FontRef, ScaleFont};
 use std::sync::OnceLock;
 
 const FONT: &[u8] = include_bytes!("../../assets/fonts/DejaVuSansMono.ttf");
-const CELL_W: usize = 8;
+const CELL_W: usize = 9;
 const CELL_H: usize = 16;
 
 // Range bit flags (also the checkbox order) + their inclusive codepoint spans.
@@ -32,13 +32,15 @@ pub const RANGES: [(&str, u8, (u32, u32)); 5] = [
 /// a parallel `char` list. A leading blank (space) anchors the ramp's light end.
 fn rasterize(mask: u8) -> (GlyphFont, Vec<char>) {
     let font = FontRef::try_from_slice(FONT).expect("bundled DejaVu is a valid font");
-    // Scale so the em's line height maps to the 8×16 cell (box-drawing glyphs then fill the cell,
-    // so their rules meet at the edges); position each glyph on the baseline.
+    // Scale so the em's line height maps to the cell (block glyphs then fill it — the ramp's dark
+    // end). The 9-wide cell gives DejaVu's ~8.3px advance a little breathing room so box-drawing
+    // and diagonal glyphs don't clip on the right; a small x nudge centres them.
     let probe = font.as_scaled(ab_glyph::PxScale::from(CELL_H as f32));
     let factor = CELL_H as f32 / probe.height().max(1.0);
     let scale = ab_glyph::PxScale::from(CELL_H as f32 * factor);
     let sf = font.as_scaled(scale);
     let baseline = sf.ascent();
+    let pen_x = ((CELL_W as f32 - sf.h_advance(font.glyph_id('█'))) * 0.5).max(0.0);
 
     let mut glyphs: Vec<Vec<u32>> = vec![vec![0u32; CELL_H]]; // glyph 0 = blank
     let mut chars: Vec<char> = vec![' '];
@@ -51,7 +53,7 @@ fn rasterize(mask: u8) -> (GlyphFont, Vec<char>) {
             let mut rows = vec![0u32; CELL_H];
             let g = font
                 .glyph_id(ch)
-                .with_scale_and_position(scale, ab_glyph::point(0.0, baseline));
+                .with_scale_and_position(scale, ab_glyph::point(pen_x, baseline));
             if let Some(o) = font.outline_glyph(g) {
                 let bb = o.px_bounds();
                 o.draw(|x, y, c| {
