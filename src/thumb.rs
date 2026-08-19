@@ -978,8 +978,25 @@ pub fn ansi_shade_grid(
                     // half-block instead of grey mush. Scaled by the "Detail" weight AND each
                     // glyph's usage, so Detail dials retention globally and F5–F8 per
                     // direction; the flat ±bias still shifts the baseline.
-                    let contrast = dist2(fg_avg, bg_avg);
-                    let bias = (use_i - 0.5) * 2.0 * max_threshold + use_i * detail * contrast;
+                    // Two NORMALISED (0..1) factors gate the retention reward so no Detail
+                    // setting can manufacture the white speckle a raw reward produced:
+                    //  • `contrast` — the sub-cell top/bottom (or left/right) spread as a
+                    //    fraction of the largest possible RGB spread. A stray-pixel cell has
+                    //    little spread; a true edge has a lot.
+                    //  • `need` — how badly a flat SOLID represents this cell (its `solid_err`
+                    //    relative to the palette spacing). A near-flat cell a solid already
+                    //    nails earns ~0 reward, so a few bright pixels can't force a black/white
+                    //    half-block; a cell a solid genuinely fails (a real edge) earns the full
+                    //    reward and snaps to a crisp half-block.
+                    // Their product, scaled by `max_threshold`, keeps the reward bounded to
+                    // ~detail·max_threshold — enough to win genuine edges, never enough to swamp
+                    // a poor colour match. (The old `detail * raw_dist2` was unbounded — Detail=5
+                    // times a ~195 075 distance dwarfed the match error and speckled the flats.)
+                    const MAX_DIST2: f32 = 3.0 * 255.0 * 255.0;
+                    let contrast = (dist2(fg_avg, bg_avg) / MAX_DIST2).min(1.0);
+                    let need = (solid_err / (max_threshold * 4.0)).min(1.0);
+                    let bias = (use_i - 0.5) * 2.0 * max_threshold
+                        + use_i * detail * contrast * need * max_threshold * 6.0;
                     let err_eff = err - bias;
                     if err_eff < hb_err {
                         hb_err = err_eff;
@@ -1684,6 +1701,58 @@ mod tests {
             !matches!(g_off.cells[0].ch, 220 | 223),
             "horizontal half-blocks disabled, yet got {}",
             g_off.cells[0].ch
+        );
+    }
+
+    #[test]
+    fn ansi_shade_max_detail_retains_true_edges_but_not_near_flat_speckle() {
+        // Regression for the white-speckle bug: at MAX Detail (5.0) the retention reward is
+        // now bounded and gated by how badly a flat solid represents the cell, so a genuine
+        // edge still snaps to a crisp half-block, but a mild near-flat cell (one a solid
+        // nails) is NOT forced into a bright half-block. The old `detail * raw_dist2` reward
+        // was unbounded — Detail=5 flipped almost any faint imbalance to a black/white
+        // half-block, stippling the dark flats.
+        let palette: Vec<[u8; 4]> = vec![
+            [0, 0, 0, 255],
+            [64, 64, 64, 255],
+            [128, 128, 128, 255],
+            [192, 192, 192, 255],
+            [255, 255, 255, 255],
+        ];
+        let cell = |top: u8, bot: u8| -> AnsiCell {
+            let (w, h) = (9usize, 16usize);
+            let mut rgba = vec![0u8; w * h * 4];
+            for y in 0..h {
+                let v = if y < 8 { top } else { bot };
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    rgba[i] = v;
+                    rgba[i + 1] = v;
+                    rgba[i + 2] = v;
+                    rgba[i + 3] = 255;
+                }
+            }
+            // Detail = 5.0 (max), half-blocks on at neutral usage, full shade search.
+            let g = ansi_shade_grid(
+                &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
+                [true; 4], [0.5; 4], 1.0, true, 0.0, 5.0,
+            );
+            g.cells[0]
+        };
+        // Strong edge (white over black): a half-block is the crisp answer — still retained.
+        let strong = cell(255, 0);
+        assert!(
+            matches!(strong.ch, 220 | 223),
+            "a true white/black edge must stay a half-block even at max Detail, got glyph {}",
+            strong.ch
+        );
+        // Mild near-flat edge (dark 100 over dark 50): a solid dark represents it well, so at
+        // max Detail it must NOT be forced into a (brighter) half-block — the speckle case.
+        let mild = cell(100, 50);
+        assert!(
+            !matches!(mild.ch, 220 | 221 | 222 | 223),
+            "a near-flat dark cell must not speckle into a half-block at max Detail, got glyph {}",
+            mild.ch
         );
     }
 

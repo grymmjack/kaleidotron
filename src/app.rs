@@ -20541,28 +20541,14 @@ impl Kaleidotron {
             if let Some(pal) = palette {
                 let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
                 crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8);
-                // Fit-to-chars: show the grid at its NATURAL cols·cell_w × rows·cell_h px,
-                // so the ANSI is genuinely redrawn at the smaller character grid (and the
-                // character ruler, which reads the displayed texture's size, reports the
-                // real cols×rows) — not upscaled back to full res, which just looked
-                // pixelated at the same footprint. Any OTHER resize (the Resize slider)
-                // keeps the old behaviour: nearest-upscale back to w×h so the on-screen
-                // size stays put while detail drops.
-                let (disp, disp_size) = if self.shade_fit_chars || (tw == w && th == h) {
-                    (work, [tw, th])
-                } else {
-                    let mut d = vec![0u8; w * h * 4];
-                    for y in 0..h {
-                        let sy = y * th / h;
-                        for x in 0..w {
-                            let sx = x * tw / w;
-                            let s = (sy * tw + sx) * 4;
-                            let o = (y * w + x) * 4;
-                            d[o..o + 4].copy_from_slice(&work[s..s + 4]);
-                        }
-                    }
-                    (d, [w, h])
-                };
+                // ANSI is a CHARACTER GRID: always show its cells at their true
+                // cols·cell_w × rows·cell_h px, whatever set the working resolution
+                // (Fit-to-chars OR the Resize slider). Fewer cells → a genuinely SMALLER
+                // piece that the viewer scales to fit, never the same footprint with
+                // enormous nearest-upscaled cells (which is what resizing an ANSI down used
+                // to do — a giant blocky mess). The character ruler reads this texture's
+                // size, so it also reports the real cols×rows.
+                let (disp, disp_size) = (work, [tw, th]);
                 let tt =
                     TiledTexture::from_rgba(ctx, "pv_full_reduced", disp_size, &disp, view_tex_opts());
                 self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
@@ -22630,7 +22616,10 @@ impl Kaleidotron {
                 .on_hover_text("Recolor every grid thumbnail with the active palette");
             if ui
                 .button("⟲ Reset all")
-                .on_hover_text("Clear adjustments + balance + palette / reduce / dither / edits")
+                .on_hover_text(
+                    "Clear the whole panel: adjustments + balance + palette / reduce / \
+                     dither (incl. ANSI Shade) / edits",
+                )
                 .clicked()
             {
                 self.adjust = Adjust::default();
@@ -22638,12 +22627,17 @@ impl Kaleidotron {
                 self.custom_palette = None;
                 self.quantize_on = false;
                 self.quantize_n = 16;
+                self.quantize_keep_bw = false;
                 self.dither_method = 0;
                 self.dither_amount = 1.0;
                 self.dither_custom_n = 4;
                 self.dither_custom = crate::thumb::bayer_values(4);
                 self.dither_scale_x = 1;
                 self.dither_scale_y = 1;
+                // ANSI Shade is a whole sub-panel of its own (F1–F8, shading / smoothness /
+                // detail, snap / iCE / fit) — reset it to the same baseline its own ↺ button
+                // uses, so "Reset all" leaves nothing behind.
+                self.reset_ansi_shade();
                 self.pixelate_h = 0.0;
                 self.postfx = PostFx::default();
                 self.scale_algo = crate::scale::Scaler::None;
@@ -38225,15 +38219,34 @@ fn force_black_white(pal: &mut [[u8; 4]]) {
             light = i;
         }
     }
-    // If the whole palette is one luminance (dark == light), give black slot 0 and, when
-    // there's room, white slot 1 — otherwise snap the distinct extremes.
+    // A single-luminance palette has no real colour spread to protect — force black into
+    // slot 0 (+ white into slot 1 when there's room), as before.
     if dark == light {
         pal[0] = [0, 0, 0, pal[0][3]];
         if pal.len() >= 2 {
             pal[1] = [255, 255, 255, pal[1][3]];
         }
-    } else {
+        return;
+    }
+    // Otherwise ONLY snap an extreme to the pure value when it's already essentially that —
+    // a small correction to a median-cut cluster that nearly landed on black/white. If the
+    // image's brightest (or darkest) colour is a real, saturated tone — a warm highlight, a
+    // deep red — snapping it to pure white/black would REPLACE that whole populous cluster,
+    // recolouring every pixel it owns and stippling the art with an extreme the source never
+    // had (the classic "white outliers on a warm image" bug). In that case leave the real
+    // colour be: "keep black/white" pulls the extremes in only when the image is genuinely
+    // close to them; otherwise its own brightest/darkest already stand in. Gate ≈ 40/channel.
+    const NEAR: f32 = 40.0 * 40.0 * 3.0;
+    let dist2 = |c: &[u8; 4], t: f32| {
+        let dr = t - c[0] as f32;
+        let dg = t - c[1] as f32;
+        let db = t - c[2] as f32;
+        dr * dr + dg * dg + db * db
+    };
+    if dist2(&pal[dark], 0.0) <= NEAR {
         pal[dark] = [0, 0, 0, pal[dark][3]];
+    }
+    if dist2(&pal[light], 255.0) <= NEAR {
         pal[light] = [255, 255, 255, pal[light][3]];
     }
 }
@@ -47120,16 +47133,31 @@ mod tests {
     }
 
     #[test]
-    fn keep_black_white_snaps_the_extremes() {
-        // A palette with no true black/white: the darkest entry becomes pure black, the
-        // brightest pure white, and the count is unchanged.
-        let mut pal = vec![[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]];
+    fn keep_black_white_snaps_only_near_extremes() {
+        // A palette whose extremes are ALREADY essentially black/white: a near-black darkest
+        // and near-white brightest snap to the pure values (a minor correction); the mid color
+        // and the count are unchanged.
+        let mut pal = vec![[8, 6, 10, 255], [245, 248, 240, 255], [120, 60, 60, 255]];
         force_black_white(&mut pal);
-        assert!(pal.contains(&[0, 0, 0, 255]), "black pinned: {pal:?}");
-        assert!(pal.contains(&[255, 255, 255, 255]), "white pinned: {pal:?}");
+        assert!(pal.contains(&[0, 0, 0, 255]), "near-black snapped to pure: {pal:?}");
+        assert!(pal.contains(&[255, 255, 255, 255]), "near-white snapped to pure: {pal:?}");
+        assert!(pal.contains(&[120, 60, 60, 255]), "mid color kept: {pal:?}");
         assert_eq!(pal.len(), 3, "color count unchanged");
-        // The mid-luma color ([40,40,60], neither darkest nor brightest) is untouched.
-        assert!(pal.contains(&[40, 40, 60, 255]), "mid color kept: {pal:?}");
+    }
+
+    #[test]
+    fn keep_black_white_leaves_saturated_extremes_alone() {
+        // Regression for the white-outliers bug: a warm image with NO true white — its
+        // brightest colour is a saturated highlight ([200,180,150]) and its darkest a deep
+        // red ([90,20,20]). Neither is close to an extreme, so "keep black/white" must NOT
+        // replace them with pure white/black (which would recolour those whole clusters and
+        // stipple the art with white the source never had). The palette is left untouched.
+        let mut pal = vec![[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]];
+        let before = pal.clone();
+        force_black_white(&mut pal);
+        assert_eq!(pal, before, "saturated extremes must be preserved: {pal:?}");
+        assert!(!pal.contains(&[255, 255, 255, 255]), "no fabricated white: {pal:?}");
+        assert!(!pal.contains(&[0, 0, 0, 255]), "no fabricated black: {pal:?}");
     }
 
     #[test]
