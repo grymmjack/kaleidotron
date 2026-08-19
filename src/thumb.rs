@@ -410,6 +410,7 @@ pub const DITHER_NAMES: &[&str] = &[
     "ATASCII",
     "Apple ][",
     "REXPaint font",
+    "Unicode",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
@@ -446,6 +447,15 @@ pub const DITHER_APPLE: u8 = 11;
 /// `DITHER_NAMES` index for the image→char-art converter over a **selected REXPaint font**
 /// (any cell size), via [`glyphfont_pass`].
 pub const DITHER_REXFONT: u8 = 12;
+
+/// `DITHER_NAMES` index for the image→**Unicode** text-art converter (half-block colour cells or
+/// Braille dot cells), which also exports real copy-pasteable UTF-8 ([`unicode_pass`]).
+pub const DITHER_UNICODE: u8 = 13;
+
+/// Unicode-art style: `▀` upper-half blocks — each character is 1×2 truecolour pixels.
+pub const UNI_HALFBLOCK: u8 = 0;
+/// Unicode-art style: Braille (U+2800..) — each character is a 2×4 dot cell, hi-res mono-ish.
+pub const UNI_BRAILLE: u8 = 1;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -2435,6 +2445,181 @@ pub fn glyphfont_pass(
     glyphfont_render(&grid, font, rgba, w, h);
 }
 
+// ── Unicode text-art converter (half-block + Braille) ───────────────────────────
+// Converts an image to real UTF-8 art with no font needed to render: half-block (▀)
+// packs 2 vertical truecolour pixels per character; Braille (U+2800..) packs a 2×4 dot
+// cell for hi-res line/tone art. Both render natively (the pass fills the shapes) AND
+// serialize to copy-pasteable text ([`unicode_to_text`]).
+
+/// A converted Unicode-art screen: `cols`×`rows` cells, each a `ch` glyph with fg/bg colours.
+pub struct UniGrid {
+    pub cols: usize,
+    pub rows: usize,
+    pub style: u8,
+    pub chars: Vec<char>,
+    pub fg: Vec<[u8; 3]>,
+    pub bg: Vec<[u8; 3]>,
+}
+
+/// Braille dot bit for sub-cell (`dx` 0..2, `dy` 0..4). Matches Unicode's dot numbering
+/// (1-2-3-7 down the left column, 4-5-6-8 down the right).
+const BRAILLE_BITS: [[u8; 4]; 2] = [[0, 1, 2, 6], [3, 4, 5, 7]];
+
+/// Convert `rgba` (`w`×`h`) into a [`UniGrid`] of `cols` characters wide (rows follow the image
+/// aspect). `style` picks half-block vs Braille; `invert` flips the Braille on/off test.
+#[allow(clippy::needless_range_loop)] // dx/dy index BRAILLE_BITS *and* compute the pixel offset
+pub fn unicode_convert(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    style: u8,
+    cols: usize,
+    invert: bool,
+) -> UniGrid {
+    let cols = cols.max(1);
+    let aspect = h.max(1) as f32 / w.max(1) as f32;
+    if style == UNI_BRAILLE {
+        let dots_x = cols * 2;
+        let dots_y = ((dots_x as f32 * aspect).round() as usize).max(4);
+        let rows = dots_y.div_ceil(4);
+        let small = box_downscale(rgba, w, h, dots_x, rows * 4);
+        let (mut chars, mut fg, mut bg) = (Vec::new(), Vec::new(), Vec::new());
+        for cy in 0..rows {
+            for cx in 0..cols {
+                let mut bits = 0u8;
+                let (mut sr, mut sg, mut sb, mut n) = (0u32, 0u32, 0u32, 0u32);
+                for dx in 0..2 {
+                    for dy in 0..4 {
+                        let o = ((cy * 4 + dy) * dots_x + (cx * 2 + dx)) * 4;
+                        let (r, g, b) = (small[o] as f32, small[o + 1] as f32, small[o + 2] as f32);
+                        let lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+                        // Dark pixels become dots (ink-on-paper); invert flips it.
+                        let on = if invert { lum > 0.5 } else { lum < 0.5 };
+                        if on {
+                            bits |= 1 << BRAILLE_BITS[dx][dy];
+                            sr += r as u32;
+                            sg += g as u32;
+                            sb += b as u32;
+                            n += 1;
+                        }
+                    }
+                }
+                chars.push(char::from_u32(0x2800 + bits as u32).unwrap_or('⠀'));
+                fg.push(if n > 0 {
+                    [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8]
+                } else {
+                    [200, 200, 200]
+                });
+                bg.push([0, 0, 0]);
+            }
+        }
+        return UniGrid { cols, rows, style, chars, fg, bg };
+    }
+    // Half-block: each char = 1 wide × 2 tall truecolour pixels (▀ upper on fg, lower on bg).
+    let px_h = ((cols as f32 * aspect).round() as usize).max(2);
+    let rows = px_h.div_ceil(2);
+    let small = box_downscale(rgba, w, h, cols, rows * 2);
+    let (mut chars, mut fg, mut bg) = (Vec::new(), Vec::new(), Vec::new());
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let ot = ((cy * 2) * cols + cx) * 4;
+            let ob = ((cy * 2 + 1) * cols + cx) * 4;
+            chars.push('▀');
+            fg.push([small[ot], small[ot + 1], small[ot + 2]]);
+            bg.push([small[ob], small[ob + 1], small[ob + 2]]);
+        }
+    }
+    UniGrid { cols, rows, style, chars, fg, bg }
+}
+
+/// Render a [`UniGrid`] into `rgba` in place, drawing each cell's shape directly (no font):
+/// half-block fills the top/bottom halves; Braille draws a dot per set bit.
+pub fn unicode_render(grid: &UniGrid, rgba: &mut [u8], w: usize, h: usize) {
+    if grid.cols == 0 || grid.rows == 0 {
+        return;
+    }
+    let cellw = (w / grid.cols).max(1);
+    let cellh = (h / grid.rows).max(1);
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let i = cy * grid.cols + cx;
+            let (fg, bg, ch) = (grid.fg[i], grid.bg[i], grid.chars[i]);
+            let bits = (ch as u32).wrapping_sub(0x2800);
+            for ry in 0..cellh {
+                let y = cy * cellh + ry;
+                if y >= h {
+                    break;
+                }
+                for rx in 0..cellw {
+                    let x = cx * cellw + rx;
+                    if x >= w {
+                        break;
+                    }
+                    let on = if grid.style == UNI_BRAILLE {
+                        // Which 2×4 dot are we in, and is a dot painted near its centre?
+                        let dx = (rx * 2 / cellw).min(1);
+                        let dy = (ry * 4 / cellh).min(3);
+                        let set = (bits >> BRAILLE_BITS[dx][dy]) & 1 == 1;
+                        // Round dot: paint the inner ~60% of the sub-cell.
+                        let (sw, sh) = ((cellw / 2).max(1), (cellh / 4).max(1));
+                        let (lx, ly) = (rx % sw, ry % sh);
+                        let inset = |p: usize, s: usize| p * 5 >= s && p * 5 < s * 4;
+                        set && inset(lx, sw) && inset(ly, sh)
+                    } else {
+                        ry * 2 < cellh // half-block: top half is fg
+                    };
+                    let c = if on { fg } else { bg };
+                    let o = (y * w + x) * 4;
+                    rgba[o..o + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+            }
+        }
+    }
+}
+
+/// The Unicode **pipeline pass**: convert then render in place (no palette needed — colours come
+/// straight from the image).
+pub fn unicode_pass(rgba: &mut [u8], w: usize, h: usize, style: u8, cols: usize, invert: bool) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let grid = unicode_convert(rgba, w, h, style, cols, invert);
+    // Rebuild the buffer background so cells that don't fill (Braille gaps) read as black.
+    for px in rgba.chunks_exact_mut(4) {
+        px.copy_from_slice(&[0, 0, 0, 255]);
+    }
+    unicode_render(&grid, rgba, w, h);
+}
+
+/// Serialize a [`UniGrid`] to text. `ansi_color` emits **xterm-256** SGR fg/bg per cell (the
+/// standard terminal-art colour format) — needed for half-block to carry its colours; Braille
+/// still reads fine as plain glyphs. An SGR is emitted only when the colour index changes. Rows
+/// end in `\n`; the file resets colour at each row end.
+pub fn unicode_to_text(grid: &UniGrid, ansi_color: bool) -> String {
+    let mut s = String::new();
+    for cy in 0..grid.rows {
+        let (mut cf, mut cb) = (256i16, 256i16);
+        for cx in 0..grid.cols {
+            let i = cy * grid.cols + cx;
+            if ansi_color {
+                let f = nearest_xterm256(grid.fg[i]) as i16;
+                let b = nearest_xterm256(grid.bg[i]) as i16;
+                if f != cf || b != cb {
+                    s.push_str(&format!("\x1b[38;5;{f};48;5;{b}m"));
+                    cf = f;
+                    cb = b;
+                }
+            }
+            s.push(grid.chars[i]);
+        }
+        if ansi_color {
+            s.push_str("\x1b[0m");
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
 /// reverse bit is handled by the caller (RVS ON/OFF), so this maps the base glyph.
 fn screencode_to_petscii(c: u8) -> u8 {
@@ -2595,6 +2780,30 @@ mod tests {
         assert_eq!(left.ch, 32, "white cell is a space");
         let cov = |c: u8| CP437_8X8[c as usize].iter().map(|b| b.count_ones()).sum::<u32>();
         assert!(cov(right.ch) > cov(left.ch), "black cell is denser than white");
+    }
+
+    #[test]
+    fn unicode_halfblock_and_braille() {
+        // Half-block: a top-red / bottom-blue image → a ▀ cell with fg red, bg blue.
+        let (w, h) = (2usize, 2usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if y == 0 { [255u8, 0, 0, 255] } else { [0, 0, 255, 255] };
+                rgba[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&c);
+            }
+        }
+        let g = unicode_convert(&rgba, w, h, UNI_HALFBLOCK, 2, false);
+        assert_eq!(g.chars[0], '▀');
+        assert_eq!(g.fg[0], [255, 0, 0], "top → fg red");
+        assert_eq!(g.bg[0], [0, 0, 255], "bottom → bg blue");
+        // Braille: an all-black image → all dots set → the full braille cell ⣿ (U+28FF).
+        let black = vec![0u8; 8 * 8 * 4];
+        let gb = unicode_convert(&black, 8, 8, UNI_BRAILLE, 1, false);
+        assert!(gb.chars.iter().all(|&c| c == '\u{28FF}'), "dark → all dots");
+        // Text output: braille is plain glyphs; ends each row with newline.
+        let txt = unicode_to_text(&gb, false);
+        assert!(txt.contains('\u{28FF}') && txt.ends_with('\n'));
     }
 
     #[test]

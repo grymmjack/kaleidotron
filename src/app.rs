@@ -1660,6 +1660,10 @@ pub struct Kaleidotron {
     rexfont_invert: bool,  // inverse video for the REXPaint-font converter
     rexfont_mask: Vec<bool>, // 256 flags: which glyphs the converter may use (all-on = all)
     rexfont_picker: bool,  // the glyph-picker popup is open
+    // Unicode text-art converter (DITHER_UNICODE): half-block / Braille → real UTF-8.
+    unicode_style: u8,   // thumb::UNI_HALFBLOCK / UNI_BRAILLE
+    unicode_cols: usize, // target character width
+    unicode_invert: bool,
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2464,6 +2468,7 @@ impl Kaleidotron {
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
+    const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3158,6 +3163,11 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value(s, Self::REXMASK_KEY))
             .unwrap_or_default();
         rexfont_mask.resize(256, true);
+        // Unicode-art converter (style, cols, invert).
+        let unicode: (u8, usize, bool) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::UNICODE_KEY))
+            .unwrap_or((0, 120, false));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3677,6 +3687,9 @@ impl Kaleidotron {
             rexfont_invert: rexfont.1,
             rexfont_mask,
             rexfont_picker: false,
+            unicode_style: unicode.0.min(1),
+            unicode_cols: unicode.1.clamp(8, 400),
+            unicode_invert: unicode.2,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19838,6 +19851,9 @@ impl Kaleidotron {
             bitfont_color: self.bitfont_color,
             bitfont_invert: bf_invert,
             rexfont_sel: self.rexfont_sel,
+            unicode_style: self.unicode_style,
+            unicode_cols: self.unicode_cols,
+            unicode_invert: self.unicode_invert,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -20072,6 +20088,9 @@ impl Kaleidotron {
             apple_col80: self.apple_col80,
             rexfont_sel: self.rexfont_sel,
             rexfont_invert: self.rexfont_invert,
+            unicode_style: self.unicode_style,
+            unicode_cols: self.unicode_cols,
+            unicode_invert: self.unicode_invert,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20159,6 +20178,9 @@ impl Kaleidotron {
         self.apple_col80 = p.apple_col80;
         self.rexfont_sel = p.rexfont_sel;
         self.rexfont_invert = p.rexfont_invert;
+        self.unicode_style = p.unicode_style.min(1);
+        self.unicode_cols = p.unicode_cols.clamp(8, 400);
+        self.unicode_invert = p.unicode_invert;
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -20181,6 +20203,7 @@ impl Kaleidotron {
                             | crate::thumb::DITHER_ATASCII
                             | crate::thumb::DITHER_APPLE
                             | crate::thumb::DITHER_REXFONT
+                            | crate::thumb::DITHER_UNICODE
                     )))
             || self.resize_active()
             || self.postfx.active()
@@ -20341,6 +20364,14 @@ impl Kaleidotron {
                 format!(
                     "|RXf{}:col{}:inv{}:m{:x}",
                     self.rexfont_sel, self.bitfont_color as u8, self.rexfont_invert as u8, mask_hash,
+                )
+            } else {
+                String::new()
+            }
+            + &if self.dither_method == crate::thumb::DITHER_UNICODE {
+                format!(
+                    "|UNIs{}:c{}:inv{}",
+                    self.unicode_style, self.unicode_cols, self.unicode_invert as u8,
                 )
             } else {
                 String::new()
@@ -20629,6 +20660,9 @@ impl Kaleidotron {
             bitfont_color: true,
             bitfont_invert: false,
             rexfont_sel: 0,
+            unicode_style: 0,
+            unicode_cols: 120,
+            unicode_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -24012,7 +24046,8 @@ impl Kaleidotron {
                         // Export as textmode art. ANSI needs a palette; PETSCII brings its own
                         // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
                         if (recolor.is_some()
-                            || self.dither_method == crate::thumb::DITHER_PETSCII)
+                            || self.dither_method == crate::thumb::DITHER_PETSCII
+                            || self.dither_method == crate::thumb::DITHER_UNICODE)
                             && ui
                                 .button("Export textmode")
                                 .on_hover_text(
@@ -25644,6 +25679,35 @@ impl Kaleidotron {
                             ui.weak("(needs a palette / Reduce for its colors)");
                         }
                     }
+                    // ----- Unicode controls (image → UTF-8 text art) -----
+                    if self.dither_method == crate::thumb::DITHER_UNICODE {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Unicode").strong());
+                            ui.weak("→ copy-pasteable UTF-8");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Style");
+                            ui.selectable_value(
+                                &mut self.unicode_style,
+                                crate::thumb::UNI_HALFBLOCK,
+                                "Half-block ▀",
+                            )
+                            .on_hover_text("Each character = 2 stacked colour pixels (full-colour)");
+                            ui.selectable_value(
+                                &mut self.unicode_style,
+                                crate::thumb::UNI_BRAILLE,
+                                "Braille ⠿",
+                            )
+                            .on_hover_text("2×4 dots per character — hi-res mono line/tone art");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Cols");
+                            ui.add(egui::Slider::new(&mut self.unicode_cols, 16..=300));
+                            ui.checkbox(&mut self.unicode_invert, "Invert")
+                                .on_hover_text("Flip the dot on/off test (Braille)");
+                        });
+                        ui.weak("Export writes .txt (xterm-256 colour for half-block).");
+                    }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
                     }
@@ -25951,6 +26015,11 @@ impl Kaleidotron {
             self.export_bitfont_png(path);
             return;
         }
+        // Unicode exports real UTF-8 text (.txt).
+        if self.dither_method == crate::thumb::DITHER_UNICODE {
+            self.export_unicode_text(path);
+            return;
+        }
         let recolor = self.active_recolor(path);
         let Some((_, palette)) = recolor else {
             self.status = "Pick a palette / Reduce first (textmode needs colors)".into();
@@ -26158,6 +26227,66 @@ impl Kaleidotron {
                     short_name(&dest),
                     cols,
                     rows
+                )
+            }
+            Err(e) => self.status = format!("Export failed: {e}"),
+        }
+    }
+
+    /// Export the current Unicode conversion as real UTF-8 text (`.txt`): the glyphs, plus
+    /// xterm-256 SGR colour for the half-block style (Braille stays plain, terminal-pasteable).
+    fn export_unicode_text(&mut self, path: &Path) {
+        let (size, rgba) = match &self.full_src {
+            Some((p, sz, px)) if p == path => (*sz, px.clone()),
+            _ => match self.registry.decode_path(&self.resolve_local(path)) {
+                Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
+                Err(e) => {
+                    self.status = format!("decode failed: {e}");
+                    return;
+                }
+            },
+        };
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
+        let (w, h, mut work) = self.scale_source(cw, ch, rgba);
+        // Value pipeline (skip Dither/Palette markers — the Unicode conversion samples the adjusted
+        // image itself, and its colours are the image's, not a snap palette).
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let mut aux = self.pipe_aux(None, dsx, dsy);
+        aux.skip_dither_palette = true;
+        apply_pipeline(&mut work, w, h, &self.adjust.order, &self.adjust, &aux);
+        let grid = crate::thumb::unicode_convert(
+            &work,
+            w,
+            h,
+            self.unicode_style,
+            self.unicode_cols,
+            self.unicode_invert,
+        );
+        // Half-block carries colour (xterm-256); Braille is legible as plain glyphs.
+        let colored = self.unicode_style == crate::thumb::UNI_HALFBLOCK;
+        let text = crate::thumb::unicode_to_text(&grid, colored);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let kind = if self.unicode_style == crate::thumb::UNI_BRAILLE {
+            "braille"
+        } else {
+            "halfblock"
+        };
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_{kind}.txt"))
+            .add_filter("Text", &["txt", "ans"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&dest, text.as_bytes()) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported Unicode {}: {} ({}×{} chars)",
+                    kind,
+                    short_name(&dest),
+                    grid.cols,
+                    grid.rows
                 )
             }
             Err(e) => self.status = format!("Export failed: {e}"),
@@ -38080,6 +38209,11 @@ impl eframe::App for Kaleidotron {
             &(self.rexfont_sel, self.rexfont_invert),
         );
         eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
+        eframe::set_value(
+            storage,
+            Self::UNICODE_KEY,
+            &(self.unicode_style, self.unicode_cols, self.unicode_invert),
+        );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -39080,6 +39214,10 @@ struct PipeAux<'a> {
     // REXPaint-font pass (DITHER_REXFONT): index into the bundled font pack (reuses
     // bitfont_color for colour + bitfont_invert for inverse video).
     rexfont_sel: usize,
+    // Unicode pass (DITHER_UNICODE): style + target cols + invert.
+    unicode_style: u8,
+    unicode_cols: usize,
+    unicode_invert: bool,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -39177,6 +39315,16 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.bitfont_invert,
                         );
                     }
+                } else if aux.dither_method == crate::thumb::DITHER_UNICODE {
+                    // Unicode art takes its colours straight from the image — no palette needed.
+                    crate::thumb::unicode_pass(
+                        rgba,
+                        w,
+                        h,
+                        aux.unicode_style,
+                        aux.unicode_cols,
+                        aux.unicode_invert,
+                    );
                 } else if aux.dither_method == crate::thumb::DITHER_ASCII {
                     // ASCII colours from the active palette (like ANSI) — skip if none.
                     if let Some(p) = aux.palette {
@@ -39405,6 +39553,9 @@ fn default_fit_rows() -> usize {
 }
 fn default_petscii_cols() -> usize {
     40
+}
+fn default_unicode_cols() -> usize {
+    120
 }
 fn default_petscii_rows() -> usize {
     25
@@ -39669,6 +39820,12 @@ struct FxPreset {
     rexfont_sel: usize,
     #[serde(default)]
     rexfont_invert: bool,
+    #[serde(default)]
+    unicode_style: u8,
+    #[serde(default = "default_unicode_cols")]
+    unicode_cols: usize,
+    #[serde(default)]
+    unicode_invert: bool,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -39742,6 +39899,9 @@ impl Default for FxPreset {
             apple_mousetext: true,
             apple_col80: false,
             rexfont_sel: 0,
+            unicode_style: 0,
+            unicode_cols: 120,
+            unicode_invert: false,
             rexfont_invert: false,
             folder: None,
         }
@@ -40082,6 +40242,9 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             bitfont_color: true,
             bitfont_invert: false,
             rexfont_sel: 0,
+            unicode_style: 0,
+            unicode_cols: 120,
+            unicode_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -48375,6 +48538,9 @@ fn preset_pipe_aux<'a>(
         bitfont_color: true,
         bitfont_invert: false,
         rexfont_sel: 0,
+        unicode_style: 0,
+        unicode_cols: 120,
+        unicode_invert: false,
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
         balance,
@@ -50696,6 +50862,9 @@ mod tests {
             bitfont_color: true,
             bitfont_invert: false,
             rexfont_sel: 0,
+            unicode_style: 0,
+            unicode_cols: 120,
+            unicode_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -50912,6 +51081,9 @@ mod tests {
             bitfont_color: true,
             bitfont_invert: false,
             rexfont_sel: 0,
+            unicode_style: 0,
+            unicode_cols: 120,
+            unicode_invert: false,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
