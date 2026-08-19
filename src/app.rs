@@ -19938,7 +19938,7 @@ impl Kaleidotron {
             unicode_style: self.unicode_style,
             unicode_cols: self.unicode_cols,
             unicode_invert: self.unicode_invert,
-            unicode_ranges: self.unicode_ranges,
+            unicode_ranges: self.unicode_effective_ranges(),
             unicode_pool: self.unicode_pool(),
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
@@ -21129,13 +21129,28 @@ impl Kaleidotron {
         }
     }
 
+    /// The Unicode Ramp's effective ranges — no boxes ticked means "use everything" (all ranges),
+    /// so the mode is never empty.
+    fn unicode_effective_ranges(&self) -> u8 {
+        const ALL: u8 = crate::decode::uniart::R_ASCII
+            | crate::decode::uniart::R_BOX
+            | crate::decode::uniart::R_BLOCK
+            | crate::decode::uniart::R_GEOM
+            | crate::decode::uniart::R_BRAILLE;
+        if self.unicode_ranges == 0 {
+            ALL
+        } else {
+            self.unicode_ranges
+        }
+    }
+
     /// The enabled-glyph pool for the Unicode Ramp: indices into the current range-mask's ramp font
     /// whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is disabled.
     fn unicode_pool(&self) -> Vec<u16> {
         if self.unicode_disabled.is_empty() {
             return Vec::new();
         }
-        let (_, chars) = crate::decode::uniart::ramp_font(self.unicode_ranges);
+        let (_, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
         chars
             .iter()
             .enumerate()
@@ -21301,7 +21316,7 @@ impl Kaleidotron {
         {
             return;
         }
-        let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_ranges);
+        let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
         let n = font.glyphs.len();
         // Build the index mask for the current range set from the disabled-codepoint list.
         let mut mask: Vec<bool> = chars
@@ -26601,7 +26616,7 @@ impl Kaleidotron {
         // Build the grid + text. Ramp goes through the DejaVu ramp font (glyph→codepoint map);
         // half-block / Braille build their shape grids directly.
         let (grid, colored) = if self.unicode_style == crate::thumb::UNI_RAMP {
-            let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_ranges);
+            let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
             let pal = self
                 .active_recolor(path)
                 .map(|(_, p)| p)

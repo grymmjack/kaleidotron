@@ -146,19 +146,46 @@ fn parsed() -> &'static [Option<GlyphFont>] {
     PARSED.get_or_init(|| REXFONTS.iter().map(|m| parse_rexpaint(m.bytes)).collect())
 }
 
-/// The parsed [`GlyphFont`] at index `i` (into [`REXFONTS`]), or `None`.
+/// The two synthetic CP437 (DOS/ANSI) fonts appended after the bundled pack, so REXPaint art can
+/// use the standard VGA glyphs too. Built from the embedded CP437 ROMs.
+fn cp437_8x8() -> &'static GlyphFont {
+    static F: OnceLock<GlyphFont> = OnceLock::new();
+    F.get_or_init(|| GlyphFont::from_8x8(&crate::decode::cp437_font_8x8::CP437_8X8))
+}
+fn cp437_8x16() -> &'static GlyphFont {
+    static F: OnceLock<GlyphFont> = OnceLock::new();
+    F.get_or_init(|| GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16))
+}
+
+/// The parsed [`GlyphFont`] at index `i` — the bundled pack, then CP437 8×8 / 8×16.
 pub fn rexfont(i: usize) -> Option<&'static GlyphFont> {
-    parsed().get(i).and_then(|o| o.as_ref())
+    let n = REXFONTS.len();
+    if i < n {
+        return parsed().get(i).and_then(|o| o.as_ref());
+    }
+    match i - n {
+        0 => Some(cp437_8x8()),
+        1 => Some(cp437_8x16()),
+        _ => None,
+    }
 }
 
-/// Number of bundled fonts.
+/// Number of selectable fonts (the pack + the 2 CP437 fonts).
 pub fn rexfont_count() -> usize {
-    REXFONTS.len()
+    REXFONTS.len() + 2
 }
 
-/// Display name of bundled font `i`.
+/// Display name of font `i`.
 pub fn rexfont_name(i: usize) -> &'static str {
-    REXFONTS.get(i).map(|m| m.name).unwrap_or("?")
+    let n = REXFONTS.len();
+    if i < n {
+        return REXFONTS[i].name;
+    }
+    match i - n {
+        0 => "CP437 8×8 (DOS)",
+        1 => "CP437 8×16 (VGA)",
+        _ => "?",
+    }
 }
 
 // ── Viewer render font ──────────────────────────────────────────────────────────
@@ -198,7 +225,10 @@ mod tests {
             assert_eq!(f.glyphs.len(), 256, "{} has 256 glyphs", m.name);
             assert!(f.cell_w >= 4 && f.cell_h >= 4, "{} sane cell", m.name);
         }
-        assert_eq!(rexfont_count(), 24);
+        // 24 bundled pack fonts + 2 synthetic CP437 fonts.
+        assert_eq!(rexfont_count(), 26);
+        assert_eq!(rexfont(24).unwrap().cell_h, 8, "CP437 8×8 appended");
+        assert_eq!(rexfont(25).unwrap().cell_h, 16, "CP437 8×16 appended");
     }
 
     #[test]
