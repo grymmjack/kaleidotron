@@ -1658,6 +1658,8 @@ pub struct Kaleidotron {
     // REXPaint-font converter (DITHER_REXFONT): image→art over a bundled REXPaint font.
     rexfont_sel: usize,    // index into crate::decode::rexfont::REXFONTS (the converter font)
     rexfont_invert: bool,  // inverse video for the REXPaint-font converter
+    rexfont_mask: Vec<bool>, // 256 flags: which glyphs the converter may use (all-on = all)
+    rexfont_picker: bool,  // the glyph-picker popup is open
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2461,6 +2463,7 @@ impl Kaleidotron {
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
+    const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3149,6 +3152,12 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::REXFONT_KEY))
             .unwrap_or((0, false));
+        // The glyph-enable mask (256 flags); default all-on. Length is normalised to 256.
+        let mut rexfont_mask: Vec<bool> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::REXMASK_KEY))
+            .unwrap_or_default();
+        rexfont_mask.resize(256, true);
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3666,6 +3675,8 @@ impl Kaleidotron {
             apple_col80: bitfont.4,
             rexfont_sel: rexfont.0,
             rexfont_invert: rexfont.1,
+            rexfont_mask,
+            rexfont_picker: false,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19767,8 +19778,9 @@ impl Kaleidotron {
             ) {
                 self.bitfont_spec()
             } else if self.dither_method == crate::thumb::DITHER_REXFONT {
-                // REXPaint font reuses the bitfont_invert slot for its own inverse toggle.
-                (&[], Vec::new(), self.rexfont_invert)
+                // REXPaint font reuses the bitfont slots: bitfont_pool = the enabled-glyph pool,
+                // bitfont_invert = its inverse toggle.
+                (&[], self.rexfont_pool(), self.rexfont_invert)
             } else {
                 (&[], Vec::new(), false)
             };
@@ -20322,9 +20334,13 @@ impl Kaleidotron {
                 String::new()
             }
             + &if self.dither_method == crate::thumb::DITHER_REXFONT {
+                // Fold the glyph mask in via a cheap rolling hash so toggling glyphs re-renders.
+                let mask_hash = self.rexfont_mask.iter().enumerate().fold(0u64, |acc, (i, &b)| {
+                    if b { acc ^ (0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1)) } else { acc }
+                });
                 format!(
-                    "|RXf{}:col{}:inv{}",
-                    self.rexfont_sel, self.bitfont_color as u8, self.rexfont_invert as u8,
+                    "|RXf{}:col{}:inv{}:m{:x}",
+                    self.rexfont_sel, self.bitfont_color as u8, self.rexfont_invert as u8, mask_hash,
                 )
             } else {
                 String::new()
@@ -20949,6 +20965,99 @@ impl Kaleidotron {
             let pool: Vec<u16> = (0..font.len() as u16).collect();
             (font, pool, self.atascii_invert)
         }
+    }
+
+    /// The glyph-picker popup for the REXPaint-font converter: a 16×16 grid of the selected font's
+    /// glyphs, click to enable/disable which ones the converter may use. Enabled glyphs render
+    /// bright, disabled are dimmed. Changing the mask re-renders the preview (folded into the key).
+    fn ui_rexfont_picker(&mut self, ctx: &egui::Context) {
+        if !self.rexfont_picker || self.dither_method != crate::thumb::DITHER_REXFONT {
+            return;
+        }
+        let Some(font) = crate::decode::rexfont::rexfont(self.rexfont_sel) else {
+            return;
+        };
+        if self.rexfont_mask.len() < 256 {
+            self.rexfont_mask.resize(256, true);
+        }
+        let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
+        // Zoom each glyph up to a legible size.
+        let s = (24 / cw.max(ch)).max(2);
+        let (aw, ah) = (16 * cw * s, 16 * ch * s);
+        let mut px = vec![0u8; aw * ah * 4];
+        for gi in 0..256usize {
+            let (gc, gr) = (gi % 16, gi / 16);
+            let enabled = self.rexfont_mask[gi];
+            for y in 0..ch {
+                for x in 0..cw {
+                    let on = font.on(gi, x, y);
+                    let col: [u8; 4] = match (enabled, on) {
+                        (true, true) => [235, 235, 240, 255],
+                        (true, false) => [34, 34, 42, 255],
+                        (false, true) => [96, 74, 74, 255],
+                        (false, false) => [20, 16, 18, 255],
+                    };
+                    for sy in 0..s {
+                        for sx in 0..s {
+                            let ax = (gc * cw + x) * s + sx;
+                            let ay = (gr * ch + y) * s + sy;
+                            let o = (ay * aw + ax) * 4;
+                            px[o..o + 4].copy_from_slice(&col);
+                        }
+                    }
+                }
+            }
+        }
+        let color = egui::ColorImage::from_rgba_unmultiplied([aw, ah], &px);
+        let tex = ctx.load_texture("rexfont_atlas", color, egui::TextureOptions::NEAREST);
+        let mut open = self.rexfont_picker;
+        egui::Window::new("REXPaint glyphs — pick usable chars")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() {
+                        self.rexfont_mask.iter_mut().for_each(|b| *b = true);
+                    }
+                    if ui.button("None").clicked() {
+                        self.rexfont_mask.iter_mut().for_each(|b| *b = false);
+                    }
+                    if ui.button("Invert").clicked() {
+                        self.rexfont_mask.iter_mut().for_each(|b| *b = !*b);
+                    }
+                    let on = self.rexfont_mask.iter().filter(|b| **b).count();
+                    ui.weak(format!("{on}/256 enabled"));
+                });
+                ui.weak("Click a glyph to toggle it. Bright = used, dim = skipped.");
+                let img = egui::Image::new(&tex)
+                    .fit_to_exact_size(egui::vec2(aw as f32, ah as f32))
+                    .sense(egui::Sense::click());
+                let resp = ui.add(img);
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let rel = pos - resp.rect.min;
+                        let gc = (rel.x as usize) / (cw * s);
+                        let gr = (rel.y as usize) / (ch * s);
+                        if gc < 16 && gr < 16 {
+                            let gi = gr * 16 + gc;
+                            self.rexfont_mask[gi] = !self.rexfont_mask[gi];
+                        }
+                    }
+                }
+            });
+        self.rexfont_picker = open;
+    }
+
+    /// The enabled-glyph pool for the REXPaint-font converter, from `rexfont_mask`. Empty means
+    /// "all glyphs" — which is what an all-on OR all-off (degenerate) mask collapses to.
+    fn rexfont_pool(&self) -> Vec<u16> {
+        let on = self.rexfont_mask.iter().filter(|b| **b).count();
+        if on == 0 || on >= 256 {
+            return Vec::new(); // all
+        }
+        (0..256u16)
+            .filter(|&i| *self.rexfont_mask.get(i as usize).unwrap_or(&true))
+            .collect()
     }
 
     /// The ASCII glyph-pool selection (categories + the "Use only chars" set resolved to
@@ -25520,6 +25629,16 @@ impl Kaleidotron {
                                 .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
                             ui.checkbox(&mut self.rexfont_invert, "Invert")
                                 .on_hover_text("Inverse video — swap ink and paper");
+                            let on = self.rexfont_mask.iter().filter(|b| **b).count();
+                            let all = on == 0 || on >= 256;
+                            let label = if all { "Chars…".to_string() } else { format!("Chars ({on})…") };
+                            if ui
+                                .button(label)
+                                .on_hover_text("Pick which glyphs the converter may use (a clickable font grid)")
+                                .clicked()
+                            {
+                                self.rexfont_picker = !self.rexfont_picker;
+                            }
                         });
                         if recolor.is_none() {
                             ui.weak("(needs a palette / Reduce for its colors)");
@@ -25996,8 +26115,16 @@ impl Kaleidotron {
                     return;
                 }
             };
-            let grid =
-                crate::thumb::glyphfont_grid(&work, w, h, &palette, font, self.bitfont_color, self.rexfont_invert);
+            let grid = crate::thumb::glyphfont_grid(
+                &work,
+                w,
+                h,
+                &palette,
+                font,
+                &self.rexfont_pool(),
+                self.bitfont_color,
+                self.rexfont_invert,
+            );
             let (c, r) = (grid.cols, grid.rows);
             crate::thumb::glyphfont_render(&grid, font, &mut work, w, h);
             (c, r)
@@ -36494,6 +36621,7 @@ impl eframe::App for Kaleidotron {
         self.ui_web_download_dialog(&ctx);
         self.ui_select_mask_dialog(&ctx);
         self.ui_ai_generate(&ctx);
+        self.ui_rexfont_picker(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -37951,6 +38079,7 @@ impl eframe::App for Kaleidotron {
             Self::REXFONT_KEY,
             &(self.rexfont_sel, self.rexfont_invert),
         );
+        eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -39043,6 +39172,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             h,
                             p,
                             font,
+                            &aux.bitfont_pool,
                             aux.bitfont_color,
                             aux.bitfont_invert,
                         );

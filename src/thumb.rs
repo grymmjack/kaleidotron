@@ -2294,12 +2294,15 @@ pub fn bitfont_pass(
 
 use crate::decode::rexfont::GlyphFont;
 
-/// Coverage-sorted ramp over all 256 glyphs of `font` (one representative per coverage bucket,
-/// blank first). Same idea as [`bitfont_ramp`] but reading the GlyphFont's own coverage.
-pub fn glyphfont_ramp(font: &GlyphFont) -> Vec<(u16, f32)> {
+/// Coverage-sorted ramp over `font`'s glyphs (one representative per coverage bucket, blank first).
+/// `pool` restricts the candidate glyphs to those indices; empty = all 256. Same idea as
+/// [`bitfont_ramp`] but reading the GlyphFont's own coverage.
+pub fn glyphfont_ramp(font: &GlyphFont, pool: &[u16]) -> Vec<(u16, f32)> {
     let total = (font.cell_w * font.cell_h).max(1) as f32;
+    let all: Vec<u16> = (0..256u16).collect();
+    let candidates: &[u16] = if pool.is_empty() { &all } else { pool };
     let mut seen: std::collections::HashMap<u16, (u16, f32)> = std::collections::HashMap::new();
-    for gi in 0..256u16 {
+    for &gi in candidates {
         let c = font.coverage(gi as usize);
         let bucket = (c * total).round() as u16;
         seen.entry(bucket).or_insert((gi, c));
@@ -2307,7 +2310,10 @@ pub fn glyphfont_ramp(font: &GlyphFont) -> Vec<(u16, f32)> {
     let mut ramp: Vec<(u16, f32)> = seen.into_values().collect();
     ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     if ramp.first().map(|(_, c)| *c > 0.0).unwrap_or(true) {
-        let blank = (0..256u16)
+        // A blank glyph, drawn from the same candidate set so a restricted pool keeps its light end.
+        let blank = candidates
+            .iter()
+            .copied()
             .find(|&g| font.coverage(g as usize) == 0.0)
             .unwrap_or(32);
         ramp.insert(0, (blank, 0.0));
@@ -2317,12 +2323,15 @@ pub fn glyphfont_ramp(font: &GlyphFont) -> Vec<(u16, f32)> {
 
 /// Analyse `rgba` into a [`BitGrid`] over `font` (cell size = the font's), mapping each cell's
 /// darkness to the ramp glyph and colouring from `palette` (per-cell when `color`, else mono).
+/// `pool` restricts which glyphs may be used (empty = all 256).
+#[allow(clippy::too_many_arguments)]
 pub fn glyphfont_grid(
     rgba: &[u8],
     w: usize,
     h: usize,
     palette: &[[u8; 4]],
     font: &GlyphFont,
+    pool: &[u16],
     color: bool,
     invert: bool,
 ) -> BitGrid {
@@ -2336,7 +2345,7 @@ pub fn glyphfont_grid(
         cells.resize(cols * rows, BitCell { glyph: 0, fg: 0, bg: 0 });
         return BitGrid { cols, rows, cells, palette: palette.to_vec() };
     }
-    let mut ramp = glyphfont_ramp(font);
+    let mut ramp = glyphfont_ramp(font, pool);
     if ramp.is_empty() {
         ramp.push((32, 0.0));
     }
@@ -2406,20 +2415,23 @@ pub fn glyphfont_render(grid: &BitGrid, font: &GlyphFont, rgba: &mut [u8], w: us
     }
 }
 
-/// The REXPaint-font **pipeline pass**: build the grid then paint it back in place.
+/// The REXPaint-font **pipeline pass**: build the grid then paint it back in place. `pool`
+/// restricts the usable glyphs (empty = all 256).
+#[allow(clippy::too_many_arguments)]
 pub fn glyphfont_pass(
     rgba: &mut [u8],
     w: usize,
     h: usize,
     palette: &[[u8; 4]],
     font: &GlyphFont,
+    pool: &[u16],
     color: bool,
     invert: bool,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = glyphfont_grid(rgba, w, h, palette, font, color, invert);
+    let grid = glyphfont_grid(rgba, w, h, palette, font, pool, color, invert);
     glyphfont_render(&grid, font, rgba, w, h);
 }
 
