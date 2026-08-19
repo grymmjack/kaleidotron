@@ -1277,6 +1277,11 @@ enum FileAction {
     NewFolder,
 }
 
+/// Right-side breathing room reserved inside the scrolling detail/recolor panels so their
+/// row controls (reorder ▲▼, resets, sliders) never touch the scrollbar — reaching for the
+/// bar shouldn't land on a widget and change a value.
+const SCROLL_GUTTER: f32 = 16.0;
+
 pub struct Kaleidotron {
     registry: Arc<Registry>,
     thumbs: ThumbBuilder,
@@ -1564,6 +1569,7 @@ pub struct Kaleidotron {
     recolor_thumb_h: f32,
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
+    quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
     dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
@@ -2368,6 +2374,8 @@ impl Kaleidotron {
     const SHUFFLE_KEY: &'static str = "shuffle";
     const ADJUST_KEY: &'static str = "adjust";
     const ADJUST_ORDER_KEY: &'static str = "adjust_order";
+    const BLUR_KEY: &'static str = "adjust_blur"; // separate: keeps the 12-wide adjust array
+
     const IMG_ZOOM_KEY: &'static str = "image_zoom";
     const THEME_KEY: &'static str = "theme";
     const GAP_KEY: &'static str = "grid_gap";
@@ -2390,6 +2398,7 @@ impl Kaleidotron {
     );
     const QUANT_ON_KEY: &'static str = "quantize_on";
     const QUANT_N_KEY: &'static str = "quantize_n";
+    const QUANT_KEEP_BW_KEY: &'static str = "quantize_keep_bw";
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -2769,11 +2778,14 @@ impl Kaleidotron {
         // Apply order: current = [u8; 19]; fall back to the legacy [u8; 15] / [u8; 12]
         // orders (with_order appends any ops that didn't exist when it was saved, so
         // the 4 post-FX ops land at the end for an older config).
-        let adjust = cc
+        let mut adjust = cc
             .storage
             .and_then(|s| {
-                eframe::get_value::<[u8; 19]>(s, Self::ADJUST_ORDER_KEY)
+                eframe::get_value::<[u8; 20]>(s, Self::ADJUST_ORDER_KEY)
                     .map(|o| o.to_vec())
+                    .or_else(|| {
+                        eframe::get_value::<[u8; 19]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
+                    })
                     .or_else(|| {
                         eframe::get_value::<[u8; 15]>(s, Self::ADJUST_ORDER_KEY).map(|o| o.to_vec())
                     })
@@ -2783,6 +2795,12 @@ impl Kaleidotron {
             })
             .map(|o| adjust.with_order(&o))
             .unwrap_or(adjust);
+        // Blur is persisted on its own key (not in the 12-wide adjust array).
+        adjust.blur = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::BLUR_KEY))
+            .unwrap_or(0.0)
+            .clamp(0.0, 8.0);
         let postfx = cc
             .storage
             .and_then(|s| eframe::get_value::<Vec<f32>>(s, Self::POSTFX_KEY))
@@ -2943,6 +2961,7 @@ impl Kaleidotron {
             .unwrap_or(240.0)
             .clamp(60.0, 1200.0);
         let quantize_on = get_bool(Self::QUANT_ON_KEY).unwrap_or(false);
+        let quantize_keep_bw = get_bool(Self::QUANT_KEEP_BW_KEY).unwrap_or(false);
         let quantize_n = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::QUANT_N_KEY))
@@ -3014,17 +3033,17 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_AMOUNT_KEY))
             .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
+            .clamp(0.0, 2.0);
         let shade_smooth = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_SMOOTH_KEY))
             .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
+            .clamp(0.0, 3.0);
         let shade_detail = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::SHADE_DETAIL_KEY))
             .unwrap_or(0.30)
-            .clamp(0.0, 1.0);
+            .clamp(0.0, 5.0);
         let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
         let shade_export_format = cc
             .storage
@@ -3474,6 +3493,7 @@ impl Kaleidotron {
             recolor_thumb_h,
             quantize_on,
             quantize_n,
+            quantize_keep_bw,
             dither_method,
             dither_amount,
             dither_custom,
@@ -19530,7 +19550,13 @@ impl Kaleidotron {
             let src = self.reduce_source(path)?;
             self.quantize_cache = Some((path.to_path_buf(), n, crate::thumb::median_cut(&src, n)));
         }
-        Some(self.quantize_cache.as_ref().unwrap().2.clone())
+        let mut pal = self.quantize_cache.as_ref().unwrap().2.clone();
+        // "Keep black/white" is applied OUTSIDE the median-cut cache (it's a cheap 2-color
+        // snap), so toggling it is instant without re-reducing.
+        if self.quantize_keep_bw {
+            force_black_white(&mut pal);
+        }
+        Some(pal)
     }
 
     /// Parse + cache a `.gpl` palette file. None if unreadable or empty.
@@ -19762,6 +19788,7 @@ impl Kaleidotron {
             color: None,
             fg: None,
             adjust_vals: self.adjust.to_array(),
+            blur: self.adjust.blur,
             order: self.adjust.order_to_u8().to_vec(),
             postfx: self.postfx.to_record(),
             dither_method: self.dither_method,
@@ -19801,6 +19828,7 @@ impl Kaleidotron {
             scale_algo: self.scale_algo as u8,
             quantize_on: self.quantize_on,
             quantize_n: self.quantize_n,
+            quantize_keep_bw: self.quantize_keep_bw,
             selected_palette: self.selected_palette.clone(),
             custom_palette: self.custom_palette.clone(),
             folder: None, // the caller (fx_save) sets it from the folder field
@@ -19813,6 +19841,7 @@ impl Kaleidotron {
     /// preview/full/grid rebuild from the recalled look.
     fn apply_fx_preset(&mut self, p: &FxPreset) {
         self.adjust = Adjust::from_array(p.adjust_vals).with_order(&p.order);
+        self.adjust.blur = p.blur.clamp(0.0, 8.0);
         self.postfx = PostFx::from_record(&p.postfx);
         self.dither_method = p.dither_method;
         self.dither_amount = p.dither_amount.clamp(0.0, 1.0);
@@ -19841,9 +19870,9 @@ impl Kaleidotron {
         self.shade_half_on = p.shade_half_on;
         self.shade_half_use = p.shade_half_use.map(|u| u.clamp(0.0, 1.0));
         self.shade_vga50 = p.shade_vga50;
-        self.shade_amount = p.shade_amount.clamp(0.0, 1.0);
-        self.shade_smooth = p.shade_smooth.clamp(0.0, 1.0);
-        self.shade_detail = p.shade_detail.clamp(0.0, 1.0);
+        self.shade_amount = p.shade_amount.clamp(0.0, 2.0);
+        self.shade_smooth = p.shade_smooth.clamp(0.0, 3.0);
+        self.shade_detail = p.shade_detail.clamp(0.0, 5.0);
         self.shade_ice = p.shade_ice;
         self.shade_export_format = p.shade_export_format.min(5);
         self.shade_fit_chars = p.shade_fit_chars;
@@ -19864,6 +19893,7 @@ impl Kaleidotron {
         self.scale_algo = crate::scale::Scaler::from_u8(p.scale_algo);
         self.quantize_on = p.quantize_on;
         self.quantize_n = p.quantize_n.clamp(2, 256);
+        self.quantize_keep_bw = p.quantize_keep_bw;
         self.selected_palette = p.selected_palette.clone();
         self.custom_palette = p.custom_palette.clone();
         // Invalidate derived caches so the recalled look rebuilds.
@@ -19910,7 +19940,7 @@ impl Kaleidotron {
         } else if let Some(pp) = &self.selected_palette {
             format!("pal:{}", pp.display())
         } else if self.quantize_on {
-            format!("reduce:{}", self.quantize_n)
+            format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8)
         } else {
             "none".to_string()
         };
@@ -20000,7 +20030,7 @@ impl Kaleidotron {
         }
         if self.quantize_on {
             let reduced = self.reduce_palette(path)?;
-            return Some((format!("reduce:{}", self.quantize_n), reduced));
+            return Some((format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8), reduced));
         }
         None
     }
@@ -20015,7 +20045,7 @@ impl Kaleidotron {
         } else if let Some(pp) = &self.selected_palette {
             format!("pal:{}", pp.display())
         } else if self.quantize_on {
-            format!("reduce:{}", self.quantize_n)
+            format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8)
         } else {
             "none".into()
         }
@@ -20032,7 +20062,7 @@ impl Kaleidotron {
         } else if let Some(pp) = &self.selected_palette {
             format!("pal:{}", pp.display())
         } else if self.quantize_on {
-            format!("reduce:{}", self.quantize_n)
+            format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8)
         } else {
             "orig".to_string()
         };
@@ -21975,6 +22005,8 @@ impl Kaleidotron {
             .id_salt("details")
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+                // Gutter between content and the scrollbar (see the recolor panel).
+                ui.set_max_width((ui.available_width() - SCROLL_GUTTER).max(0.0));
                 ui.label(egui::RichText::new(short_name(&entry.path)).strong());
                 ui.add_space(6.0);
                 if entry.is_dir {
@@ -22641,6 +22673,10 @@ impl Kaleidotron {
             .id_salt("recolor")
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+                // Leave a right-side gutter so the row controls (the ▲▼ reorder arrows, ↺
+                // resets, the widest sliders) don't hug the scrollbar — you can grab it
+                // without landing on a control and nudging a value while wheeling.
+                ui.set_max_width((ui.available_width() - SCROLL_GUTTER).max(0.0));
                 let pal_state = self.palettes.get(&entry.path).cloned();
                 let recolor = self.active_recolor(&entry.path);
                 // The palette shown as swatches: the active recolor palette, else the
@@ -23249,7 +23285,7 @@ impl Kaleidotron {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 19]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 20]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -23634,7 +23670,7 @@ impl Kaleidotron {
                     // Quick reduction presets.
                     ui.horizontal(|ui| {
                         ui.weak("Quick");
-                        for nq in [4usize, 8, 16, 32] {
+                        for nq in [2usize, 3, 4, 6, 8, 10, 16, 32, 48] {
                             if ui.button(nq.to_string()).clicked() {
                                 self.quantize_n = nq;
                                 self.quantize_on = true;
@@ -23642,6 +23678,13 @@ impl Kaleidotron {
                                 self.custom_palette = None;
                             }
                         }
+                        ui.checkbox(&mut self.quantize_keep_bw, "Keep black/white")
+                            .on_hover_text(
+                                "Force pure black + white into the reduced palette — snaps the \
+                                 darkest color to black and the brightest to white (uses the \
+                                 palette's own extremes when it has no true black/white). Keeps \
+                                 the color count; great for readable ANSI contrast.",
+                            );
                     });
                     self.quantize_n = self.quantize_n.clamp(2, 256);
 
@@ -23662,7 +23705,24 @@ impl Kaleidotron {
                                 }
                             });
                         wheel_cycle(ui, &cr.response, &mut m, crate::thumb::DITHER_NAMES.len());
+                        let prev = self.dither_method;
                         self.dither_method = m as u8;
+                        // Usability: ANSI Shade draws in PALETTE colours, so with nothing
+                        // providing any it silently does nothing. When the user switches TO
+                        // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
+                        // (an ANSI-appropriate default) so it works on the spot — they can then
+                        // pick a palette or change N from there.
+                        if self.dither_method == crate::thumb::DITHER_ANSI
+                            && prev != crate::thumb::DITHER_ANSI
+                            && self.custom_palette.is_none()
+                            && self.selected_palette.is_none()
+                            && !self.quantize_on
+                        {
+                            self.quantize_on = true;
+                            self.quantize_n = 16;
+                            self.quantize_cache = None;
+                            self.reduce_src = None;
+                        }
                     });
                     // ANSI Shade ignores "Amount" (it's a hard two-colour quantize).
                     if self.dither_method != 0
@@ -23884,27 +23944,29 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label("Shading");
                             let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_amount, 0.0..=1.0))
+                                .add(egui::Slider::new(&mut self.shade_amount, 0.0..=2.0))
                                 .on_hover_text(
-                                    "How much shading vs. flat color — low = flats stay \
-                                     solid, shade only in transitions.",
+                                    "How much shading vs. flat color. 0..1: low = flats stay \
+                                     solid, shade only in transitions. 1..2: FORCE dithering — \
+                                     solids get penalized so even flats go textured.",
                                 );
                             middle_reset(ui, &resp, &mut self.shade_amount, 1.0f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_amount, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_amount, 0.05, 0.0f32, 2.0f32);
                         });
                         // Smoothness: contrast penalty on the shade blocks so the search
                         // avoids garish high-contrast dithers.
                         ui.horizontal(|ui| {
                             ui.label("Smoothness");
                             let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_smooth, 0.0..=1.0))
+                                .add(egui::Slider::new(&mut self.shade_smooth, 0.0..=3.0))
                                 .on_hover_text(
-                                    "Avoid garish high-contrast dithers — higher keeps shade \
-                                     blocks between similar colors (prefers solids), lower \
-                                     allows any pair.",
+                                    "False-color avoidance — higher penalizes dithering two \
+                                     different HUES (yellow▒blue), keeping shade blocks between \
+                                     similar colors; push past 1 for a hard clamp. Lower allows \
+                                     any pair.",
                                 );
                             middle_reset(ui, &resp, &mut self.shade_smooth, 0.5f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 3.0f32);
                         });
                         // Detail: how hard a cell's internal contrast pulls the search toward
                         // half-blocks. Higher = crisper edges when shrunk (more ▀▄▌▐, less
@@ -23912,14 +23974,15 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label("Detail");
                             let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_detail, 0.0..=1.0))
+                                .add(egui::Slider::new(&mut self.shade_detail, 0.0..=5.0))
                                 .on_hover_text(
                                     "Edge detail retention when shrinking — higher makes cells \
                                      with a strong internal contrast render as crisp half-blocks \
-                                     (▀▄▌▐) instead of averaged shades. Scales the F5–F8 usage.",
+                                     (▀▄▌▐) instead of averaged shades. Scales the F5–F8 usage; \
+                                     crank it for aggressive edge-preservation.",
                                 );
                             middle_reset(ui, &resp, &mut self.shade_detail, 0.30f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_detail, 0.05, 0.0f32, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.shade_detail, 0.05, 0.0f32, 5.0f32);
                         });
                         // The fill fractions the ░▒▓ shade blocks stand for; the leading
                         // checkbox toggles whether that shade level is a candidate at all.
@@ -36049,6 +36112,7 @@ impl eframe::App for Kaleidotron {
         // (ratings persist to their own JSON sidecar, not eframe storage)
         eframe::set_value(storage, Self::ADJUST_KEY, &self.adjust.to_array());
         eframe::set_value(storage, Self::ADJUST_ORDER_KEY, &self.adjust.order_to_u8());
+        eframe::set_value(storage, Self::BLUR_KEY, &self.adjust.blur);
         eframe::set_value(storage, Self::IMG_ZOOM_KEY, &self.raster_zoom);
         eframe::set_value(storage, Self::ZOOM_LOCK_KEY, &self.zoom_lock);
         eframe::set_value(storage, Self::THEME_KEY, &self.theme);
@@ -36071,6 +36135,7 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::QUANT_ON_KEY, &self.quantize_on);
         eframe::set_value(storage, Self::QUANT_N_KEY, &self.quantize_n);
+        eframe::set_value(storage, Self::QUANT_KEEP_BW_KEY, &self.quantize_keep_bw);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -36673,12 +36738,16 @@ enum OpKind {
     Glow,
     Vignette,
     Phosphor,
+    /// Gaussian-style spatial blur. A value op: 0 = off, larger = softer. Paired with
+    /// Sharpen (blur → sharpen) it melts pixel-art jaggies into smooth solid islands — a
+    /// no-scale XBR-ish "vectorize". Appended last so persisted op indices stay valid.
+    Blur,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
     /// so persisted order indices stay valid across upgrades.
-    const ALL: [OpKind; 19] = [
+    const ALL: [OpKind; 20] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -36698,6 +36767,7 @@ impl OpKind {
         OpKind::Glow,
         OpKind::Vignette,
         OpKind::Phosphor,
+        OpKind::Blur,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -36735,7 +36805,7 @@ impl OpKind {
             OpKind::Saturation => ("Saturation", -1.0, 1.0, 0.0, 0.0),
             OpKind::Vibrance => ("Vibrance", -1.0, 1.0, 0.0, 0.0),
             OpKind::Pixelate => ("Pixelate", 0.0, 0.0, 0.0, 0.0),
-            OpKind::Sharpen => ("Sharpen", 0.0, 1.0, 0.0, 0.0),
+            OpKind::Sharpen => ("Sharpen", 0.0, 4.0, 0.0, 0.0),
             OpKind::Invert => ("Invert", 0.0, 1.0, 0.0, 0.0),
             OpKind::Palette => ("Palette", 0.0, 0.0, 0.0, 0.0),
             OpKind::ColorBalance => ("Color balance", 0.0, 0.0, 0.0, 0.0),
@@ -36744,6 +36814,7 @@ impl OpKind {
             OpKind::Glow => ("Glow", 0.0, 0.0, 0.0, 0.0),
             OpKind::Vignette => ("Vignette", 0.0, 0.0, 0.0, 0.0),
             OpKind::Phosphor => ("Phosphor", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Blur => ("Blur", 0.0, 8.0, 0.0, 0.0),
         }
     }
 }
@@ -36773,10 +36844,13 @@ struct Adjust {
     sharpen: f32,
     /// Invert amount: 0 = off, 1 = full negative, in between blends original↔negative.
     invert: f32,
+    /// Blur radius in px (0 = off). NOT part of `to_array`/`adjust_vals` — persisted on
+    /// its own so the 12-wide preset array stays unchanged and old presets still load.
+    blur: f32,
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 19],
+    order: [OpKind; 20],
 }
 
 impl Default for Adjust {
@@ -36794,6 +36868,7 @@ impl Default for Adjust {
             pixelate: 0.0,
             sharpen: 0.0,
             invert: 0.0,
+            blur: 0.0,
             order: Self::DEFAULT_ORDER,
         }
     }
@@ -36803,7 +36878,7 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 19] = [
+    const DEFAULT_ORDER: [OpKind; 20] = [
         OpKind::Pixelate,
         OpKind::Brightness,
         OpKind::Contrast,
@@ -36816,6 +36891,9 @@ impl Adjust {
         OpKind::Saturation,
         OpKind::Vibrance,
         OpKind::ColorBalance,
+        // Blur then Sharpen by default: soften regions, then re-harden the edges — the
+        // "melt pixel-art into solid shapes" move works out of the box.
+        OpKind::Blur,
         OpKind::Sharpen,
         OpKind::Dither,
         OpKind::Palette,
@@ -36840,6 +36918,7 @@ impl Adjust {
             && self.pixelate < 2.0
             && self.sharpen <= 0.0
             && self.invert <= 0.0
+            && self.blur <= 0.0
     }
     fn key(&self) -> String {
         let order: String = self
@@ -36848,7 +36927,7 @@ impl Adjust {
             .map(|o| (*o as u8 + b'a') as char)
             .collect();
         format!(
-            "a{:.2},{:.2},{:.2},{:.2},{:.2},{:.0},{:.3},{:.3},{:.3},{:.0},{:.3},{:.3};o{order}",
+            "a{:.2},{:.2},{:.2},{:.2},{:.2},{:.0},{:.3},{:.3},{:.3},{:.0},{:.3},{:.3},b{:.2};o{order}",
             self.brightness,
             self.contrast,
             self.gamma,
@@ -36860,11 +36939,12 @@ impl Adjust {
             self.vibrance,
             self.pixelate,
             self.sharpen,
-            self.invert
+            self.invert,
+            self.blur
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 19] {
+    fn order_to_u8(&self) -> [u8; 20] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -36890,7 +36970,7 @@ impl Adjust {
                 ops.push(op);
             }
         }
-        if let Ok(order) = <[OpKind; 19]>::try_from(ops) {
+        if let Ok(order) = <[OpKind; 20]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -36920,6 +37000,7 @@ impl Adjust {
             OpKind::Saturation => &mut self.saturation,
             OpKind::Vibrance => &mut self.vibrance,
             OpKind::Sharpen => &mut self.sharpen,
+            OpKind::Blur => &mut self.blur,
         }
     }
     fn to_array(self) -> [f32; 12] {
@@ -36952,6 +37033,7 @@ impl Adjust {
             pixelate: a[9],
             sharpen: a[10],
             invert: a[11],
+            blur: 0.0, // not in the 12-wide array — set separately from BLUR_KEY / preset
             order: Self::DEFAULT_ORDER,
         }
     }
@@ -37391,6 +37473,8 @@ struct FxPreset {
     color: Option<[u8; 3]>, // Places button background tint (ANSI32 swatch)
     fg: Option<[u8; 3]>,    // button text color override (else auto black/white for contrast)
     adjust_vals: [f32; 12], // Adjust::to_array()
+    #[serde(default)]
+    blur: f32, // Adjust::blur — kept out of adjust_vals so the array width never changes
     order: Vec<u8>,         // Adjust::order_to_u8() — portable across op additions
     postfx: Vec<f32>,       // PostFx::to_record()
     dither_method: u8,
@@ -37443,6 +37527,8 @@ struct FxPreset {
     scale_algo: u8, // pixel-art upscaler index (crate::scale::Scaler)
     quantize_on: bool,
     quantize_n: usize,
+    #[serde(default)]
+    quantize_keep_bw: bool,
     selected_palette: Option<PathBuf>,
     custom_palette: Option<Vec<[u8; 4]>>,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
@@ -37456,6 +37542,7 @@ impl Default for FxPreset {
             color: None,
             fg: None,
             adjust_vals: Adjust::default().to_array(),
+            blur: 0.0,
             order: Adjust::default().order_to_u8().to_vec(),
             postfx: PostFx::default().to_record(),
             dither_method: 0,
@@ -37495,6 +37582,7 @@ impl Default for FxPreset {
             scale_algo: 0,
             quantize_on: false,
             quantize_n: 16,
+            quantize_keep_bw: false,
             selected_palette: None,
             custom_palette: None,
             folder: None,
@@ -37879,6 +37967,11 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
                 sharpen_image(rgba, w, h, a.sharpen);
             }
         }
+        OpKind::Blur => {
+            if a.blur > 0.0 && w > 0 && h > 0 {
+                blur_image(rgba, w, h, a.blur);
+            }
+        }
         OpKind::Invert => {
             // Blend toward the photographic negative: 0 = original, 1 = full invert.
             if a.invert > 0.0 {
@@ -37984,6 +38077,54 @@ fn pixelate_blocks(rgba: &mut [u8], w: usize, h: usize, bw: usize, bh: usize) {
 /// −amount). Reads a snapshot so the pass isn't self-referential; transparent
 /// neighbours (and image edges) clamp to the center value, so silhouettes don't
 /// bleed dark halos.
+/// Gaussian-ish blur via THREE separable box passes (the standard fast Gaussian
+/// approximation). `radius` is in pixels; each box is alpha-weighted so transparent
+/// pixels don't bleed dark color into the edges, and original alpha is preserved. Paired
+/// with `sharpen_image` (blur → sharpen) this melts pixel-art steps into smooth solids.
+fn blur_image(rgba: &mut [u8], w: usize, h: usize, radius: f32) {
+    let r = radius.round() as i32;
+    if r < 1 || w == 0 || h == 0 {
+        return;
+    }
+    // One alpha-weighted box pass along a run of `len` samples with stride `stride`
+    // (bytes). `get(k)` returns the byte index of sample k. Works for a row or a column.
+    let box_pass = |buf: &mut [u8], len: usize, idx: &dyn Fn(usize) -> usize| {
+        // Prefix sums of alpha-weighted channels + alpha, so each window is O(1).
+        let mut pr = vec![0f64; len + 1];
+        let mut pg = vec![0f64; len + 1];
+        let mut pb = vec![0f64; len + 1];
+        let mut pa = vec![0f64; len + 1];
+        for k in 0..len {
+            let i = idx(k);
+            let a = buf[i + 3] as f64;
+            pr[k + 1] = pr[k] + buf[i] as f64 * a;
+            pg[k + 1] = pg[k] + buf[i + 1] as f64 * a;
+            pb[k + 1] = pb[k] + buf[i + 2] as f64 * a;
+            pa[k + 1] = pa[k] + a;
+        }
+        for k in 0..len {
+            let lo = k.saturating_sub(r as usize);
+            let hi = (k + r as usize + 1).min(len);
+            let sa = pa[hi] - pa[lo];
+            let i = idx(k);
+            if sa > 0.0 {
+                buf[i] = (((pr[hi] - pr[lo]) / sa).round()).clamp(0.0, 255.0) as u8;
+                buf[i + 1] = (((pg[hi] - pg[lo]) / sa).round()).clamp(0.0, 255.0) as u8;
+                buf[i + 2] = (((pb[hi] - pb[lo]) / sa).round()).clamp(0.0, 255.0) as u8;
+            }
+            // alpha itself is box-averaged (soft edges) but never below the original count.
+        }
+    };
+    for _ in 0..3 {
+        for y in 0..h {
+            box_pass(rgba, w, &|x| (y * w + x) * 4);
+        }
+        for x in 0..w {
+            box_pass(rgba, h, &|y| (y * w + x) * 4);
+        }
+    }
+}
+
 fn sharpen_image(rgba: &mut [u8], w: usize, h: usize, amount: f32) {
     let src = rgba.to_vec();
     let center = 1.0 + 4.0 * amount;
@@ -38064,6 +38205,37 @@ fn palette_hash(pal: &[[u8; 4]]) -> u64 {
         }
     }
     h
+}
+
+/// Pin pure black + white into a palette ("Keep black/white"): snap the DARKEST entry to
+/// [0,0,0] and the BRIGHTEST to [255,255,255], so ANSI art always has its two contrast
+/// anchors — even when the reduced palette had neither. Replaces (never adds), so the
+/// colour count is unchanged; alpha is preserved.
+fn force_black_white(pal: &mut [[u8; 4]]) {
+    if pal.is_empty() {
+        return;
+    }
+    let luma = |c: &[u8; 4]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+    let (mut dark, mut light) = (0usize, 0usize);
+    for (i, c) in pal.iter().enumerate() {
+        if luma(c) < luma(&pal[dark]) {
+            dark = i;
+        }
+        if luma(c) > luma(&pal[light]) {
+            light = i;
+        }
+    }
+    // If the whole palette is one luminance (dark == light), give black slot 0 and, when
+    // there's room, white slot 1 — otherwise snap the distinct extremes.
+    if dark == light {
+        pal[0] = [0, 0, 0, pal[0][3]];
+        if pal.len() >= 2 {
+            pal[1] = [255, 255, 255, pal[1][3]];
+        }
+    } else {
+        pal[dark] = [0, 0, 0, pal[dark][3]];
+        pal[light] = [255, 255, 255, pal[light][3]];
+    }
 }
 
 /// A wall-clock-seeded index in `0..n` (for the Random palette pick). Rust's
@@ -46934,6 +47106,33 @@ mod tests {
     }
 
     #[test]
+    fn blur_softens_a_hard_edge() {
+        // A 2×1 black|white edge, blurred, pulls both pixels toward the mid grey.
+        let mut px = vec![0u8, 0, 0, 255, 255, 255, 255, 255];
+        blur_image(&mut px, 2, 1, 1.0);
+        assert!((90..=165).contains(&px[0]), "left lifted: {}", px[0]);
+        assert!((90..=165).contains(&px[4]), "right lowered: {}", px[4]);
+        assert_eq!(px[3], 255);
+        assert_eq!(px[7], 255);
+        // Blur is in the op set + default order, and reachable by the Blur field.
+        assert!(Adjust::DEFAULT_ORDER.contains(&OpKind::Blur));
+        assert_eq!(OpKind::Blur.spec().0, "Blur");
+    }
+
+    #[test]
+    fn keep_black_white_snaps_the_extremes() {
+        // A palette with no true black/white: the darkest entry becomes pure black, the
+        // brightest pure white, and the count is unchanged.
+        let mut pal = vec![[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]];
+        force_black_white(&mut pal);
+        assert!(pal.contains(&[0, 0, 0, 255]), "black pinned: {pal:?}");
+        assert!(pal.contains(&[255, 255, 255, 255]), "white pinned: {pal:?}");
+        assert_eq!(pal.len(), 3, "color count unchanged");
+        // The mid-luma color ([40,40,60], neither darkest nor brightest) is untouched.
+        assert!(pal.contains(&[40, 40, 60, 255]), "mid color kept: {pal:?}");
+    }
+
+    #[test]
     fn batch_builds_grid_from_preset_and_maps_formats() {
         // The headless batch path: a default ANSI-Shade preset (snap 9×16) on an 18×32
         // opaque image yields a 2×2 cell grid — proving `build_ansi_grid_from_preset`
@@ -47767,6 +47966,7 @@ mod tests {
             OpKind::Glow,
             OpKind::Vignette,
             OpKind::Phosphor,
+            OpKind::Blur,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -47818,6 +48018,7 @@ mod tests {
                 OpKind::Glow,
                 OpKind::Vignette,
                 OpKind::Phosphor,
+                OpKind::Blur,
             ],
             ..Default::default()
         };
@@ -47878,6 +48079,7 @@ mod tests {
             color: Some([10, 20, 30]),
             quantize_on: true,
             quantize_n: 8,
+            quantize_keep_bw: false,
             resize_on: true,
             resize_fx: 0.5,
             ..Default::default()

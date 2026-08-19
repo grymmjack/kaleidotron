@@ -780,16 +780,22 @@ pub fn ansi_shade_grid(
     // The max threshold is scaled to the palette's spacing (≈ the solid-error of a
     // midpoint cell = spacing/4), so the FULL 0..1 slider is useful on any palette.
     let max_threshold = palette_spacing(&pf) * 0.25;
-    let threshold = (1.0 - shade_amount.clamp(0.0, 1.0)) * max_threshold;
+    // "Shading" now runs 0..2. 0..1 is the flat-cell THRESHOLD (low → big threshold → flats
+    // stay a solid █, only real transitions shade). Above 1 it FORCES dithering: the flat
+    // gate is off and solid glyphs (space/█) pay a penalty that grows with the amount, so
+    // shade pairs win even on near-flat cells — the whole canvas goes textured at 2.0.
+    let amt = shade_amount.clamp(0.0, 2.0);
+    let threshold = (1.0 - amt).max(0.0) * max_threshold;
+    let solid_penalty = (amt - 1.0).max(0.0) * palette_spacing(&pf) * 0.5;
     // "Smoothness" = false-colour avoidance. The greedy pair search would happily dither
     // two DIFFERENT HUES that average to the target (yellow▒blue → grey) — garish false
     // colour the source never had. We penalise mid-shade glyphs (░▒▓) by their CHROMA
     // distance (hue difference with brightness removed), so mixing hues is costly but
     // brightness-only shading (grey▓grey, white▒black) — which has ~zero chroma distance
     // — stays free at ANY Smoothness. A baseline weight is always applied so greys never
-    // dither into colour even at Smoothness 0; the slider adds more on top. Solids and
-    // the half-blocks are exempt (see the loop below): they show real, un-blended colour.
-    let smooth_w = smooth.clamp(0.0, 1.0);
+    // dither into colour even at Smoothness 0; the slider adds more on top (now 0..3 for a
+    // much harder clamp on hue-mixing). Solids and half-blocks are exempt (see the loop).
+    let smooth_w = smooth.clamp(0.0, 3.0);
     let chroma_w = 0.10 + 0.40 * smooth_w;
     // Perf: a cell this small can't show a visible shade pattern, so it always
     // renders as a flat colour — a constant of the effective cell size, hoisted out.
@@ -860,9 +866,11 @@ pub fn ansi_shade_grid(
             }
             // Shading-amount gate: if `avg` is already close to a solid palette colour
             // (within `threshold`), keep the cell a flat █ and skip the shade search —
-            // so large flat regions stay solid instead of being needlessly dithered.
+            // so large flat regions stay solid instead of being needlessly dithered. When
+            // Shading > 1 (`solid_penalty` on), the gate is bypassed so even flats get to
+            // dither.
             let solid_err = dist2(avg, pf[solid_idx as usize]);
-            if solid_err <= threshold {
+            if solid_err <= threshold && solid_penalty <= 0.0 {
                 row[cx] = AnsiCell { fg: solid_idx, bg: solid_idx, ch: 219 };
                 continue;
             }
@@ -913,7 +921,9 @@ pub fn ansi_shade_grid(
                         let err_eff = if cov != 0.0 && cov != 1.0 {
                             dist2(avg, pred) + chroma_pen
                         } else {
-                            dist2(avg, pred)
+                            // space (cov 0) / █ (cov 1) are the SOLIDS — penalise them when
+                            // Shading > 1 so shade pairs win even on flats (forced dither).
+                            dist2(avg, pred) + solid_penalty
                         };
                         if err_eff < best_err {
                             best_err = err_eff;
