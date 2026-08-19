@@ -1589,6 +1589,10 @@ pub struct Kaleidotron {
     crop_preset_new: String,        // name buffer for "Save current crop"
     crop_preset_rename: Option<usize>, // preset being renamed inline
     crop_presets_open: bool,        // show the inline presets panel (not a menu — text edits work)
+    // Named presets for JUST the ANSI-Shade panel (below PixelFX). Persisted.
+    ansi_presets: Vec<AnsiPreset>,
+    ansi_preset_sel: Option<usize>,    // last-applied preset (dropdown display)
+    ansi_preset_rename: Option<usize>, // preset being renamed inline
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
@@ -2424,6 +2428,7 @@ impl Kaleidotron {
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
+    const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3552,6 +3557,12 @@ impl Kaleidotron {
             crop_preset_new: String::new(),
             crop_preset_rename: None,
             crop_presets_open: false,
+            ansi_presets: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<AnsiPreset>>(s, Self::ANSI_PRESETS_KEY))
+                .unwrap_or_default(),
+            ansi_preset_sel: None,
+            ansi_preset_rename: None,
             dither_method,
             dither_amount,
             dither_custom,
@@ -20582,6 +20593,56 @@ impl Kaleidotron {
         self.shade_fit_chars = false;
     }
 
+    /// Snapshot the ANSI-Shade panel controls into a named preset (just the shade "chunk" —
+    /// snap/VGA50/half/iCE/format/fit + shading/smoothness/detail + F1–F8).
+    fn capture_ansi_preset(&self, name: String) -> AnsiPreset {
+        AnsiPreset {
+            name,
+            snap916: self.shade_snap916,
+            vga50: self.shade_vga50,
+            half: self.shade_half,
+            ice: self.shade_ice,
+            export_format: self.shade_export_format,
+            fit_chars: self.shade_fit_chars,
+            fit_cols: self.shade_fit_cols,
+            fit_rows: self.shade_fit_rows,
+            amount: self.shade_amount,
+            smooth: self.shade_smooth,
+            detail: self.shade_detail,
+            f1: self.shade_f1,
+            f2: self.shade_f2,
+            f3: self.shade_f3,
+            f1_on: self.shade_f1_on,
+            f2_on: self.shade_f2_on,
+            f3_on: self.shade_f3_on,
+            half_on: self.shade_half_on,
+            half_use: self.shade_half_use,
+        }
+    }
+
+    /// Apply a named ANSI-Shade preset's controls to the live state.
+    fn apply_ansi_preset(&mut self, p: &AnsiPreset) {
+        self.shade_snap916 = p.snap916;
+        self.shade_vga50 = p.vga50;
+        self.shade_half = p.half;
+        self.shade_ice = p.ice;
+        self.shade_export_format = p.export_format.min(5);
+        self.shade_fit_chars = p.fit_chars;
+        self.shade_fit_cols = p.fit_cols.max(1);
+        self.shade_fit_rows = p.fit_rows.max(1);
+        self.shade_amount = p.amount;
+        self.shade_smooth = p.smooth;
+        self.shade_detail = p.detail;
+        self.shade_f1 = p.f1;
+        self.shade_f2 = p.f2;
+        self.shade_f3 = p.f3;
+        self.shade_f1_on = p.f1_on;
+        self.shade_f2_on = p.f2_on;
+        self.shade_f3_on = p.f3_on;
+        self.shade_half_on = p.half_on;
+        self.shade_half_use = p.half_use;
+    }
+
     /// THE single source of truth for the ANSI-shade grid. Both the on-screen preview
     /// ([`make_full_reduced`]) and every export format ([`export_textmode`]) call this,
     /// so a rendered `.ans`/`.xb`/`.tnd` is guaranteed **cell-identical** to what the
@@ -24545,6 +24606,91 @@ impl Kaleidotron {
                                 self.reset_ansi_shade();
                             }
                         });
+                        // Named presets for JUST this panel (below PixelFX): pick to apply, [s]
+                        // saves the current settings as a new one, [x] deletes, Rename renames.
+                        ui.horizontal(|ui| {
+                            ui.label("Preset");
+                            let sel_name = self
+                                .ansi_preset_sel
+                                .and_then(|i| self.ansi_presets.get(i))
+                                .map(|p| p.name.clone());
+                            let mut to_apply: Option<usize> = None;
+                            egui::ComboBox::from_id_salt("ansi_preset")
+                                .selected_text(sel_name.as_deref().unwrap_or("—"))
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.ansi_preset_sel.is_none(), "—")
+                                        .clicked()
+                                    {
+                                        self.ansi_preset_sel = None;
+                                    }
+                                    for i in 0..self.ansi_presets.len() {
+                                        if ui
+                                            .selectable_label(
+                                                self.ansi_preset_sel == Some(i),
+                                                &self.ansi_presets[i].name,
+                                            )
+                                            .clicked()
+                                        {
+                                            to_apply = Some(i);
+                                        }
+                                    }
+                                });
+                            if let Some(i) = to_apply {
+                                self.ansi_preset_sel = Some(i);
+                                let p = self.ansi_presets[i].clone();
+                                self.apply_ansi_preset(&p);
+                            }
+                            if ui
+                                .small_button("s")
+                                .on_hover_text("Save the current ANSI-shade settings as a preset")
+                                .clicked()
+                            {
+                                let name = format!("Style {}", self.ansi_presets.len() + 1);
+                                let p = self.capture_ansi_preset(name);
+                                self.ansi_presets.push(p);
+                                self.ansi_preset_sel = Some(self.ansi_presets.len() - 1);
+                                self.ansi_preset_rename = self.ansi_preset_sel; // name it now
+                            }
+                            let has_sel = self.ansi_preset_sel.is_some();
+                            if ui
+                                .add_enabled(has_sel, egui::Button::new("x").small())
+                                .on_hover_text("Delete the selected preset")
+                                .clicked()
+                            {
+                                if let Some(i) = self.ansi_preset_sel.take() {
+                                    if i < self.ansi_presets.len() {
+                                        self.ansi_presets.remove(i);
+                                    }
+                                    self.ansi_preset_rename = None;
+                                }
+                            }
+                            if ui
+                                .add_enabled(has_sel, egui::Button::new("Rename").small())
+                                .clicked()
+                            {
+                                self.ansi_preset_rename = self.ansi_preset_sel;
+                            }
+                        });
+                        if let Some(i) = self.ansi_preset_rename {
+                            if i < self.ansi_presets.len() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Name");
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(&mut self.ansi_presets[i].name)
+                                            .desired_width(150.0),
+                                    );
+                                    if ui.button("✓").clicked()
+                                        || (r.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    {
+                                        self.ansi_preset_rename = None;
+                                    }
+                                });
+                            } else {
+                                self.ansi_preset_rename = None;
+                            }
+                        }
                         // Snap 9×16 and Snap 8×8 (VGA50) are mutually exclusive — the
                         // cell can only be one authentic text size at a time.
                         if ui
@@ -36942,6 +37088,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::CROPS_KEY, &self.crops);
         eframe::set_value(storage, Self::CROP_GUIDE_KEY, &self.crop_guide);
         eframe::set_value(storage, Self::CROP_PRESETS_KEY, &self.crop_presets);
+        eframe::set_value(storage, Self::ANSI_PRESETS_KEY, &self.ansi_presets);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -39106,6 +39253,34 @@ const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 struct CropPreset {
     name: String,
     rect: [f32; 4],
+}
+
+/// A named preset for JUST the ANSI-Shade panel (the shade tuning "chunk") — distinct from a
+/// PixelFX preset, which sits higher and captures the whole recolor stack. Save/recall/rename/
+/// delete from the ANSI-Shade section. `#[serde(default)]` so older saves gain new fields.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct AnsiPreset {
+    name: String,
+    snap916: bool,
+    vga50: bool,
+    half: bool,
+    ice: bool,
+    export_format: u8,
+    fit_chars: bool,
+    fit_cols: usize,
+    fit_rows: usize,
+    amount: f32,
+    smooth: f32,
+    detail: f32,
+    f1: f32,
+    f2: f32,
+    f3: f32,
+    f1_on: bool,
+    f2_on: bool,
+    f3_on: bool,
+    half_on: [bool; 4],
+    half_use: [f32; 4],
 }
 
 /// Canonical key for the per-image crop map (shared by the GUI + `--batch`) so a crop set in
