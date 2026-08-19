@@ -1576,6 +1576,15 @@ pub struct Kaleidotron {
     crop_ratio: Option<(u32, u32)>, // locked aspect for drag + ratio buttons (None = free)
     crop_drag: Option<u8>,          // handle grabbed this gesture: 0-3 corners, 4-7 edges, 8 = move
     crop_backup: bool,              // back up the original before a destructive "Apply crop"
+    // Zoom/pan of the crop surface (the Details thumbnail) for pixel-precise selections —
+    // wheel zooms (cursor-centred), middle-drag pans, middle-click resets. This is a VIEW of
+    // the source only; the stored crop stays in full-image coords. Reset when the image changes.
+    crop_zoom: f32,                 // 1.0 = whole image fits; higher = zoomed in
+    crop_center: egui::Vec2,        // normalized centre of the view window (0.5,0.5 = centre)
+    crop_view_for: Option<PathBuf>, // which image the zoom/pan applies to (else reset)
+    crop_mid_active: bool,          // a middle-button gesture is in progress
+    crop_mid_moved: f32,            // accumulated middle-drag movement (px) → click vs drag
+    crop_guide: u8,                 // composition overlay: 0 thirds,1 golden,2 grid,3 spiral,4 none
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
@@ -2409,6 +2418,7 @@ impl Kaleidotron {
     const QUANT_N_KEY: &'static str = "quantize_n";
     const QUANT_KEEP_BW_KEY: &'static str = "quantize_keep_bw";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
+    const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3517,6 +3527,16 @@ impl Kaleidotron {
             crop_ratio: None,
             crop_drag: None,
             crop_backup: true,
+            crop_zoom: 1.0,
+            crop_center: egui::vec2(0.5, 0.5),
+            crop_view_for: None,
+            crop_mid_active: false,
+            crop_mid_moved: 0.0,
+            crop_guide: cc
+                .storage
+                .and_then(|s| eframe::get_value::<u8>(s, Self::CROP_GUIDE_KEY))
+                .unwrap_or(0)
+                .min(4),
             dither_method,
             dither_amount,
             dither_custom,
@@ -20797,14 +20817,25 @@ impl Kaleidotron {
         };
         let (area, resp) = ui.allocate_exact_size(egui::vec2(avail_w, area_h), sense);
         let fit = fit_centered(area, egui::vec2(bw.max(1.0), (bh * ar_y).max(1.0)));
-        ui.painter().image(
-            tex.id(),
-            fit,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
         if crop_edit {
-            self.draw_crop_box(ui, path, fit, &resp, bw.max(1.0) / bh.max(1.0));
+            // Reset zoom/pan when the crop target changes, then apply wheel-zoom / middle-pan.
+            if self.crop_view_for.as_deref() != Some(path) {
+                self.crop_view_for = Some(path.to_path_buf());
+                self.crop_zoom = 1.0;
+                self.crop_center = egui::vec2(0.5, 0.5);
+            }
+            self.handle_crop_view_input(ui, &resp, fit);
+            let view = self.crop_view_rect();
+            // Paint the (zoomed/panned) window of the image — the view rect is the UV.
+            ui.painter().image(tex.id(), fit, view, egui::Color32::WHITE);
+            self.draw_crop_box(ui, path, fit, view, &resp, bw.max(1.0) / bh.max(1.0));
+        } else {
+            ui.painter().image(
+                tex.id(),
+                fit,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         }
         // Divider handle: a row of dots the user drags up/down to resize the band.
         let (bar, resp) = ui.allocate_exact_size(egui::vec2(avail_w, 10.0), egui::Sense::drag());
@@ -20830,52 +20861,177 @@ impl Kaleidotron {
         new_h
     }
 
-    /// Draw the non-destructive crop box over the Details thumbnail (`fit` = the image's
-    /// on-screen rect) and handle dragging its 8 handles / body. `px_aspect` is the image's
-    /// pixel width/height, used to hold a locked ratio in pixel terms. Writes the new crop via
-    /// `set_crop`, which invalidates the preview/full caches so the change shows immediately.
+    /// The current crop view window in normalized image coords (0..1), from zoom + pan. At
+    /// zoom 1 it's the whole image; zooming in shrinks it and pans within [0,1].
+    fn crop_view_rect(&self) -> egui::Rect {
+        let z = self.crop_zoom.clamp(1.0, 40.0);
+        let vs = 1.0 / z;
+        let half = vs * 0.5;
+        let cx = self.crop_center.x.clamp(half, 1.0 - half);
+        let cy = self.crop_center.y.clamp(half, 1.0 - half);
+        egui::Rect::from_min_size(egui::pos2(cx - half, cy - half), egui::vec2(vs, vs))
+    }
+
+    /// Keep the view centre so the window stays inside [0,1] at the current zoom.
+    fn clamp_crop_center(&mut self) {
+        let half = 0.5 / self.crop_zoom.clamp(1.0, 40.0);
+        self.crop_center.x = self.crop_center.x.clamp(half, 1.0 - half);
+        self.crop_center.y = self.crop_center.y.clamp(half, 1.0 - half);
+    }
+
+    /// Wheel zoom, keeping the image point under `cursor` fixed (cursor-centred zoom).
+    fn zoom_crop_view(&mut self, factor: f32, cursor: Option<egui::Pos2>, fit: egui::Rect) {
+        let old = self.crop_zoom.clamp(1.0, 40.0);
+        let new = (old * factor).clamp(1.0, 40.0);
+        if (new - old).abs() < 1e-5 {
+            return;
+        }
+        if let Some(cur) = cursor.filter(|c| fit.contains(*c)) {
+            let view = self.crop_view_rect();
+            let fx = (cur.x - fit.min.x) / fit.width().max(1.0);
+            let fy = (cur.y - fit.min.y) / fit.height().max(1.0);
+            let px = view.min.x + fx * view.width();
+            let py = view.min.y + fy * view.height();
+            let vs = 1.0 / new;
+            self.crop_zoom = new;
+            self.crop_center = egui::vec2(px - fx * vs + vs * 0.5, py - fy * vs + vs * 0.5);
+        } else {
+            self.crop_zoom = new;
+        }
+        self.clamp_crop_center();
+    }
+
+    /// Handle the crop-surface view gestures on the Details thumbnail: mouse-wheel zooms
+    /// (cursor-centred, and the scroll is consumed so the panel doesn't also scroll),
+    /// middle-drag pans, and a middle-click with no drag resets zoom + pan.
+    fn handle_crop_view_input(&mut self, ui: &egui::Ui, resp: &egui::Response, fit: egui::Rect) {
+        // Wheel zoom (only while hovering the image).
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                let cursor = ui.input(|i| i.pointer.interact_pos());
+                self.zoom_crop_view((scroll * 0.004).exp(), cursor, fit);
+                // Consume the scroll so the enclosing details ScrollArea stays put.
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+        }
+        // Middle button: drag pans, a click (no real movement) resets.
+        let mid_down = ui.input(|i| i.pointer.middle_down());
+        if mid_down {
+            if !self.crop_mid_active && resp.hovered() {
+                self.crop_mid_active = true;
+                self.crop_mid_moved = 0.0;
+            }
+            if self.crop_mid_active {
+                let d = ui.input(|i| i.pointer.delta());
+                self.crop_mid_moved += d.length();
+                let view = self.crop_view_rect();
+                self.crop_center -= egui::vec2(
+                    d.x / fit.width().max(1.0) * view.width(),
+                    d.y / fit.height().max(1.0) * view.height(),
+                );
+                self.clamp_crop_center();
+                if self.crop_mid_moved > 2.0 {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+            }
+        } else if self.crop_mid_active {
+            if self.crop_mid_moved < 4.0 {
+                // A middle-click without a drag → reset the view.
+                self.crop_zoom = 1.0;
+                self.crop_center = egui::vec2(0.5, 0.5);
+            }
+            self.crop_mid_active = false;
+        }
+    }
+
+    /// Draw the non-destructive crop box over the Details thumbnail and handle its 8 handles /
+    /// body. `fit` = the image's on-screen rect; `view` = the zoomed/panned window shown in it
+    /// (normalized image coords); `px_aspect` holds a locked ratio in pixel terms. Colours come
+    /// from the theme; the hovered/dragged handle lights up and sets a directional cursor.
+    /// Writes the new crop via `set_crop`, which invalidates the caches so it shows at once.
     fn draw_crop_box(
         &mut self,
         ui: &mut egui::Ui,
         path: &Path,
         fit: egui::Rect,
+        view: egui::Rect,
         resp: &egui::Response,
         px_aspect: f32,
     ) {
         let c = self.crop_of(path);
-        let to_screen = |nx: f32, ny: f32| fit.min + egui::vec2(nx * fit.width(), ny * fit.height());
+        // Map full-image normalized coords → screen through the current view window.
+        let to_screen = |nx: f32, ny: f32| {
+            egui::pos2(
+                fit.min.x + (nx - view.min.x) / view.width().max(1e-6) * fit.width(),
+                fit.min.y + (ny - view.min.y) / view.height().max(1e-6) * fit.height(),
+            )
+        };
+        let to_norm = |p: egui::Pos2| {
+            egui::vec2(
+                view.min.x + (p.x - fit.min.x) / fit.width().max(1.0) * view.width(),
+                view.min.y + (p.y - fit.min.y) / fit.height().max(1.0) * view.height(),
+            )
+        };
         let bx = egui::Rect::from_min_max(to_screen(c[0], c[1]), to_screen(c[0] + c[2], c[1] + c[3]));
-        let red = egui::Color32::from_rgb(255, 45, 45);
+        // Which handle is under the pointer (for hover light-up + cursor); the dragged one wins.
+        let hover_pos = resp.hover_pos().or_else(|| ui.input(|i| i.pointer.interact_pos()));
+        let active_handle = self
+            .crop_drag
+            .or_else(|| hover_pos.map(|p| pick_crop_handle(p, bx, fit)));
+        // Theme colours: the selection accent for the box, a brightened accent for the hovered
+        // handle, and the window's shadow for the dim surround.
+        let accent = ui.visuals().selection.bg_fill;
+        let lighten = |c: egui::Color32, t: u8| {
+            let m = |v: u8| v.saturating_add(((255 - v) as u16 * t as u16 / 255) as u8);
+            egui::Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
+        };
+        let hot = lighten(accent, 150);
+        let guide_kind = self.crop_guide;
         {
-            let painter = ui.painter();
-            // Dim everything outside the crop so the kept region reads clearly.
+            let painter = ui.painter_at(fit); // clip box + handles to the image area
             let dim = egui::Color32::from_black_alpha(110);
-            let r = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a, b);
+            let r = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a.min(b), a.max(b));
             painter.rect_filled(r(fit.min, egui::pos2(fit.max.x, bx.min.y)), 0.0, dim);
             painter.rect_filled(r(egui::pos2(fit.min.x, bx.max.y), fit.max), 0.0, dim);
             painter.rect_filled(r(egui::pos2(fit.min.x, bx.min.y), egui::pos2(bx.min.x, bx.max.y)), 0.0, dim);
             painter.rect_filled(r(egui::pos2(bx.max.x, bx.min.y), egui::pos2(fit.max.x, bx.max.y)), 0.0, dim);
-            // Rule-of-thirds guides + the red outline.
-            let guide = egui::Stroke::new(0.5, egui::Color32::from_white_alpha(90));
-            for k in 1..3 {
-                let fx = bx.min.x + bx.width() * k as f32 / 3.0;
-                let fy = bx.min.y + bx.height() * k as f32 / 3.0;
-                painter.line_segment([egui::pos2(fx, bx.min.y), egui::pos2(fx, bx.max.y)], guide);
-                painter.line_segment([egui::pos2(bx.min.x, fy), egui::pos2(bx.max.x, fy)], guide);
-            }
-            painter.rect_stroke(bx, 0.0, egui::Stroke::new(1.5, red), egui::StrokeKind::Inside);
-            for (p, _) in crop_handle_points(bx) {
-                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0)), 1.0, red);
+            draw_crop_guide(&painter, bx, guide_kind, egui::Stroke::new(0.7, ui.visuals().weak_text_color()));
+            painter.rect_stroke(bx, 0.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+            for (p, idx) in crop_handle_points(bx) {
+                let on = active_handle == Some(idx);
+                let sz = if on { 11.0 } else { 8.0 };
+                let col = if on { hot } else { accent };
+                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(sz, sz)), 1.5, col);
+                painter.rect_stroke(
+                    egui::Rect::from_center_size(p, egui::vec2(sz, sz)),
+                    1.5,
+                    egui::Stroke::new(1.0, ui.visuals().extreme_bg_color),
+                    egui::StrokeKind::Middle,
+                );
             }
         }
-        // --- interaction ---
+        // Directional resize cursor over a handle (or a move/crosshair otherwise).
+        if resp.hovered() || self.crop_drag.is_some() {
+            let icon = match active_handle {
+                Some(0) | Some(2) => egui::CursorIcon::ResizeNwSe,
+                Some(1) | Some(3) => egui::CursorIcon::ResizeNeSw,
+                Some(4) | Some(6) => egui::CursorIcon::ResizeVertical,
+                Some(5) | Some(7) => egui::CursorIcon::ResizeHorizontal,
+                Some(8) => egui::CursorIcon::Move,
+                _ => egui::CursorIcon::Crosshair,
+            };
+            ui.ctx().set_cursor_icon(icon);
+        }
+        // --- interaction (primary button) ---
         if resp.drag_started() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let h = pick_crop_handle(pos, bx, fit);
                 if h == 255 {
-                    // Outside the box → begin a fresh crop at the pointer, grown by its BR corner.
-                    let nx = ((pos.x - fit.min.x) / fit.width().max(1.0)).clamp(0.0, 1.0 - CROP_MIN);
-                    let ny = ((pos.y - fit.min.y) / fit.height().max(1.0)).clamp(0.0, 1.0 - CROP_MIN);
+                    // Outside the box → start a fresh crop at the pointer, grown by its BR corner.
+                    let n = to_norm(pos);
+                    let nx = n.x.clamp(0.0, 1.0 - CROP_MIN);
+                    let ny = n.y.clamp(0.0, 1.0 - CROP_MIN);
                     self.set_crop(path, [nx, ny, CROP_MIN, CROP_MIN]);
                     self.crop_drag = Some(2);
                 } else {
@@ -20886,8 +21042,9 @@ impl Kaleidotron {
         if resp.dragged() {
             if let Some(h) = self.crop_drag {
                 let d = resp.drag_delta();
-                let dx = d.x / fit.width().max(1.0);
-                let dy = d.y / fit.height().max(1.0);
+                // Screen delta → normalized image delta through the view scale.
+                let dx = d.x / fit.width().max(1.0) * view.width();
+                let dy = d.y / fit.height().max(1.0) * view.height();
                 let a_norm = self
                     .crop_ratio
                     .map(|(rw, rh)| (rw as f32 / rh as f32) / px_aspect.max(0.001));
@@ -20897,9 +21054,6 @@ impl Kaleidotron {
         }
         if resp.drag_stopped() {
             self.crop_drag = None;
-        }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
     }
 
@@ -20950,6 +21104,15 @@ impl Kaleidotron {
                 }
             }
         });
+        // Composition overlay picker.
+        ui.horizontal(|ui| {
+            ui.label("Guide");
+            for (i, lbl) in ["Thirds", "Golden", "Grid", "Spiral", "None"].iter().enumerate() {
+                if ui.selectable_label(self.crop_guide == i as u8, *lbl).clicked() {
+                    self.crop_guide = i as u8;
+                }
+            }
+        });
         // Pixel X/Y/W/H (readout + editable), when the source's native size is known.
         if let Some((iw, ih)) = dims {
             let c = self.crop_of(path);
@@ -20990,6 +21153,11 @@ impl Kaleidotron {
                 }
             });
         }
+        // Breathing room + a divider before the Details metadata below, so the crop controls
+        // don't feel crammed against it.
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
     }
 
     /// Bake this image's crop into the file on disk: decode the original, crop, (optionally)
@@ -36576,6 +36744,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::QUANT_N_KEY, &self.quantize_n);
         eframe::set_value(storage, Self::QUANT_KEEP_BW_KEY, &self.quantize_keep_bw);
         eframe::set_value(storage, Self::CROPS_KEY, &self.crops);
+        eframe::set_value(storage, Self::CROP_GUIDE_KEY, &self.crop_guide);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38793,6 +38962,57 @@ fn crop_apply_ratio(c: [f32; 4], rw: u32, rh: u32, px_aspect: f32) -> [f32; 4] {
         h = w / a.max(0.0001);
     }
     clamp_crop([cx - w * 0.5, cy - h * 0.5, w, h])
+}
+
+/// Draw the composition overlay inside the crop box: 0 rule-of-thirds, 1 golden-ratio (φ)
+/// lines, 2 a 4×4 grid, 3 a golden spiral (+ φ lines), 4 none.
+fn draw_crop_guide(painter: &egui::Painter, bx: egui::Rect, guide: u8, stroke: egui::Stroke) {
+    let vline = |x: f32| painter.line_segment([egui::pos2(x, bx.min.y), egui::pos2(x, bx.max.y)], stroke);
+    let hline = |y: f32| painter.line_segment([egui::pos2(bx.min.x, y), egui::pos2(bx.max.x, y)], stroke);
+    let at = |f: f32, lo: f32, span: f32| lo + span * f;
+    match guide {
+        0 => {
+            for k in 1..3 {
+                vline(at(k as f32 / 3.0, bx.min.x, bx.width()));
+                hline(at(k as f32 / 3.0, bx.min.y, bx.height()));
+            }
+        }
+        1 | 3 => {
+            for f in [0.382_f32, 0.618] {
+                vline(at(f, bx.min.x, bx.width()));
+                hline(at(f, bx.min.y, bx.height()));
+            }
+            if guide == 3 {
+                draw_golden_spiral(painter, bx, stroke);
+            }
+        }
+        2 => {
+            for k in 1..4 {
+                vline(at(k as f32 / 4.0, bx.min.x, bx.width()));
+                hline(at(k as f32 / 4.0, bx.min.y, bx.height()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A golden (logarithmic) spiral fitted to `bx`, converging on the φ point, as a polyline.
+/// An approximation for composition — grows by φ every quarter turn over ~3 turns.
+fn draw_golden_spiral(painter: &egui::Painter, bx: egui::Rect, stroke: egui::Stroke) {
+    use std::f32::consts::PI;
+    const K: f32 = 0.306_349; // ln(φ) / (π/2): radius ×φ per quarter turn
+    let steps = 220;
+    let t_max = 3.0 * 2.0 * PI;
+    let (cx, cy) = (bx.min.x + bx.width() * 0.618, bx.min.y + bx.height() * 0.618);
+    let (sx, sy) = (bx.width() * 0.618, bx.height() * 0.618);
+    let pts: Vec<egui::Pos2> = (0..=steps)
+        .map(|i| {
+            let t = t_max * i as f32 / steps as f32;
+            let rr = (K * (t - t_max)).exp(); // 1 at the outer turn, shrinking inward
+            egui::pos2(cx + sx * rr * t.cos(), cy + sy * rr * t.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, stroke));
 }
 
 /// The 8 crop handles as `(screen position, handle index)` — 0-3 corners (TL,TR,BR,BL),
