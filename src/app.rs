@@ -33375,7 +33375,7 @@ impl Kaleidotron {
                                 label = label.color(tc);
                             }
                             let hover = if read_only {
-                                "Apply this Factory preset (read-only — Save a copy to customize)"
+                                "Apply this Factory preset · right-click to recolor its button (structure read-only)"
                             } else {
                                 "Apply this preset · right-click to rename / move / recolor / remove"
                             };
@@ -33385,11 +33385,34 @@ impl Kaleidotron {
                             }
                             r.context_menu(|ui| {
                                 if read_only {
-                                    // Factory presets are read-only: apply only, no mutate (else a
-                                    // rename/delete would just resurrect next launch, confusingly).
-                                    ui.weak("Factory preset — read-only");
+                                    // Factory presets are read-only for STRUCTURE — rename / move /
+                                    // remove would just resurrect next launch, confusingly. But
+                                    // RECOLORING the Places button is fine: the colour lives on the
+                                    // copy merged into your saved list, and the merge leaves an
+                                    // already-filed builtin alone, so it persists across launches.
+                                    ui.weak("Factory preset — structure read-only");
                                     if ui.button("Apply").clicked() {
                                         fx_apply = Some(i);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    ui.weak("Background");
+                                    if ui.button("× Clear").clicked() {
+                                        fx_color = Some((i, None));
+                                        ui.close();
+                                    }
+                                    if let Some(c) = ansi32_swatch_grid(ui, ("pixelfx_bg", i), color) {
+                                        fx_color = Some((i, Some(c)));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    ui.weak("Text");
+                                    if ui.button("× Clear (auto)").clicked() {
+                                        fx_fg = Some((i, None));
+                                        ui.close();
+                                    }
+                                    if let Some(c) = ansi32_swatch_grid(ui, ("pixelfx_fg", i), fg) {
+                                        fx_fg = Some((i, Some(c)));
                                         ui.close();
                                     }
                                     return;
