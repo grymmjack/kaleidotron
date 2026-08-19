@@ -1632,6 +1632,15 @@ pub struct Kaleidotron {
     shade_fit_chars: bool,
     shade_fit_cols: usize,
     shade_fit_rows: usize,
+    // PETSCII converter (DITHER_PETSCII): its own C64 char grid, purity, charset page, and
+    // background. Grid is cols×rows 8×8 cells; purity 0 = clean block art, 1 = full charset.
+    petscii_cols: usize,
+    petscii_rows: usize,
+    petscii_purity: f32,
+    petscii_page: usize, // 0 upper/graphics, 1 lower
+    petscii_bg_auto: bool,
+    petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
+    petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2429,6 +2438,7 @@ impl Kaleidotron {
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
+    const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3093,6 +3103,11 @@ impl Kaleidotron {
             .unwrap_or(0)
             .min(5);
         let shade_fit_chars = get_bool(Self::SHADE_FIT_CHARS_KEY).unwrap_or(false);
+        // PETSCII settings persisted as one tuple (cols, rows, purity, page, bg_auto, bg).
+        let petscii: (usize, usize, f32, u8, bool, u8) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::PETSCII_KEY))
+            .unwrap_or((40, 25, 1.0, 0, true, 0));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3589,6 +3604,13 @@ impl Kaleidotron {
             shade_fit_chars,
             shade_fit_cols,
             shade_fit_rows,
+            petscii_cols: petscii.0,
+            petscii_rows: petscii.1,
+            petscii_purity: petscii.2,
+            petscii_page: petscii.3 as usize,
+            petscii_bg_auto: petscii.4,
+            petscii_bg: petscii.5,
+            petscii_export_format: 0,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -20002,7 +20024,8 @@ impl Kaleidotron {
             || self.balance_offset() != [0, 0, 0]
             || (self.dither_method != 0
                 && (self.dither_amount > 0.0
-                    || self.dither_method == crate::thumb::DITHER_ANSI))
+                    || self.dither_method == crate::thumb::DITHER_ANSI
+                    || self.dither_method == crate::thumb::DITHER_PETSCII))
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
@@ -20105,6 +20128,19 @@ impl Kaleidotron {
             self.pixelate_h,
             self.scale_algo as u8
         ) + &ssig
+            + &if self.dither_method == crate::thumb::DITHER_PETSCII {
+                format!(
+                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}",
+                    self.petscii_cols,
+                    self.petscii_rows,
+                    self.petscii_purity,
+                    self.petscii_page,
+                    self.petscii_bg_auto as u8,
+                    self.petscii_bg,
+                )
+            } else {
+                String::new()
+            }
     }
 
     /// The palette to remap the inspected image to right now, plus a cache key
@@ -20643,6 +20679,45 @@ impl Kaleidotron {
         self.shade_half_use = p.half_use;
     }
 
+    /// Build the PETSCII grid for the current image: run the value ops (+ resize-in-place) on a
+    /// black-composited copy, then match to the C64 charset. Shared by preview + export so they
+    /// agree. Uses the VIC-II palette internally (no chosen palette needed).
+    fn build_petscii_grid(&self, w: usize, h: usize, rgba: &[u8]) -> crate::thumb::PetsciiGrid {
+        let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
+        let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
+        let mut aux = self.pipe_aux(None, dsx, dsy);
+        aux.skip_dither_palette = true;
+        let mut work = rgba.to_vec();
+        for px in work.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a < 255 {
+                px[0] = (px[0] as u32 * a / 255) as u8;
+                px[1] = (px[1] as u32 * a / 255) as u8;
+                px[2] = (px[2] as u32 * a / 255) as u8;
+                px[3] = 255;
+            }
+        }
+        if self.resize_on {
+            resize_in_place(&mut work, w, h, self.resize_fx, self.resize_fy);
+        }
+        apply_pipeline(&mut work, w, h, &self.adjust.order, &self.adjust, &aux);
+        let bg = if self.petscii_bg_auto {
+            None
+        } else {
+            Some(self.petscii_bg & 15)
+        };
+        crate::thumb::petscii_grid(
+            &work,
+            w,
+            h,
+            self.petscii_cols.max(1),
+            self.petscii_rows.max(1),
+            self.petscii_page.min(1),
+            self.petscii_purity,
+            bg,
+        )
+    }
+
     /// THE single source of truth for the ANSI-shade grid. Both the on-screen preview
     /// ([`make_full_reduced`]) and every export format ([`export_textmode`]) call this,
     /// so a rendered `.ans`/`.xb`/`.tnd` is guaranteed **cell-identical** to what the
@@ -20739,6 +20814,14 @@ impl Kaleidotron {
         // Pixel-art upscale (if any) first; the enlarged art feeds the pipeline + Save.
         let (w, h, mut rgba) = self.scale_source(cw, ch, rgba);
         let size = [w, h];
+        // PETSCII preview: build the C64 char grid + render it (its own converter/palette).
+        if self.dither_method == crate::thumb::DITHER_PETSCII {
+            let grid = self.build_petscii_grid(w, h, &rgba);
+            let (pw, ph, px) = crate::thumb::petscii_render(&grid);
+            let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [pw, ph], &px, view_tex_opts());
+            self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
+            return Some(tt);
+        }
         // ANSI Shade preview: build the grid through the SAME `build_ansi_grid` the
         // export uses, then render its glyphs — so what the viewer shows is exactly the
         // `.ans`/`.xb`/`.tnd` that gets written. (Every other dither method stays on the
@@ -23543,9 +23626,10 @@ impl Kaleidotron {
                                 save_request = Some(true);
                             }
                         }
-                        // Export as textmode art — needs a palette to draw in. Format follows
-                        // the Colors selector: 16→.ans (EGA) / .xbin, 256→.ans, RGB→.tnd.
-                        if recolor.is_some()
+                        // Export as textmode art. ANSI needs a palette; PETSCII brings its own
+                        // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
+                        if (recolor.is_some()
+                            || self.dither_method == crate::thumb::DITHER_PETSCII)
                             && ui
                                 .button("Export textmode")
                                 .on_hover_text(
@@ -24904,6 +24988,82 @@ impl Kaleidotron {
                             ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
                         }
                     }
+                    // ----- PETSCII controls (image → C64 hi-res char art) -----
+                    if self.dither_method == crate::thumb::DITHER_PETSCII {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("PETSCII").strong());
+                            ui.weak("C64 char art · VIC-II palette");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Cols");
+                            ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
+                            ui.label("Rows");
+                            ui.add(egui::DragValue::new(&mut self.petscii_rows).range(1..=120));
+                            if ui.small_button("40×25").on_hover_text("C64 screen").clicked() {
+                                self.petscii_cols = 40;
+                                self.petscii_rows = 25;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Purity");
+                            let r = ui
+                                .add(egui::Slider::new(&mut self.petscii_purity, 0.0..=1.0))
+                                .on_hover_text(
+                                    "0 = clean block / quadrant art · 1 = full charset (photographic)",
+                                );
+                            middle_reset(ui, &r, &mut self.petscii_purity, 1.0f32);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Charset");
+                            ui.selectable_value(&mut self.petscii_page, 0, "Upper/graphics");
+                            ui.selectable_value(&mut self.petscii_page, 1, "Lower");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Export");
+                            const F: [&str; 4] = [".petmate", ".seq", ".json", ".png"];
+                            let cur = self.petscii_export_format.min(3) as usize;
+                            egui::ComboBox::from_id_salt("petscii_fmt")
+                                .selected_text(F[cur])
+                                .show_ui(ui, |ui| {
+                                    for (i, n) in F.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.petscii_export_format,
+                                            i as u8,
+                                            *n,
+                                        );
+                                    }
+                                });
+                            ui.weak("(use “Export textmode”)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.petscii_bg_auto, "Auto background");
+                            if !self.petscii_bg_auto {
+                                for c in 0u8..16 {
+                                    let col = crate::decode::VIC2[c as usize];
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(15.0, 15.0),
+                                        egui::Sense::click(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        egui::Color32::from_rgb(col[0], col[1], col[2]),
+                                    );
+                                    if self.petscii_bg == c {
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            2.0,
+                                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                            egui::StrokeKind::Middle,
+                                        );
+                                    }
+                                    if resp.clicked() {
+                                        self.petscii_bg = c;
+                                    }
+                                }
+                            }
+                        });
+                    }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
                     }
@@ -25196,6 +25356,11 @@ impl Kaleidotron {
     /// (which embeds the exact palette + font). Both get a SAUCE trailer. Written via a
     /// Save-As dialog, mirroring the other exporters.
     fn export_textmode(&mut self, path: &Path) {
+        // PETSCII has its own converter/palette + formats (.petmate/.seq/.json/.png).
+        if self.dither_method == crate::thumb::DITHER_PETSCII {
+            self.export_petscii(path);
+            return;
+        }
         let recolor = self.active_recolor(path);
         let Some((_, palette)) = recolor else {
             self.status = "Pick a palette / Reduce first (textmode needs colors)".into();
@@ -25258,6 +25423,62 @@ impl Kaleidotron {
             }
             Err(e) => self.status = format!("Export failed: {e}"),
         }
+    }
+
+    /// Export the current image as PETSCII in the selected format: `.petmate` (edit in petmate),
+    /// `.seq` (C64 stream), `.json` (interchange), or `.png` (rendered). Uses the SAME
+    /// `build_petscii_grid` the preview does, so the file matches what's on screen.
+    fn export_petscii(&mut self, path: &Path) {
+        let (size, rgba) = match &self.full_src {
+            Some((p, sz, px)) if p == path => (*sz, px.clone()),
+            _ => match self.registry.decode_path(&self.resolve_local(path)) {
+                Ok(img) => ([img.width as usize, img.height as usize], img.rgba_bytes()),
+                Err(e) => {
+                    self.status = format!("decode failed: {e}");
+                    return;
+                }
+            },
+        };
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
+        let (w, h, rgba) = self.scale_source(cw, ch, rgba);
+        let grid = self.build_petscii_grid(w, h, &rgba);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let (ext, filter): (&str, &str) = match self.petscii_export_format {
+            1 => ("seq", "PETSCII sequence"),
+            2 => ("json", "PETSCII JSON"),
+            3 => ("png", "PNG image"),
+            _ => ("petmate", "petmate"),
+        };
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}.{ext}"))
+            .add_filter(filter, &[ext])
+            .save_file()
+        else {
+            return;
+        };
+        let res: Result<(), String> = match self.petscii_export_format {
+            1 => std::fs::write(&dest, crate::thumb::petscii_grid_to_seq(&grid, true))
+                .map_err(|e| e.to_string()),
+            2 => std::fs::write(&dest, crate::thumb::petscii_grid_to_json(&grid))
+                .map_err(|e| e.to_string()),
+            3 => {
+                let (pw, ph, px) = crate::thumb::petscii_render(&grid);
+                image::save_buffer(&dest, &px, pw as u32, ph as u32, image::ColorType::Rgba8)
+                    .map_err(|e| e.to_string())
+            }
+            _ => std::fs::write(&dest, crate::thumb::petscii_grid_to_petmate(&grid))
+                .map_err(|e| e.to_string()),
+        };
+        self.status = match res {
+            Ok(()) => format!(
+                "Exported PETSCII {}: {} ({}×{} chars)",
+                ext.to_uppercase(),
+                short_name(&dest),
+                grid.cols,
+                grid.rows
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
     }
 
     /// Any async listing/media fetch that should paint a spinner (+ the status line) in an
@@ -37089,6 +37310,18 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::CROP_GUIDE_KEY, &self.crop_guide);
         eframe::set_value(storage, Self::CROP_PRESETS_KEY, &self.crop_presets);
         eframe::set_value(storage, Self::ANSI_PRESETS_KEY, &self.ansi_presets);
+        eframe::set_value(
+            storage,
+            Self::PETSCII_KEY,
+            &(
+                self.petscii_cols,
+                self.petscii_rows,
+                self.petscii_purity,
+                self.petscii_page as u8,
+                self.petscii_bg_auto,
+                self.petscii_bg,
+            ),
+        );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);

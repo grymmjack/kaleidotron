@@ -405,6 +405,7 @@ pub const DITHER_NAMES: &[&str] = &[
     "Atkinson",
     "Custom",
     "ANSI Shade",
+    "PETSCII",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
@@ -416,6 +417,12 @@ pub const DITHER_CUSTOM: u8 = 6;
 /// palette (like error-diffusion), and it already outputs palette colours so a
 /// following Palette snap is a no-op.
 pub const DITHER_ANSI: u8 = 7;
+
+/// `DITHER_NAMES` index for the image→PETSCII (C64 hi-res char art) converter. Unlike the
+/// others this one has its OWN matcher ([`petscii_grid`]) + fixed VIC-II palette + serializers,
+/// so it takes a separate preview/export path (it does not reuse the shade grid or a chosen
+/// palette).
+pub const DITHER_PETSCII: u8 = 8;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -1602,7 +1609,6 @@ pub fn letterbox(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
 
 /// One PETSCII cell: a C64 screen code (0..255; ≥128 = reverse) + a VIC-II fg index (0..15).
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub struct PetsciiCell {
     pub code: u8,
     pub fg: u8,
@@ -1610,7 +1616,6 @@ pub struct PetsciiCell {
 
 /// A converted PETSCII screen: `cols`×`rows` cells over one global background `bg`, with `page`
 /// selecting the charset (0 = upper/graphics, 1 = lower).
-#[allow(dead_code)]
 pub struct PetsciiGrid {
     pub cols: usize,
     pub rows: usize,
@@ -1622,7 +1627,6 @@ pub struct PetsciiGrid {
 /// Is C64 screen-code `code` (in font `page`) a "block" glyph — each of its four 4×4 quadrants
 /// uniformly on/off? Captures space / full / halves / quarters (the classic block set), computed
 /// from the ROM so no screen codes are hardcoded.
-#[allow(dead_code)]
 fn c64_is_block(page: usize, code: u8) -> bool {
     let g = &crate::decode::C64_FONT[page * 256 + code as usize];
     for &(r0, c0) in &[(0usize, 0usize), (0, 4), (4, 0), (4, 4)] {
@@ -1644,7 +1648,7 @@ fn c64_is_block(page: usize, code: u8) -> bool {
 /// Best (code, fg, error) for one 8×8 `cell` given a fixed background, searching the C64 font.
 /// `block_only` restricts to block glyphs (used for the cheap bg search); otherwise non-block
 /// glyphs pay `penalty` (the purity bias). Error = Σset(src-fg)² + Σclear(src-bg)².
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn petscii_cell_match(
     cell: &[[f32; 3]; 64],
     page: usize,
@@ -1707,7 +1711,7 @@ fn petscii_cell_match(
 /// (C64 glyph, VIC-II fg). `page` selects the charset (0 upper/graphics, 1 lower). `purity` 0..1
 /// biases toward clean block glyphs (0) vs the full charset (1). `bg_override` forces the
 /// background colour; otherwise it's auto-picked to minimise total error.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn petscii_grid(
     rgba: &[u8],
     w: usize,
@@ -1776,7 +1780,6 @@ pub fn petscii_grid(
 
 /// Render a [`PetsciiGrid`] to an RGBA buffer (`cols*8` × `rows*8`) via the C64 font + VIC-II —
 /// the same pixels the decoder produces, so the preview matches a re-opened export.
-#[allow(dead_code)]
 pub fn petscii_render(grid: &PetsciiGrid) -> (usize, usize, Vec<u8>) {
     let (w, h) = (grid.cols * 8, grid.rows * 8);
     let mut rgba = vec![0u8; w * h * 4];
@@ -1800,7 +1803,6 @@ pub fn petscii_render(grid: &PetsciiGrid) -> (usize, usize, Vec<u8>) {
 
 /// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
 /// reverse bit is handled by the caller (RVS ON/OFF), so this maps the base glyph.
-#[allow(dead_code)]
 fn screencode_to_petscii(c: u8) -> u8 {
     match c {
         0x00..=0x1f => c + 0x40,
@@ -1816,7 +1818,6 @@ fn screencode_to_petscii(c: u8) -> u8 {
 }
 
 /// petmate's "upper"/"lower" charset name for a font page (0 = upper/graphics, 1 = lower).
-#[allow(dead_code)]
 fn petscii_charset_name(page: usize) -> &'static str {
     if page == 1 {
         "lower"
@@ -1828,7 +1829,6 @@ fn petscii_charset_name(page: usize) -> &'static str {
 /// Serialize a [`PetsciiGrid`] to a C64 `.seq` stream: PETSCII glyph bytes with colour-control
 /// bytes on each colour change, RVS on/off (`0x12`/`0x92`) around reverse glyphs, a charset-set
 /// prefix, an optional clear-screen, and a CR (`0x0d`) per row. Displayable on a real C64.
-#[allow(dead_code)]
 pub fn petscii_grid_to_seq(grid: &PetsciiGrid, clear: bool) -> Vec<u8> {
     // idx = VIC-II colour, value = the PETSCII colour-control byte (petmate's `seq_colors`).
     const COLORS: [u8; 16] = [
@@ -1866,7 +1866,6 @@ pub fn petscii_grid_to_seq(grid: &PetsciiGrid, clear: bool) -> Vec<u8> {
 
 /// Serialize to petmate's **native `.petmate`** JSON (opens for editing in petmate): one framebuf
 /// whose `framebuf` is a 2-D array (rows) of `{code, color}` cells over a global background.
-#[allow(dead_code)]
 pub fn petscii_grid_to_petmate(grid: &PetsciiGrid) -> Vec<u8> {
     let mut s = String::from("{\"version\":2,\"screens\":[0],\"framebufs\":[{");
     s.push_str(&format!("\"width\":{},\"height\":{},", grid.cols, grid.rows));
@@ -1898,7 +1897,6 @@ pub fn petscii_grid_to_petmate(grid: &PetsciiGrid) -> Vec<u8> {
 
 /// Serialize to petmate's flat **`.json`** interchange format: `screencodes[]` + `colors[]` flat
 /// arrays (width×height), easiest to script against.
-#[allow(dead_code)]
 pub fn petscii_grid_to_json(grid: &PetsciiGrid) -> Vec<u8> {
     let codes: Vec<String> = grid.cells.iter().map(|c| c.code.to_string()).collect();
     let colors: Vec<String> = grid.cells.iter().map(|c| c.fg.to_string()).collect();
