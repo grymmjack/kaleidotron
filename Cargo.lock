@@ -2624,6 +2624,7 @@ dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "flate2",
  "gltf",
  "hqx",
  "icy_parser_core",

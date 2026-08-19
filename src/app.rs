@@ -47204,7 +47204,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
         "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm",
+        "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
@@ -47234,7 +47234,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
 fn is_textmode_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
         "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "xb", "xbin", "bin", "tnd", "idf", "adf",
-        "seq", "pet", "petscii", "petmate",
+        "seq", "pet", "petscii", "petmate", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => EXTS.contains(&x.to_ascii_lowercase().as_str()),

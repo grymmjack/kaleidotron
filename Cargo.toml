@@ -44,6 +44,9 @@ unarc-rs = "0.6"
 # "Download zip" export. Already in the tree transitively via unarc-rs (zip 8.6.x), so it's
 # proven to build on stable rustc 1.92; a direct dep unifies to that same build.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# REXPaint .xp decode/encode: the files are gzip streams. flate2 (miniz_oxide backend, pure Rust)
+# is already in the tree transitively, so a direct dep unifies to the same build.
+flate2 = "1"
 # Mike Krüger's scene-art parsers (PETSCII/RIP/ATASCII/…). The lightweight parser
 # crate only — no tokio/egui — driven into our own renderer via its CommandSink.
 # Pinned to a rev so upstream master can't break our build.

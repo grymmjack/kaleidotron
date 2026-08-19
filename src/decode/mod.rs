@@ -46,6 +46,7 @@ mod petscii;
 mod psd;
 pub mod rad; // Reality Adlib Tracker replayer (RADPlayer port) — .rad → OPL3 register writes
 mod rip;
+mod rexpaint; // REXPaint .xp (gzipped layered CP437 art)
 mod rip_chr;
 mod svg;
 mod tundra;
@@ -158,6 +159,7 @@ impl Registry {
                 Box::new(ansi::AnsiDecoder),          // .ans/.asc/.nfo/.diz (CP437 + ANSI)
                 Box::new(xbin::XBinDecoder),          // .xb/.xbin (binary ANSI: palette/font/RLE)
                 Box::new(tundra::TundraDecoder),      // .tnd (TundraDraw — 24-bit truecolor)
+                Box::new(rexpaint::RexPaintDecoder),  // .xp (REXPaint — gzipped layered CP437)
                 Box::new(idf::IdfDecoder),            // .idf (iCE Draw — RLE + embedded font/pal)
                 Box::new(adf::AdfDecoder),            // .adf (Artworx — embedded font/palette)
                 Box::new(petscii::PetsciiDecoder), // .seq/.pet (Commodore PETSCII; icy_parser_core)
