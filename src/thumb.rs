@@ -802,7 +802,11 @@ pub fn ansi_shade_grid(
     ice: bool,
     smooth: f32,
     detail: f32,
+    allowed: Option<&[bool]>,
 ) -> AnsiGrid {
+    // Glyph-picker gate: which of the shade/half candidates the matcher may use (space stays a
+    // fallback). None = all. Codes outside the block set are irrelevant to this matcher.
+    let ok = |g: u8| -> bool { allowed.is_none_or(|a| a.get(g as usize).copied().unwrap_or(true)) };
     let cw = cell_w.max(1);
     let ch_ = cell_h.max(1);
     let cols = w.div_ceil(cw);
@@ -820,17 +824,19 @@ pub fn ansi_shade_grid(
     // then out-competes █ and swallows the whole image (the "only F3" bug). The bands
     // also keep the ramp ordered near each glyph's true fill (░≈¼ ▒≈½ ▓≈¾).
     let mut coverages: Vec<(f32, u8)> = Vec::with_capacity(5);
-    coverages.push((0.0, SHADE_GLYPHS[0])); // space
-    if f1_on {
+    coverages.push((0.0, SHADE_GLYPHS[0])); // space (always — the fallback glyph)
+    if f1_on && ok(SHADE_GLYPHS[1]) {
         coverages.push((f1.clamp(0.10, 0.40), SHADE_GLYPHS[1])); // ░
     }
-    if f2_on {
+    if f2_on && ok(SHADE_GLYPHS[2]) {
         coverages.push((f2.clamp(0.40, 0.60), SHADE_GLYPHS[2])); // ▒
     }
-    if f3_on {
+    if f3_on && ok(SHADE_GLYPHS[3]) {
         coverages.push((f3.clamp(0.60, 0.90), SHADE_GLYPHS[3])); // ▓
     }
-    coverages.push((1.0, SHADE_GLYPHS[4])); // █
+    if ok(SHADE_GLYPHS[4]) {
+        coverages.push((1.0, SHADE_GLYPHS[4])); // █
+    }
     // Palette as f32 triples for the joint search.
     let pf: Vec<[f32; 3]> = palette
         .iter()
@@ -1023,7 +1029,7 @@ pub fn ansi_shade_grid(
                 let mut hb_err = f32::MAX;
                 let mut hb: Option<(u8, u8, u8)> = None;
                 for (i, &(glyph, fg_avg, bg_avg)) in halves.iter().enumerate() {
-                    if !half_on[i] {
+                    if !half_on[i] || !ok(glyph) {
                         continue;
                     }
                     let fg = nearest_index([fg_avg[0] as u8, fg_avg[1] as u8, fg_avg[2] as u8], palette);
@@ -1183,13 +1189,14 @@ pub fn ansi_shade_pass(
     smooth: f32,
     detail: f32,
     invert: bool,
+    allowed: Option<&[bool]>,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
     let mut grid = ansi_shade_grid(
         rgba, w, h, palette, cell_w, cell_h, f1, f2, f3, half_blocks, f1_on, f2_on, f3_on,
-        half_on, half_use, shade_amount, ice, smooth, detail,
+        half_on, half_use, shade_amount, ice, smooth, detail, allowed,
     );
     if invert {
         for c in &mut grid.cells {
@@ -2701,7 +2708,6 @@ pub fn unicode_pass(rgba: &mut [u8], w: usize, h: usize, style: u8, cols: usize,
 /// preserve the image aspect), each the ramp glyph matching that region's tone, coloured from
 /// `palette`. Shared by the pass (render) and text export (glyph→char).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn unicode_ramp_grid(
     rgba: &[u8],
     w: usize,
@@ -3129,6 +3135,7 @@ mod tests {
             false, // no iCE
             0.0,   // Smoothness 0 → proves the ALWAYS-ON baseline kills false colour
             0.30,  // Detail weight
+            None,
         );
         for (i, cell) in grid.cells.iter().enumerate() {
             assert!(
@@ -3166,7 +3173,7 @@ mod tests {
         // Half-blocks ON → expect a horizontal half-block (▀ 223 or ▄ 220), not a shade.
         let g_on = ansi_shade_grid(
             &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
-            [true; 4], [0.5; 4], 1.0, true, 0.0, 0.30,
+            [true; 4], [0.5; 4], 1.0, true, 0.0, 0.30, None,
         );
         assert!(
             matches!(g_on.cells[0].ch, 220 | 223),
@@ -3176,7 +3183,7 @@ mod tests {
         // Horizontal pair OFF (F5 ▀ + F6 ▄), vertical still on → must NOT be ▀/▄.
         let g_off = ansi_shade_grid(
             &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
-            [false, false, true, true], [0.5; 4], 1.0, true, 0.0, 0.30,
+            [false, false, true, true], [0.5; 4], 1.0, true, 0.0, 0.30, None,
         );
         assert!(
             !matches!(g_off.cells[0].ch, 220 | 223),
@@ -3216,7 +3223,7 @@ mod tests {
             // Detail = 5.0 (max), half-blocks on at neutral usage, full shade search.
             let g = ansi_shade_grid(
                 &rgba, w, h, &palette, 9, 16, 0.25, 0.50, 0.75, true, true, true, true,
-                [true; 4], [0.5; 4], 1.0, true, 0.0, 5.0,
+                [true; 4], [0.5; 4], 1.0, true, 0.0, 5.0, None,
             );
             g.cells[0]
         };

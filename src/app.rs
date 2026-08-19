@@ -1625,6 +1625,8 @@ pub struct Kaleidotron {
     shade_detail: f32,    // 0..1: half-block detail weight (high = keep edges crisp when shrunk)
     shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
     shade_invert: bool,   // ANSI Shade inverse video — swap fg/bg per cell (default off)
+    ansi_mask: Vec<bool>, // ANSI Shade glyph-picker mask over CP437 (256); default = the block set
+    ansi_picker: bool,    // ANSI glyph-picker popup open
     // Textmode EXPORT format (explicit): 0=Auto, 1=ANSI16 .ans, 2=ANSI256 .ans,
     // 3=ANSI truecolor .ans, 4=XBin .xb, 5=Tundra .tnd.
     shade_export_format: u8,
@@ -2516,6 +2518,7 @@ impl Kaleidotron {
     const SHADE_DETAIL_KEY: &'static str = "shade_detail";
     const SHADE_ICE_KEY: &'static str = "shade_ice";
     const SHADE_INVERT_KEY: &'static str = "shade_invert";
+    const ANSI_MASK_KEY: &'static str = "ansi_mask";
     const SHADE_EXPORT_FORMAT_KEY: &'static str = "shade_export_format";
     const SHADE_FIT_CHARS_KEY: &'static str = "shade_fit_chars";
     const SHADE_FIT_COLS_KEY: &'static str = "shade_fit_cols";
@@ -3157,6 +3160,10 @@ impl Kaleidotron {
             .clamp(0.0, 5.0);
         let shade_ice = get_bool(Self::SHADE_ICE_KEY).unwrap_or(false);
         let shade_invert = get_bool(Self::SHADE_INVERT_KEY).unwrap_or(false);
+        let ansi_mask: Vec<bool> = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::ANSI_MASK_KEY))
+            .unwrap_or_default();
         let shade_export_format = cc
             .storage
             .and_then(|s| eframe::get_value::<u8>(s, Self::SHADE_EXPORT_FORMAT_KEY))
@@ -3702,6 +3709,8 @@ impl Kaleidotron {
             shade_detail,
             shade_ice,
             shade_invert,
+            ansi_mask,
+            ansi_picker: false,
             shade_export_format,
             shade_fit_chars,
             shade_fit_cols,
@@ -19904,6 +19913,7 @@ impl Kaleidotron {
             font_8x8: self.shade_vga50,
             shade_ice: self.shade_ice,
             shade_invert: self.shade_invert,
+            shade_allowed: self.ansi_allowed().map(|s| s.to_vec()),
             petscii_cols: self.petscii_cols.max(1),
             petscii_rows: self.petscii_rows.max(1),
             petscii_page: self.petscii_page.min(1),
@@ -20343,7 +20353,7 @@ impl Kaleidotron {
         // half-block / snap toggles won't invalidate the cached preview.
         let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
             format!(
-                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}:iv{}|H{:?}:{:?}|Fit{}:{}x{}",
+                "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}:iv{}:m{:x}|H{:?}:{:?}|Fit{}:{}x{}",
                 self.shade_f1,
                 self.shade_f2,
                 self.shade_f3,
@@ -20358,6 +20368,7 @@ impl Kaleidotron {
                 self.shade_smooth,
                 self.shade_detail,
                 self.shade_invert as u8,
+                mask_hash(&self.ansi_mask),
                 // Per half-block toggles + usage — moving an F5–F8 slider/checkbox must
                 // invalidate the cached preview too.
                 self.shade_half_on,
@@ -20752,6 +20763,7 @@ impl Kaleidotron {
             font_8x8: false,
             shade_ice: false,
             shade_invert: false,
+            shade_allowed: None,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -21103,6 +21115,20 @@ impl Kaleidotron {
     /// The bit-font spec for the current ATASCII / Apple ][ mode: `(font, glyph pool, invert)`.
     /// The pool selects which of the font's glyphs are candidates (Apple adds the MouseText block
     /// when enabled). Colour is `self.bitfont_color`.
+    /// The CP437 codes the ANSI-Shade matcher works with (space + shades ░▒▓█ + half-blocks) — the
+    /// picker's default set. Restoring the picker returns to this.
+    const ANSI_BLOCK_GLYPHS: [u8; 9] = [32, 176, 177, 178, 219, 220, 221, 222, 223];
+
+    /// The ANSI glyph mask as an `allowed` slice, or None when it's empty/all-on (no restriction).
+    fn ansi_allowed(&self) -> Option<&[bool]> {
+        let on = self.ansi_mask.iter().filter(|b| **b).count();
+        if self.ansi_mask.len() == 256 && on > 0 && on < 256 {
+            Some(&self.ansi_mask)
+        } else {
+            None
+        }
+    }
+
     /// The enabled-glyph pool for the Unicode Ramp: indices into the current range-mask's ramp font
     /// whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is disabled.
     fn unicode_pool(&self) -> Vec<u16> {
@@ -21295,6 +21321,33 @@ impl Kaleidotron {
             .collect();
     }
 
+    /// ANSI Shade glyph picker over CP437. DEFAULT = the block set (space + ░▒▓█ + half-blocks) —
+    /// what the shade matcher already uses — so it's a no-op until you customize; the matcher only
+    /// considers those glyphs, so enabling others has no effect (noted in the window).
+    fn ui_ansi_picker(&mut self, ctx: &egui::Context) {
+        if !self.ansi_picker || self.dither_method != crate::thumb::DITHER_ANSI {
+            return;
+        }
+        // The default set: only the block glyphs enabled.
+        let mut default = vec![false; 256];
+        for g in Self::ANSI_BLOCK_GLYPHS {
+            default[g as usize] = true;
+        }
+        // First open with no mask → seed it to the default so the block set shows enabled.
+        if self.ansi_mask.len() != 256 {
+            self.ansi_mask = default.clone();
+        }
+        let font = crate::decode::rexfont::GlyphFont::from_8x8(
+            &crate::decode::cp437_font_8x8::CP437_8X8,
+        );
+        let mut open = self.ansi_picker;
+        glyph_picker_window(
+            ctx, "ANSI Shade glyphs (block set)", "ansi_atlas", &font, 256, &mut self.ansi_mask,
+            &default, &mut open, &mut self.glyph_drag,
+        );
+        self.ansi_picker = open;
+    }
+
     /// The enabled-glyph pool for the REXPaint-font converter, from `rexfont_mask`. Empty means
     /// "all glyphs" — which is what an all-on OR all-off (degenerate) mask collapses to.
     fn rexfont_pool(&self) -> Vec<u16> {
@@ -21413,7 +21466,7 @@ impl Kaleidotron {
                 &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
                 self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
                 self.shade_half_on, self.shade_half_use, self.shade_amount, self.shade_ice,
-                self.shade_smooth, self.shade_detail,
+                self.shade_smooth, self.shade_detail, self.ansi_allowed(),
             )
         };
         let mut grid = grid;
@@ -25465,6 +25518,9 @@ impl Kaleidotron {
                                 );
                             ui.checkbox(&mut self.shade_invert, "Invert")
                                 .on_hover_text("Inverse video — swap fg/bg per cell (default off)");
+                            if ui.button("Chars…").on_hover_text("Pick which block glyphs the shade matcher may use").clicked() {
+                                self.ansi_picker = !self.ansi_picker;
+                            }
                         });
                         // Explicit EXPORT format (export only — does not affect the preview).
                         // Each entry names the actual output file `export_textmode` writes.
@@ -37060,6 +37116,7 @@ impl eframe::App for Kaleidotron {
         self.ui_apple_picker(&ctx);
         self.ui_ascii_picker(&ctx);
         self.ui_unicode_picker(&ctx);
+        self.ui_ansi_picker(&ctx);
 
         if self.show_hotkeys {
             let mut open = true;
@@ -38562,6 +38619,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SHADE_DETAIL_KEY, &self.shade_detail);
         eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
         eframe::set_value(storage, Self::SHADE_INVERT_KEY, &self.shade_invert);
+        eframe::set_value(storage, Self::ANSI_MASK_KEY, &self.ansi_mask);
         eframe::set_value(storage, Self::SHADE_EXPORT_FORMAT_KEY, &self.shade_export_format);
         eframe::set_value(storage, Self::SHADE_FIT_CHARS_KEY, &self.shade_fit_chars);
         eframe::set_value(storage, Self::SHADE_FIT_COLS_KEY, &self.shade_fit_cols);
@@ -39646,6 +39704,7 @@ struct PipeAux<'a> {
     font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
     shade_ice: bool,    // iCE color: unlock all 16 colors as backgrounds
     shade_invert: bool, // ANSI Shade inverse video
+    shade_allowed: Option<Vec<bool>>, // ANSI glyph-picker mask (None = all)
     // PETSCII pass params (only consulted when dither_method == DITHER_PETSCII). Lets
     // PETSCII apply through the pipeline — grid tiles, details preview, "Apply to grid".
     petscii_cols: usize,
@@ -39843,6 +39902,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.shade_smooth,
                             aux.shade_detail,
                             aux.shade_invert,
+                            aux.shade_allowed.as_deref(),
                         );
                     }
                 } else {
@@ -40721,6 +40781,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             font_8x8: false,
             shade_ice: false,
             shade_invert: false,
+            shade_allowed: None,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -49021,6 +49082,7 @@ fn preset_pipe_aux<'a>(
         font_8x8: p.shade_vga50,
         shade_ice: p.shade_ice,
         shade_invert: p.shade_invert,
+        shade_allowed: None,
         // Presets don't carry PETSCII/ASCII params (those modes aren't preset-driven yet) —
         // safe defaults keep the pipeline pass a no-op unless the preset's dither_method is one.
         petscii_cols: 40,
@@ -49094,7 +49156,7 @@ fn build_ansi_grid_from_preset(
     let grid = crate::thumb::ansi_shade_grid(
         &work, tw, th, palette, cw, ch_, p.shade_f1, p.shade_f2, p.shade_f3, p.shade_half,
         p.shade_f1_on, p.shade_f2_on, p.shade_f3_on, p.shade_half_on, p.shade_half_use,
-        p.shade_amount, p.shade_ice, p.shade_smooth, p.shade_detail,
+        p.shade_amount, p.shade_ice, p.shade_smooth, p.shade_detail, None,
     );
     (grid, work, tw, th, font_8x8)
 }
@@ -51353,6 +51415,7 @@ mod tests {
             font_8x8: false,
             shade_ice: false,
             shade_invert: false,
+            shade_allowed: None,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
@@ -51578,6 +51641,7 @@ mod tests {
             font_8x8: false,
             shade_ice: false,
             shade_invert: false,
+            shade_allowed: None,
             petscii_cols: 40,
             petscii_rows: 25,
             petscii_page: 0,
