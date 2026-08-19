@@ -1585,6 +1585,9 @@ pub struct Kaleidotron {
     crop_mid_active: bool,          // a middle-button gesture is in progress
     crop_mid_moved: f32,            // accumulated middle-drag movement (px) → click vs drag
     crop_guide: u8,                 // composition overlay: 0 thirds,1 golden,2 grid,3 spiral,4 none
+    crop_presets: Vec<CropPreset>,  // named reusable crop rects (persisted)
+    crop_preset_new: String,        // name buffer for "Save current crop"
+    crop_preset_rename: Option<usize>, // preset being renamed inline
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
@@ -2419,6 +2422,7 @@ impl Kaleidotron {
     const QUANT_KEEP_BW_KEY: &'static str = "quantize_keep_bw";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
+    const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3537,6 +3541,12 @@ impl Kaleidotron {
                 .and_then(|s| eframe::get_value::<u8>(s, Self::CROP_GUIDE_KEY))
                 .unwrap_or(0)
                 .min(4),
+            crop_presets: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<CropPreset>>(s, Self::CROP_PRESETS_KEY))
+                .unwrap_or_default(),
+            crop_preset_new: String::new(),
+            crop_preset_rename: None,
             dither_method,
             dither_amount,
             dither_custom,
@@ -21113,6 +21123,83 @@ impl Kaleidotron {
                 }
             }
         });
+        // Named crop presets (normalized → apply to any image): recall / save / rename / delete.
+        let mut apply_rect: Option<[f32; 4]> = None;
+        let mut delete_i: Option<usize> = None;
+        let mut save_now = false;
+        ui.horizontal(|ui| {
+            ui.label("Presets");
+            ui.menu_button("▾", |ui| {
+                if self.crop_presets.is_empty() {
+                    ui.weak("No saved crops yet");
+                }
+                for i in 0..self.crop_presets.len() {
+                    ui.horizontal(|ui| {
+                        if self.crop_preset_rename == Some(i) {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.crop_presets[i].name)
+                                    .desired_width(110.0),
+                            );
+                            if ui.button("✓").clicked() || r.lost_focus() {
+                                self.crop_preset_rename = None;
+                            }
+                        } else {
+                            if ui
+                                .button(&self.crop_presets[i].name)
+                                .on_hover_text("Apply this crop")
+                                .clicked()
+                            {
+                                apply_rect = Some(self.crop_presets[i].rect);
+                                ui.close();
+                            }
+                            if ui.small_button("✎").on_hover_text("Rename").clicked() {
+                                self.crop_preset_rename = Some(i);
+                            }
+                            if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                delete_i = Some(i);
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.crop_preset_new)
+                            .hint_text("name")
+                            .desired_width(110.0),
+                    );
+                    if ui
+                        .add_enabled(cropped, egui::Button::new("Save current"))
+                        .on_hover_text("Save the current crop as a named preset")
+                        .clicked()
+                    {
+                        save_now = true;
+                        ui.close();
+                    }
+                });
+            });
+        });
+        if let Some(rect) = apply_rect {
+            self.set_crop(path, clamp_crop(rect));
+        }
+        if let Some(i) = delete_i {
+            if i < self.crop_presets.len() {
+                self.crop_presets.remove(i);
+                self.crop_preset_rename = None;
+            }
+        }
+        if save_now {
+            let rect = self.crop_of(path);
+            if rect != FULL_CROP {
+                let name = if self.crop_preset_new.trim().is_empty() {
+                    format!("Crop {}", self.crop_presets.len() + 1)
+                } else {
+                    self.crop_preset_new.trim().to_string()
+                };
+                self.crop_presets.push(CropPreset { name, rect });
+                self.crop_preset_new.clear();
+            }
+        }
         // Pixel X/Y/W/H (readout + editable), when the source's native size is known.
         if let Some((iw, ih)) = dims {
             let c = self.crop_of(path);
@@ -36745,6 +36832,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::QUANT_KEEP_BW_KEY, &self.quantize_keep_bw);
         eframe::set_value(storage, Self::CROPS_KEY, &self.crops);
         eframe::set_value(storage, Self::CROP_GUIDE_KEY, &self.crop_guide);
+        eframe::set_value(storage, Self::CROP_PRESETS_KEY, &self.crop_presets);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38826,6 +38914,14 @@ fn palette_hash(pal: &[[u8; 4]]) -> u64 {
 
 /// The identity crop: the whole frame. Stored as *absent* from the crops map.
 const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// A named, reusable crop rectangle (normalized `[x,y,w,h]`) — save/recall/rename/delete from
+/// the crop controls. Being normalized, a preset applies to any image regardless of its size.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CropPreset {
+    name: String,
+    rect: [f32; 4],
+}
 
 /// Canonical key for the per-image crop map (shared by the GUI + `--batch`) so a crop set in
 /// the viewer is found again however the path is spelled. Falls back to the raw path for
