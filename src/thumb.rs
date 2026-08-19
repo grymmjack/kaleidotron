@@ -406,6 +406,7 @@ pub const DITHER_NAMES: &[&str] = &[
     "Custom",
     "ANSI Shade",
     "PETSCII",
+    "ASCII",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
@@ -423,6 +424,13 @@ pub const DITHER_ANSI: u8 = 7;
 /// so it takes a separate preview/export path (it does not reuse the shade grid or a chosen
 /// palette).
 pub const DITHER_PETSCII: u8 = 8;
+
+/// `DITHER_NAMES` index for the image→ASCII (character-density) converter. Like ANSI Shade it
+/// produces an [`AnsiGrid`] (so it reuses the whole `.ans`/`.xb`/`.tnd` export + preview render),
+/// but instead of the two-colour shade matcher it maps each cell's brightness to a glyph on a
+/// coverage-sorted ramp built from the enabled character ranges (32–126 always, + control 0–31,
+/// + high 128–255). Colour is per-cell from the active palette (or monochrome).
+pub const DITHER_ASCII: u8 = 9;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -1804,6 +1812,184 @@ pub fn petscii_render(grid: &PetsciiGrid, pal: &[[u8; 4]; 16]) -> (usize, usize,
     (w, h, rgba)
 }
 
+/// The PETSCII **pipeline pass**: convert `rgba` (w×h) to a `cols`×`rows` C64 char grid, render it,
+/// then nearest-sample that char art back into the same w×h buffer. This is what lets PETSCII apply
+/// everywhere the pipeline runs (grid tiles, the details preview, "Apply to grid") — exactly the way
+/// [`ansi_shade_pass`] does for ANSI Shade. The full-view path builds the grid directly for a crisp
+/// cell-exact render; here we fit the char art into whatever buffer the pipeline hands us.
+#[allow(clippy::too_many_arguments)]
+pub fn petscii_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    cols: usize,
+    rows: usize,
+    page: usize,
+    purity: f32,
+    bg_override: Option<u8>,
+    pal: &[[u8; 4]; 16],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let grid = petscii_grid(rgba, w, h, cols, rows, page, purity, bg_override, pal);
+    let (pw, ph, px) = petscii_render(&grid, pal);
+    if pw == 0 || ph == 0 {
+        return;
+    }
+    for y in 0..h {
+        let sy = (y * ph / h).min(ph - 1);
+        for x in 0..w {
+            let sx = (x * pw / w).min(pw - 1);
+            let so = (sy * pw + sx) * 4;
+            let d = (y * w + x) * 4;
+            rgba[d..d + 4].copy_from_slice(&px[so..so + 4]);
+        }
+    }
+}
+
+// ── ASCII (character-density) converter ─────────────────────────────────────────
+// Maps image brightness to CP437 glyphs on a coverage-sorted ramp. The ramp is built
+// from whichever character ranges the user enables — printable 32–126 is always in,
+// control 0–31 and high 128–255 are optional (the high range brings the ░▒▓█ shade
+// blocks, which fill out the dark end of the ramp). Produces an `AnsiGrid`, so it
+// rides the same render + `.ans`/`.xb`/`.tnd` export as ANSI Shade.
+
+/// Build the light→dark ASCII ramp: `(glyph, coverage)` pairs sorted by ink coverage
+/// (fraction of set pixels in the render font), one representative glyph per distinct
+/// coverage level. Printable ASCII wins ties (so classic glyphs are preferred over a
+/// control/high glyph of equal density). `font_8x8` selects which CP437 font the
+/// coverage is measured from, so it matches the renderer.
+pub fn ascii_ramp(high: bool, control: bool, font_8x8: bool) -> Vec<(u8, f32)> {
+    let total = if font_8x8 { 64.0 } else { 8.0 * 16.0 };
+    let cov = |code: u8| -> f32 {
+        let bits: u32 = if font_8x8 {
+            CP437_8X8[code as usize].iter().map(|b| b.count_ones()).sum()
+        } else {
+            CP437_8X16[code as usize].iter().map(|b| b.count_ones()).sum()
+        };
+        bits as f32 / total
+    };
+    // Preference order: printable ASCII first, then high, then control — first glyph
+    // seen for a given (quantized) coverage wins.
+    let mut order: Vec<u8> = (32u8..=126).collect();
+    if high {
+        order.extend(127u8..=255);
+    }
+    if control {
+        order.extend(0u8..=31);
+    }
+    let mut seen: std::collections::HashMap<u16, (u8, f32)> = std::collections::HashMap::new();
+    for code in order {
+        let c = cov(code);
+        let bucket = (c * total).round() as u16; // one slot per set-pixel count
+        seen.entry(bucket).or_insert((code, c));
+    }
+    let mut ramp: Vec<(u8, f32)> = seen.into_values().collect();
+    ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // Guarantee a blank (space) at the light end even if some odd font had no 0-cover glyph.
+    if ramp.first().map(|(_, c)| *c > 0.0).unwrap_or(true) {
+        ramp.insert(0, (32, 0.0));
+    }
+    ramp
+}
+
+/// Analyse `rgba` (w×h) into an ASCII [`AnsiGrid`]: per `cell_w`×`cell_h` cell, pick the
+/// ramp glyph whose coverage matches the cell's darkness, and colour it from `palette`
+/// (per-cell nearest when `color`, else a fixed brightest-on-darkest monochrome). The
+/// glyph pool follows `high`/`control` (see [`ascii_ramp`]).
+#[allow(clippy::too_many_arguments)]
+pub fn ascii_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    high: bool,
+    control: bool,
+    color: bool,
+    font_8x8: bool,
+) -> AnsiGrid {
+    let cw = cell_w.max(1);
+    let ch_ = cell_h.max(1);
+    let cols = w.div_ceil(cw);
+    let rows = h.div_ceil(ch_);
+    let mut cells = Vec::with_capacity(cols * rows);
+    if palette.is_empty() || w == 0 || h == 0 {
+        cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
+        return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells };
+    }
+    let ramp = ascii_ramp(high, control, font_8x8);
+    // Fixed monochrome ink/paper: brightest + darkest palette entries.
+    let paper = nearest_index([0, 0, 0], palette);
+    let ink = nearest_index([255, 255, 255], palette);
+    for cy in 0..rows {
+        for cx in 0..cols {
+            // Average the cell block (clamped to the image bounds), tracking alpha so a
+            // fully-transparent cell becomes blank paper.
+            let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for y in cy * ch_..((cy + 1) * ch_).min(h) {
+                for x in cx * cw..((cx + 1) * cw).min(w) {
+                    let o = (y * w + x) * 4;
+                    let a = rgba[o + 3] as u32;
+                    sr += rgba[o] as u32 * a;
+                    sg += rgba[o + 1] as u32 * a;
+                    sb += rgba[o + 2] as u32 * a;
+                    sa += a;
+                    n += 1;
+                }
+            }
+            if n == 0 || sa == 0 {
+                cells.push(AnsiCell { fg: ink, bg: paper, ch: 32 });
+                continue;
+            }
+            let avg = [(sr / sa) as u8, (sg / sa) as u8, (sb / sa) as u8];
+            // Coverage darkness = 1 - luminance; low alpha reads as background.
+            let lum = (0.299 * avg[0] as f32 + 0.587 * avg[1] as f32 + 0.114 * avg[2] as f32)
+                / 255.0;
+            let cover = (sa as f32 / (n as f32 * 255.0)) * (1.0 - lum);
+            // Nearest ramp glyph by coverage.
+            let ch = ramp
+                .iter()
+                .min_by(|a, b| {
+                    (a.1 - cover)
+                        .abs()
+                        .partial_cmp(&(b.1 - cover).abs())
+                        .unwrap()
+                })
+                .map(|(g, _)| *g)
+                .unwrap_or(32);
+            let fg = if color { nearest_index(avg, palette) } else { ink };
+            cells.push(AnsiCell { fg, bg: paper, ch });
+        }
+    }
+    AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells }
+}
+
+/// The ASCII **pipeline pass**: build the ASCII grid from `rgba` then paint it back in
+/// place — the twin of [`ansi_shade_pass`], so ASCII applies everywhere the pipeline
+/// runs (grid tiles, details preview, "Apply to grid").
+#[allow(clippy::too_many_arguments)]
+pub fn ascii_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    cell_w: usize,
+    cell_h: usize,
+    high: bool,
+    control: bool,
+    color: bool,
+    font_8x8: bool,
+) {
+    if palette.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, high, control, color, font_8x8);
+    ansi_render_grid(&grid, rgba, w, h, font_8x8);
+}
+
 /// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
 /// reverse bit is handled by the caller (RVS ON/OFF), so this maps the base glyph.
 fn screencode_to_petscii(c: u8) -> u8 {
@@ -1919,6 +2105,42 @@ pub fn petscii_grid_to_json(grid: &PetsciiGrid) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_ramp_spans_blank_to_full() {
+        // The ramp is coverage-sorted: lightest (space, 0.0) first. With High ASCII on it
+        // reaches the full block █ (CP437 219, coverage 1.0) at the dark end.
+        let ramp = ascii_ramp(true, false, true);
+        assert_eq!(ramp.first().unwrap().1, 0.0, "lightest is a blank");
+        let (dark_glyph, dark_cov) = *ramp.last().unwrap();
+        assert!(dark_cov > 0.9, "darkest ramp entry is nearly full ink");
+        assert_eq!(dark_glyph, 219, "the full block anchors the dark end");
+        // Without High ASCII the block glyphs are gone, so the dark end is lighter.
+        let low = ascii_ramp(false, false, true);
+        assert!(low.last().unwrap().1 < 0.9, "printable-only ramp can't reach solid");
+    }
+
+    #[test]
+    fn ascii_maps_brightness_to_density() {
+        // Two cells: white (left) → blank/space, black (right) → dense glyph.
+        let pal = [[0u8, 0, 0, 255], [255, 255, 255, 255]];
+        let (w, h) = (16usize, 8usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < 8 { 255u8 } else { 0u8 }; // left white, right black
+                let o = (y * w + x) * 4;
+                rgba[o..o + 4].copy_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, true, false, false, true);
+        assert_eq!(grid.cols, 2);
+        let left = grid.cells[0];
+        let right = grid.cells[1];
+        assert_eq!(left.ch, 32, "white cell is a space");
+        let cov = |c: u8| CP437_8X8[c as usize].iter().map(|b| b.count_ones()).sum::<u32>();
+        assert!(cov(right.ch) > cov(left.ch), "black cell is denser than white");
+    }
 
     #[test]
     fn petscii_solid_color_round_trips() {

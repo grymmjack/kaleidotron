@@ -1642,6 +1642,10 @@ pub struct Kaleidotron {
     petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
     petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
     petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
+    // ASCII converter (DITHER_ASCII): brightness→glyph over an enabled character range.
+    ascii_high: bool,    // include high ASCII (128..255 — brings the ░▒▓█ blocks)
+    ascii_control: bool, // include control chars (0..31)
+    ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2440,6 +2444,7 @@ impl Kaleidotron {
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
+    const ASCII_KEY: &'static str = "ascii"; // (high, control, color)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3109,6 +3114,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::PETSCII_KEY))
             .unwrap_or((40, 25, 1.0, 0, true, 0, 0));
+        // ASCII settings (high-range, control-range, per-cell colour).
+        let ascii: (bool, bool, bool) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
+            .unwrap_or((true, false, true));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3613,6 +3623,9 @@ impl Kaleidotron {
             petscii_bg: petscii.5,
             petscii_export_format: 0,
             petscii_palette: petscii.6,
+            ascii_high: ascii.0,
+            ascii_control: ascii.1,
+            ascii_color: ascii.2,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19741,6 +19754,19 @@ impl Kaleidotron {
             },
             font_8x8: self.shade_vga50,
             shade_ice: self.shade_ice,
+            petscii_cols: self.petscii_cols.max(1),
+            petscii_rows: self.petscii_rows.max(1),
+            petscii_page: self.petscii_page.min(1),
+            petscii_purity: self.petscii_purity,
+            petscii_bg: if self.petscii_bg_auto {
+                None
+            } else {
+                Some(self.petscii_bg & 15)
+            },
+            petscii_pal: self.petscii_pal(),
+            ascii_high: self.ascii_high,
+            ascii_control: self.ascii_control,
+            ascii_color: self.ascii_color,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -19852,15 +19878,23 @@ impl Kaleidotron {
         Some((by_res, by_res))
     }
 
+    /// True when the current dither method is one of the AnsiGrid text-mode converters
+    /// (ANSI Shade or ASCII) — both build an [`crate::thumb::AnsiGrid`] and share the
+    /// fit-to-chars sizing, cell dims, and the whole render/export path.
+    fn is_ansi_grid_mode(&self) -> bool {
+        self.dither_method == crate::thumb::DITHER_ANSI
+            || self.dither_method == crate::thumb::DITHER_ASCII
+    }
+
     /// The resample target dims for a `w`×`h` pipeline buffer: the buffer scaled by
     /// the resize factors (min 1px, never up). Equals `(w, h)` when Resize is off, so
     /// callers can unconditionally pass the result to [`apply_pipeline_resized`].
     /// Factor-based (not absolute px) so preview + full-res degrade by the same ratio.
     fn resize_target(&self, w: usize, h: usize) -> (usize, usize) {
-        // Fit-to-character-grid (ANSI Shade): force the working image to exactly
-        // cols*cell_w × rows*cell_h px so the ANSI grid is precisely cols×rows. Wins
+        // Fit-to-character-grid (ANSI Shade / ASCII): force the working image to exactly
+        // cols*cell_w × rows*cell_h px so the char grid is precisely cols×rows. Wins
         // over the resize slider, and may UP-scale (aspect is intentionally not kept).
-        if self.shade_fit_chars && self.dither_method == crate::thumb::DITHER_ANSI {
+        if self.shade_fit_chars && self.is_ansi_grid_mode() {
             let (cw, ch) = self.ansi_cell_dims();
             return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
         }
@@ -19877,7 +19911,7 @@ impl Kaleidotron {
     /// detail reduction instead, so a resized image is ANSI-fied at full size, not squashed
     /// into a few cells).
     fn ansi_work_target(&self, w: usize, h: usize) -> (usize, usize) {
-        if self.shade_fit_chars && self.dither_method == crate::thumb::DITHER_ANSI {
+        if self.shade_fit_chars && self.is_ansi_grid_mode() {
             let (cw, ch) = self.ansi_cell_dims();
             return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
         }
@@ -20027,7 +20061,8 @@ impl Kaleidotron {
             || (self.dither_method != 0
                 && (self.dither_amount > 0.0
                     || self.dither_method == crate::thumb::DITHER_ANSI
-                    || self.dither_method == crate::thumb::DITHER_PETSCII))
+                    || self.dither_method == crate::thumb::DITHER_PETSCII
+                    || self.dither_method == crate::thumb::DITHER_ASCII))
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
@@ -20140,6 +20175,23 @@ impl Kaleidotron {
                     self.petscii_bg_auto as u8,
                     self.petscii_bg,
                     self.petscii_palette,
+                )
+            } else {
+                String::new()
+            }
+            // ASCII shares the ANSI fit/cell controls (via build_ansi_grid), so its key folds in
+            // the range toggles + colour AND the fit/cell state that sets the working resolution.
+            + &if self.dither_method == crate::thumb::DITHER_ASCII {
+                format!(
+                    "|Ah{}:c{}:col{}:v{}:s{}|Fit{}:{}x{}",
+                    self.ascii_high as u8,
+                    self.ascii_control as u8,
+                    self.ascii_color as u8,
+                    self.shade_vga50 as u8,
+                    self.shade_snap916 as u8,
+                    self.shade_fit_chars as u8,
+                    self.shade_fit_cols,
+                    self.shade_fit_rows,
                 )
             } else {
                 String::new()
@@ -20415,6 +20467,15 @@ impl Kaleidotron {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            petscii_cols: 40,
+            petscii_rows: 25,
+            petscii_page: 0,
+            petscii_purity: 1.0,
+            petscii_bg: None,
+            petscii_pal: crate::decode::petscii_palette(0),
+            ascii_high: true,
+            ascii_control: false,
+            ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -20811,12 +20872,21 @@ impl Kaleidotron {
             resize_in_place(&mut work, tw, th, self.resize_fx, self.resize_fy);
         }
         apply_pipeline(&mut work, tw, th, &self.adjust.order, &self.adjust, &aux);
-        let grid = crate::thumb::ansi_shade_grid(
-            &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-            self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-            self.shade_half_on, self.shade_half_use, self.shade_amount, self.shade_ice,
-            self.shade_smooth, self.shade_detail,
-        );
+        // ASCII and ANSI Shade both produce an AnsiGrid (so they share this build + the whole
+        // render/export path); they differ only in the cell→glyph decision.
+        let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
+            crate::thumb::ascii_grid(
+                &work, tw, th, palette, cw, ch_, self.ascii_high, self.ascii_control,
+                self.ascii_color, font_8x8,
+            )
+        } else {
+            crate::thumb::ansi_shade_grid(
+                &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
+                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
+                self.shade_half_on, self.shade_half_use, self.shade_amount, self.shade_ice,
+                self.shade_smooth, self.shade_detail,
+            )
+        };
         (grid, work, tw, th, font_8x8)
     }
 
@@ -20853,11 +20923,13 @@ impl Kaleidotron {
             self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
             return Some(tt);
         }
-        // ANSI Shade preview: build the grid through the SAME `build_ansi_grid` the
+        // ANSI Shade / ASCII preview: build the grid through the SAME `build_ansi_grid` the
         // export uses, then render its glyphs — so what the viewer shows is exactly the
         // `.ans`/`.xb`/`.tnd` that gets written. (Every other dither method stays on the
         // generic resized pipeline below.)
-        if self.dither_method == crate::thumb::DITHER_ANSI {
+        if self.dither_method == crate::thumb::DITHER_ANSI
+            || self.dither_method == crate::thumb::DITHER_ASCII
+        {
             if let Some(pal) = palette {
                 let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
                 crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8);
@@ -24602,8 +24674,11 @@ impl Kaleidotron {
                         // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
                         // (an ANSI-appropriate default) so it works on the spot — they can then
                         // pick a palette or change N from there.
-                        if self.dither_method == crate::thumb::DITHER_ANSI
-                            && prev != crate::thumb::DITHER_ANSI
+                        // ANSI Shade and ASCII both colour from the active palette — auto-enable
+                        // Reduce → 16 when switching to either with nothing providing colours.
+                        if (self.dither_method == crate::thumb::DITHER_ANSI
+                            || self.dither_method == crate::thumb::DITHER_ASCII)
+                            && prev != self.dither_method
                             && self.custom_palette.is_none()
                             && self.selected_palette.is_none()
                             && !self.quantize_on
@@ -24622,10 +24697,9 @@ impl Kaleidotron {
                             self.petscii_sync_selected_palette();
                         }
                     });
-                    // ANSI Shade ignores "Amount" (it's a hard two-colour quantize).
-                    if self.dither_method != 0
-                        && self.dither_method != crate::thumb::DITHER_ANSI
-                    {
+                    // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
+                    // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
+                    if matches!(self.dither_method, 1..=6) {
                         ui.horizontal(|ui| {
                             ui.label("Amount");
                             let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
@@ -24641,7 +24715,7 @@ impl Kaleidotron {
                     // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
                     if matches!(self.dither_method, 1..=3)
                         || self.dither_method == crate::thumb::DITHER_CUSTOM
-                        || (self.dither_method == crate::thumb::DITHER_ANSI
+                        || (self.is_ansi_grid_mode()
                             && !self.shade_snap916
                             && !self.shade_vga50)
                     {
@@ -25128,6 +25202,50 @@ impl Kaleidotron {
                                 }
                             }
                         });
+                    }
+                    // ----- ASCII controls (image → character-density art) -----
+                    if self.dither_method == crate::thumb::DITHER_ASCII {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("ASCII").strong());
+                            ui.weak("brightness → character density");
+                        });
+                        // Character ranges. Printable 32–126 is always in the pool; High ASCII
+                        // adds 128–255 (the ░▒▓█ blocks fill out the dark end) and Control adds 0–31.
+                        ui.horizontal(|ui| {
+                            ui.label("Chars");
+                            ui.weak("32–126");
+                            ui.checkbox(&mut self.ascii_high, "High ASCII")
+                                .on_hover_text("Include 128–255 (CP437 extended — brings the ░▒▓█ shade blocks)");
+                            ui.checkbox(&mut self.ascii_control, "Control")
+                                .on_hover_text("Include control chars 0–31 (their CP437 glyphs)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.ascii_color, "Color")
+                                .on_hover_text(
+                                    "Per-cell colour from the active palette (off = monochrome ink on paper)",
+                                );
+                            ui.weak("·");
+                            ui.checkbox(&mut self.shade_vga50, "8×8 cell")
+                                .on_hover_text("Render in the 8×8 VGA50 font (off = 8×16)");
+                        });
+                        // Fit-to-chars: force an exact cols×rows canvas (shared with ANSI Shade).
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
+                                .on_hover_text("Force an exact cols×rows character canvas");
+                            if self.shade_fit_chars {
+                                ui.label("Cols");
+                                ui.add(egui::DragValue::new(&mut self.shade_fit_cols).range(1..=300));
+                                ui.label("Rows");
+                                ui.add(egui::DragValue::new(&mut self.shade_fit_rows).range(1..=300));
+                                if ui.small_button("80×25").clicked() {
+                                    self.shade_fit_cols = 80;
+                                    self.shade_fit_rows = 25;
+                                }
+                            }
+                        });
+                        if recolor.is_none() {
+                            ui.weak("(needs a palette / Reduce for its colors)");
+                        }
                     }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
@@ -30248,7 +30366,7 @@ impl Kaleidotron {
         // so the user can read off the cell grid (cols×rows). Only in ANSI-shade mode
         // with a live recolor, and never over an actual text-mode art file. `img_rect`
         // already encodes zoom+pan, so the ruler tracks the art as it moves. ---
-        if self.dither_method == crate::thumb::DITHER_ANSI
+        if self.is_ansi_grid_mode()
             && self.any_recolor_active()
             && !self.viewing_textmode
         {
@@ -37388,6 +37506,11 @@ impl eframe::App for Kaleidotron {
                 self.petscii_palette,
             ),
         );
+        eframe::set_value(
+            storage,
+            Self::ASCII_KEY,
+            &(self.ascii_high, self.ascii_control, self.ascii_color),
+        );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38350,6 +38473,18 @@ struct PipeAux<'a> {
     shade_ch: usize,
     font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
     shade_ice: bool,    // iCE color: unlock all 16 colors as backgrounds
+    // PETSCII pass params (only consulted when dither_method == DITHER_PETSCII). Lets
+    // PETSCII apply through the pipeline — grid tiles, details preview, "Apply to grid".
+    petscii_cols: usize,
+    petscii_rows: usize,
+    petscii_page: usize,
+    petscii_purity: f32,
+    petscii_bg: Option<u8>,
+    petscii_pal: &'static [[u8; 4]; 16],
+    // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
+    ascii_high: bool,
+    ascii_control: bool,
+    ascii_color: bool,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -38397,7 +38532,38 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                 // Pre-shade export pass: leave the dither op for `ansi_shade_grid`.
             }
             OpKind::Dither => {
-                if aux.dither_method == crate::thumb::DITHER_ANSI {
+                if aux.dither_method == crate::thumb::DITHER_PETSCII {
+                    // PETSCII brings its OWN 16-colour palette, so it needs no active palette.
+                    // This is what makes PETSCII apply through the pipeline — grid tiles, the
+                    // details preview, "Apply to grid" — exactly like ANSI Shade.
+                    crate::thumb::petscii_pass(
+                        rgba,
+                        w,
+                        h,
+                        aux.petscii_cols,
+                        aux.petscii_rows,
+                        aux.petscii_page,
+                        aux.petscii_purity,
+                        aux.petscii_bg,
+                        aux.petscii_pal,
+                    );
+                } else if aux.dither_method == crate::thumb::DITHER_ASCII {
+                    // ASCII colours from the active palette (like ANSI) — skip if none.
+                    if let Some(p) = aux.palette {
+                        crate::thumb::ascii_pass(
+                            rgba,
+                            w,
+                            h,
+                            p,
+                            aux.shade_cw,
+                            aux.shade_ch,
+                            aux.ascii_high,
+                            aux.ascii_control,
+                            aux.ascii_color,
+                            aux.font_8x8,
+                        );
+                    }
+                } else if aux.dither_method == crate::thumb::DITHER_ANSI {
                     // ANSI shade needs a palette (like error-diffusion) — skip if none.
                     if let Some(p) = aux.palette {
                         crate::thumb::ansi_shade_pass(
@@ -39201,6 +39367,15 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            petscii_cols: 40,
+            petscii_rows: 25,
+            petscii_page: 0,
+            petscii_purity: 1.0,
+            petscii_bg: None,
+            petscii_pal: crate::decode::petscii_palette(0),
+            ascii_high: true,
+            ascii_control: false,
+            ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -47471,6 +47646,17 @@ fn preset_pipe_aux<'a>(
         shade_ch: preset_cell_dims(p).1,
         font_8x8: p.shade_vga50,
         shade_ice: p.shade_ice,
+        // Presets don't carry PETSCII/ASCII params (those modes aren't preset-driven yet) —
+        // safe defaults keep the pipeline pass a no-op unless the preset's dither_method is one.
+        petscii_cols: 40,
+        petscii_rows: 25,
+        petscii_page: 0,
+        petscii_purity: 1.0,
+        petscii_bg: None,
+        petscii_pal: crate::decode::petscii_palette(0),
+        ascii_high: true,
+        ascii_control: false,
+        ascii_color: true,
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
         balance,
@@ -49778,6 +49964,15 @@ mod tests {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            petscii_cols: 40,
+            petscii_rows: 25,
+            petscii_page: 0,
+            petscii_purity: 1.0,
+            petscii_bg: None,
+            petscii_pal: crate::decode::petscii_palette(0),
+            ascii_high: true,
+            ascii_control: false,
+            ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -49969,6 +50164,15 @@ mod tests {
             shade_ch: 16,
             font_8x8: false,
             shade_ice: false,
+            petscii_cols: 40,
+            petscii_rows: 25,
+            petscii_page: 0,
+            petscii_purity: 1.0,
+            petscii_bg: None,
+            petscii_pal: crate::decode::petscii_palette(0),
+            ascii_high: true,
+            ascii_control: false,
+            ascii_color: true,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
