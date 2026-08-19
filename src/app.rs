@@ -1567,6 +1567,15 @@ pub struct Kaleidotron {
     // *fits inside* this fixed band instead of dictating the pane's height. Persisted.
     details_thumb_h: f32,
     recolor_thumb_h: f32,
+    // Non-destructive per-image CROP. `crops[canon(path)]` = a normalized [x, y, w, h] in
+    // 0..1 of the *source* (before the pixel-art upscale + pipeline); an absent entry means
+    // the full frame. Drawn as a draggable red box on the Details thumbnail, applied in every
+    // pipeline path (preview / full view / export) and by the headless `--batch`. Persisted
+    // (RON under `CROPS_KEY`) so a crop is remembered across sessions + readable by batch.
+    crops: std::collections::HashMap<PathBuf, [f32; 4]>,
+    crop_ratio: Option<(u32, u32)>, // locked aspect for drag + ratio buttons (None = free)
+    crop_drag: Option<u8>,          // handle grabbed this gesture: 0-3 corners, 4-7 edges, 8 = move
+    crop_backup: bool,              // back up the original before a destructive "Apply crop"
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
@@ -2399,6 +2408,7 @@ impl Kaleidotron {
     const QUANT_ON_KEY: &'static str = "quantize_on";
     const QUANT_N_KEY: &'static str = "quantize_n";
     const QUANT_KEEP_BW_KEY: &'static str = "quantize_keep_bw";
+    const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -2960,6 +2970,15 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<f32>(s, Self::RECOLOR_THUMB_H_KEY))
             .unwrap_or(240.0)
             .clamp(60.0, 1200.0);
+        let crops = cc
+            .storage
+            .and_then(|s| {
+                eframe::get_value::<std::collections::HashMap<PathBuf, [f32; 4]>>(
+                    s,
+                    Self::CROPS_KEY,
+                )
+            })
+            .unwrap_or_default();
         let quantize_on = get_bool(Self::QUANT_ON_KEY).unwrap_or(false);
         let quantize_keep_bw = get_bool(Self::QUANT_KEEP_BW_KEY).unwrap_or(false);
         let quantize_n = cc
@@ -3494,6 +3513,10 @@ impl Kaleidotron {
             quantize_on,
             quantize_n,
             quantize_keep_bw,
+            crops,
+            crop_ratio: None,
+            crop_drag: None,
+            crop_backup: true,
             dither_method,
             dither_amount,
             dither_custom,
@@ -19541,20 +19564,31 @@ impl Kaleidotron {
     /// memoized by (path, N). None only when the image can't be decoded at all.
     fn reduce_palette(&mut self, path: &Path) -> Option<Vec<[u8; 4]>> {
         let n = self.quantize_n.clamp(2, 256);
+        // "Keep black/white" RESERVES two palette slots for pure black + white, so the median
+        // cut targets n-2 real clusters and black+white are appended after. This guarantees
+        // both extremes AND preserves every real colour cluster — nothing populous is
+        // overwritten with an extreme (overwriting the brightest cluster with white is what
+        // sprayed white "outliers" across warm art). The median count is the cache key, so
+        // toggling keep-b/w just re-reduces to n-2 (still cached after).
+        let keep_bw = self.quantize_keep_bw;
+        let median_n = if keep_bw { n.saturating_sub(2) } else { n };
         let stale = self
             .quantize_cache
             .as_ref()
-            .map(|(p, cn, _)| p != path || *cn != n)
+            .map(|(p, cn, _)| p != path || *cn != median_n)
             .unwrap_or(true);
         if stale {
             let src = self.reduce_source(path)?;
-            self.quantize_cache = Some((path.to_path_buf(), n, crate::thumb::median_cut(&src, n)));
+            let pal = if median_n == 0 {
+                Vec::new()
+            } else {
+                crate::thumb::median_cut(&src, median_n)
+            };
+            self.quantize_cache = Some((path.to_path_buf(), median_n, pal));
         }
         let mut pal = self.quantize_cache.as_ref().unwrap().2.clone();
-        // "Keep black/white" is applied OUTSIDE the median-cut cache (it's a cheap 2-color
-        // snap), so toggling it is instant without re-reducing.
-        if self.quantize_keep_bw {
-            force_black_white(&mut pal);
+        if keep_bw {
+            add_black_white(&mut pal);
         }
         Some(pal)
     }
@@ -20093,7 +20127,20 @@ impl Kaleidotron {
             if src.is_empty() {
                 return None;
             }
-            return Some(crate::thumb::median_cut(&src, self.quantize_n));
+            // Match the details/recolor reduce: Keep black/white reserves 2 slots (median to
+            // n-2, then append the extremes) so tiles get black+white without overwriting a
+            // real cluster.
+            let n = self.quantize_n.clamp(2, 256);
+            let median_n = if self.quantize_keep_bw { n.saturating_sub(2) } else { n };
+            let mut pal = if median_n == 0 {
+                Vec::new()
+            } else {
+                crate::thumb::median_cut(&src, median_n)
+            };
+            if self.quantize_keep_bw {
+                add_black_white(&mut pal);
+            }
+            return Some(pal);
         }
         None
     }
@@ -20347,6 +20394,39 @@ impl Kaleidotron {
         )
     }
 
+    /// This image's crop rect (normalized [x, y, w, h]), or the full frame if none set.
+    fn crop_of(&self, path: &Path) -> [f32; 4] {
+        self.crops
+            .get(&crop_canon(path))
+            .copied()
+            .unwrap_or(FULL_CROP)
+    }
+
+    /// A short cache-key fragment for `path`'s crop — empty when uncropped, so the preview /
+    /// full / export caches rebuild the moment the box is dragged (and only then).
+    fn crop_sig(&self, path: &Path) -> String {
+        let c = self.crop_of(path);
+        if c == FULL_CROP {
+            String::new()
+        } else {
+            format!("|C{:.4},{:.4},{:.4},{:.4}", c[0], c[1], c[2], c[3])
+        }
+    }
+
+    /// Set (or clear) `path`'s crop, storing a full-frame rect as *absent* so the map only
+    /// carries real crops. Invalidates the preview/full caches so the change shows at once.
+    fn set_crop(&mut self, path: &Path, rect: [f32; 4]) {
+        let key = crop_canon(path);
+        if rect == FULL_CROP {
+            self.crops.remove(&key);
+        } else {
+            self.crops.insert(key, rect);
+        }
+        self.preview_tex = None;
+        self.full_reduced = None;
+        self.want_repaint = true;
+    }
+
     fn make_preview(
         &mut self,
         ctx: &egui::Context,
@@ -20363,6 +20443,8 @@ impl Kaleidotron {
                     return Some(tex.clone());
                 }
             }
+            // Non-destructive crop first (before the pixel-art upscale + pipeline).
+            let (w, h, rgba) = apply_crop_rgba(self.crop_of(path), w, h, &rgba);
             let (w, h, mut rgba) = self.scale_source(w, h, rgba);
             let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
             let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
@@ -20402,6 +20484,9 @@ impl Kaleidotron {
             let s = self.preview_src.as_ref().unwrap();
             (s.1, s.2, s.3.clone())
         };
+        // Non-destructive crop first (kept out of preview_src so dragging the box re-crops
+        // the cached decode instead of forcing a re-decode).
+        let (w, h, rgba) = apply_crop_rgba(self.crop_of(path), w, h, &rgba);
         // Pixel-art upscale (if any) runs first — the enlarged art then feeds the pipeline.
         let (w, h, mut rgba) = self.scale_source(w, h, rgba);
         // The dither preview-vs-full ratio keys off native dims — scaled by the same
@@ -20530,8 +20615,11 @@ impl Kaleidotron {
                 ([img.width as usize, img.height as usize], img.rgba_bytes())
             }
         };
+        // Non-destructive crop first (kept out of full_src so the crop box re-crops the
+        // cached decode instead of re-decoding).
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
         // Pixel-art upscale (if any) first; the enlarged art feeds the pipeline + Save.
-        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
+        let (w, h, mut rgba) = self.scale_source(cw, ch, rgba);
         let size = [w, h];
         // ANSI Shade preview: build the grid through the SAME `build_ansi_grid` the
         // export uses, then render its glyphs — so what the viewer shows is exactly the
@@ -20694,12 +20782,20 @@ impl Kaleidotron {
         tex: &egui::TextureHandle,
         ar_y: f32,
         area_h: f32,
+        crop_edit: bool,
     ) -> f32 {
         let (bw, bh) = self.preview_aspect(path, tex.size_vec2());
         let avail_w = ui.available_width();
         let area_h = area_h.clamp(60.0, 1200.0);
-        // Reserve the fixed band and fit the image inside it (letterboxed, both axes).
-        let (area, _) = ui.allocate_exact_size(egui::vec2(avail_w, area_h), egui::Sense::hover());
+        // Reserve the fixed band and fit the image inside it (letterboxed, both axes). When
+        // crop-editing the Details thumbnail, the area senses drags so the red box's handles
+        // work; otherwise it's a passive preview.
+        let sense = if crop_edit {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::hover()
+        };
+        let (area, resp) = ui.allocate_exact_size(egui::vec2(avail_w, area_h), sense);
         let fit = fit_centered(area, egui::vec2(bw.max(1.0), (bh * ar_y).max(1.0)));
         ui.painter().image(
             tex.id(),
@@ -20707,6 +20803,9 @@ impl Kaleidotron {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+        if crop_edit {
+            self.draw_crop_box(ui, path, fit, &resp, bw.max(1.0) / bh.max(1.0));
+        }
         // Divider handle: a row of dots the user drags up/down to resize the band.
         let (bar, resp) = ui.allocate_exact_size(egui::vec2(avail_w, 10.0), egui::Sense::drag());
         let active = resp.hovered() || resp.dragged();
@@ -20729,6 +20828,214 @@ impl Kaleidotron {
         };
         ui.add_space(4.0);
         new_h
+    }
+
+    /// Draw the non-destructive crop box over the Details thumbnail (`fit` = the image's
+    /// on-screen rect) and handle dragging its 8 handles / body. `px_aspect` is the image's
+    /// pixel width/height, used to hold a locked ratio in pixel terms. Writes the new crop via
+    /// `set_crop`, which invalidates the preview/full caches so the change shows immediately.
+    fn draw_crop_box(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        fit: egui::Rect,
+        resp: &egui::Response,
+        px_aspect: f32,
+    ) {
+        let c = self.crop_of(path);
+        let to_screen = |nx: f32, ny: f32| fit.min + egui::vec2(nx * fit.width(), ny * fit.height());
+        let bx = egui::Rect::from_min_max(to_screen(c[0], c[1]), to_screen(c[0] + c[2], c[1] + c[3]));
+        let red = egui::Color32::from_rgb(255, 45, 45);
+        {
+            let painter = ui.painter();
+            // Dim everything outside the crop so the kept region reads clearly.
+            let dim = egui::Color32::from_black_alpha(110);
+            let r = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a, b);
+            painter.rect_filled(r(fit.min, egui::pos2(fit.max.x, bx.min.y)), 0.0, dim);
+            painter.rect_filled(r(egui::pos2(fit.min.x, bx.max.y), fit.max), 0.0, dim);
+            painter.rect_filled(r(egui::pos2(fit.min.x, bx.min.y), egui::pos2(bx.min.x, bx.max.y)), 0.0, dim);
+            painter.rect_filled(r(egui::pos2(bx.max.x, bx.min.y), egui::pos2(fit.max.x, bx.max.y)), 0.0, dim);
+            // Rule-of-thirds guides + the red outline.
+            let guide = egui::Stroke::new(0.5, egui::Color32::from_white_alpha(90));
+            for k in 1..3 {
+                let fx = bx.min.x + bx.width() * k as f32 / 3.0;
+                let fy = bx.min.y + bx.height() * k as f32 / 3.0;
+                painter.line_segment([egui::pos2(fx, bx.min.y), egui::pos2(fx, bx.max.y)], guide);
+                painter.line_segment([egui::pos2(bx.min.x, fy), egui::pos2(bx.max.x, fy)], guide);
+            }
+            painter.rect_stroke(bx, 0.0, egui::Stroke::new(1.5, red), egui::StrokeKind::Inside);
+            for (p, _) in crop_handle_points(bx) {
+                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0)), 1.0, red);
+            }
+        }
+        // --- interaction ---
+        if resp.drag_started() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let h = pick_crop_handle(pos, bx, fit);
+                if h == 255 {
+                    // Outside the box → begin a fresh crop at the pointer, grown by its BR corner.
+                    let nx = ((pos.x - fit.min.x) / fit.width().max(1.0)).clamp(0.0, 1.0 - CROP_MIN);
+                    let ny = ((pos.y - fit.min.y) / fit.height().max(1.0)).clamp(0.0, 1.0 - CROP_MIN);
+                    self.set_crop(path, [nx, ny, CROP_MIN, CROP_MIN]);
+                    self.crop_drag = Some(2);
+                } else {
+                    self.crop_drag = Some(h);
+                }
+            }
+        }
+        if resp.dragged() {
+            if let Some(h) = self.crop_drag {
+                let d = resp.drag_delta();
+                let dx = d.x / fit.width().max(1.0);
+                let dy = d.y / fit.height().max(1.0);
+                let a_norm = self
+                    .crop_ratio
+                    .map(|(rw, rh)| (rw as f32 / rh as f32) / px_aspect.max(0.001));
+                let nc = update_crop(self.crop_of(path), h, dx, dy, a_norm);
+                self.set_crop(path, nc);
+            }
+        }
+        if resp.drag_stopped() {
+            self.crop_drag = None;
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+    }
+
+    /// The crop controls under the Details thumbnail: Reset, aspect-ratio locks (Free / 4:3 /
+    /// 16:9 / 16:10) + a ⇄ flip (landscape ↔ portrait), pixel X/Y/W/H fields, and a destructive
+    /// "Apply crop to file" (with an optional backup). The crop itself is otherwise
+    /// non-destructive — it feeds the preview/export/batch and is remembered per image.
+    fn ui_crop_controls(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let c = self.crop_of(path);
+        let cropped = c != FULL_CROP;
+        let dims = self.img_meta.get(path).map(|m| (m.w as f32, m.h as f32));
+        let px_aspect = dims.map(|(w, h)| w / h.max(1.0)).unwrap_or(1.0);
+        ui.horizontal(|ui| {
+            ui.label("Crop");
+            if ui
+                .add_enabled(cropped || self.crop_ratio.is_some(), egui::Button::new("Reset"))
+                .on_hover_text("Clear the crop (full frame) and unlock the ratio")
+                .clicked()
+            {
+                self.crop_ratio = None;
+                self.set_crop(path, FULL_CROP);
+            }
+            ui.separator();
+            for (lbl, rt) in [
+                ("Free", None),
+                ("4:3", Some((4u32, 3u32))),
+                ("16:9", Some((16, 9))),
+                ("16:10", Some((16, 10))),
+            ] {
+                if ui.selectable_label(self.crop_ratio == rt, lbl).clicked() {
+                    self.crop_ratio = rt;
+                    if let Some((rw, rh)) = rt {
+                        let base = if cropped { c } else { [0.05, 0.05, 0.9, 0.9] };
+                        let nc = crop_apply_ratio(base, rw, rh, px_aspect);
+                        self.set_crop(path, nc);
+                    }
+                }
+            }
+            if ui
+                .add_enabled(self.crop_ratio.is_some(), egui::Button::new("⇄"))
+                .on_hover_text("Flip the ratio (landscape ↔ portrait) — great for tall ANSI")
+                .clicked()
+            {
+                if let Some((rw, rh)) = self.crop_ratio {
+                    self.crop_ratio = Some((rh, rw));
+                    let nc = crop_apply_ratio(self.crop_of(path), rh, rw, px_aspect);
+                    self.set_crop(path, nc);
+                }
+            }
+        });
+        // Pixel X/Y/W/H (readout + editable), when the source's native size is known.
+        if let Some((iw, ih)) = dims {
+            let c = self.crop_of(path);
+            let mut v = [
+                (c[0] * iw).round(),
+                (c[1] * ih).round(),
+                (c[2] * iw).round(),
+                (c[3] * ih).round(),
+            ];
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for (lbl, i, mx) in [("X", 0usize, iw), ("Y", 1, ih), ("W", 2, iw), ("H", 3, ih)] {
+                    ui.label(lbl);
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut v[i]).range(0.0..=mx).speed(1.0))
+                        .changed();
+                }
+            });
+            if changed {
+                let nc = clamp_crop([v[0] / iw, v[1] / ih, (v[2] / iw).max(0.0), (v[3] / ih).max(0.0)]);
+                self.set_crop(path, nc);
+            }
+        }
+        // Destructive bake: write the cropped pixels back to a file.
+        if cropped {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.crop_backup, "Backup original")
+                    .on_hover_text("Copy the original to <name>.bak before overwriting");
+                if ui
+                    .button("Apply crop to file")
+                    .on_hover_text("Bake the crop into the file on disk (destructive)")
+                    .clicked()
+                {
+                    match self.apply_crop_to_file(path) {
+                        Ok(msg) => self.status = msg,
+                        Err(e) => self.status = format!("Apply crop failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
+    /// Bake this image's crop into the file on disk: decode the original, crop, (optionally)
+    /// back up the original to `<name>.bak`, then re-encode over the original. Clears the crop
+    /// + decode caches afterward so the view reflects the now-cropped file. Returns a status.
+    fn apply_crop_to_file(&mut self, path: &Path) -> Result<String, String> {
+        let rect = self.crop_of(path);
+        if rect == FULL_CROP {
+            return Err("nothing to crop".into());
+        }
+        let real = self.resolve_local(path);
+        let img = self.registry.decode_path(&real).map_err(|e| e.to_string())?;
+        let (w, h) = (img.width as usize, img.height as usize);
+        let (cw, ch, rgba) = apply_crop_rgba(rect, w, h, &img.rgba_bytes());
+        if self.crop_backup {
+            let bak = real.with_extension(format!(
+                "{}.bak",
+                real.extension().and_then(|e| e.to_str()).unwrap_or("orig")
+            ));
+            std::fs::copy(&real, &bak).map_err(|e| format!("backup failed: {e}"))?;
+        }
+        // JPEG can't carry alpha — drop it to RGB for those; everything else keeps RGBA.
+        let ext = real
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let res = if ext == "jpg" || ext == "jpeg" {
+            let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            image::save_buffer(&real, &rgb, cw as u32, ch as u32, image::ColorType::Rgb8)
+        } else {
+            image::save_buffer(&real, &rgba, cw as u32, ch as u32, image::ColorType::Rgba8)
+        };
+        res.map_err(|e| e.to_string())?;
+        // The file is now the cropped image → clear the crop + every cached decode/preview.
+        self.set_crop(path, FULL_CROP);
+        self.full_src = None;
+        self.preview_src = None;
+        self.quantize_cache = None;
+        self.img_meta.remove(path);
+        self.thumbs.request(path, THUMB_PX);
+        Ok(format!(
+            "Applied crop → {} ({cw}×{ch}){}",
+            short_name(&real),
+            if self.crop_backup { " · original backed up" } else { "" }
+        ))
     }
 
     /// Details-pane content for a Steam game detail view (`<steam>/game/<appid>`): the game's
@@ -22104,8 +22411,20 @@ impl Kaleidotron {
                         } else {
                             1.0
                         };
-                        self.details_thumb_h =
-                            self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.details_thumb_h);
+                        // The Details thumbnail is the crop surface: a raster image gets the
+                        // draggable red box (the full frame by default).
+                        let croppable = is_image_ext(&entry.path);
+                        self.details_thumb_h = self.draw_thumb_area(
+                            ui,
+                            &entry.path,
+                            &tex,
+                            ar_y,
+                            self.details_thumb_h,
+                            croppable,
+                        );
+                        if croppable {
+                            self.ui_crop_controls(ui, &entry.path);
+                        }
                     } else {
                         self.thumbs.request(&entry.path, THUMB_PX);
                         self.want_repaint = true;
@@ -22691,10 +23010,16 @@ impl Kaleidotron {
                     tex = self.make_flash_tex(&ctx, &entry.path, pal, fc);
                     self.want_repaint = true;
                 }
-                if tex.is_none() && (self.pipeline_active() || recolor.is_some()) {
-                    // Adjustments + (optional) palette map.
+                if tex.is_none()
+                    && (self.pipeline_active()
+                        || recolor.is_some()
+                        || self.crop_of(&entry.path) != FULL_CROP)
+                {
+                    // Adjustments + (optional) palette map. Fold in the per-image crop so
+                    // dragging the crop box rebuilds this preview.
                     let rkey = recolor.as_ref().map(|(k, _)| k.as_str()).unwrap_or("orig");
-                    let key = format!("{}|{rkey}", self.pipeline_key());
+                    let key =
+                        format!("{}|{rkey}{}", self.pipeline_key(), self.crop_sig(&entry.path));
                     let pal = recolor.as_ref().map(|(_, p)| p.as_slice());
                     tex = self.make_preview(&ctx, &entry.path, &key, pal);
                 }
@@ -22712,7 +23037,7 @@ impl Kaleidotron {
                         1.0
                     };
                     self.recolor_thumb_h =
-                        self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.recolor_thumb_h);
+                        self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.recolor_thumb_h, false);
                 } else {
                     self.thumbs.request(&entry.path, THUMB_PX);
                     self.want_repaint = true;
@@ -24320,8 +24645,9 @@ impl Kaleidotron {
                 }
             },
         };
-        // Save the image AS SHOWN: pixel-art upscale, then full-res dither scale + resample.
-        let (w, h, mut rgba) = self.scale_source(size[0], size[1], rgba);
+        // Save the image AS SHOWN: crop, pixel-art upscale, then full-res dither + resample.
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
+        let (w, h, mut rgba) = self.scale_source(cw, ch, rgba);
         let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
         let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
         let (tw, th) = self.resize_target(w, h);
@@ -24375,11 +24701,13 @@ impl Kaleidotron {
                 }
             },
         };
+        // Non-destructive crop first, so the exported file matches the cropped preview.
+        let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
         // Build the grid through the SAME `build_ansi_grid` the on-screen preview uses,
         // so the exported file is guaranteed cell-identical to the viewer. (It runs the
         // value ops + resize on the pre-shade buffer, then grids once — the preview then
         // renders that very grid's glyphs.)
-        let (w, h, rgba) = self.scale_source(size[0], size[1], rgba);
+        let (w, h, rgba) = self.scale_source(cw, ch, rgba);
         let (grid, _work, _tw, _th, font_8x8) = self.build_ansi_grid(w, h, &rgba, &palette);
         // Serialize (+ SAUCE) via the SHARED routine the headless batch also uses, so a
         // batch-exported file is byte-identical to this one.
@@ -27352,11 +27680,14 @@ impl Kaleidotron {
         // Recolor view: apply the adjustments + swap palette / Reduce (shared with
         // the details pane) to the full image.
         let recolor = self.active_recolor(&path);
-        let proc = if !self.pipeline_active() && recolor.is_none() {
+        let cropped = self.crop_of(&path) != FULL_CROP;
+        let proc = if !self.pipeline_active() && recolor.is_none() && !cropped {
             None
         } else {
+            // Fold the crop into the key so dragging the box rebuilds the full view (and a
+            // crop-only image still routes through make_full_reduced to show cropped).
             let rkey = recolor.as_ref().map(|(k, _)| k.as_str()).unwrap_or("orig");
-            let key = format!("{}|{rkey}", self.pipeline_key());
+            let key = format!("{}|{rkey}{}", self.pipeline_key(), self.crop_sig(&path));
             let pal = recolor.as_ref().map(|(_, p)| p.clone());
             Some((key, pal))
         };
@@ -36244,6 +36575,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::QUANT_ON_KEY, &self.quantize_on);
         eframe::set_value(storage, Self::QUANT_N_KEY, &self.quantize_n);
         eframe::set_value(storage, Self::QUANT_KEEP_BW_KEY, &self.quantize_keep_bw);
+        eframe::set_value(storage, Self::CROPS_KEY, &self.crops);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38323,53 +38655,186 @@ fn palette_hash(pal: &[[u8; 4]]) -> u64 {
     h
 }
 
-/// Pin pure black + white into a palette ("Keep black/white"): snap the DARKEST entry to
-/// [0,0,0] and the BRIGHTEST to [255,255,255], so ANSI art always has its two contrast
-/// anchors — even when the reduced palette had neither. Replaces (never adds), so the
-/// colour count is unchanged; alpha is preserved.
-fn force_black_white(pal: &mut [[u8; 4]]) {
-    if pal.is_empty() {
-        return;
+/// The identity crop: the whole frame. Stored as *absent* from the crops map.
+const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Canonical key for the per-image crop map (shared by the GUI + `--batch`) so a crop set in
+/// the viewer is found again however the path is spelled. Falls back to the raw path for
+/// virtual entries (16colo) that don't resolve on disk.
+fn crop_canon(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Crop `rgba` (`w`×`h`) to the normalized rect `[x, y, cw, ch]` (each 0..1), returning the
+/// sub-image and its pixel size. A full-frame rect returns the buffer unchanged. Pixel bounds
+/// are clamped inside the image and kept ≥1px, so a degenerate rect can't panic.
+fn apply_crop_rgba(rect: [f32; 4], w: usize, h: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
+    if rect == FULL_CROP || w == 0 || h == 0 {
+        return (w, h, rgba.to_vec());
     }
-    let luma = |c: &[u8; 4]| 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
-    let (mut dark, mut light) = (0usize, 0usize);
-    for (i, c) in pal.iter().enumerate() {
-        if luma(c) < luma(&pal[dark]) {
-            dark = i;
-        }
-        if luma(c) > luma(&pal[light]) {
-            light = i;
-        }
+    let x0 = ((rect[0].clamp(0.0, 1.0) * w as f32).floor() as usize).min(w - 1);
+    let y0 = ((rect[1].clamp(0.0, 1.0) * h as f32).floor() as usize).min(h - 1);
+    let cw = ((rect[2].clamp(0.0, 1.0) * w as f32).round() as usize).clamp(1, w - x0);
+    let ch = ((rect[3].clamp(0.0, 1.0) * h as f32).round() as usize).clamp(1, h - y0);
+    let mut out = vec![0u8; cw * ch * 4];
+    for row in 0..ch {
+        let src = ((y0 + row) * w + x0) * 4;
+        let dst = row * cw * 4;
+        out[dst..dst + cw * 4].copy_from_slice(&rgba[src..src + cw * 4]);
     }
-    // A single-luminance palette has no real colour spread to protect — force black into
-    // slot 0 (+ white into slot 1 when there's room), as before.
-    if dark == light {
-        pal[0] = [0, 0, 0, pal[0][3]];
-        if pal.len() >= 2 {
-            pal[1] = [255, 255, 255, pal[1][3]];
-        }
-        return;
+    (cw, ch, out)
+}
+
+/// Append pure black + white to a reduced palette ("Keep black/white"), unless already
+/// present. Used with a median cut that targeted n-2 colours, so the result lands back at n
+/// with both contrast anchors guaranteed AND every real cluster intact — the extremes are
+/// ADDED, never substituted for a real colour (substituting the brightest cluster with white
+/// is what sprayed white "outliers" across warm art). Alpha is opaque.
+/// Smallest a crop side may shrink to (normalized) — keeps the box grabbable + non-empty.
+const CROP_MIN: f32 = 0.03;
+
+/// Recompute a normalized crop rect `[x, y, w, h]` after dragging a handle. `handle`: 0-3 =
+/// corners (TL, TR, BR, BL), 4-7 = edges (Top, Right, Bottom, Left), 8 = move the whole box.
+/// `(dx, dy)` is the pointer delta in normalized image units. `a_norm = Some(w/h)` locks the
+/// crop's normalized aspect (height follows width), anchored at the handle's opposite side so
+/// resizing feels natural; `None` is a free resize. The result is clamped inside [0,1] with a
+/// minimum side of [`CROP_MIN`].
+fn update_crop(c: [f32; 4], handle: u8, dx: f32, dy: f32, a_norm: Option<f32>) -> [f32; 4] {
+    let (mut l, mut t, mut r, mut b) = (c[0], c[1], c[0] + c[2], c[1] + c[3]);
+    if handle == 8 {
+        // Move: translate, clamped so the whole box stays inside [0,1].
+        let (w, h) = (r - l, b - t);
+        l = (l + dx).clamp(0.0, 1.0 - w);
+        t = (t + dy).clamp(0.0, 1.0 - h);
+        return [l, t, w, h];
     }
-    // Otherwise ONLY snap an extreme to the pure value when it's already essentially that —
-    // a small correction to a median-cut cluster that nearly landed on black/white. If the
-    // image's brightest (or darkest) colour is a real, saturated tone — a warm highlight, a
-    // deep red — snapping it to pure white/black would REPLACE that whole populous cluster,
-    // recolouring every pixel it owns and stippling the art with an extreme the source never
-    // had (the classic "white outliers on a warm image" bug). In that case leave the real
-    // colour be: "keep black/white" pulls the extremes in only when the image is genuinely
-    // close to them; otherwise its own brightest/darkest already stand in. Gate ≈ 40/channel.
-    const NEAR: f32 = 40.0 * 40.0 * 3.0;
-    let dist2 = |c: &[u8; 4], t: f32| {
-        let dr = t - c[0] as f32;
-        let dg = t - c[1] as f32;
-        let db = t - c[2] as f32;
-        dr * dr + dg * dg + db * db
+    // Which edges does this handle move, and what stays anchored?
+    let (mv_l, mv_r, mv_t, mv_b) = match handle {
+        0 => (true, false, true, false),  // TL
+        1 => (false, true, true, false),  // TR
+        2 => (false, true, false, true),  // BR
+        3 => (true, false, false, true),  // BL
+        4 => (false, false, true, false), // Top
+        5 => (false, true, false, false), // Right
+        6 => (false, false, false, true), // Bottom
+        7 => (true, false, false, false), // Left
+        _ => (false, false, false, false),
     };
-    if dist2(&pal[dark], 0.0) <= NEAR {
-        pal[dark] = [0, 0, 0, pal[dark][3]];
+    if mv_l {
+        l = (l + dx).clamp(0.0, r - CROP_MIN);
     }
-    if dist2(&pal[light], 255.0) <= NEAR {
-        pal[light] = [255, 255, 255, pal[light][3]];
+    if mv_r {
+        r = (r + dx).clamp(l + CROP_MIN, 1.0);
+    }
+    if mv_t {
+        t = (t + dy).clamp(0.0, b - CROP_MIN);
+    }
+    if mv_b {
+        b = (b + dy).clamp(t + CROP_MIN, 1.0);
+    }
+    if let Some(a) = a_norm.filter(|a| *a > 0.0) {
+        // Lock aspect: width leads, height follows (h = w / a), anchored at the side opposite
+        // the grabbed handle so the box grows away from where you're pulling.
+        let w = r - l;
+        let mut nh = (w / a).clamp(CROP_MIN, 1.0);
+        // Vertical anchor: a bottom-moving handle keeps the top fixed, and vice-versa; edges
+        // and pure-horizontal handles grow symmetrically about the centre.
+        if mv_t && !mv_b {
+            // top moved → keep bottom fixed
+            if b - nh < 0.0 {
+                nh = b;
+            }
+            t = b - nh;
+        } else if mv_b && !mv_t {
+            if t + nh > 1.0 {
+                nh = 1.0 - t;
+            }
+            b = t + nh;
+        } else {
+            let cy = (t + b) * 0.5;
+            let (mut nt, mut nb) = (cy - nh * 0.5, cy + nh * 0.5);
+            if nt < 0.0 {
+                nb -= nt;
+                nt = 0.0;
+            }
+            if nb > 1.0 {
+                nt -= nb - 1.0;
+                nb = 1.0;
+            }
+            t = nt.max(0.0);
+            b = nb.min(1.0);
+        }
+    }
+    [l, t, (r - l).max(CROP_MIN), (b - t).max(CROP_MIN)]
+}
+
+/// Clamp a normalized crop rect inside [0,1] with a minimum side of [`CROP_MIN`].
+fn clamp_crop(c: [f32; 4]) -> [f32; 4] {
+    let w = c[2].clamp(CROP_MIN, 1.0);
+    let h = c[3].clamp(CROP_MIN, 1.0);
+    let x = c[0].clamp(0.0, 1.0 - w);
+    let y = c[1].clamp(0.0, 1.0 - h);
+    [x, y, w, h]
+}
+
+/// Reshape a crop rect to a target pixel ratio `rw:rh`, anchored on its centre. `px_aspect` is
+/// the image's pixel width/height, so the box's *pixel* proportions match the ratio even though
+/// the rect is stored normalized. Fitted inside [0,1].
+fn crop_apply_ratio(c: [f32; 4], rw: u32, rh: u32, px_aspect: f32) -> [f32; 4] {
+    let a = (rw as f32 / rh.max(1) as f32) / px_aspect.max(0.001); // target normalized w/h
+    let (cx, cy) = (c[0] + c[2] * 0.5, c[1] + c[3] * 0.5);
+    let (mut w, mut h) = (c[2], c[2] / a.max(0.0001));
+    if h > 1.0 {
+        h = 1.0;
+        w = h * a;
+    }
+    if w > 1.0 {
+        w = 1.0;
+        h = w / a.max(0.0001);
+    }
+    clamp_crop([cx - w * 0.5, cy - h * 0.5, w, h])
+}
+
+/// The 8 crop handles as `(screen position, handle index)` — 0-3 corners (TL,TR,BR,BL),
+/// 4-7 edge midpoints (Top,Right,Bottom,Left) — matching [`update_crop`]'s indices.
+fn crop_handle_points(bx: egui::Rect) -> [(egui::Pos2, u8); 8] {
+    let c = bx.center();
+    [
+        (bx.left_top(), 0),
+        (bx.right_top(), 1),
+        (bx.right_bottom(), 2),
+        (bx.left_bottom(), 3),
+        (egui::pos2(c.x, bx.top()), 4),
+        (egui::pos2(bx.right(), c.y), 5),
+        (egui::pos2(c.x, bx.bottom()), 6),
+        (egui::pos2(bx.left(), c.y), 7),
+    ]
+}
+
+/// Which crop control is under `pos`: a handle index 0-7 (within grab distance), 8 to move the
+/// whole box (inside it), or 255 to start a fresh crop (elsewhere on the image `fit`).
+fn pick_crop_handle(pos: egui::Pos2, bx: egui::Rect, fit: egui::Rect) -> u8 {
+    const GRAB: f32 = 9.0;
+    for (p, idx) in crop_handle_points(bx) {
+        if p.distance(pos) <= GRAB {
+            return idx;
+        }
+    }
+    if bx.contains(pos) {
+        return 8;
+    }
+    let _ = fit;
+    255
+}
+
+fn add_black_white(pal: &mut Vec<[u8; 4]>) {
+    let black = [0, 0, 0, 255];
+    let white = [255, 255, 255, 255];
+    if !pal.contains(&black) {
+        pal.push(black);
+    }
+    if !pal.contains(&white) {
+        pal.push(white);
     }
 }
 
@@ -46089,6 +46554,24 @@ fn load_user_fx_presets() -> Vec<FxPreset> {
         .unwrap_or_default()
 }
 
+/// The viewer's saved per-image crops, read straight from `app.ron` (same shape as
+/// [`load_user_fx_presets`]: the outer map is `String→String`, the `crops` value is itself
+/// RON — a `PathBuf→[f32;4]` map). Empty on any error, so a batch with no crops just runs full.
+fn load_user_crops() -> std::collections::HashMap<PathBuf, [f32; 4]> {
+    let Some(path) = eframe::storage_dir("kaleidotron").map(|d| d.join("app.ron")) else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(map) = ron::from_str::<std::collections::HashMap<String, String>>(&text) else {
+        return Default::default();
+    };
+    map.get("crops")
+        .and_then(|v| ron::from_str::<std::collections::HashMap<PathBuf, [f32; 4]>>(v).ok())
+        .unwrap_or_default()
+}
+
 /// Every PixelFX preset resolvable by name: the bundled Factory set plus the user's saved
 /// presets (a user preset only adds when its name isn't already a Factory one).
 fn load_all_fx_presets() -> Vec<FxPreset> {
@@ -46132,10 +46615,13 @@ fn batch_one(
     format: u8,
     date: &str,
     outdir: Option<&Path>,
+    crop: [f32; 4],
 ) -> Result<(PathBuf, usize, usize), String> {
     let img = reg.decode_path(input).map_err(|e| e.to_string())?;
     let (w, h) = (img.width as usize, img.height as usize);
     let rgba = img.rgba_bytes();
+    // Non-destructive crop (the same per-image crop the viewer stored), before the upscale.
+    let (w, h, rgba) = apply_crop_rgba(crop, w, h, &rgba);
     // Pixel-art upscaler (preset's scale_algo) runs before the pipeline, same as the GUI.
     let scaler = crate::scale::Scaler::from_u8(preset.scale_algo);
     let (w, h, rgba) = if scaler == crate::scale::Scaler::None {
@@ -46300,9 +46786,15 @@ pub fn run_batch(cli: &CliArgs) -> i32 {
     let reg = crate::decode::Registry::with_builtins();
     let date = today_ccyymmdd();
     let outdir = cli.render_outdir.as_deref();
+    // Per-image crops saved by the viewer — applied so a batch matches what you cropped.
+    let crops = load_user_crops();
     let (mut ok, mut fail) = (0u32, 0u32);
     for (job, base) in &jobs {
-        match batch_one(&reg, job, base, preset, &palette, format, &date, outdir) {
+        let crop = crops
+            .get(&crop_canon(job))
+            .copied()
+            .unwrap_or(FULL_CROP);
+        match batch_one(&reg, job, base, preset, &palette, format, &date, outdir, crop) {
             Ok((out, cols, rows)) => {
                 println!("{} → {} ({cols}×{rows} cells)", job.display(), out.display());
                 ok += 1;
@@ -47285,31 +47777,81 @@ mod tests {
     }
 
     #[test]
-    fn keep_black_white_snaps_only_near_extremes() {
-        // A palette whose extremes are ALREADY essentially black/white: a near-black darkest
-        // and near-white brightest snap to the pure values (a minor correction); the mid color
-        // and the count are unchanged.
-        let mut pal = vec![[8, 6, 10, 255], [245, 248, 240, 255], [120, 60, 60, 255]];
-        force_black_white(&mut pal);
-        assert!(pal.contains(&[0, 0, 0, 255]), "near-black snapped to pure: {pal:?}");
-        assert!(pal.contains(&[255, 255, 255, 255]), "near-white snapped to pure: {pal:?}");
-        assert!(pal.contains(&[120, 60, 60, 255]), "mid color kept: {pal:?}");
-        assert_eq!(pal.len(), 3, "color count unchanged");
+    fn keep_black_white_adds_extremes_without_touching_real_clusters() {
+        // "Keep black/white" ADDS pure black + white to a reduced palette (reserving 2 slots
+        // via a median cut to n-2) instead of overwriting a real cluster. A warm image with
+        // NO true white keeps ALL its real colours — the saturated highlight [200,180,150] and
+        // deep red [90,20,20] are untouched — and gains both contrast anchors. This is the
+        // white-outliers fix: nothing populous is recoloured to an extreme, yet the artist
+        // still has black + white in the palette.
+        let mut pal = vec![[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]];
+        add_black_white(&mut pal);
+        for c in [[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]] {
+            assert!(pal.contains(&c), "real cluster {c:?} preserved: {pal:?}");
+        }
+        assert!(pal.contains(&[0, 0, 0, 255]), "black added: {pal:?}");
+        assert!(pal.contains(&[255, 255, 255, 255]), "white added: {pal:?}");
+        assert_eq!(pal.len(), 5, "3 clusters + black + white");
     }
 
     #[test]
-    fn keep_black_white_leaves_saturated_extremes_alone() {
-        // Regression for the white-outliers bug: a warm image with NO true white — its
-        // brightest colour is a saturated highlight ([200,180,150]) and its darkest a deep
-        // red ([90,20,20]). Neither is close to an extreme, so "keep black/white" must NOT
-        // replace them with pure white/black (which would recolour those whole clusters and
-        // stipple the art with white the source never had). The palette is left untouched.
-        let mut pal = vec![[40, 40, 60, 255], [200, 180, 150, 255], [90, 20, 20, 255]];
-        let before = pal.clone();
-        force_black_white(&mut pal);
-        assert_eq!(pal, before, "saturated extremes must be preserved: {pal:?}");
-        assert!(!pal.contains(&[255, 255, 255, 255]), "no fabricated white: {pal:?}");
-        assert!(!pal.contains(&[0, 0, 0, 255]), "no fabricated black: {pal:?}");
+    fn keep_black_white_does_not_duplicate_existing_extremes() {
+        // If the reduced palette already contains pure black/white, they aren't duplicated.
+        let mut pal = vec![[0, 0, 0, 255], [128, 40, 40, 255], [255, 255, 255, 255]];
+        add_black_white(&mut pal);
+        assert_eq!(pal.len(), 3, "no duplicate extremes: {pal:?}");
+    }
+
+    #[test]
+    fn crop_extracts_the_right_subregion() {
+        // 4×4 image with R=x, G=y. Crop the bottom-right 2×2 quadrant.
+        let (w, h) = (4usize, 4usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                rgba[i] = x as u8;
+                rgba[i + 1] = y as u8;
+                rgba[i + 3] = 255;
+            }
+        }
+        let (cw, ch, out) = apply_crop_rgba([0.5, 0.5, 0.5, 0.5], w, h, &rgba);
+        assert_eq!((cw, ch), (2, 2));
+        assert_eq!(&out[0..2], &[2, 2], "crop origin is pixel (2,2)");
+        // A full-frame rect returns the buffer unchanged.
+        let (fw, fh, f) = apply_crop_rgba(FULL_CROP, w, h, &rgba);
+        assert_eq!((fw, fh), (4, 4));
+        assert_eq!(f, rgba);
+    }
+
+    #[test]
+    fn crop_move_preserves_size_and_stays_in_bounds() {
+        let moved = update_crop([0.6, 0.6, 0.3, 0.3], 8, 0.5, 0.5, None);
+        assert!(moved[0] + moved[2] <= 1.0 + 1e-4 && moved[1] + moved[3] <= 1.0 + 1e-4);
+        assert!((moved[2] - 0.3).abs() < 1e-4 && (moved[3] - 0.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crop_resize_shrinks_and_respects_min() {
+        let s = update_crop([0.2, 0.2, 0.6, 0.6], 2, -0.4, -0.4, None);
+        assert!(s[2] < 0.6 && s[3] < 0.6, "BR drag inward shrinks");
+        let tiny = update_crop([0.2, 0.2, 0.1, 0.1], 2, -1.0, -1.0, None);
+        assert!(tiny[2] >= CROP_MIN - 1e-6 && tiny[3] >= CROP_MIN - 1e-6, "min side held");
+    }
+
+    #[test]
+    fn crop_locked_aspect_holds_and_matches_pixels() {
+        // update_crop keeps the normalized w/h at a_norm when a corner is dragged.
+        let out = update_crop([0.1, 0.1, 0.4, 0.4], 2, 0.3, 0.0, Some(1.5));
+        assert!((out[2] / out[3] - 1.5).abs() < 0.05, "w/h {}", out[2] / out[3]);
+        // crop_apply_ratio yields a box whose PIXEL ratio matches (square image → px_aspect 1).
+        let c = crop_apply_ratio([0.1, 0.1, 0.8, 0.8], 16, 9, 1.0);
+        let pixel_ratio = (c[2] / c[3]) * 1.0;
+        assert!((pixel_ratio - 16.0 / 9.0).abs() < 0.02, "pixel ratio {pixel_ratio}");
+        // Flipping to 9:16 gives the reciprocal.
+        let c2 = crop_apply_ratio(c, 9, 16, 1.0);
+        let pr2 = (c2[2] / c2[3]) * 1.0;
+        assert!((pr2 - 9.0 / 16.0).abs() < 0.02, "flipped ratio {pr2}");
     }
 
     #[test]
@@ -48286,6 +48828,7 @@ mod tests {
             scan_period: 4,
             scan_dir: 2,
             scan_color: [10, 20, 30],
+            scan_thick: 2,
             glow_amt: 1.2,
             glow_radius: 5.0,
             vig_amt: 0.6,
