@@ -1648,6 +1648,7 @@ pub struct Kaleidotron {
     ascii_blocks: bool,  // include the ░▒▓█ + half/quarter block glyphs
     ascii_box: bool,     // include box-drawing glyphs (179..218)
     ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
+    ascii_invert: bool,  // inverse video — swap ink/paper
     ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
     // ATASCII / Apple ][ converters (DITHER_ATASCII / DITHER_APPLE): generic 8×8 bit-font art.
     bitfont_color: bool,   // per-cell colour from the palette (shared by both modes; else mono)
@@ -2466,6 +2467,7 @@ impl Kaleidotron {
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
+    const ASCII_INVERT_KEY: &'static str = "ascii_invert";
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
@@ -3148,6 +3150,7 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
             .unwrap_or((true, false, true, false, false, String::new()));
+        let ascii_invert = get_bool(Self::ASCII_INVERT_KEY).unwrap_or(false);
         // ATASCII / Apple ][ settings (colour, atascii invert, apple invert, mousetext, 80-col).
         let bitfont: (bool, bool, bool, bool, bool) = cc
             .storage
@@ -3681,6 +3684,7 @@ impl Kaleidotron {
             ascii_high: ascii.0,
             ascii_control: ascii.1,
             ascii_color: ascii.2,
+            ascii_invert,
             ascii_blocks: ascii.3,
             ascii_box: ascii.4,
             ascii_chars: ascii.5,
@@ -19853,6 +19857,7 @@ impl Kaleidotron {
             petscii_pal: self.petscii_pal(),
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
+            ascii_invert: self.ascii_invert,
             bitfont_font: bf_font,
             bitfont_pool: bf_pool,
             bitfont_color: self.bitfont_color,
@@ -20088,6 +20093,7 @@ impl Kaleidotron {
             ascii_blocks: self.ascii_blocks,
             ascii_box: self.ascii_box,
             ascii_color: self.ascii_color,
+            ascii_invert: self.ascii_invert,
             ascii_chars: self.ascii_chars.clone(),
             bitfont_color: self.bitfont_color,
             atascii_invert: self.atascii_invert,
@@ -20179,6 +20185,7 @@ impl Kaleidotron {
         self.ascii_blocks = p.ascii_blocks;
         self.ascii_box = p.ascii_box;
         self.ascii_color = p.ascii_color;
+        self.ascii_invert = p.ascii_invert;
         self.ascii_chars = p.ascii_chars.clone();
         self.bitfont_color = p.bitfont_color;
         self.atascii_invert = p.atascii_invert;
@@ -20335,12 +20342,13 @@ impl Kaleidotron {
             // the range toggles + colour AND the fit/cell state that sets the working resolution.
             + &if self.dither_method == crate::thumb::DITHER_ASCII {
                 format!(
-                    "|Ah{}:c{}:bl{}:bx{}:col{}:only{}:v{}:s{}|Fit{}:{}x{}",
+                    "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:v{}:s{}|Fit{}:{}x{}",
                     self.ascii_high as u8,
                     self.ascii_control as u8,
                     self.ascii_blocks as u8,
                     self.ascii_box as u8,
                     self.ascii_color as u8,
+                    self.ascii_invert as u8,
                     self.ascii_chars,
                     self.shade_vga50 as u8,
                     self.shade_snap916 as u8,
@@ -20667,6 +20675,7 @@ impl Kaleidotron {
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_invert: false,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -21205,7 +21214,8 @@ impl Kaleidotron {
         // render/export path); they differ only in the cell→glyph decision.
         let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
             crate::thumb::ascii_grid(
-                &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color, font_8x8,
+                &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color,
+                self.ascii_invert, font_8x8,
             )
         } else {
             crate::thumb::ansi_shade_grid(
@@ -25584,6 +25594,8 @@ impl Kaleidotron {
                                 .on_hover_text(
                                     "Per-cell colour from the active palette (off = monochrome ink on paper)",
                                 );
+                            ui.checkbox(&mut self.ascii_invert, "Invert")
+                                .on_hover_text("Inverse video — draw the glyph in paper on an ink-coloured cell");
                             ui.weak("·");
                             ui.checkbox(&mut self.shade_vga50, "8×8 cell")
                                 .on_hover_text("Render in the 8×8 VGA50 font (off = 8×16)");
@@ -38250,6 +38262,7 @@ impl eframe::App for Kaleidotron {
                 self.ascii_chars.clone(),
             ),
         );
+        eframe::set_value(storage, Self::ASCII_INVERT_KEY, &self.ascii_invert);
         eframe::set_value(
             storage,
             Self::BITFONT_KEY,
@@ -39269,6 +39282,7 @@ struct PipeAux<'a> {
     // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
     ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
+    ascii_invert: bool,
     // Bit-font pass params (DITHER_ATASCII / DITHER_APPLE): the ROM font + glyph pool + toggles.
     bitfont_font: &'a [[u8; 8]],
     bitfont_pool: Vec<u16>,
@@ -39417,6 +39431,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.shade_ch,
                             &aux.ascii_cs,
                             aux.ascii_color,
+                            aux.ascii_invert,
                             aux.font_8x8,
                         );
                     }
@@ -39887,6 +39902,8 @@ struct FxPreset {
     #[serde(default = "default_true")]
     ascii_color: bool,
     #[serde(default)]
+    ascii_invert: bool,
+    #[serde(default)]
     ascii_chars: String,
     // ATASCII / Apple ][ converter settings.
     #[serde(default = "default_true")]
@@ -39977,6 +39994,7 @@ impl Default for FxPreset {
             ascii_blocks: false,
             ascii_box: false,
             ascii_color: true,
+            ascii_invert: false,
             ascii_chars: String::new(),
             bitfont_color: true,
             atascii_invert: false,
@@ -40322,6 +40340,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_invert: false,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -48619,6 +48638,7 @@ fn preset_pipe_aux<'a>(
         petscii_bg: None,
         petscii_pal: crate::decode::petscii_palette(0),
         ascii_cs: crate::thumb::AsciiCharset::default(),
+        ascii_invert: false,
         ascii_color: true,
         bitfont_font: &[],
         bitfont_pool: Vec::new(),
@@ -50944,6 +50964,7 @@ mod tests {
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_invert: false,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),
@@ -51164,6 +51185,7 @@ mod tests {
             petscii_bg: None,
             petscii_pal: crate::decode::petscii_palette(0),
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_invert: false,
             ascii_color: true,
             bitfont_font: &[],
             bitfont_pool: Vec::new(),

@@ -2047,6 +2047,7 @@ pub fn ascii_grid(
     cell_h: usize,
     cs: &AsciiCharset,
     color: bool,
+    invert: bool,
     font_8x8: bool,
 ) -> AnsiGrid {
     let cw = cell_w.max(1);
@@ -2082,7 +2083,8 @@ pub fn ascii_grid(
                 }
             }
             if n == 0 || sa == 0 {
-                cells.push(AnsiCell { fg: ink, bg: paper, ch: 32 });
+                let (fg, bg) = if invert { (paper, ink) } else { (ink, paper) };
+                cells.push(AnsiCell { fg, bg, ch: 32 });
                 continue;
             }
             let avg = [(sr / sa) as u8, (sg / sa) as u8, (sb / sa) as u8];
@@ -2102,7 +2104,9 @@ pub fn ascii_grid(
                 .map(|(g, _)| *g)
                 .unwrap_or(32);
             let fg = if color { nearest_index(avg, palette) } else { ink };
-            cells.push(AnsiCell { fg, bg: paper, ch });
+            // Invert = inverse video: draw the glyph in paper on an fg-coloured cell.
+            let (fg, bg) = if invert { (paper, fg) } else { (fg, paper) };
+            cells.push(AnsiCell { fg, bg, ch });
         }
     }
     AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: palette.to_vec(), cells }
@@ -2121,12 +2125,13 @@ pub fn ascii_pass(
     cell_h: usize,
     cs: &AsciiCharset,
     color: bool,
+    invert: bool,
     font_8x8: bool,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, font_8x8);
+    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, invert, font_8x8);
     ansi_render_grid(&grid, rgba, w, h, font_8x8);
 }
 
@@ -2880,7 +2885,7 @@ mod tests {
             }
         }
         let cs = AsciiCharset { high: true, ..Default::default() };
-        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, true);
+        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, false, true);
         assert_eq!(grid.cols, 2);
         let left = grid.cells[0];
         let right = grid.cells[1];
