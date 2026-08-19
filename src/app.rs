@@ -1654,6 +1654,7 @@ pub struct Kaleidotron {
     atascii_invert: bool,  // ATASCII inverse video (swap ink/paper)
     apple_invert: bool,    // Apple ][ inverse video
     apple_mousetext: bool, // include the Apple //e MouseText glyphs in the pool
+    apple_col80: bool,     // false = PR#0 (40-column font), true = PR#3 (80-column font)
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2453,7 +2454,7 @@ impl Kaleidotron {
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
-    const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext)
+    const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3128,11 +3129,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::ASCII_KEY))
             .unwrap_or((true, false, true, false, false, String::new()));
-        // ATASCII / Apple ][ settings (colour, atascii invert, apple invert, apple mousetext).
-        let bitfont: (bool, bool, bool, bool) = cc
+        // ATASCII / Apple ][ settings (colour, atascii invert, apple invert, mousetext, 80-col).
+        let bitfont: (bool, bool, bool, bool, bool) = cc
             .storage
             .and_then(|s| eframe::get_value(s, Self::BITFONT_KEY))
-            .unwrap_or((true, false, false, true));
+            .unwrap_or((true, false, false, true, false));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3647,6 +3648,7 @@ impl Kaleidotron {
             atascii_invert: bitfont.1,
             apple_invert: bitfont.2,
             apple_mousetext: bitfont.3,
+            apple_col80: bitfont.4,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -20033,6 +20035,7 @@ impl Kaleidotron {
             atascii_invert: self.atascii_invert,
             apple_invert: self.apple_invert,
             apple_mousetext: self.apple_mousetext,
+            apple_col80: self.apple_col80,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20117,6 +20120,7 @@ impl Kaleidotron {
         self.atascii_invert = p.atascii_invert;
         self.apple_invert = p.apple_invert;
         self.apple_mousetext = p.apple_mousetext;
+        self.apple_col80 = p.apple_col80;
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -20280,11 +20284,12 @@ impl Kaleidotron {
                 crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
             ) {
                 format!(
-                    "|BFcol{}:ai{}:pi{}:mt{}",
+                    "|BFcol{}:ai{}:pi{}:mt{}:c80{}",
                     self.bitfont_color as u8,
                     self.atascii_invert as u8,
                     self.apple_invert as u8,
                     self.apple_mousetext as u8,
+                    self.apple_col80 as u8,
                 )
             } else {
                 String::new()
@@ -20892,7 +20897,11 @@ impl Kaleidotron {
     /// when enabled). Colour is `self.bitfont_color`.
     fn bitfont_spec(&self) -> (&'static [[u8; 8]], Vec<u16>, bool) {
         if self.dither_method == crate::thumb::DITHER_APPLE {
-            let font = crate::thumb::apple_font();
+            let font = if self.apple_col80 {
+                crate::thumb::apple_font_80() // PR#3
+            } else {
+                crate::thumb::apple_font() // PR#0
+            };
             let base = crate::thumb::apple_text_len() as u16;
             let mut pool: Vec<u16> = (0..base).collect();
             if self.apple_mousetext {
@@ -25422,6 +25431,13 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Apple ][").strong());
                             ui.weak("Apple II character art");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Font");
+                            ui.selectable_value(&mut self.apple_col80, false, "PR#0 (40 col)")
+                                .on_hover_text("The 40-column Apple II text font");
+                            ui.selectable_value(&mut self.apple_col80, true, "PR#3 (80 col)")
+                                .on_hover_text("The 80-column card font (narrower PRNumber3 style)");
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.bitfont_color, "Color")
@@ -37788,6 +37804,7 @@ impl eframe::App for Kaleidotron {
                 self.atascii_invert,
                 self.apple_invert,
                 self.apple_mousetext,
+                self.apple_col80,
             ),
         );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
@@ -39354,6 +39371,8 @@ struct FxPreset {
     apple_invert: bool,
     #[serde(default = "default_true")]
     apple_mousetext: bool,
+    #[serde(default)]
+    apple_col80: bool,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -39425,6 +39444,7 @@ impl Default for FxPreset {
             atascii_invert: false,
             apple_invert: false,
             apple_mousetext: true,
+            apple_col80: false,
             folder: None,
         }
     }

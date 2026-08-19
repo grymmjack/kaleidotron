@@ -2204,7 +2204,19 @@ pub fn apple_font() -> &'static [[u8; 8]] {
     })
 }
 
-/// Number of text glyphs in [`apple_font`] before the MouseText block begins.
+/// The Apple ][ **80-column** (PR#3) render font: the PRNumber3 text set followed by the same
+/// MouseText block, so it shares the text/MouseText index layout with [`apple_font`].
+pub fn apple_font_80() -> &'static [[u8; 8]] {
+    static F: std::sync::OnceLock<Vec<[u8; 8]>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut v = crate::decode::APPLE2_80_FONT.to_vec();
+        v.extend_from_slice(&crate::decode::APPLE2_MOUSETEXT);
+        v
+    })
+}
+
+/// Number of text glyphs in [`apple_font`] / [`apple_font_80`] before the MouseText block begins
+/// (both text sets are the same length, so one value serves both).
 pub fn apple_text_len() -> usize {
     crate::decode::APPLE2_FONT.len()
 }
