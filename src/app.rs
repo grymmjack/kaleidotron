@@ -19986,6 +19986,19 @@ impl Kaleidotron {
             quantize_keep_bw: self.quantize_keep_bw,
             selected_palette: self.selected_palette.clone(),
             custom_palette: self.custom_palette.clone(),
+            petscii_cols: self.petscii_cols,
+            petscii_rows: self.petscii_rows,
+            petscii_purity: self.petscii_purity,
+            petscii_page: self.petscii_page,
+            petscii_bg_auto: self.petscii_bg_auto,
+            petscii_bg: self.petscii_bg,
+            petscii_palette: self.petscii_palette,
+            ascii_high: self.ascii_high,
+            ascii_control: self.ascii_control,
+            ascii_blocks: self.ascii_blocks,
+            ascii_box: self.ascii_box,
+            ascii_color: self.ascii_color,
+            ascii_chars: self.ascii_chars.clone(),
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20051,6 +20064,21 @@ impl Kaleidotron {
         self.quantize_keep_bw = p.quantize_keep_bw;
         self.selected_palette = p.selected_palette.clone();
         self.custom_palette = p.custom_palette.clone();
+        // PETSCII converter settings.
+        self.petscii_cols = p.petscii_cols.clamp(1, 120);
+        self.petscii_rows = p.petscii_rows.clamp(1, 120);
+        self.petscii_purity = p.petscii_purity.clamp(0.0, 1.0);
+        self.petscii_page = p.petscii_page.min(1);
+        self.petscii_bg_auto = p.petscii_bg_auto;
+        self.petscii_bg = p.petscii_bg & 15;
+        self.petscii_palette = p.petscii_palette.min(3);
+        // ASCII converter settings.
+        self.ascii_high = p.ascii_high;
+        self.ascii_control = p.ascii_control;
+        self.ascii_blocks = p.ascii_blocks;
+        self.ascii_box = p.ascii_box;
+        self.ascii_color = p.ascii_color;
+        self.ascii_chars = p.ascii_chars.clone();
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -38852,6 +38880,15 @@ fn default_fit_cols() -> usize {
 fn default_fit_rows() -> usize {
     25
 }
+fn default_petscii_cols() -> usize {
+    40
+}
+fn default_petscii_rows() -> usize {
+    25
+}
+fn default_one() -> f32 {
+    1.0
+}
 fn default_ink() -> [u8; 3] {
     [235, 235, 235]
 }
@@ -39065,6 +39102,35 @@ struct FxPreset {
     quantize_keep_bw: bool,
     selected_palette: Option<PathBuf>,
     custom_palette: Option<Vec<[u8; 4]>>,
+    // PETSCII converter settings (DITHER_PETSCII). Struct-level `#[serde(default)]` fills these
+    // for presets saved before they existed, using the fns below for sane non-zero defaults.
+    #[serde(default = "default_petscii_cols")]
+    petscii_cols: usize,
+    #[serde(default = "default_petscii_rows")]
+    petscii_rows: usize,
+    #[serde(default = "default_one")]
+    petscii_purity: f32,
+    #[serde(default)]
+    petscii_page: usize,
+    #[serde(default = "default_true")]
+    petscii_bg_auto: bool,
+    #[serde(default)]
+    petscii_bg: u8,
+    #[serde(default)]
+    petscii_palette: u8,
+    // ASCII converter settings (DITHER_ASCII).
+    #[serde(default = "default_true")]
+    ascii_high: bool,
+    #[serde(default)]
+    ascii_control: bool,
+    #[serde(default)]
+    ascii_blocks: bool,
+    #[serde(default)]
+    ascii_box: bool,
+    #[serde(default = "default_true")]
+    ascii_color: bool,
+    #[serde(default)]
+    ascii_chars: String,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -39119,6 +39185,19 @@ impl Default for FxPreset {
             quantize_keep_bw: false,
             selected_palette: None,
             custom_palette: None,
+            petscii_cols: 40,
+            petscii_rows: 25,
+            petscii_purity: 1.0,
+            petscii_page: 0,
+            petscii_bg_auto: true,
+            petscii_bg: 0,
+            petscii_palette: 0,
+            ascii_high: true,
+            ascii_control: false,
+            ascii_blocks: false,
+            ascii_box: false,
+            ascii_color: true,
+            ascii_chars: String::new(),
             folder: None,
         }
     }
