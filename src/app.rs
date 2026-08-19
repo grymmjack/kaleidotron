@@ -20971,9 +20971,6 @@ impl Kaleidotron {
                 self.zoom_crop_view((scroll * 0.004).exp(), cursor, fit);
                 // Consume the scroll so the enclosing details ScrollArea stays put.
                 ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
-                // Zooming in frames the crop: shrink it to the (now smaller) view so the box
-                // stays visible and the preview follows the zoom.
-                self.clamp_crop_to_view(path);
             }
         }
         // Middle button: drag pans, a click (no real movement) resets.
@@ -21009,6 +21006,10 @@ impl Kaleidotron {
             }
             self.crop_mid_active = false;
         }
+        // Every frame, keep the crop within the view so NO handle is ever off-screen (an
+        // off-screen corner can't be grabbed and the drag falls through to "move"). Only
+        // shrinks when the crop actually exceeds the view, so a smaller crop is untouched.
+        self.clamp_crop_to_view(path);
     }
 
     /// Draw the non-destructive crop box over the Details thumbnail and handle its 8 handles /
@@ -21066,12 +21067,14 @@ impl Kaleidotron {
             painter.rect_stroke(bx, 0.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
             for (p, idx) in crop_handle_points(bx) {
                 let on = active_handle == Some(idx);
-                let sz = if on { 11.0 } else { 8.0 };
+                // Corners are drawn a touch larger than edge handles; the active one grows more.
+                let base = if idx < 4 { 13.0 } else { 11.0 };
+                let sz = if on { base + 4.0 } else { base };
                 let col = if on { hot } else { accent };
-                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(sz, sz)), 1.5, col);
+                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(sz, sz)), 2.0, col);
                 painter.rect_stroke(
                     egui::Rect::from_center_size(p, egui::vec2(sz, sz)),
-                    1.5,
+                    2.0,
                     egui::Stroke::new(1.0, ui.visuals().extreme_bg_color),
                     egui::StrokeKind::Middle,
                 );
@@ -39312,10 +39315,18 @@ fn crop_handle_points(bx: egui::Rect) -> [(egui::Pos2, u8); 8] {
 /// Which crop control is under `pos`: a handle index 0-7 (within grab distance), 8 to move the
 /// whole box (inside it), or 255 to start a fresh crop (elsewhere on the image `fit`).
 fn pick_crop_handle(pos: egui::Pos2, bx: egui::Rect, fit: egui::Rect) -> u8 {
-    const GRAB: f32 = 9.0;
-    for (p, idx) in crop_handle_points(bx) {
+    const GRAB: f32 = 16.0;
+    // Corners (0-3) win over edges (4-7) when both are in range, so a corner drag never
+    // degrades into an edge/move: check corners first.
+    let pts = crop_handle_points(bx);
+    for (p, idx) in pts.iter().filter(|(_, i)| *i < 4) {
         if p.distance(pos) <= GRAB {
-            return idx;
+            return *idx;
+        }
+    }
+    for (p, idx) in pts.iter().filter(|(_, i)| *i >= 4) {
+        if p.distance(pos) <= GRAB {
+            return *idx;
         }
     }
     if bx.contains(pos) {
