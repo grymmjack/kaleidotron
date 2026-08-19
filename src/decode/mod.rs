@@ -48,6 +48,7 @@ mod psd;
 pub mod rad; // Reality Adlib Tracker replayer (RADPlayer port) — .rad → OPL3 register writes
 mod rip;
 mod rexpaint; // REXPaint .xp (gzipped layered CP437 art)
+pub(crate) mod rexfont; // REXPaint bitmap fonts pack (16×16 glyph-grid PNGs → GlyphFont)
 mod rip_chr;
 mod svg;
 mod tundra;

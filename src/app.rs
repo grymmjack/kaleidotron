@@ -1655,6 +1655,9 @@ pub struct Kaleidotron {
     apple_invert: bool,    // Apple ][ inverse video
     apple_mousetext: bool, // include the Apple //e MouseText glyphs in the pool
     apple_col80: bool,     // false = PR#0 (40-column font), true = PR#3 (80-column font)
+    // REXPaint-font converter (DITHER_REXFONT): image→art over a bundled REXPaint font.
+    rexfont_sel: usize,    // index into crate::decode::rexfont::REXFONTS (the converter font)
+    rexfont_invert: bool,  // inverse video for the REXPaint-font converter
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
@@ -2455,6 +2458,7 @@ impl Kaleidotron {
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
+    const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3134,6 +3138,11 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value(s, Self::BITFONT_KEY))
             .unwrap_or((true, false, false, true, false));
+        // REXPaint-font converter (font index, invert).
+        let rexfont: (usize, bool) = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Self::REXFONT_KEY))
+            .unwrap_or((0, false));
         let shade_fit_cols = cc
             .storage
             .and_then(|s| eframe::get_value::<usize>(s, Self::SHADE_FIT_COLS_KEY))
@@ -3649,6 +3658,8 @@ impl Kaleidotron {
             apple_invert: bitfont.2,
             apple_mousetext: bitfont.3,
             apple_col80: bitfont.4,
+            rexfont_sel: rexfont.0,
+            rexfont_invert: rexfont.1,
             pixelate_h,
             pixelate_lock,
             resize_on,
@@ -19748,6 +19759,9 @@ impl Kaleidotron {
                 crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
             ) {
                 self.bitfont_spec()
+            } else if self.dither_method == crate::thumb::DITHER_REXFONT {
+                // REXPaint font reuses the bitfont_invert slot for its own inverse toggle.
+                (&[], Vec::new(), self.rexfont_invert)
             } else {
                 (&[], Vec::new(), false)
             };
@@ -19804,6 +19818,7 @@ impl Kaleidotron {
             bitfont_pool: bf_pool,
             bitfont_color: self.bitfont_color,
             bitfont_invert: bf_invert,
+            rexfont_sel: self.rexfont_sel,
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
             balance: self.balance_offset(),
@@ -20036,6 +20051,8 @@ impl Kaleidotron {
             apple_invert: self.apple_invert,
             apple_mousetext: self.apple_mousetext,
             apple_col80: self.apple_col80,
+            rexfont_sel: self.rexfont_sel,
+            rexfont_invert: self.rexfont_invert,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20121,6 +20138,8 @@ impl Kaleidotron {
         self.apple_invert = p.apple_invert;
         self.apple_mousetext = p.apple_mousetext;
         self.apple_col80 = p.apple_col80;
+        self.rexfont_sel = p.rexfont_sel;
+        self.rexfont_invert = p.rexfont_invert;
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -20142,6 +20161,7 @@ impl Kaleidotron {
                             | crate::thumb::DITHER_ASCII
                             | crate::thumb::DITHER_ATASCII
                             | crate::thumb::DITHER_APPLE
+                            | crate::thumb::DITHER_REXFONT
                     )))
             || self.resize_active()
             || self.postfx.active()
@@ -20290,6 +20310,14 @@ impl Kaleidotron {
                     self.apple_invert as u8,
                     self.apple_mousetext as u8,
                     self.apple_col80 as u8,
+                )
+            } else {
+                String::new()
+            }
+            + &if self.dither_method == crate::thumb::DITHER_REXFONT {
+                format!(
+                    "|RXf{}:col{}:inv{}",
+                    self.rexfont_sel, self.bitfont_color as u8, self.rexfont_invert as u8,
                 )
             } else {
                 String::new()
@@ -20577,6 +20605,7 @@ impl Kaleidotron {
             bitfont_pool: Vec::new(),
             bitfont_color: true,
             bitfont_invert: false,
+            rexfont_sel: 0,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: self.balance_offset(),
@@ -24817,6 +24846,7 @@ impl Kaleidotron {
                                 | crate::thumb::DITHER_ASCII
                                 | crate::thumb::DITHER_ATASCII
                                 | crate::thumb::DITHER_APPLE
+                                | crate::thumb::DITHER_REXFONT
                         ) && prev != self.dither_method
                             && self.custom_palette.is_none()
                             && self.selected_palette.is_none()
@@ -25453,6 +25483,41 @@ impl Kaleidotron {
                             ui.weak("(needs a palette / Reduce for its colors)");
                         }
                     }
+                    // ----- REXPaint-font controls (image → art in a bundled REXPaint font) -----
+                    if self.dither_method == crate::thumb::DITHER_REXFONT {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("REXPaint font").strong());
+                            let f = crate::decode::rexfont::rexfont(self.rexfont_sel);
+                            ui.weak(match f {
+                                Some(g) => format!("{}×{} cells", g.cell_w, g.cell_h),
+                                None => "—".into(),
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Font");
+                            let cur = self.rexfont_sel.min(crate::decode::rexfont::rexfont_count() - 1);
+                            egui::ComboBox::from_id_salt("rexfont_sel")
+                                .selected_text(crate::decode::rexfont::rexfont_name(cur))
+                                .show_ui(ui, |ui| {
+                                    for i in 0..crate::decode::rexfont::rexfont_count() {
+                                        ui.selectable_value(
+                                            &mut self.rexfont_sel,
+                                            i,
+                                            crate::decode::rexfont::rexfont_name(i),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.bitfont_color, "Color")
+                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
+                            ui.checkbox(&mut self.rexfont_invert, "Invert")
+                                .on_hover_text("Inverse video — swap ink and paper");
+                        });
+                        if recolor.is_none() {
+                            ui.weak("(needs a palette / Reduce for its colors)");
+                        }
+                    }
                     if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
                         ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
                     }
@@ -25750,10 +25815,12 @@ impl Kaleidotron {
             self.export_petscii(path);
             return;
         }
-        // ATASCII / Apple ][ export as a rendered PNG (their bit-font art isn't CP437/.ans).
+        // ATASCII / Apple ][ / REXPaint-font export as a rendered PNG (not CP437/.ans).
         if matches!(
             self.dither_method,
-            crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+            crate::thumb::DITHER_ATASCII
+                | crate::thumb::DITHER_APPLE
+                | crate::thumb::DITHER_REXFONT
         ) {
             self.export_bitfont_png(path);
             return;
@@ -25913,16 +25980,34 @@ impl Kaleidotron {
             }
         }
         apply_pipeline(&mut work, w, h, &self.adjust.order, &self.adjust, &aux);
-        let (font, pool, invert) = self.bitfont_spec();
-        let grid = crate::thumb::bitfont_grid(
-            &work, w, h, &palette, 8, 8, font, &pool, self.bitfont_color, invert,
-        );
-        crate::thumb::bitfont_render(&grid, font, &mut work, w, h, 8, 8);
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-        let kind = if self.dither_method == crate::thumb::DITHER_APPLE {
-            "apple"
+        let (cols, rows) = if self.dither_method == crate::thumb::DITHER_REXFONT {
+            let font = crate::decode::rexfont::rexfont(self.rexfont_sel);
+            let font = match font {
+                Some(f) => f,
+                None => {
+                    self.status = "REXPaint font failed to load".into();
+                    return;
+                }
+            };
+            let grid =
+                crate::thumb::glyphfont_grid(&work, w, h, &palette, font, self.bitfont_color, self.rexfont_invert);
+            let (c, r) = (grid.cols, grid.rows);
+            crate::thumb::glyphfont_render(&grid, font, &mut work, w, h);
+            (c, r)
         } else {
-            "atascii"
+            let (font, pool, invert) = self.bitfont_spec();
+            let grid = crate::thumb::bitfont_grid(
+                &work, w, h, &palette, 8, 8, font, &pool, self.bitfont_color, invert,
+            );
+            let (c, r) = (grid.cols, grid.rows);
+            crate::thumb::bitfont_render(&grid, font, &mut work, w, h, 8, 8);
+            (c, r)
+        };
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let kind = match self.dither_method {
+            m if m == crate::thumb::DITHER_APPLE => "apple",
+            m if m == crate::thumb::DITHER_REXFONT => "rexpaint",
+            _ => "atascii",
         };
         let Some(dest) = rfd::FileDialog::new()
             .set_file_name(format!("{stem}_{kind}.png"))
@@ -25937,8 +26022,8 @@ impl Kaleidotron {
                     "Exported {} PNG: {} ({}×{} cells)",
                     kind.to_uppercase(),
                     short_name(&dest),
-                    grid.cols,
-                    grid.rows
+                    cols,
+                    rows
                 )
             }
             Err(e) => self.status = format!("Export failed: {e}"),
@@ -37810,6 +37895,11 @@ impl eframe::App for Kaleidotron {
                 self.apple_col80,
             ),
         );
+        eframe::set_value(
+            storage,
+            Self::REXFONT_KEY,
+            &(self.rexfont_sel, self.rexfont_invert),
+        );
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38807,6 +38897,9 @@ struct PipeAux<'a> {
     bitfont_pool: Vec<u16>,
     bitfont_color: bool,
     bitfont_invert: bool,
+    // REXPaint-font pass (DITHER_REXFONT): index into the bundled font pack (reuses
+    // bitfont_color for colour + bitfont_invert for inverse video).
+    rexfont_sel: usize,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
@@ -38884,6 +38977,21 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             8,
                             aux.bitfont_font,
                             &aux.bitfont_pool,
+                            aux.bitfont_color,
+                            aux.bitfont_invert,
+                        );
+                    }
+                } else if aux.dither_method == crate::thumb::DITHER_REXFONT {
+                    // REXPaint font — a generic glyph-font over the selected bundled font.
+                    if let (Some(p), Some(font)) =
+                        (aux.palette, crate::decode::rexfont::rexfont(aux.rexfont_sel))
+                    {
+                        crate::thumb::glyphfont_pass(
+                            rgba,
+                            w,
+                            h,
+                            p,
+                            font,
                             aux.bitfont_color,
                             aux.bitfont_invert,
                         );
@@ -39376,6 +39484,10 @@ struct FxPreset {
     apple_mousetext: bool,
     #[serde(default)]
     apple_col80: bool,
+    #[serde(default)]
+    rexfont_sel: usize,
+    #[serde(default)]
+    rexfont_invert: bool,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -39448,6 +39560,8 @@ impl Default for FxPreset {
             apple_invert: false,
             apple_mousetext: true,
             apple_col80: false,
+            rexfont_sel: 0,
+            rexfont_invert: false,
             folder: None,
         }
     }
@@ -39786,6 +39900,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             bitfont_pool: Vec::new(),
             bitfont_color: true,
             bitfont_invert: false,
+            rexfont_sel: 0,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -48078,6 +48193,7 @@ fn preset_pipe_aux<'a>(
         bitfont_pool: Vec::new(),
         bitfont_color: true,
         bitfont_invert: false,
+        rexfont_sel: 0,
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
         balance,
@@ -50398,6 +50514,7 @@ mod tests {
             bitfont_pool: Vec::new(),
             bitfont_color: true,
             bitfont_invert: false,
+            rexfont_sel: 0,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],
@@ -50613,6 +50730,7 @@ mod tests {
             bitfont_pool: Vec::new(),
             bitfont_color: true,
             bitfont_invert: false,
+            rexfont_sel: 0,
             pixelate_h: 0.0,
             fx: PostFx::default(),
             balance: [0, 0, 0],

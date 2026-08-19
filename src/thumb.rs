@@ -409,6 +409,7 @@ pub const DITHER_NAMES: &[&str] = &[
     "ASCII",
     "ATASCII",
     "Apple ][",
+    "REXPaint font",
 ];
 
 /// `DITHER_NAMES` index for the user-editable custom matrix.
@@ -441,6 +442,10 @@ pub const DITHER_ATASCII: u8 = 10;
 /// `DITHER_NAMES` index for the image→Apple ][ character-art converter (Apple II text font, with
 /// optional MouseText glyphs + inverse video), via the same [`bitfont_pass`].
 pub const DITHER_APPLE: u8 = 11;
+
+/// `DITHER_NAMES` index for the image→char-art converter over a **selected REXPaint font**
+/// (any cell size), via [`glyphfont_pass`].
+pub const DITHER_REXFONT: u8 = 12;
 
 // 0..n²-1 ordered-dither (Bayer) threshold matrices.
 const BAYER2: [u32; 4] = [0, 2, 3, 1];
@@ -2280,6 +2285,142 @@ pub fn bitfont_pass(
     }
     let grid = bitfont_grid(rgba, w, h, palette, cell_w, cell_h, font, pool, color, invert);
     bitfont_render(&grid, font, rgba, w, h, cell_w, cell_h);
+}
+
+// ── REXPaint GlyphFont density converter (any cell size) ────────────────────────
+// The bit-font converter generalized to a [`crate::decode::rexfont::GlyphFont`] of any
+// cell size. Used by the REXPaint-font image→art mode; the render is also reused by the
+// textmode viewer to re-draw decoded cells in a chosen font.
+
+use crate::decode::rexfont::GlyphFont;
+
+/// Coverage-sorted ramp over all 256 glyphs of `font` (one representative per coverage bucket,
+/// blank first). Same idea as [`bitfont_ramp`] but reading the GlyphFont's own coverage.
+pub fn glyphfont_ramp(font: &GlyphFont) -> Vec<(u16, f32)> {
+    let total = (font.cell_w * font.cell_h).max(1) as f32;
+    let mut seen: std::collections::HashMap<u16, (u16, f32)> = std::collections::HashMap::new();
+    for gi in 0..256u16 {
+        let c = font.coverage(gi as usize);
+        let bucket = (c * total).round() as u16;
+        seen.entry(bucket).or_insert((gi, c));
+    }
+    let mut ramp: Vec<(u16, f32)> = seen.into_values().collect();
+    ramp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    if ramp.first().map(|(_, c)| *c > 0.0).unwrap_or(true) {
+        let blank = (0..256u16)
+            .find(|&g| font.coverage(g as usize) == 0.0)
+            .unwrap_or(32);
+        ramp.insert(0, (blank, 0.0));
+    }
+    ramp
+}
+
+/// Analyse `rgba` into a [`BitGrid`] over `font` (cell size = the font's), mapping each cell's
+/// darkness to the ramp glyph and colouring from `palette` (per-cell when `color`, else mono).
+pub fn glyphfont_grid(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    font: &GlyphFont,
+    color: bool,
+    invert: bool,
+) -> BitGrid {
+    let (cw, ch_) = (font.cell_w.max(1), font.cell_h.max(1));
+    let cols = w.div_ceil(cw);
+    let rows = h.div_ceil(ch_);
+    let mut cells = Vec::with_capacity(cols * rows);
+    let paper = nearest_index([0, 0, 0], palette);
+    let ink = nearest_index([255, 255, 255], palette);
+    if palette.is_empty() || w == 0 || h == 0 {
+        cells.resize(cols * rows, BitCell { glyph: 0, fg: 0, bg: 0 });
+        return BitGrid { cols, rows, cells, palette: palette.to_vec() };
+    }
+    let mut ramp = glyphfont_ramp(font);
+    if ramp.is_empty() {
+        ramp.push((32, 0.0));
+    }
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for y in cy * ch_..((cy + 1) * ch_).min(h) {
+                for x in cx * cw..((cx + 1) * cw).min(w) {
+                    let o = (y * w + x) * 4;
+                    let a = rgba[o + 3] as u32;
+                    sr += rgba[o] as u32 * a;
+                    sg += rgba[o + 1] as u32 * a;
+                    sb += rgba[o + 2] as u32 * a;
+                    sa += a;
+                    n += 1;
+                }
+            }
+            let (glyph, fg) = if n == 0 || sa == 0 {
+                (ramp[0].0, ink)
+            } else {
+                let avg = [(sr / sa) as u8, (sg / sa) as u8, (sb / sa) as u8];
+                let lum = (0.299 * avg[0] as f32 + 0.587 * avg[1] as f32 + 0.114 * avg[2] as f32)
+                    / 255.0;
+                let cover = (sa as f32 / (n as f32 * 255.0)) * (1.0 - lum);
+                let g = ramp
+                    .iter()
+                    .min_by(|a, b| (a.1 - cover).abs().partial_cmp(&(b.1 - cover).abs()).unwrap())
+                    .map(|(g, _)| *g)
+                    .unwrap_or(0);
+                (g, if color { nearest_index(avg, palette) } else { ink })
+            };
+            let (fg, bg) = if invert { (paper, fg) } else { (fg, paper) };
+            cells.push(BitCell { glyph, fg, bg });
+        }
+    }
+    BitGrid { cols, rows, cells, palette: palette.to_vec() }
+}
+
+/// Render a [`BitGrid`] using `font`'s glyphs (cell size = the font's) into `rgba` in place.
+/// Shared by the REXPaint-font converter and the textmode viewer's font re-render.
+pub fn glyphfont_render(grid: &BitGrid, font: &GlyphFont, rgba: &mut [u8], w: usize, h: usize) {
+    if grid.palette.is_empty() {
+        return;
+    }
+    let (cw, ch_) = (font.cell_w.max(1), font.cell_h.max(1));
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let fg = grid.palette[cell.fg as usize % grid.palette.len()];
+            let bg = grid.palette[cell.bg as usize % grid.palette.len()];
+            for ry in 0..ch_ {
+                let y = cy * ch_ + ry;
+                if y >= h {
+                    break;
+                }
+                for rx in 0..cw {
+                    let x = cx * cw + rx;
+                    if x >= w {
+                        break;
+                    }
+                    let col = if font.on(cell.glyph as usize, rx, ry) { fg } else { bg };
+                    let o = (y * w + x) * 4;
+                    rgba[o..o + 4].copy_from_slice(&col);
+                }
+            }
+        }
+    }
+}
+
+/// The REXPaint-font **pipeline pass**: build the grid then paint it back in place.
+pub fn glyphfont_pass(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    palette: &[[u8; 4]],
+    font: &GlyphFont,
+    color: bool,
+    invert: bool,
+) {
+    if palette.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let grid = glyphfont_grid(rgba, w, h, palette, font, color, invert);
+    glyphfont_render(&grid, font, rgba, w, h);
 }
 
 /// A C64 **screen code** → **PETSCII** (printable) byte, matching petmate's `convertToSEQ`. The
