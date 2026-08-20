@@ -1524,6 +1524,9 @@ pub struct Kaleidotron {
     pixelfx: Vec<FxPreset>,
     pixelfx_name: String,                    // "save current" name buffer
     pixelfx_folder: String, // "save into folder" buffer (empty = top level); also the "＋ new folder" target in Move-to
+    look_pins: Vec<String>,   // preset names pinned to the Studio quick-looks row (persisted)
+    show_looks_browser: bool, // the "Browse all looks" modal
+    looks_query: String,      // filter text in the looks browser
     pixelfx_rename: Option<(usize, String)>, // inline-rename buffer (transient)
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
@@ -2460,6 +2463,7 @@ impl Kaleidotron {
     const WINDOW_GEOM_KEY: &'static str = "window_geom"; // [x, y, w, h]: restore last window place
     const SAMPLE_PLACES_KEY: &'static str = "sample_places"; // user Samples locations
     const PIXELFX_KEY: &'static str = "pixelfx"; // saved recolor-stack presets
+    const LOOK_PINS_KEY: &'static str = "look_pins"; // quick-looks pinned to the Studio row
     const ZOOM_EDIT_KEY: &'static str = "zoom_edit_pct"; // waveform edge-inset magnification
     const WAVE_AMP_KEY: &'static str = "wave_amp"; // waveform vertical magnification
     const TRANSIENTS_KEY: &'static str = "transients_on";
@@ -3682,6 +3686,12 @@ impl Kaleidotron {
             },
             pixelfx_name: String::new(),
             pixelfx_folder: String::new(),
+            look_pins: cc
+                .storage
+                .and_then(|s| eframe::get_value::<Vec<String>>(s, Self::LOOK_PINS_KEY))
+                .unwrap_or_else(default_look_pins),
+            show_looks_browser: false,
+            looks_query: String::new(),
             pixelfx_rename: None,
             sample_rename: None,
             sample_browse: None,
@@ -24499,6 +24509,98 @@ impl Kaleidotron {
 
     /// The Recolor dock: live recolored preview + palette-swap / reduce / dither /
     /// random controls + swatches + export/save, all acting on `inspected_entry`.
+    /// The full look library, opened from the Studio "Browse all…" button: a searchable,
+    /// folder-grouped picker over every saved look. Click to apply; ★ to pin/unpin the
+    /// quick row. Deferred (apply/pin) so the render never borrows `self.pixelfx` mutably.
+    fn ui_looks_browser(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_looks_browser;
+        let mut apply: Option<String> = None;
+        let mut toggle_pin: Option<String> = None;
+        egui::Window::new("Look library")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .max_height(ctx.content_rect().height() - 100.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(icons::SEARCH);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.looks_query)
+                            .hint_text("filter looks…")
+                            .desired_width(220.0),
+                    );
+                    if !self.looks_query.is_empty() && ui.small_button("✕").clicked() {
+                        self.looks_query.clear();
+                    }
+                });
+                ui.separator();
+                let q = self.looks_query.to_lowercase();
+                let pinned: std::collections::HashSet<String> =
+                    self.look_pins.iter().cloned().collect();
+                // Owned, folder-then-name sorted rows so the render doesn't borrow self.pixelfx.
+                let mut rows: Vec<(String, String, Option<[u8; 3]>, Option<[u8; 3]>)> = self
+                    .pixelfx
+                    .iter()
+                    .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
+                    .map(|p| (p.folder.clone().unwrap_or_default(), p.name.clone(), p.color, p.fg))
+                    .collect();
+                rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                    let mut cur = String::from("\u{0}");
+                    for (folder, name, color, fg) in &rows {
+                        if folder != &cur {
+                            cur = folder.clone();
+                            let label =
+                                if folder.is_empty() { "Top level".into() } else { folder.clone() };
+                            panel_header(ui, &label);
+                        }
+                        ui.horizontal(|ui| {
+                            let is_pin = pinned.contains(name);
+                            if ui
+                                .selectable_label(is_pin, if is_pin { "\u{2605}" } else { "\u{2606}" })
+                                .on_hover_text(if is_pin {
+                                    "Pinned — click to unpin"
+                                } else {
+                                    "Pin to the quick row"
+                                })
+                                .clicked()
+                            {
+                                toggle_pin = Some(name.clone());
+                            }
+                            let txt = match (color, fg) {
+                                (_, Some(f)) => egui::Color32::from_rgb(f[0], f[1], f[2]),
+                                (Some(c), None) => contrast_text(*c),
+                                _ => ui.visuals().text_color(),
+                            };
+                            let mut btn = egui::Button::new(egui::RichText::new(name).color(txt))
+                                .min_size(egui::vec2(190.0, 0.0));
+                            if let Some(c) = color {
+                                btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
+                            }
+                            if ui.add(btn).clicked() {
+                                apply = Some(name.clone());
+                            }
+                        });
+                    }
+                });
+            });
+        self.show_looks_browser = open;
+        if let Some(name) = apply {
+            if let Some(p) = self.pixelfx.iter().find(|p| p.name == name).cloned() {
+                self.apply_fx_preset(&p);
+                self.status = format!("Applied look “{}”", p.name);
+            }
+        }
+        if let Some(name) = toggle_pin {
+            if let Some(pos) = self.look_pins.iter().position(|n| n == &name) {
+                self.look_pins.remove(pos);
+            } else {
+                self.look_pins.push(name);
+            }
+        }
+    }
+
     fn ui_recolor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -24615,56 +24717,75 @@ impl Kaleidotron {
                     self.want_repaint = true;
                 }
 
-                // ----- Presets (PixelFX), surfaced at the TOP of the pane -----
-                // The fastest path to a good look (CGA / Game Boy / EGA / …) was previously
-                // three tabs away in Places. Here it sits right under the preview: click a
-                // chip to apply the whole recolor stack, or Save the current stack as one.
+                // ----- Looks (quick recolor presets) — a small gallery, not a wall -----
+                // Cockpit rule: the fast path is SMALL and always visible. The quick row shows
+                // only PINNED looks; the full library lives behind "Browse all…". Right-click a
+                // look to unpin; a freshly-saved look auto-pins so it appears here.
                 {
-                    panel_header(ui, "Presets");
-                    // Deferred: can't borrow `self.pixelfx` while calling the `&mut self`
-                    // apply/capture methods, so render from an owned snapshot + apply after.
-                    let snap = self
-                        .pixelfx
+                    panel_header(ui, "Looks");
+                    // Owned snapshot: can't borrow self.pixelfx while apply/capture take &mut self.
+                    let by_name: std::collections::HashMap<String, (Option<[u8; 3]>, Option<[u8; 3]>)> =
+                        self.pixelfx.iter().map(|p| (p.name.clone(), (p.color, p.fg))).collect();
+                    let pins: Vec<String> = self
+                        .look_pins
                         .iter()
-                        .map(|p| (p.name.clone(), p.color, p.fg))
-                        .collect::<Vec<_>>();
-                    let mut apply_idx: Option<usize> = None;
-                    if snap.is_empty() {
-                        ui.weak("No presets yet — tune the controls below, then Save.");
-                    } else {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                            for (i, (name, color, fg)) in snap.iter().enumerate() {
-                                let txt = match (color, fg) {
-                                    (_, Some(f)) => {
-                                        egui::Color32::from_rgb(f[0], f[1], f[2])
-                                    }
-                                    (Some(c), None) => contrast_text(*c),
-                                    _ => ui.visuals().text_color(),
-                                };
-                                let mut btn =
-                                    egui::Button::new(egui::RichText::new(name).color(txt)).small();
-                                if let Some(c) = color {
-                                    btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
-                                }
-                                if ui.add(btn).on_hover_text("Apply this preset").clicked() {
-                                    apply_idx = Some(i);
-                                }
+                        .filter(|n| by_name.contains_key(*n))
+                        .cloned()
+                        .collect();
+                    let total = self.pixelfx.len();
+                    let mut apply_name: Option<String> = None;
+                    let mut unpin: Option<String> = None;
+                    let mut open_browser = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                        if pins.is_empty() {
+                            ui.weak("No pinned looks —");
+                        }
+                        for name in &pins {
+                            let (color, fg) = by_name[name];
+                            let txt = match (color, fg) {
+                                (_, Some(f)) => egui::Color32::from_rgb(f[0], f[1], f[2]),
+                                (Some(c), None) => contrast_text(c),
+                                _ => ui.visuals().text_color(),
+                            };
+                            let mut btn = egui::Button::new(egui::RichText::new(name).color(txt));
+                            if let Some(c) = color {
+                                btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
                             }
-                        });
+                            let r = ui.add(btn).on_hover_text("Apply this look · right-click to unpin");
+                            if r.clicked() {
+                                apply_name = Some(name.clone());
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("✕ Unpin").clicked() {
+                                    unpin = Some(name.clone());
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        if ui
+                            .button(format!("{} Browse all ({total})…", icons::SEARCH))
+                            .on_hover_text("Open the full look library")
+                            .clicked()
+                        {
+                            open_browser = true;
+                        }
+                    });
+                    if open_browser {
+                        self.show_looks_browser = true;
                     }
+                    // Save the current stack as a look (auto-pins it into the quick row).
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.pixelfx_name)
-                                .hint_text("preset name…")
-                                .desired_width(130.0),
+                                .hint_text("name this look…")
+                                .desired_width(140.0),
                         );
                         let name = self.pixelfx_name.trim().to_string();
-                        let can = !name.is_empty();
                         if ui
-                            .add_enabled(can, egui::Button::new("＋ Save"))
-                            .on_hover_text("Save the current recolor stack as a PixelFX preset")
+                            .add_enabled(!name.is_empty(), egui::Button::new("＋ Save"))
+                            .on_hover_text("Save the current recolor stack as a look")
                             .clicked()
                         {
                             let preset = self.capture_fx_preset(name.clone());
@@ -24678,14 +24799,21 @@ impl Kaleidotron {
                             } else {
                                 self.pixelfx.push(preset);
                             }
+                            if !self.look_pins.iter().any(|n| n == &name) {
+                                self.look_pins.push(name.clone());
+                            }
                             self.pixelfx_name.clear();
-                            self.status = format!("Saved PixelFX preset “{name}”");
+                            self.status = format!("Saved look “{name}”");
                         }
                     });
-                    if let Some(i) = apply_idx {
-                        let p = self.pixelfx[i].clone();
-                        self.apply_fx_preset(&p);
-                        self.status = format!("Applied preset “{}”", p.name);
+                    if let Some(name) = apply_name {
+                        if let Some(p) = self.pixelfx.iter().find(|p| p.name == name).cloned() {
+                            self.apply_fx_preset(&p);
+                            self.status = format!("Applied look “{}”", p.name);
+                        }
+                    }
+                    if let Some(name) = unpin {
+                        self.look_pins.retain(|n| n != &name);
                     }
                 }
 
@@ -38981,6 +39109,11 @@ impl eframe::App for Kaleidotron {
         // File-type associations editor (View → Associations…).
         self.ui_associations(&ctx);
 
+        // The full look library (Studio → Browse all…).
+        if self.show_looks_browser {
+            self.ui_looks_browser(&ctx);
+        }
+
         // Font-thumbnail preview-text editor (the "…" button in the grid status bar).
         if self.show_font_preview_edit {
             let mut open = true;
@@ -39130,6 +39263,7 @@ impl eframe::App for Kaleidotron {
         }
         eframe::set_value(storage, Self::SAMPLE_PLACES_KEY, &self.sample_places);
         eframe::set_value(storage, Self::PIXELFX_KEY, &self.pixelfx);
+        eframe::set_value(storage, Self::LOOK_PINS_KEY, &self.look_pins);
         eframe::set_value(storage, Self::ZOOM_EDIT_KEY, &self.zoom_edit_pct);
         eframe::set_value(storage, Self::WAVE_AMP_KEY, &self.wave_amp);
         eframe::set_value(storage, Self::TRANSIENTS_KEY, &self.transients_on);
@@ -42659,6 +42793,19 @@ fn drag_handle(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Response {
 
 /// Vertical breathing room BETWEEN sections in a docked pane.
 const PANE_SECTION_GAP: f32 = 12.0;
+
+/// Default pins for the Studio quick-looks row — a curated spread of the bundled
+/// Factory looks, so a fresh install shows a good gallery before the user saves any.
+/// Names that don't resolve are simply skipped at render time.
+fn default_look_pins() -> Vec<String> {
+    [
+        "1bit Nostalgia", "CGA Dreams", "Gameboy", "C=64", "EGA", "PETSCII", "ATARI 2600",
+        "ANSI EGA",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 
 /// Spaced small-caps ("PRESETS" → "P R E S E T S"). egui has no letter-spacing
 /// property, so we interleave thin spaces (U+2009, rendered via the DejaVu fallback)
