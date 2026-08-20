@@ -24623,11 +24623,11 @@ impl Kaleidotron {
                     panel_header(ui, "Presets");
                     // Deferred: can't borrow `self.pixelfx` while calling the `&mut self`
                     // apply/capture methods, so render from an owned snapshot + apply after.
-                    let snap: Vec<(String, Option<[u8; 3]>, Option<[u8; 3]>)> = self
+                    let snap = self
                         .pixelfx
                         .iter()
                         .map(|p| (p.name.clone(), p.color, p.fg))
-                        .collect();
+                        .collect::<Vec<_>>();
                     let mut apply_idx: Option<usize> = None;
                     if snap.is_empty() {
                         ui.weak("No presets yet — tune the controls below, then Save.");
