@@ -1043,6 +1043,14 @@ impl RailSection {
 enum PaletteAct {
     Menu(MenuAction),
     Source(u8),
+    /// Set the Studio "Convert to" mode (a `dither_method` value) + open the Studio pane.
+    ConvertTo(u8),
+    /// Apply a PixelFX preset by index into `self.pixelfx`.
+    ApplyPreset(usize),
+    /// Turn on the slideshow (auto-advance).
+    StartSlideshow,
+    /// Open the standalone Sample-Pads (kit) editor.
+    OpenKitEditor,
 }
 
 #[derive(Clone)]
@@ -33234,6 +33242,32 @@ impl Kaleidotron {
             ("Go home".into(), "Go".into(), Menu(MenuAction::Home)),
             ("Amiga ColorFonts".into(), "Go".into(), Menu(MenuAction::AmigaFonts)),
         ];
+        // Goal-shaped commands so you can type what you WANT, not which control to open.
+        // Convert-to modes (Studio): "Full color" + every hard converter.
+        v.push((
+            "Convert image to full color".into(),
+            "Studio".into(),
+            PaletteAct::ConvertTo(0),
+        ));
+        for m in crate::thumb::DITHER_ANSI..=crate::thumb::DITHER_UNICODE {
+            v.push((
+                format!("Convert image to {}", crate::thumb::DITHER_NAMES[m as usize]),
+                "Studio".into(),
+                PaletteAct::ConvertTo(m),
+            ));
+        }
+        // Apply a saved look.
+        for (i, p) in self.pixelfx.iter().enumerate() {
+            v.push((
+                format!("Apply preset: {}", p.name),
+                "Studio · PixelFX".into(),
+                PaletteAct::ApplyPreset(i),
+            ));
+        }
+        v.push(("Start slideshow".into(), "View".into(), PaletteAct::StartSlideshow));
+        if self.plugin_audio {
+            v.push(("Open kit editor".into(), "Audio".into(), PaletteAct::OpenKitEditor));
+        }
         // Navigating to a source is the commonest thing you'd want a palette for, and these come
         // straight from the rail's own table so the two can't drift.
         for (idx, _glyph, label, tip) in RailSection::source_buttons() {
@@ -33359,6 +33393,31 @@ impl Kaleidotron {
                         self.rail_section = RailSection::Sources;
                         self.places_tab = tab;
                         self.show_explorer = true;
+                    }
+                    Some(PaletteAct::ConvertTo(m)) => {
+                        self.dither_method = m;
+                        self.show_recolor = true; // reveal the Studio pane so the result is visible
+                        self.status = format!(
+                            "Convert to: {}",
+                            if m == 0 { "Full color" } else { crate::thumb::DITHER_NAMES[m as usize] }
+                        );
+                    }
+                    Some(PaletteAct::ApplyPreset(i)) => {
+                        if let Some(p) = self.pixelfx.get(i).cloned() {
+                            self.apply_fx_preset(&p);
+                            self.show_recolor = true;
+                            self.status = format!("Applied preset “{}”", p.name);
+                        }
+                    }
+                    Some(PaletteAct::StartSlideshow) => {
+                        self.auto_next = true;
+                        self.auto_paused = false;
+                        self.status = "Slideshow on".into();
+                    }
+                    Some(PaletteAct::OpenKitEditor) => {
+                        if self.plugin_audio {
+                            self.enter_kit_editor();
+                        }
                     }
                     None => {}
                 }
