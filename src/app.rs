@@ -25066,6 +25066,31 @@ impl Kaleidotron {
                     }
                 }
 
+                // ----- Quick Adjust (the 3 sliders you touch most, always visible) -----
+                // The full 12-op stack + pipeline reorder live under "More adjustments" below.
+                panel_header(ui, "Quick Adjust");
+                {
+                    const PAD: f32 = 10.0;
+                    const VALUE_W: f32 = 56.0;
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let label_col = ui
+                        .painter()
+                        .layout_no_wrap("Saturation".to_string(), font, egui::Color32::WHITE)
+                        .size()
+                        .x;
+                    let slider_w =
+                        (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
+                    let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f32, lo: f32, hi: f32| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = PAD;
+                            value_slider(ui, label, label_col, slider_w, VALUE_W, v, lo, hi, 0.0, 0.01, 2);
+                        });
+                    };
+                    row(ui, "Brightness", &mut self.adjust.brightness, -1.0, 1.0);
+                    row(ui, "Contrast", &mut self.adjust.contrast, -1.0, 1.0);
+                    row(ui, "Saturation", &mut self.adjust.saturation, -1.0, 3.0);
+                }
+
                 panel_header(ui, "Resize & Upscale");
 
                 // ----- Resize / resample (downsample the art, run the whole pipeline
@@ -25248,13 +25273,13 @@ impl Kaleidotron {
                 // ----- Adjustments (applied before the palette map) -----
                 {
                     let header = if self.adjust.is_identity() {
-                        "Adjustments".to_string()
+                        "More adjustments".to_string()
                     } else {
-                        "Adjustments *".to_string() // * = active (font lacks ● U+25CF)
+                        "More adjustments *".to_string() // * = active (font lacks ● U+25CF)
                     };
                     egui::CollapsingHeader::new(header)
                         .id_salt("adjustments")
-                        .default_open(true)
+                        .default_open(false)
                         .show(ui, |ui| {
                             let mut a = self.adjust;
                             let n = a.order.len();
