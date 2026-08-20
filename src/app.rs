@@ -24764,48 +24764,11 @@ impl Kaleidotron {
                         crate::thumb::SWATCH_CAP
                     ));
                 }
-                // ----- export / save, kept directly under the swatches so they stay
-                //       reachable without scrolling on small screens -----
-                if let Some(d) = &display {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Export .GPL…").clicked() {
-                            do_export = Some((short_name(&entry.path), d.clone()));
-                        }
-                        // Save the processed image (recolor and/or adjustments).
-                        if recolor.is_some() || self.pipeline_active() {
-                            if ui
-                                .button("💾 Save recolored")
-                                .on_hover_text("Write to a 'recolored' subfolder next to the image")
-                                .clicked()
-                            {
-                                save_request = Some(false);
-                            }
-                            if ui.button("Save As…").clicked() {
-                                save_request = Some(true);
-                            }
-                        }
-                        // Export as textmode art. ANSI needs a palette; PETSCII brings its own
-                        // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
-                        if (recolor.is_some()
-                            || self.dither_method == crate::thumb::DITHER_PETSCII
-                            || self.dither_method == crate::thumb::DITHER_UNICODE)
-                            && ui
-                                .button("Export textmode")
-                                .on_hover_text(
-                                    "Write the recolored image as textmode art. Format follows \
-                                     the Colors selector: 16-color → .ans (EGA-16) or .xbin \
-                                     (embeds the palette); 256-color → .ans; RGB → .tnd \
-                                     (TundraDraw 24-bit). All carry a SAUCE record.",
-                                )
-                                .clicked()
-                        {
-                            ans_request = true;
-                        }
-                    });
-                }
-                ui.add_space(6.0);
-                ui.separator();
+                // The pane now reads top-to-bottom in named bands: Resize & Upscale →
+                // Adjust → Effects → Color & Convert → Export (Export pinned at the very
+                // bottom). Each band opens with a `panel_header` so the eight former peer
+                // accordions group into one intentional hierarchy.
+                panel_header(ui, "Resize & Upscale");
 
                 // ----- Resize / resample (downsample the art, run the whole pipeline
                 //       at that lower resolution, then nearest-upscale back so it shows
@@ -24983,8 +24946,7 @@ impl Kaleidotron {
                             });
                         });
                 }
-                ui.add_space(4.0);
-
+                panel_header(ui, "Adjust");
                 // ----- Adjustments (applied before the palette map) -----
                 {
                     let header = if self.adjust.is_identity() {
@@ -25477,6 +25439,7 @@ impl Kaleidotron {
                         });
                 }
 
+                panel_header(ui, "Effects");
                 // ----- Post FX (CRT-style filters: scanlines / glow / vignette /
                 //       phosphor). Each is a marker op in the Adjustments list above —
                 //       drag it to position where it applies in the stack. -----
@@ -25608,9 +25571,8 @@ impl Kaleidotron {
                 }
 
                 {
-                    // ----- Recolor controls (palette-swap / reduce) -----
-                    ui.add_space(8.0);
-                    ui.separator();
+                    // ----- Color & convert (palette-swap / reduce / convert-to) -----
+                    panel_header(ui, "Color & Convert");
                     let has_own_palette = matches!(pal_state, Some(Some(_)));
                     // Reduce works on ANY image: with an extractable palette it
                     // median-cuts that; otherwise it synthesizes a palette from the
@@ -26803,6 +26765,49 @@ impl Kaleidotron {
                             self.palette_favorites.push(fp);
                         }
                     }
+                }
+
+                // ----- Export / save — pinned to the very bottom of the pane so the
+                //       controls above read as the "recipe" and export is the last step. -----
+                panel_header(ui, "Export");
+                if let Some(d) = &display {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Export .GPL…").clicked() {
+                            do_export = Some((short_name(&entry.path), d.clone()));
+                        }
+                        // Save the processed image (recolor and/or adjustments).
+                        if recolor.is_some() || self.pipeline_active() {
+                            if ui
+                                .button("💾 Save recolored")
+                                .on_hover_text("Write to a 'recolored' subfolder next to the image")
+                                .clicked()
+                            {
+                                save_request = Some(false);
+                            }
+                            if ui.button("Save As…").clicked() {
+                                save_request = Some(true);
+                            }
+                        }
+                        // Export as textmode art. ANSI needs a palette; PETSCII brings its own
+                        // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
+                        if (recolor.is_some()
+                            || self.dither_method == crate::thumb::DITHER_PETSCII
+                            || self.dither_method == crate::thumb::DITHER_UNICODE)
+                            && ui
+                                .button("Export textmode")
+                                .on_hover_text(
+                                    "Write the recolored image as textmode art. Format follows \
+                                     the Colors selector: 16-color → .ans (EGA-16) or .xbin \
+                                     (embeds the palette); 256-color → .ans; RGB → .tnd \
+                                     (TundraDraw 24-bit). All carry a SAUCE record.",
+                                )
+                                .clicked()
+                        {
+                            ans_request = true;
+                        }
+                    });
+                } else {
+                    ui.weak("Recolor or adjust the image to enable export.");
                 }
             });
         if let Some((name, pal)) = do_export {
