@@ -24366,17 +24366,16 @@ impl Kaleidotron {
                             && self.colo_sauce_pending > 0
                             && self.colo_pieces.contains_key(&entry.path);
                         let sc = sauce.unwrap_or_default();
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.strong("SAUCE");
-                            if fetching {
+                        // Shared section divider (matches the Studio pane's bands).
+                        panel_header(ui, "SAUCE");
+                        if fetching {
+                            ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new().size(13.0));
                                 ui.weak("fetching…");
-                            } else if none {
-                                ui.weak("· no record");
-                            }
-                        });
+                            });
+                        } else if none {
+                            ui.weak("· no record");
+                        }
                         ui.add_space(2.0);
                         egui::Grid::new("details_sauce")
                             .num_columns(2)
@@ -42660,8 +42659,6 @@ fn drag_handle(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Response {
 
 /// Vertical breathing room BETWEEN sections in a docked pane.
 const PANE_SECTION_GAP: f32 = 12.0;
-/// Smaller gap before a group / between related rows.
-const PANE_ROW_GAP: f32 = 6.0;
 
 /// Spaced small-caps ("PRESETS" → "P R E S E T S"). egui has no letter-spacing
 /// property, so we interleave thin spaces (U+2009, rendered via the DejaVu fallback)
@@ -42693,23 +42690,6 @@ fn panel_header(ui: &mut egui::Ui, title: &str) {
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
     ui.add_space(6.0);
-}
-
-/// A consistently-styled collapsible section for the redesigned panes. Wraps
-/// `CollapsingHeader` with a strong title and a stable id (so open/close state
-/// persists and indents identically everywhere). Returns the body's value if open.
-fn studio_group<R>(
-    ui: &mut egui::Ui,
-    title: &str,
-    default_open: bool,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> Option<R> {
-    ui.add_space(PANE_ROW_GAP);
-    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
-        .id_salt(("studio_group", title))
-        .default_open(default_open)
-        .show(ui, add)
-        .body_returned
 }
 
 /// While `resp` (a ComboBox header) holds the pointer, the mouse wheel steps
