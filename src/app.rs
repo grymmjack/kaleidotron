@@ -37837,17 +37837,20 @@ impl eframe::App for Kaleidotron {
                     // groups (YouTube, the Steam key, the SoundFont, format colours) live inside
                     // `if plugin_… {}` conditionals, so they ride along with the section that
                     // encloses them, and the names reflect where things actually landed.
-                    const PREF_SECTIONS: [&str; 8] = [
-                        "Appearance",
-                        "Viewer",
-                        "Keyboard",
-                        "Sources",
-                        "Plugins",
-                        "Audio & Colors",
-                        "Advanced",
-                        "Config files",
+                    // Task-based section names (was: Appearance / Viewer / Keyboard / Sources /
+                    // Plugins / Audio & Colors / Advanced / Config files — grab-bag names that
+                    // "reflected where things landed"). Config-files editing folded into System.
+                    const PREF_SECTIONS: [&str; 7] = [
+                        "Look & Feel",       // 0 (was Appearance)
+                        "Viewing",           // 1 (was Viewer)
+                        "Shortcuts",         // 2 (was Keyboard)
+                        "Web Sources",       // 3 (was Sources)
+                        "Formats & Plugins", // 4 (was Plugins)
+                        "Audio & Color",     // 5 (was Audio & Colors)
+                        "System",            // 6 (was Advanced + Config files)
                     ];
-                    let sec = self.prefs_section;
+                    // Clamp so a persisted section 7 (old "Config files") lands on System.
+                    let sec = self.prefs_section.min(6);
                     // Section selector: padded, evenly sized tabs so the row reads as a strip
                     // rather than as run-together text.
                     ui.add_space(4.0);
@@ -38611,7 +38614,7 @@ impl eframe::App for Kaleidotron {
                                     }
                                 });
                                 }
-                                if sec == 7 {
+                                if sec == 6 {
                                 ui.label("Configuration files");
                                 ui.weak(
                                     "Plain text, hand-editable, and safe to keep in a dotfile \
@@ -53086,11 +53089,11 @@ mod gui_tests {
         harness.run();
         harness.get_by_label("Preferences…").click();
         harness.run();
-        // Preferences opens on the Appearance section, so its controls are the visible ones.
+        // Preferences opens on the Look & Feel section, so its controls are the visible ones.
         harness.get_by_label("Grid spacing (horizontal)");
         // Settings now live behind section tabs rather than all being shown at once, so the
-        // hotkeys are reachable only after selecting Keyboard — which is exactly what this asserts.
-        harness.get_by_label("Keyboard").click();
+        // hotkeys are reachable only after selecting Shortcuts — which is exactly what this asserts.
+        harness.get_by_label("Shortcuts").click();
         harness.run();
         harness.get_by_label("Previous image");
     }
