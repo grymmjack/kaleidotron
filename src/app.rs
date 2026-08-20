@@ -24539,16 +24539,16 @@ impl Kaleidotron {
                 let pinned: std::collections::HashSet<String> =
                     self.look_pins.iter().cloned().collect();
                 // Owned, folder-then-name sorted rows so the render doesn't borrow self.pixelfx.
-                let mut rows: Vec<(String, String, Option<[u8; 3]>, Option<[u8; 3]>)> = self
+                let mut rows: Vec<(String, String, LookTag)> = self
                     .pixelfx
                     .iter()
                     .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
-                    .map(|p| (p.folder.clone().unwrap_or_default(), p.name.clone(), p.color, p.fg))
+                    .map(|p| (p.folder.clone().unwrap_or_default(), p.name.clone(), (p.color, p.fg)))
                     .collect();
                 rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
                 egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
                     let mut cur = String::from("\u{0}");
-                    for (folder, name, color, fg) in &rows {
+                    for (folder, name, (color, fg)) in &rows {
                         if folder != &cur {
                             cur = folder.clone();
                             let label =
@@ -24724,7 +24724,7 @@ impl Kaleidotron {
                 {
                     panel_header(ui, "Looks");
                     // Owned snapshot: can't borrow self.pixelfx while apply/capture take &mut self.
-                    let by_name: std::collections::HashMap<String, (Option<[u8; 3]>, Option<[u8; 3]>)> =
+                    let by_name: std::collections::HashMap<String, LookTag> =
                         self.pixelfx.iter().map(|p| (p.name.clone(), (p.color, p.fg))).collect();
                     let pins: Vec<String> = self
                         .look_pins
@@ -24759,7 +24759,7 @@ impl Kaleidotron {
                             r.context_menu(|ui| {
                                 if ui.button("✕ Unpin").clicked() {
                                     unpin = Some(name.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -25080,7 +25080,7 @@ impl Kaleidotron {
                         .x;
                     let slider_w =
                         (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
-                    let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f32, lo: f32, hi: f32| {
+                    let row = |ui: &mut egui::Ui, label: &str, v: &mut f32, lo: f32, hi: f32| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = PAD;
                             value_slider(ui, label, label_col, slider_w, VALUE_W, v, lo, hi, 0.0, 0.01, 2);
@@ -42798,6 +42798,9 @@ fn drag_handle(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Response {
 
 /// Vertical breathing room BETWEEN sections in a docked pane.
 const PANE_SECTION_GAP: f32 = 12.0;
+
+/// A look chip's colour tags: (background tint, text-colour override).
+type LookTag = (Option<[u8; 3]>, Option<[u8; 3]>);
 
 /// Default pins for the Studio quick-looks row — a curated spread of the bundled
 /// Factory looks, so a fresh install shows a good gallery before the user saves any.
