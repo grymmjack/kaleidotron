@@ -34350,6 +34350,125 @@ impl Kaleidotron {
         }
     }
 
+    /// Whether the contextual viewer toolbar applies now, and to which file. Only the
+    /// plain image / scene-art path in single view qualifies — the special viewers
+    /// (video / GIF / audio / font / TDF / FON / Amiga / PDF / XMind / 3D / text / kit)
+    /// carry their own control rows, and immersive mode hides all chrome.
+    fn view_toolbar_path(&self) -> Option<PathBuf> {
+        if self.mode != Mode::Single || self.immersive {
+            return None;
+        }
+        if self.text_doc.is_some()
+            || self.video_player.is_some()
+            || self.anim.is_some()
+            || self.audio_player.is_some()
+            || self.pdf_view.is_some()
+            || self.xmind_view.is_some()
+            || self.three_d.is_some()
+            || self.kit_editor
+        {
+            return None;
+        }
+        let p = self.full_tex.as_ref().map(|(p, _)| p.clone())?;
+        if is_font_ext(&p)
+            || is_tdf_ext(&p)
+            || is_fon_ext(&p)
+            || is_amiga_font_ext(&p)
+            || is_audio_ext(&p)
+        {
+            return None;
+        }
+        (is_image_ext(&p) || is_textmode_ext(&p)).then_some(p)
+    }
+
+    /// The contextual toolbar pinned above the art in single view: prev/next + a
+    /// filename chip on the left, and — right-aligned — Fit, the retro-look toggles
+    /// for scene art, and the slideshow toggle. "Controls where the eyes are" instead
+    /// of buried in the bottom status bar; the status bar keeps the full CRT menu.
+    fn ui_view_toolbar(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let ctx = ui.ctx().clone();
+        let textmode = is_textmode_ext(path);
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            if ui.button("\u{25C0}").on_hover_text("Previous image").clicked() {
+                self.step_image(&ctx, false);
+            }
+            if ui.button("\u{25B6}").on_hover_text("Next image").clicked() {
+                self.step_image(&ctx, true);
+            }
+            ui.separator();
+            ui.label(egui::RichText::new(short_name(path)).strong());
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if !ext.is_empty() {
+                    ui.weak(format!("· {}", ext.to_uppercase()));
+                }
+            }
+
+            // Right-aligned cluster: Fit · look toggles · slideshow.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                let slide = format!("{} Slideshow", icons::PLAY);
+                let slide = if self.auto_paused {
+                    egui::RichText::new(slide).color(egui::Color32::from_rgb(240, 200, 60))
+                } else {
+                    egui::RichText::new(slide)
+                };
+                if ui
+                    .selectable_label(self.auto_next, slide)
+                    .on_hover_text("Auto-advance through the folder after each image settles")
+                    .clicked()
+                {
+                    if self.auto_paused {
+                        self.auto_next = true;
+                        self.auto_paused = false;
+                    } else {
+                        self.auto_next = !self.auto_next;
+                    }
+                }
+                ui.separator();
+                if textmode {
+                    // 9-dot VGA cell (decode-time — redecode on change, like the CRT menu).
+                    if ui
+                        .selectable_label(self.font_9px, "9px")
+                        .on_hover_text("Render the VGA font in a 9-dot cell, like real DOS text mode")
+                        .clicked()
+                    {
+                        self.font_9px = !self.font_9px;
+                        crate::decode::set_font_9px(self.font_9px);
+                        self.redecode_full(&ctx);
+                        if let Some(p) = &mut self.player {
+                            p.tex = None;
+                        }
+                    }
+                    if ui
+                        .selectable_label(self.crt_aspect, "CRT")
+                        .on_hover_text("Stretch text-mode art ≈1.2× vertically for 4:3 VGA pixels")
+                        .clicked()
+                    {
+                        self.crt_aspect = !self.crt_aspect;
+                    }
+                    ui.separator();
+                }
+                if ui
+                    .button("Fit W")
+                    .on_hover_text("Fit the art to the viewport width")
+                    .clicked()
+                {
+                    self.fit_width_on_open = true;
+                }
+                if ui
+                    .selectable_label(self.fit_mode, "Fit")
+                    .on_hover_text("Fit to window + keep fitting new images (F)")
+                    .clicked()
+                {
+                    self.fit_mode = !self.fit_mode;
+                }
+            });
+        });
+        ui.add_space(3.0);
+    }
+
     /// Bottom status row. Left: folder counts (grid) or viewer actions (single).
     /// Right (flush): the zoom readout + hint that used to live in the top toolbar.
     fn ui_status(&mut self, ui: &mut egui::Ui) {
@@ -37732,6 +37851,13 @@ impl eframe::App for Kaleidotron {
                 .default_size(340.0)
                 .min_size(220.0)
                 .show_inside(ui, |ui| self.ui_recolor(ui));
+        }
+
+        // Contextual viewer toolbar: pinned to the top of the central area for the plain
+        // image / scene-art viewer, so the most-used per-file-type controls sit right
+        // above the art. Hidden for the special viewers + immersive mode (see the gate).
+        if let Some(p) = self.view_toolbar_path() {
+            egui::Panel::top("view_toolbar").show_inside(ui, |ui| self.ui_view_toolbar(ui, &p));
         }
 
         // In immersive mode the central panel fills pure black (no grey frame/margin
