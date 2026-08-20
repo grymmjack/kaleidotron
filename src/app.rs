@@ -1979,6 +1979,8 @@ pub struct Kaleidotron {
     auto_next_secs: u8, // slideshow delay in seconds: 1/3/5/10 (persisted)
     auto_next_dwell: f32, // slideshow: seconds the current (settled) file has been shown
     auto_paused: bool, // slideshow paused by a user interaction (scroll/key/drag); not persisted
+    slide_shuffle: bool, // slideshow: auto-advance in a random order (persisted)
+    shuffle_bag: Vec<PathBuf>, // remaining images this shuffle pass; refilled (reshuffled) when empty
     immersive: bool,  // F11 fullscreen: hide all bars/UI, show only the art
     // DEBUG_MODE=true: dock the window to the bottom-right corner on startup (so a dev test
     // instance stays out of the way). Consumed once the monitor size is known. Not persisted.
@@ -2488,6 +2490,7 @@ impl Kaleidotron {
     const OSD_SECS_KEY: &'static str = "osd_secs";
     const AUTO_NEXT_KEY: &'static str = "auto_next";
     const AUTO_NEXT_SECS_KEY: &'static str = "auto_next_secs";
+    const SLIDE_SHUFFLE_KEY: &'static str = "slide_shuffle";
     const GLOW_KEY: &'static str = "glow";
     const GLOW_AMT_KEY: &'static str = "glow_amt";
     const SHUFFLE_KEY: &'static str = "shuffle";
@@ -4153,6 +4156,8 @@ impl Kaleidotron {
             auto_next_secs,
             auto_next_dwell: 0.0,
             auto_paused: false,
+            slide_shuffle: get_bool(Self::SLIDE_SHUFFLE_KEY).unwrap_or(false),
+            shuffle_bag: Vec::new(),
             immersive: false,
             debug_dock_pending: std::env::var("DEBUG_MODE")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
@@ -4484,6 +4489,7 @@ impl Kaleidotron {
             e(V, "osd_secs", self.osd_secs, "seconds the OSD holds before fading"),
             e(V, "auto_next", self.auto_next, "slideshow: auto-advance to the next file"),
             e(V, "auto_next_secs", self.auto_next_secs, "slideshow delay in seconds (1/3/5/10)"),
+            e(V, "slide_shuffle", self.slide_shuffle, "slideshow: auto-advance in a random order"),
             // Format plugins — these gate decoders, so changing one re-syncs the Registry.
             e(P, "plugin_code", self.plugin_code, "syntax-highlighted source & text files"),
             e(P, "plugin_pdf", self.plugin_pdf, "PDF pages (needs pdfium or poppler)"),
@@ -4633,6 +4639,9 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "auto_next_secs") {
             self.auto_next_secs = (v as u8).clamp(1, 60);
+        }
+        if let Some(v) = st::get_bool(&m, "slide_shuffle") {
+            self.slide_shuffle = v;
         }
         // Format plugins. The Registry was told the storage-loaded values during construction, so
         // anything the file changes has to be pushed to it again — otherwise the checkbox reads as
@@ -4981,6 +4990,7 @@ impl Kaleidotron {
         self.pad_list_focus = false;
         self.hotswap_pad = None;
         self.hotswap_orig = None;
+        self.shuffle_bag.clear(); // a new folder gets a fresh shuffle pass
         self.all_entries = entries;
         // Record in the back/forward history unless we're navigating *via* it.
         if !self.suppress_history {
@@ -19074,6 +19084,42 @@ impl Kaleidotron {
         }
     }
 
+    /// Slideshow shuffle: advance to a random image the current pass hasn't shown yet. `shuffle_bag`
+    /// holds the remaining images (by path, so it survives a re-sort); when it empties we refill it
+    /// with a fresh shuffle of every image in the listing — the "auto shuffle" that keeps a random
+    /// slideshow going forever with no repeats until the whole folder has been seen.
+    fn advance_shuffled(&mut self, ctx: &egui::Context) {
+        let cur = self.entries.get(self.selected).map(|e| e.path.clone());
+        if self.shuffle_bag.is_empty() {
+            let mut imgs: Vec<PathBuf> = self
+                .entries
+                .iter()
+                .filter(|e| !e.is_dir && !e.is_archive)
+                .map(|e| e.path.clone())
+                .collect();
+            if imgs.len() <= 1 {
+                return; // nothing to shuffle between
+            }
+            shuffle_in_place(&mut imgs);
+            // Don't open a fresh pass on the image already showing — move it to the front so it's
+            // popped last (`shuffle_bag` is consumed from the back).
+            if imgs.last() == cur.as_ref() {
+                let n = imgs.len();
+                imgs.swap(0, n - 1);
+            }
+            self.shuffle_bag = imgs;
+        }
+        while let Some(p) = self.shuffle_bag.pop() {
+            if Some(&p) == cur.as_ref() {
+                continue; // skip the current image if it resurfaced
+            }
+            if let Some(idx) = self.entries.iter().position(|e| e.path == p) {
+                self.activate(ctx, idx);
+                return;
+            }
+        }
+    }
+
     /// Dolphin-style breadcrumb bar: clickable path segments, with a "✎" toggle
     /// that swaps in an editable text field (Enter navigates).
     fn ui_breadcrumbs(&mut self, ui: &mut egui::Ui) {
@@ -29327,9 +29373,11 @@ impl Kaleidotron {
                 i.smooth_scroll_delta != egui::Vec2::ZERO
                     || (i.zoom_delta() - 1.0).abs() > 0.001
                     || i.pointer.is_decidedly_dragging()
-                    || i.events
-                        .iter()
-                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+                    || i.events.iter().any(|e| {
+                        // Toggling fullscreen (F11) is a VIEW change, not navigation — it must not
+                        // pause the slideshow. Every other key press hands control back.
+                        matches!(e, egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::F11)
+                    })
             });
             if touched {
                 self.auto_paused = true;
@@ -29414,9 +29462,13 @@ impl Kaleidotron {
                 if self.auto_next_dwell >= self.auto_next_secs as f32 {
                     self.auto_next_dwell = 0.0;
                     let before = self.selected;
-                    self.step_image(ctx, true); // next file
-                                                // End of the pack (step was a no-op) + Shuffle → jump to another
-                                                // random pack and keep going: an endless real-art screensaver.
+                    if self.slide_shuffle {
+                        self.advance_shuffled(ctx); // next file in a random order
+                    } else {
+                        self.step_image(ctx, true); // next file (in listing order)
+                    }
+                    // End of the pack (step was a no-op) + screensaver Shuffle → jump to another
+                    // random pack and keep going: an endless real-art screensaver.
                     if self.selected == before && self.shuffle && self.random_rx.is_none() {
                         self.start_random_pack();
                     }
@@ -34382,6 +34434,16 @@ impl Kaleidotron {
                                     .response
                                     .on_hover_text("Seconds to wait before advancing");
                             });
+                            if ui
+                                .checkbox(&mut self.slide_shuffle, "shuffle order")
+                                .on_hover_text(
+                                    "Auto-advance through the folder's images in a random order — \
+                                     every image shown once, then it reshuffles and goes again.",
+                                )
+                                .changed()
+                            {
+                                self.shuffle_bag.clear(); // start a fresh pass on toggle
+                            }
                             ui.separator();
                             self.ui_shuffle_controls(ui);
                         })
@@ -36978,11 +37040,19 @@ impl eframe::App for Kaleidotron {
             }
             hide_cursor = self.idle_t > CURSOR_HIDE_SECS;
             self.want_repaint = true; // keep polling the pointer for edge reveal + idle
+            // A menu/combo opened from an edge bar (e.g. the "Auto" popup) extends AWAY from the
+            // edge — moving the pointer onto it would leave the 48px reveal zone and hide the bar,
+            // closing the menu. Keep every edge shown while any popup is open (and never hide the
+            // cursor then), so the menu stays reachable.
+            let popup_open = egui::Popup::is_any_open(&ctx);
+            if popup_open {
+                hide_cursor = false;
+            }
             (
-                p.is_some_and(|p| p.y - win.min.y < EDGE),
-                p.is_some_and(|p| win.max.y - p.y < EDGE),
-                p.is_some_and(|p| p.x - win.min.x < EDGE),
-                p.is_some_and(|p| win.max.x - p.x < EDGE),
+                popup_open || p.is_some_and(|p| p.y - win.min.y < EDGE),
+                popup_open || p.is_some_and(|p| win.max.y - p.y < EDGE),
+                popup_open || p.is_some_and(|p| p.x - win.min.x < EDGE),
+                popup_open || p.is_some_and(|p| win.max.x - p.x < EDGE),
             )
         } else {
             self.idle_t = 0.0;
@@ -38906,6 +38976,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::OSD_SECS_KEY, &self.osd_secs);
         eframe::set_value(storage, Self::AUTO_NEXT_KEY, &self.auto_next);
         eframe::set_value(storage, Self::AUTO_NEXT_SECS_KEY, &self.auto_next_secs);
+        eframe::set_value(storage, Self::SLIDE_SHUFFLE_KEY, &self.slide_shuffle);
         eframe::set_value(storage, Self::GLOW_KEY, &self.glow);
         eframe::set_value(storage, Self::GLOW_AMT_KEY, &self.glow_amt);
         eframe::set_value(storage, Self::SHUFFLE_KEY, &self.shuffle);
@@ -42500,6 +42571,22 @@ fn is_gif(path: &std::path::Path) -> bool {
 
 /// Pick a pseudo-random element, seeded from the wall clock (no `rand` dependency —
 /// good enough for a screensaver's pack shuffle). None if empty.
+/// Fisher-Yates shuffle seeded from the clock (no `rand` crate — good enough for a slideshow).
+fn shuffle_in_place<T>(v: &mut [T]) {
+    let mut s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+        | 1; // non-zero seed for xorshift
+    for i in (1..v.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17; // xorshift64
+        let j = (s % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+}
+
 fn pick_random<T>(items: &[T]) -> Option<&T> {
     if items.is_empty() {
         return None;
