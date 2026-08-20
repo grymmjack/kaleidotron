@@ -24493,7 +24493,7 @@ impl Kaleidotron {
     fn ui_recolor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            ui.strong("Recolor");
+            ui.strong("Studio").on_hover_text("Recolor, palette, dither, convert & effects");
             ui.checkbox(&mut self.recolor_grid, "Apply to grid")
                 .on_hover_text("Recolor every grid thumbnail with the active palette");
             if ui
@@ -33037,7 +33037,7 @@ impl Kaleidotron {
                     self.show_details = !self.show_details;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, "Recolor pane").clicked() {
+                if row(ui, "\u{1F3A8}", "Studio", self.show_recolor, "Studio — recolor, palette & effects").clicked() {
                     self.show_recolor = !self.show_recolor;
                 }
                 ui.add_space(12.0);
@@ -33222,7 +33222,7 @@ impl Kaleidotron {
             ("Force refresh".into(), "View  Shift+F5".into(), Menu(MenuAction::HardRefresh)),
             ("Toggle Explorer pane".into(), "View".into(), Menu(MenuAction::ToggleExplorer)),
             ("Toggle Details pane".into(), "View".into(), Menu(MenuAction::ToggleDetails)),
-            ("Toggle Recolor pane".into(), "View".into(), Menu(MenuAction::ToggleRecolor)),
+            ("Toggle Studio pane".into(), "View".into(), Menu(MenuAction::ToggleRecolor)),
             ("Toggle task output".into(), "View".into(), Menu(MenuAction::ToggleTasksPanel)),
             ("Reload project tasks".into(), "View".into(), Menu(MenuAction::ReloadTasks)),
             ("Toggle grid / table view".into(), "View  T".into(), Menu(MenuAction::ToggleTable)),
@@ -35015,7 +35015,7 @@ impl Kaleidotron {
                     ui.close();
                 }
                 if ui
-                    .selectable_label(self.show_recolor, "Recolor pane")
+                    .selectable_label(self.show_recolor, "Studio pane")
                     .clicked()
                 {
                     action = Some(MenuAction::ToggleRecolor);
