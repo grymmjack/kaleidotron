@@ -25634,58 +25634,100 @@ impl Kaleidotron {
                     self.quantize_n = self.quantize_n.clamp(2, 256);
 
                     ui.add_space(4.0);
-                    // ----- Dither (a movable pipeline op — the "Dither" row in
-                    //       Adjustments picks *where* it applies). Above the palette
-                    //       chooser, always visible. -----
+                    // ----- Convert to (output MODE) + Dither (pattern) -----
+                    // Split out of the old single "Dither" combo: choosing a whole art
+                    // converter (PETSCII / ANSI / ASCII / …) is a MODE, not a dither, so it
+                    // gets its own top-level selector. Both still write the one
+                    // `dither_method` field — converters (7–13) and real dithers (0–6) are
+                    // disjoint values of it, so the pipeline is untouched.
+                    let prev = self.dither_method;
+                    let is_conv = |m: u8| m >= crate::thumb::DITHER_ANSI;
                     ui.horizontal(|ui| {
-                        ui.label("Dither");
-                        let mut m = self.dither_method as usize;
-                        let cr = egui::ComboBox::from_id_salt("dither_method")
-                            .selected_text(
-                                crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
-                            )
+                        ui.label("Convert to").on_hover_text(
+                            "Output style. “Full color” keeps RGB — use Palette / Reduce / \
+                             Dither below. The others are hard converters to scene-art formats \
+                             (they do their own colour + shading).",
+                        );
+                        // 255 = the "Full color" sentinel (no converter); else the converter value.
+                        let mut choice: u8 =
+                            if is_conv(self.dither_method) { self.dither_method } else { 255 };
+                        egui::ComboBox::from_id_salt("convert_to")
+                            .selected_text(if choice == 255 {
+                                "Full color"
+                            } else {
+                                crate::thumb::DITHER_NAMES[choice as usize]
+                            })
                             .show_ui(ui, |ui| {
-                                for (i, name) in crate::thumb::DITHER_NAMES.iter().enumerate() {
-                                    ui.selectable_value(&mut m, i, *name);
+                                ui.selectable_value(&mut choice, 255, "Full color");
+                                ui.separator();
+                                for m in crate::thumb::DITHER_ANSI..=crate::thumb::DITHER_UNICODE {
+                                    ui.selectable_value(
+                                        &mut choice,
+                                        m,
+                                        crate::thumb::DITHER_NAMES[m as usize],
+                                    );
                                 }
                             });
-                        wheel_cycle(ui, &cr.response, &mut m, crate::thumb::DITHER_NAMES.len());
-                        let prev = self.dither_method;
-                        self.dither_method = m as u8;
-                        // Usability: ANSI Shade draws in PALETTE colours, so with nothing
-                        // providing any it silently does nothing. When the user switches TO
-                        // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
-                        // (an ANSI-appropriate default) so it works on the spot — they can then
-                        // pick a palette or change N from there.
-                        // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple) auto-enable
-                        // Reduce → 16 when switched to with nothing providing colours.
-                        if matches!(
-                            self.dither_method,
-                            crate::thumb::DITHER_ANSI
-                                | crate::thumb::DITHER_ASCII
-                                | crate::thumb::DITHER_ATASCII
-                                | crate::thumb::DITHER_APPLE
-                                | crate::thumb::DITHER_REXFONT
-                        ) && prev != self.dither_method
-                            && self.custom_palette.is_none()
-                            && self.selected_palette.is_none()
-                            && !self.quantize_on
-                        {
-                            self.quantize_on = true;
-                            self.quantize_n = 16;
-                            self.quantize_cache = None;
-                            self.reduce_src = None;
-                        }
-                        // Switching TO PETSCII: auto-select the matching C64 palette so the
-                        // export/save buttons appear (they need an active palette) and the
-                        // Colors swatches match the converter's colours.
-                        if self.dither_method == crate::thumb::DITHER_PETSCII
-                            && prev != crate::thumb::DITHER_PETSCII
-                            && !self.petscii_use_selected
-                        {
-                            self.petscii_sync_selected_palette();
+                        // Apply: leaving converters for "Full color" resets the field to a
+                        // no-dither (0); the real Dither combo below then takes over.
+                        if choice == 255 {
+                            if is_conv(self.dither_method) {
+                                self.dither_method = 0;
+                            }
+                        } else {
+                            self.dither_method = choice;
                         }
                     });
+                    // Auto-defaults when switching INTO a converter (unchanged behaviour).
+                    // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple/Rex) need a
+                    // palette or they render nothing, so seed Reduce → 16 if none is active.
+                    if matches!(
+                        self.dither_method,
+                        crate::thumb::DITHER_ANSI
+                            | crate::thumb::DITHER_ASCII
+                            | crate::thumb::DITHER_ATASCII
+                            | crate::thumb::DITHER_APPLE
+                            | crate::thumb::DITHER_REXFONT
+                    ) && prev != self.dither_method
+                        && self.custom_palette.is_none()
+                        && self.selected_palette.is_none()
+                        && !self.quantize_on
+                    {
+                        self.quantize_on = true;
+                        self.quantize_n = 16;
+                        self.quantize_cache = None;
+                        self.reduce_src = None;
+                    }
+                    // Switching TO PETSCII auto-selects the matching C64 palette (needed for
+                    // the export/save buttons + swatches to match the converter's colours).
+                    if self.dither_method == crate::thumb::DITHER_PETSCII
+                        && prev != crate::thumb::DITHER_PETSCII
+                        && !self.petscii_use_selected
+                    {
+                        self.petscii_sync_selected_palette();
+                    }
+                    // Dither PATTERN — only meaningful for "Full color"; a converter does its
+                    // own shading, so the pattern combo is hidden while one is active.
+                    if !is_conv(self.dither_method) {
+                        ui.horizontal(|ui| {
+                            ui.label("Dither");
+                            let mut m = self.dither_method as usize; // 0..=6
+                            let last = crate::thumb::DITHER_CUSTOM as usize;
+                            let cr = egui::ComboBox::from_id_salt("dither_method")
+                                .selected_text(
+                                    crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in
+                                        crate::thumb::DITHER_NAMES[..=last].iter().enumerate()
+                                    {
+                                        ui.selectable_value(&mut m, i, *name);
+                                    }
+                                });
+                            wheel_cycle(ui, &cr.response, &mut m, last + 1);
+                            self.dither_method = m as u8;
+                        });
+                    }
                     // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
                     // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
                     if matches!(self.dither_method, 1..=6) {
