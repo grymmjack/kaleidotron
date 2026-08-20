@@ -1472,6 +1472,7 @@ pub struct Kaleidotron {
     rail_expanded: bool, // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
     prefs_section: u8,        // which Preferences section is showing
+    prefs_search: String,     // Preferences filter box — jumps to the best-matching section
     /// The open text/code file: (path, contents). Kept separate from `full_tex` — the grid tile
     /// stays a raster, the viewer works on the real text.
     text_doc: Option<(PathBuf, String)>,
@@ -3623,6 +3624,7 @@ impl Kaleidotron {
             rail_expanded: get_bool(Self::RAIL_EXPANDED_KEY).unwrap_or(false),
             rail_settings_menu: false,
             prefs_section: 0,
+            prefs_search: String::new(),
             text_doc: None,
             text_wrap: false,
             text_edit: false,
@@ -37849,6 +37851,59 @@ impl eframe::App for Kaleidotron {
                         "Audio & Color",     // 5 (was Audio & Colors)
                         "System",            // 6 (was Advanced + Config files)
                     ];
+                    // Keywords per section, so the search box can jump by what a setting is
+                    // ABOUT, not just the tab name (the content is interleaved `sec == N`
+                    // groups, so per-control filtering isn't feasible — a jump is).
+                    const PREF_KEYWORDS: [&[&str]; 7] = [
+                        &["theme", "dark", "light", "code font", "grid spacing", "tile border",
+                          "font preview", "title bar", "appearance"],
+                        &["zoom", "textmode", "osd", "captions", "table columns", "transparency",
+                          "checkerboard", "crt", "viewer"],
+                        &["hotkeys", "keybindings", "rebind", "keyboard", "shortcut"],
+                        &["16colo", "lospec", "youtube", "steam", "modarchive", "polyhaven",
+                          "web source", "cookies"],
+                        &["audio plugin", "video", "pdf", "3d", "source code", "plugin", "format"],
+                        &["soundfont", "midi", "format colors", "volume", "audio"],
+                        &["git", "tasks", "cache", "config files", "settings.json",
+                          "keybindings.json", "system", "advanced"],
+                    ];
+                    // Search box: typing jumps to the best-matching section (only on change, so
+                    // you can still click a tab afterwards without it snapping back).
+                    let mut search_changed = false;
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(icons::SEARCH);
+                        let re = ui.add(
+                            egui::TextEdit::singleline(&mut self.prefs_search)
+                                .hint_text("Search settings…")
+                                .desired_width(220.0),
+                        );
+                        search_changed = re.changed();
+                        if !self.prefs_search.is_empty() && ui.small_button("✕").clicked() {
+                            self.prefs_search.clear();
+                            search_changed = true;
+                        }
+                    });
+                    let q = self.prefs_search.trim().to_string();
+                    if search_changed && !q.is_empty() {
+                        let mut best: Option<(i32, usize)> = None;
+                        for (i, kws) in PREF_KEYWORDS.iter().enumerate() {
+                            let mut s = Self::palette_score(PREF_SECTIONS[i], &q);
+                            for kw in kws.iter() {
+                                if let Some(sc) = Self::palette_score(kw, &q) {
+                                    s = Some(s.map_or(sc, |x| x.max(sc)));
+                                }
+                            }
+                            if let Some(sc) = s {
+                                if best.is_none_or(|(bs, _)| sc > bs) {
+                                    best = Some((sc, i));
+                                }
+                            }
+                        }
+                        if let Some((_, i)) = best {
+                            self.prefs_section = i as u8;
+                        }
+                    }
                     // Clamp so a persisted section 7 (old "Config files") lands on System.
                     let sec = self.prefs_section.min(6);
                     // Section selector: padded, evenly sized tabs so the row reads as a strip
