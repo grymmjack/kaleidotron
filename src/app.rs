@@ -34475,20 +34475,12 @@ impl Kaleidotron {
                                 self.auto_next_dwell = 0.0;
                             }
                             ui.horizontal(|ui| {
-                                ui.label("delay");
-                                egui::ComboBox::from_id_salt("auto_next_secs")
-                                    .selected_text(format!("{}s", self.auto_next_secs))
-                                    .show_ui(ui, |ui| {
-                                        for s in [1u8, 3, 5, 10] {
-                                            ui.selectable_value(
-                                                &mut self.auto_next_secs,
-                                                s,
-                                                format!("{s}s"),
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("Seconds to wait before advancing");
+                                ui.label("delay").on_hover_text("Seconds to wait before advancing");
+                                // Inline selectable chips, NOT a ComboBox: a nested combo's popup
+                                // closes the parent menu (egui treats it as a click outside).
+                                for s in [1u8, 3, 5, 10] {
+                                    ui.selectable_value(&mut self.auto_next_secs, s, format!("{s}s"));
+                                }
                             });
                             if ui
                                 .checkbox(&mut self.slide_shuffle, "shuffle order")
