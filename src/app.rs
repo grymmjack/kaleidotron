@@ -24606,6 +24606,80 @@ impl Kaleidotron {
                     self.want_repaint = true;
                 }
 
+                // ----- Presets (PixelFX), surfaced at the TOP of the pane -----
+                // The fastest path to a good look (CGA / Game Boy / EGA / …) was previously
+                // three tabs away in Places. Here it sits right under the preview: click a
+                // chip to apply the whole recolor stack, or Save the current stack as one.
+                {
+                    panel_header(ui, "Presets");
+                    // Deferred: can't borrow `self.pixelfx` while calling the `&mut self`
+                    // apply/capture methods, so render from an owned snapshot + apply after.
+                    let snap: Vec<(String, Option<[u8; 3]>, Option<[u8; 3]>)> = self
+                        .pixelfx
+                        .iter()
+                        .map(|p| (p.name.clone(), p.color, p.fg))
+                        .collect();
+                    let mut apply_idx: Option<usize> = None;
+                    if snap.is_empty() {
+                        ui.weak("No presets yet — tune the controls below, then Save.");
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                            for (i, (name, color, fg)) in snap.iter().enumerate() {
+                                let txt = match (color, fg) {
+                                    (_, Some(f)) => {
+                                        egui::Color32::from_rgb(f[0], f[1], f[2])
+                                    }
+                                    (Some(c), None) => contrast_text(*c),
+                                    _ => ui.visuals().text_color(),
+                                };
+                                let mut btn =
+                                    egui::Button::new(egui::RichText::new(name).color(txt)).small();
+                                if let Some(c) = color {
+                                    btn = btn.fill(egui::Color32::from_rgb(c[0], c[1], c[2]));
+                                }
+                                if ui.add(btn).on_hover_text("Apply this preset").clicked() {
+                                    apply_idx = Some(i);
+                                }
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pixelfx_name)
+                                .hint_text("preset name…")
+                                .desired_width(130.0),
+                        );
+                        let name = self.pixelfx_name.trim().to_string();
+                        let can = !name.is_empty();
+                        if ui
+                            .add_enabled(can, egui::Button::new("＋ Save"))
+                            .on_hover_text("Save the current recolor stack as a PixelFX preset")
+                            .clicked()
+                        {
+                            let preset = self.capture_fx_preset(name.clone());
+                            if let Some(slot) = self.pixelfx.iter_mut().find(|p| p.name == name) {
+                                let (color, fg, folder) =
+                                    (slot.color, slot.fg, slot.folder.clone());
+                                *slot = preset;
+                                slot.color = color;
+                                slot.fg = fg;
+                                slot.folder = folder;
+                            } else {
+                                self.pixelfx.push(preset);
+                            }
+                            self.pixelfx_name.clear();
+                            self.status = format!("Saved PixelFX preset “{name}”");
+                        }
+                    });
+                    if let Some(i) = apply_idx {
+                        let p = self.pixelfx[i].clone();
+                        self.apply_fx_preset(&p);
+                        self.status = format!("Applied preset “{}”", p.name);
+                    }
+                }
+
                 // ----- extracted palette swatches, kept directly under the preview so
                 //       they're always visible (Export/Save stay further down) -----
                 if let Some(d) = &display {
