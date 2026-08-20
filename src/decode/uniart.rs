@@ -160,6 +160,21 @@ pub fn build_ramp(font_bytes: &[u8], mask: u8, extra: &[u32]) -> (GlyphFont, Vec
     (GlyphFont { cell_w: CELL_W, cell_h: CELL_H, glyphs }, chars)
 }
 
+/// Rasterize a TTF/OTF into a **CP437-ordered** [`GlyphFont`] (256 glyphs, 8×16): glyph `code` is
+/// CP437 codepoint `code` mapped to Unicode. Used by the ASCII converter so it can render/measure
+/// through an arbitrary outline font, indexed by the same CP437 codes as its built-in font. Missing
+/// glyphs come out blank. Returns `None` if the bytes aren't a valid font.
+pub fn build_cp437_font(font_bytes: &[u8]) -> Option<GlyphFont> {
+    let (font, scale, baseline) = render_ctx(font_bytes)?;
+    let glyphs = (0u16..256)
+        .map(|code| {
+            let ch = retrofont::tdf::CP437_TO_UNICODE[code as usize];
+            raster_glyph(&font, scale, baseline, ch).unwrap_or_else(|| vec![0u32; CELL_H])
+        })
+        .collect();
+    Some(GlyphFont { cell_w: CELL_W, cell_h: CELL_H, glyphs })
+}
+
 /// The rasterized ramp font + codepoint list for the current [`RampSrc`], `mask`, and `extra`.
 /// Single-entry memo keyed by `(source id, mask, extra)`: the picker calls this every frame, but
 /// rebuilds only when the font, ranges, or codepoints change. Returns an `Arc` so the converter,
@@ -287,6 +302,20 @@ mod tests {
         );
         assert_eq!(font.glyphs.len(), base + 1, "only the powerline glyph is new");
         assert_eq!(*chars.last().unwrap(), '\u{E0B0}');
+    }
+
+    #[test]
+    fn cp437_font_from_ttf_maps_codes() {
+        // build_cp437_font indexes by CP437 code: code 0x41 is 'A' (ink), 0x20 is space (blank),
+        // 0xB0..=0xB2 are the shade blocks (increasing ink). DejaVu covers all of these.
+        let f = build_cp437_font(DEJAVU_FONT).expect("valid font");
+        assert_eq!(f.glyphs.len(), 256);
+        assert!(f.coverage(0x41) > 0.05, "'A' has ink");
+        assert_eq!(f.coverage(0x20), 0.0, "space is blank");
+        assert!(
+            f.coverage(0xB0) < f.coverage(0xB2),
+            "light shade ░ is lighter than dark shade ▓"
+        );
     }
 
     #[test]

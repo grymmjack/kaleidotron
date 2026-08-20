@@ -141,6 +141,23 @@ impl Default for UniFont {
     }
 }
 
+/// Which font the ASCII converter renders + measures its coverage ramp from. `Cp437` (the built-in
+/// VGA ROM, 8×8 or 8×16 per the VGA50 toggle) is the default and keeps the authentic 9-dot cell;
+/// `Rex(i)` is a bundled REXPaint font (index into `rexfont`); `File` is any TTF/OTF, rasterized
+/// CP437-ordered so the pool codes still line up.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum AsciiFont {
+    Cp437,
+    Rex(usize),
+    File(PathBuf),
+}
+
+impl Default for AsciiFont {
+    fn default() -> Self {
+        AsciiFont::Cp437
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Grid,
@@ -1673,6 +1690,10 @@ pub struct Kaleidotron {
     ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
     ascii_mask: Vec<bool>, // glyph-picker mask over CP437 (256); intersects the ramp pool
     ascii_picker: bool,    // ASCII glyph-picker popup open
+    ascii_font: AsciiFont, // which font the converter renders/measures from (CP437 / REXPaint / TTF)
+    // Resolved render font: (cache key, glyph font, Some(vga50) when it's the CP437 9-dot renderer).
+    ascii_font_cache: Option<(u64, std::sync::Arc<crate::decode::rexfont::GlyphFont>, Option<bool>)>,
+    ascii_font_file: Option<(PathBuf, std::sync::Arc<crate::decode::rexfont::GlyphFont>)>, // TTF cache
     // Unified foreground / background for the mono char converters (ASCII / ATASCII / Apple ][).
     tm_fg: [u8; 3],
     tm_bg: [u8; 3],
@@ -2504,6 +2525,7 @@ impl Kaleidotron {
     const PETSCII_KEY: &'static str = "petscii"; // (cols,rows,purity,page,bg_auto,bg,palette)
     const ASCII_KEY: &'static str = "ascii"; // (high, control, color, blocks, box, chars)
     const ASCII_INVERT_KEY: &'static str = "ascii_invert";
+    const ASCII_FONT_KEY: &'static str = "ascii_font"; // AsciiFont: CP437 / REXPaint / TTF
     const ASCII_MASK_KEY: &'static str = "ascii_mask";
     const TM_COLOR_KEY: &'static str = "textmode_fgbg"; // unified (fg, bg) for ASCII/ATASCII/Apple
     const BITFONT_KEY: &'static str = "bitfont"; // (color, atascii_invert, apple_invert, apple_mousetext, apple_col80)
@@ -3752,6 +3774,12 @@ impl Kaleidotron {
             ascii_invert,
             ascii_mask,
             ascii_picker: false,
+            ascii_font: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::ASCII_FONT_KEY))
+                .unwrap_or_default(),
+            ascii_font_cache: None,
+            ascii_font_file: None,
             tm_fg,
             tm_bg,
             ascii_blocks: ascii.3,
@@ -19962,6 +19990,12 @@ impl Kaleidotron {
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
             ascii_invert: self.ascii_invert,
+            ascii_font: if self.dither_method == crate::thumb::DITHER_ASCII {
+                self.ascii_render_font().map(|(f, _)| f)
+            } else {
+                None
+            },
+            ascii_cp437: self.ascii_render_font().and_then(|(_, m)| m),
             tm_mono: self.textmode_mono(),
             bitfont_font: bf_font,
             bitfont_pool: bf_pool,
@@ -20475,7 +20509,7 @@ impl Kaleidotron {
             // the range toggles + colour AND the fit/cell state that sets the working resolution.
             + &if self.dither_method == crate::thumb::DITHER_ASCII {
                 format!(
-                    "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:m{:x}:v{}:s{}|Fit{}:{}x{}",
+                    "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:m{:x}:v{}:s{}:fnt{}|Fit{}:{}x{}",
                     self.ascii_high as u8,
                     self.ascii_control as u8,
                     self.ascii_blocks as u8,
@@ -20486,6 +20520,7 @@ impl Kaleidotron {
                     mask_hash(&self.ascii_mask),
                     self.shade_vga50 as u8,
                     self.shade_snap916 as u8,
+                    self.ascii_font_tag(),
                     self.shade_fit_chars as u8,
                     self.shade_fit_cols,
                     self.shade_fit_rows,
@@ -20829,6 +20864,8 @@ impl Kaleidotron {
             petscii_pal: crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_font: None,
+            ascii_cp437: None,
             ascii_invert: false,
             tm_mono: None,
             ascii_color: true,
@@ -21416,16 +21453,22 @@ impl Kaleidotron {
         if !self.ascii_picker || self.dither_method != crate::thumb::DITHER_ASCII {
             return;
         }
-        // Match the render cell: VGA50 → 8×8 font, else the 8×16 VGA font.
-        let font = if self.shade_vga50 {
-            crate::decode::rexfont::GlyphFont::from_8x8(&crate::decode::cp437_font_8x8::CP437_8X8)
-        } else {
-            crate::decode::rexfont::GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16)
+        // Show the glyphs of the ACTUAL render font (CP437 / REXPaint / TTF), so the mask lines up
+        // with what's drawn. Falls back to the 8×16 VGA font if nothing's resolved yet.
+        let resolved = self.ascii_render_font().map(|(f, _)| f);
+        let fallback;
+        let font: &crate::decode::rexfont::GlyphFont = match &resolved {
+            Some(f) => f,
+            None => {
+                fallback = crate::decode::rexfont::GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16);
+                &fallback
+            }
         };
-        let default = vec![true; 256];
+        let n = 256.min(font.glyphs.len());
+        let default = vec![true; n];
         let mut open = self.ascii_picker;
         glyph_picker_window(
-            ctx, "ASCII / CP437 glyphs", "ascii_atlas", &font, 256, &mut self.ascii_mask, &default,
+            ctx, "ASCII glyphs", "ascii_atlas", font, n, &mut self.ascii_mask, &default,
             &mut open, &mut self.glyph_drag, None,
         );
         self.ascii_picker = open;
@@ -21526,6 +21569,71 @@ impl Kaleidotron {
         }
     }
 
+    /// A short stable tag identifying the current ASCII render font, for the render cache key.
+    fn ascii_font_tag(&self) -> String {
+        match &self.ascii_font {
+            AsciiFont::Cp437 => format!("cp{}", self.shade_vga50 as u8),
+            AsciiFont::Rex(i) => format!("rex{i}"),
+            AsciiFont::File(p) => format!("f{:016x}", path_hash(p)),
+        }
+    }
+
+    /// A display name for the current ASCII render font.
+    fn ascii_font_name(&self) -> String {
+        match &self.ascii_font {
+            AsciiFont::Cp437 => "CP437 (built-in)".into(),
+            AsciiFont::Rex(i) => crate::decode::rexfont::rexfont_name(*i).to_string(),
+            AsciiFont::File(p) => {
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("(font)").to_string()
+            }
+        }
+    }
+
+    /// Read + cache a user TTF/OTF as a CP437-ordered [`GlyphFont`] for the ASCII converter.
+    fn ascii_font_load(&mut self, path: &Path) -> Option<std::sync::Arc<crate::decode::rexfont::GlyphFont>> {
+        if let Some((p, f)) = &self.ascii_font_file {
+            if p == path {
+                return Some(f.clone());
+            }
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let font = crate::decode::uniart::build_cp437_font(&bytes)?;
+        let arc = std::sync::Arc::new(font);
+        self.ascii_font_file = Some((path.to_path_buf(), arc.clone()));
+        Some(arc)
+    }
+
+    /// Resolve `ascii_font` (+ the VGA50 toggle) into the render glyph font + a flag: `Some(vga50)`
+    /// keeps the authentic CP437 9-dot renderer, `None` draws the font's own glyphs. Cached; rebuilt
+    /// only when the selection changes. A user font that no longer reads falls back to CP437.
+    fn refresh_ascii_font(&mut self) {
+        use crate::decode::rexfont::GlyphFont;
+        let key = path_hash(Path::new(&self.ascii_font_tag()));
+        if self.ascii_font_cache.as_ref().is_some_and(|(k, _, _)| *k == key) {
+            return;
+        }
+        let vga50 = self.shade_vga50;
+        let cp437 =
+            || (std::sync::Arc::new(crate::thumb::cp437_glyphfont(vga50).clone()), Some(vga50));
+        let (font, mode): (std::sync::Arc<GlyphFont>, Option<bool>) = match self.ascii_font.clone() {
+            AsciiFont::Cp437 => cp437(),
+            AsciiFont::Rex(i) => match crate::decode::rexfont::rexfont(i) {
+                Some(f) => (std::sync::Arc::new(f.clone()), None),
+                None => cp437(),
+            },
+            AsciiFont::File(p) => match self.ascii_font_load(&p) {
+                Some(f) => (f, None),
+                None => cp437(),
+            },
+        };
+        self.ascii_font_cache = Some((key, font, mode));
+    }
+
+    /// The resolved ASCII render font + renderer flag for the pipeline (see [`Self::refresh_ascii_font`]).
+    fn ascii_render_font(&self) -> Option<(std::sync::Arc<crate::decode::rexfont::GlyphFont>, Option<bool>)> {
+        self.ascii_font_cache.as_ref().map(|(_, f, m)| (f.clone(), *m))
+    }
+
     /// Point the quantize palette selection at the bundled `.GPL` matching the current PETSCII
     /// palette (petmate/colodore/pepto/vice). The converter brings its own colours, but selecting
     /// the matching palette here (a) makes the "Export textmode"/Save buttons appear — they're
@@ -21610,9 +21718,13 @@ impl Kaleidotron {
         // ASCII and ANSI Shade both produce an AnsiGrid (so they share this build + the whole
         // render/export path); they differ only in the cell→glyph decision.
         let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
+            let font = self
+                .ascii_render_font()
+                .map(|(f, _)| f)
+                .unwrap_or_else(|| std::sync::Arc::new(crate::thumb::cp437_glyphfont(font_8x8).clone()));
             crate::thumb::ascii_grid(
                 &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color,
-                self.ascii_invert, font_8x8, self.textmode_mono(),
+                self.ascii_invert, &font, self.textmode_mono(),
             )
         } else {
             crate::thumb::ansi_shade_grid(
@@ -25968,6 +26080,40 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("ASCII").strong());
                             ui.weak("brightness → character density");
+                        });
+                        // Render font: built-in CP437, any bundled REXPaint font, or a TTF/OTF.
+                        ui.horizontal(|ui| {
+                            ui.label("Font");
+                            egui::ComboBox::from_id_salt("ascii_font")
+                                .selected_text(self.ascii_font_name())
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.ascii_font, AsciiFont::Cp437, "CP437 (built-in)")
+                                        .on_hover_text("The VGA ROM — authentic 9-dot cell.");
+                                    ui.separator();
+                                    for i in 0..crate::decode::rexfont::rexfont_count() {
+                                        let sel = matches!(self.ascii_font, AsciiFont::Rex(j) if j == i);
+                                        if ui
+                                            .selectable_label(sel, crate::decode::rexfont::rexfont_name(i))
+                                            .clicked()
+                                        {
+                                            self.ascii_font = AsciiFont::Rex(i);
+                                        }
+                                    }
+                                });
+                            if ui.button("TTF…").on_hover_text("Render with any .ttf/.otf font (rasterized CP437-ordered)").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Font", &["ttf", "otf", "ttc"])
+                                    .pick_file()
+                                {
+                                    self.ascii_font = AsciiFont::File(p);
+                                }
+                            }
+                            if !matches!(self.ascii_font, AsciiFont::Cp437)
+                                && ui.small_button("✖").on_hover_text("Back to CP437").clicked()
+                            {
+                                self.ascii_font = AsciiFont::Cp437;
+                            }
                         });
                         // "Use only chars": type an exact glyph set (e.g. " .oOX$") — when it has
                         // any resolvable glyphs it OVERRIDES the category toggles below.
@@ -36487,6 +36633,9 @@ impl eframe::App for Kaleidotron {
         // Track the live zoom factor (changed by Ctrl +/-) so `save` can persist it.
         self.ui_zoom = ctx.zoom_factor();
         self.want_repaint = false;
+        // Keep the resolved ASCII render font in sync with the selection + VGA50 toggle (cheap:
+        // returns immediately when unchanged) so the pipeline always has it.
+        self.refresh_ascii_font();
         // DEBUG_MODE=true → dock this instance to the bottom-right corner once the monitor
         // size is known (it's None on the very first frame), leaving a taskbar margin so a
         // dev test window stays out of the user's way.
@@ -38781,6 +38930,7 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::ASCII_INVERT_KEY, &self.ascii_invert);
         eframe::set_value(storage, Self::ASCII_MASK_KEY, &self.ascii_mask);
+        eframe::set_value(storage, Self::ASCII_FONT_KEY, &self.ascii_font);
         eframe::set_value(storage, Self::TM_COLOR_KEY, &(self.tm_fg, self.tm_bg));
         eframe::set_value(
             storage,
@@ -39979,6 +40129,10 @@ struct PipeAux<'a> {
     ascii_cs: crate::thumb::AsciiCharset,
     ascii_color: bool,
     ascii_invert: bool,
+    // The resolved ASCII render font + renderer flag (`Some(vga50)` = CP437 9-dot path; `None` =
+    // draw the font's glyphs). `None` font = not ASCII / not resolved.
+    ascii_font: Option<std::sync::Arc<crate::decode::rexfont::GlyphFont>>,
+    ascii_cp437: Option<bool>,
     // Unified fg/bg for the mono char modes (ASCII / ATASCII / Apple ][), or None.
     tm_mono: Option<([u8; 3], [u8; 3])>,
     // Bit-font pass params (DITHER_ATASCII / DITHER_APPLE): the ROM font + glyph pool + toggles.
@@ -40126,7 +40280,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                     }
                 } else if aux.dither_method == crate::thumb::DITHER_ASCII {
                     // ASCII colours from the active palette (like ANSI) — skip if none.
-                    if let Some(p) = aux.palette {
+                    if let (Some(p), Some(font)) = (aux.palette, aux.ascii_font.as_ref()) {
                         crate::thumb::ascii_pass(
                             rgba,
                             w,
@@ -40137,7 +40291,8 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             &aux.ascii_cs,
                             aux.ascii_color,
                             aux.ascii_invert,
-                            aux.font_8x8,
+                            font,
+                            aux.ascii_cp437,
                             aux.tm_mono,
                         );
                     }
@@ -41082,6 +41237,8 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_pal: crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_font: None,
+            ascii_cp437: None,
             ascii_invert: false,
             tm_mono: None,
             ascii_color: true,
@@ -49386,6 +49543,8 @@ fn preset_pipe_aux<'a>(
         petscii_pal: crate::decode::petscii_palette(0),
         petscii_allowed: None,
         ascii_cs: crate::thumb::AsciiCharset::default(),
+        ascii_font: None,
+        ascii_cp437: None,
         ascii_invert: false,
         tm_mono: None,
         ascii_color: true,
@@ -51754,6 +51913,8 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_font: None,
+            ascii_cp437: None,
             ascii_invert: false,
             tm_mono: None,
             ascii_color: true,
@@ -51981,6 +52142,8 @@ mod tests {
             petscii_pal: crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
+            ascii_font: None,
+            ascii_cp437: None,
             ascii_invert: false,
             tm_mono: None,
             ascii_color: true,

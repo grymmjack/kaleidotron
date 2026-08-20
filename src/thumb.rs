@@ -2004,21 +2004,27 @@ pub struct AsciiCharset {
     pub mask: Vec<bool>, // glyph-picker mask over CP437 (256); intersects the pool. Empty = all.
 }
 
+/// The CP437 ROM as a [`GlyphFont`] (cached), 8×8 (VGA50) or 8×16 (VGA). Lets the ASCII converter
+/// measure its coverage ramp through the same [`GlyphFont`] code path as the REXPaint / TTF fonts.
+pub fn cp437_glyphfont(vga50: bool) -> &'static GlyphFont {
+    static F8: std::sync::OnceLock<GlyphFont> = std::sync::OnceLock::new();
+    static F16: std::sync::OnceLock<GlyphFont> = std::sync::OnceLock::new();
+    if vga50 {
+        F8.get_or_init(|| GlyphFont::from_8x8(&CP437_8X8))
+    } else {
+        F16.get_or_init(|| GlyphFont::from_8x16(&CP437_8X16))
+    }
+}
+
 /// Build the light→dark ASCII ramp: `(glyph, coverage)` pairs sorted by ink coverage
 /// (fraction of set pixels in the render font). For the category-based pool one
 /// representative glyph is kept per distinct coverage level (printable ASCII wins ties);
-/// an explicit "only" set keeps every typed glyph. `font_8x8` selects which CP437 font
-/// the coverage is measured from, so it matches the renderer.
-pub fn ascii_ramp(cs: &AsciiCharset, font_8x8: bool) -> Vec<(u8, f32)> {
-    let total = if font_8x8 { 64.0 } else { 8.0 * 16.0 };
-    let cov = |code: u8| -> f32 {
-        let bits: u32 = if font_8x8 {
-            CP437_8X8[code as usize].iter().map(|b| b.count_ones()).sum()
-        } else {
-            CP437_8X16[code as usize].iter().map(|b| b.count_ones()).sum()
-        };
-        bits as f32 / total
-    };
+/// an explicit "only" set keeps every typed glyph. Coverage is measured from `font` (the same
+/// glyph set the renderer draws), so the ramp matches the output — whether that's CP437, a
+/// REXPaint bitmap font, or a rasterized TTF.
+pub fn ascii_ramp(cs: &AsciiCharset, font: &GlyphFont) -> Vec<(u8, f32)> {
+    let total = (font.cell_w * font.cell_h).max(1) as f32;
+    let cov = |code: u8| -> f32 { font.coverage(code as usize) };
     // Glyph-picker mask (256): when set, only these CP437 codes are usable. Empty = all.
     let mask_on = cs.mask.len() == 256 && cs.mask.iter().any(|b| !*b);
     let allowed = |code: u8| -> bool {
@@ -2087,7 +2093,7 @@ pub fn ascii_grid(
     cs: &AsciiCharset,
     color: bool,
     invert: bool,
-    font_8x8: bool,
+    font: &GlyphFont,
     mono: Option<([u8; 3], [u8; 3])>,
 ) -> AnsiGrid {
     let cw = cell_w.max(1);
@@ -2101,7 +2107,7 @@ pub fn ascii_grid(
         cells.resize(cols * rows, AnsiCell { fg: 0, bg: 0, ch: 32 });
         return AnsiGrid { cols, rows, cell_w: cw, cell_h: ch_, palette: out_pal, cells };
     }
-    let mut ramp = ascii_ramp(cs, font_8x8);
+    let mut ramp = ascii_ramp(cs, font);
     if ramp.is_empty() {
         ramp.push((32, 0.0)); // a stray empty "only" set → all blank rather than a panic
     }
@@ -2165,14 +2171,60 @@ pub fn ascii_pass(
     cs: &AsciiCharset,
     color: bool,
     invert: bool,
-    font_8x8: bool,
+    font: &GlyphFont,
+    // `Some(vga50)` renders through the CP437 renderer (with its authentic 9-dot VGA cell / plain
+    // 8×8 VGA50 rule); `None` renders `font`'s own glyphs directly (REXPaint bitmap or TTF).
+    cp437_vga50: Option<bool>,
     mono: Option<([u8; 3], [u8; 3])>,
 ) {
     if palette.is_empty() || w == 0 || h == 0 {
         return;
     }
-    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, invert, font_8x8, mono);
-    ansi_render_grid(&grid, rgba, w, h, font_8x8);
+    let grid = ascii_grid(rgba, w, h, palette, cell_w, cell_h, cs, color, invert, font, mono);
+    match cp437_vga50 {
+        Some(vga50) => ansi_render_grid(&grid, rgba, w, h, vga50),
+        None => ansi_render_grid_gf(&grid, font, rgba, w, h),
+    }
+}
+
+/// Render an [`AnsiGrid`] using an arbitrary [`GlyphFont`] (a REXPaint bitmap font or a rasterized
+/// TTF) instead of the built-in CP437 ROM — the generic twin of [`ansi_render_grid`]. Each cell's
+/// `ch` indexes the font's glyphs; fg/bg come from the grid palette. The font's cell is nearest-
+/// sampled to the grid cell so any cell size works.
+pub fn ansi_render_grid_gf(grid: &AnsiGrid, font: &GlyphFont, rgba: &mut [u8], w: usize, h: usize) {
+    if grid.palette.is_empty() {
+        return;
+    }
+    let (cw, ch_) = (grid.cell_w.max(1), grid.cell_h.max(1));
+    let (fw, fh) = (font.cell_w.max(1), font.cell_h.max(1));
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let fg = grid.palette[cell.fg as usize % grid.palette.len()];
+            let bg = grid.palette[cell.bg as usize % grid.palette.len()];
+            let (x0, y0) = (cx * cw, cy * ch_);
+            for ry in 0..ch_ {
+                let y = y0 + ry;
+                if y >= h {
+                    break;
+                }
+                let fy = if ch_ == fh { ry } else { ry * fh / ch_ };
+                for rx in 0..cw {
+                    let x = x0 + rx;
+                    if x >= w {
+                        break;
+                    }
+                    let fx = if cw == fw { rx } else { rx * fw / cw };
+                    let col = if font.on(cell.ch as usize, fx, fy) { fg } else { bg };
+                    let i = (y * w + x) * 4;
+                    rgba[i] = col[0];
+                    rgba[i + 1] = col[1];
+                    rgba[i + 2] = col[2];
+                    // alpha preserved
+                }
+            }
+        }
+    }
 }
 
 // ── Generic 8×8 bit-font density converter (ATASCII, Apple ][, …) ────────────────
@@ -2941,22 +2993,51 @@ mod tests {
         // The ramp is coverage-sorted: lightest (space, 0.0) first. With High ASCII on it
         // reaches the full block █ (CP437 219, coverage 1.0) at the dark end.
         let hi = AsciiCharset { high: true, ..Default::default() };
-        let ramp = ascii_ramp(&hi, true);
+        let ramp = ascii_ramp(&hi, cp437_glyphfont(true));
         assert_eq!(ramp.first().unwrap().1, 0.0, "lightest is a blank");
         let (dark_glyph, dark_cov) = *ramp.last().unwrap();
         assert!(dark_cov > 0.9, "darkest ramp entry is nearly full ink");
         assert_eq!(dark_glyph, 219, "the full block anchors the dark end");
         // Without High ASCII the block glyphs are gone, so the dark end is lighter.
-        let low = ascii_ramp(&AsciiCharset::default(), true);
+        let low = ascii_ramp(&AsciiCharset::default(), cp437_glyphfont(true));
         assert!(low.last().unwrap().1 < 0.9, "printable-only ramp can't reach solid");
         // Blocks category brings the full block back even with High ASCII off.
         let blk = AsciiCharset { blocks: true, ..Default::default() };
-        assert_eq!(ascii_ramp(&blk, true).last().unwrap().0, 219, "Blocks adds the full block");
+        assert_eq!(ascii_ramp(&blk, cp437_glyphfont(true)).last().unwrap().0, 219, "Blocks adds the full block");
         // "Use only chars" uses exactly the typed set, coverage-sorted.
         let only = AsciiCharset { only: b" .oOX".to_vec(), ..Default::default() };
-        let r = ascii_ramp(&only, true);
+        let r = ascii_ramp(&only, cp437_glyphfont(true));
         assert_eq!(r.len(), 5, "every typed glyph kept");
         assert_eq!(r.first().unwrap().0, b' ', "space is lightest");
+    }
+
+    #[test]
+    fn ascii_renders_through_an_arbitrary_glyphfont() {
+        // A 2×1 image (white | black) rendered with a REXPaint bitmap font: the white cell picks a
+        // near-blank glyph (little ink), the black cell a dense one — and ansi_render_grid_gf draws
+        // that font's pixels. Proves the ASCII path is font-agnostic.
+        let font = crate::decode::rexfont::rexfont(crate::decode::rexfont::REXFONTS.len() + 1) // CP437 8×16
+            .unwrap();
+        let pal = [[0u8, 0, 0, 255], [255, 255, 255, 255]];
+        let (cw, ch) = (font.cell_w, font.cell_h);
+        let (w, h) = (cw * 2, ch);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < cw { 255u8 } else { 0u8 };
+                let o = (y * w + x) * 4;
+                rgba[o..o + 4].copy_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let cs = AsciiCharset { high: true, ..Default::default() };
+        let grid = ascii_grid(&rgba, w, h, &pal, cw, ch, &cs, false, false, font, None);
+        assert_eq!(grid.cols, 2);
+        assert!(
+            font.coverage(grid.cells[0].ch as usize) < font.coverage(grid.cells[1].ch as usize),
+            "white cell is lighter than the black cell"
+        );
+        // Render it — must not panic and must write into the buffer.
+        ansi_render_grid_gf(&grid, font, &mut rgba, w, h);
     }
 
     #[test]
@@ -2973,7 +3054,7 @@ mod tests {
             }
         }
         let cs = AsciiCharset { high: true, ..Default::default() };
-        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, false, true, None);
+        let grid = ascii_grid(&rgba, w, h, &pal, 8, 8, &cs, false, false, cp437_glyphfont(true), None);
         assert_eq!(grid.cols, 2);
         let left = grid.cells[0];
         let right = grid.cells[1];
