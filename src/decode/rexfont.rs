@@ -99,10 +99,67 @@ pub fn parse_rexpaint(bytes: &[u8]) -> Option<GlyphFont> {
     Some(GlyphFont { cell_w: cw, cell_h: ch, glyphs })
 }
 
+/// Parse a raw linear bitmap font (TheDraw / FONTRAPTION `.F08` / `.F16`, or any VGA-style ROM
+/// dump): 256 glyphs, 8 px wide, `cell_h` rows, one byte per row (bit 7 = leftmost), CP437-ordered
+/// and header-less. `None` if the blob is too short for 256 glyphs.
+pub fn parse_raw(bytes: &[u8], cell_h: usize) -> Option<GlyphFont> {
+    if cell_h == 0 || bytes.len() < 256 * cell_h {
+        return None;
+    }
+    let glyphs = (0..256)
+        .map(|g| bytes[g * cell_h..g * cell_h + cell_h].iter().map(|&b| b as u32).collect())
+        .collect();
+    Some(GlyphFont { cell_w: 8, cell_h, glyphs })
+}
+
 /// One bundled font: a display name + its embedded PNG bytes.
 pub struct RexFontMeta {
     pub name: &'static str,
     pub bytes: &'static [u8],
+}
+
+/// One bundled raw-format font: display name + embedded `.F08`/`.F16` bytes + its cell height.
+pub struct RawFontMeta {
+    pub name: &'static str,
+    pub bytes: &'static [u8],
+    pub cell_h: usize,
+}
+
+macro_rules! rawfonts {
+    ($(($name:literal, $file:literal, $h:literal)),+ $(,)?) => {
+        pub const RAWFONTS: &[RawFontMeta] = &[
+            $(RawFontMeta {
+                name: $name,
+                bytes: include_bytes!(concat!("../../assets/rexfonts/raw/", $file)),
+                cell_h: $h,
+            }),+
+        ];
+    };
+}
+
+// FONTRAPTION bitmap fonts from grymmjack's collection — the GJSCI custom "scientific" glyph sets
+// plus a run of classic Amiga / ANSI text fonts (Topaz, mO'sOul, P0T-NOoDLE, MicroKnight, the
+// newschool set, …). 8×16 unless noted.
+rawfonts! {
+    ("GJSCI (GJ)", "gjsci.F16", 16),
+    ("GJSCI4 (GJ)", "gjsci4.F16", 16),
+    ("GJSCI-4 (GJ)", "gjsci_4.F16", 16),
+    ("GJSCI-X (GJ)", "gjsci_x.F16", 16),
+    ("GJSCI-X6 (GJ)", "gjsci_x6.F16", 16),
+    ("Topaz A1200 8x16", "topaz_a1200.F16", 16),
+    ("mO'sOul 8x16", "mosoul.F16", 16),
+    ("P0T-NOoDLE 8x16", "p0t_noodle.F16", 16),
+    ("MicroKnight 8x16", "microknight.F16", 16),
+    ("Donna 8x16", "donna.F16", 16),
+    ("Orator 8x16", "orator.F16", 16),
+    ("Wiggly 8x16", "wiggly.F16", 16),
+    ("Newschool 1 8x16", "newschool_1.F16", 16),
+    ("Newschool 2 8x16", "newschool_2.F16", 16),
+    ("Newschool 3 8x16", "newschool_3.F16", 16),
+    ("Newschool 4 8x16", "newschool_4.F16", 16),
+    ("Newschool 5 8x16", "newschool_5.F16", 16),
+    ("Newschool HF 8x16", "newschool_hf.F16", 16),
+    ("Mini 8x8", "mini.F08", 8),
 }
 
 macro_rules! rexfonts {
@@ -146,6 +203,12 @@ fn parsed() -> &'static [Option<GlyphFont>] {
     PARSED.get_or_init(|| REXFONTS.iter().map(|m| parse_rexpaint(m.bytes)).collect())
 }
 
+/// The bundled raw-format (`.F08`/`.F16`) fonts, parsed once (lazily).
+fn parsed_raw() -> &'static [Option<GlyphFont>] {
+    static PARSED: OnceLock<Vec<Option<GlyphFont>>> = OnceLock::new();
+    PARSED.get_or_init(|| RAWFONTS.iter().map(|m| parse_raw(m.bytes, m.cell_h)).collect())
+}
+
 /// The two synthetic CP437 (DOS/ANSI) fonts appended after the bundled pack, so REXPaint art can
 /// use the standard VGA glyphs too. Built from the embedded CP437 ROMs.
 fn cp437_8x8() -> &'static GlyphFont {
@@ -157,7 +220,8 @@ fn cp437_8x16() -> &'static GlyphFont {
     F.get_or_init(|| GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16))
 }
 
-/// The parsed [`GlyphFont`] at index `i` — the bundled pack, then CP437 8×8 / 8×16.
+/// The parsed [`GlyphFont`] at index `i` — the bundled PNG pack, then CP437 8×8 / 8×16, then the
+/// bundled raw-format (FONTRAPTION `.F08`/`.F16`) fonts.
 pub fn rexfont(i: usize) -> Option<&'static GlyphFont> {
     let n = REXFONTS.len();
     if i < n {
@@ -166,13 +230,13 @@ pub fn rexfont(i: usize) -> Option<&'static GlyphFont> {
     match i - n {
         0 => Some(cp437_8x8()),
         1 => Some(cp437_8x16()),
-        _ => None,
+        k => parsed_raw().get(k - 2).and_then(|o| o.as_ref()),
     }
 }
 
-/// Number of selectable fonts (the pack + the 2 CP437 fonts).
+/// Number of selectable fonts (the PNG pack + the 2 CP437 fonts + the raw-format pack).
 pub fn rexfont_count() -> usize {
-    REXFONTS.len() + 2
+    REXFONTS.len() + 2 + RAWFONTS.len()
 }
 
 /// Display name of font `i`.
@@ -184,7 +248,7 @@ pub fn rexfont_name(i: usize) -> &'static str {
     match i - n {
         0 => "CP437 8×8 (DOS)",
         1 => "CP437 8×16 (VGA)",
-        _ => "?",
+        k => RAWFONTS.get(k - 2).map(|m| m.name).unwrap_or("?"),
     }
 }
 
@@ -225,10 +289,26 @@ mod tests {
             assert_eq!(f.glyphs.len(), 256, "{} has 256 glyphs", m.name);
             assert!(f.cell_w >= 4 && f.cell_h >= 4, "{} sane cell", m.name);
         }
-        // 24 bundled pack fonts + 2 synthetic CP437 fonts.
-        assert_eq!(rexfont_count(), 26);
+        // 24 bundled pack fonts + 2 synthetic CP437 fonts + the raw-format pack.
+        assert_eq!(rexfont_count(), REXFONTS.len() + 2 + RAWFONTS.len());
         assert_eq!(rexfont(24).unwrap().cell_h, 8, "CP437 8×8 appended");
         assert_eq!(rexfont(25).unwrap().cell_h, 16, "CP437 8×16 appended");
+    }
+
+    #[test]
+    fn raw_fonts_parse_to_256_glyphs() {
+        for (i, m) in RAWFONTS.iter().enumerate() {
+            let f = parsed_raw()[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("raw font {:?} failed to parse", m.name));
+            assert_eq!(f.glyphs.len(), 256, "{} has 256 glyphs", m.name);
+            assert_eq!(f.cell_w, 8, "{} is 8px wide", m.name);
+            assert_eq!(f.cell_h, m.cell_h, "{} cell height", m.name);
+        }
+        // They're reachable through the shared `rexfont` index, after the pack + 2 CP437 fonts.
+        let first_raw = REXFONTS.len() + 2;
+        assert!(rexfont(first_raw).is_some(), "first raw font is selectable");
+        assert_eq!(rexfont_name(first_raw), RAWFONTS[0].name);
     }
 
     #[test]
