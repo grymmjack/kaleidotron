@@ -24905,6 +24905,167 @@ impl Kaleidotron {
                 // Adjust → Effects → Color & Convert → Export (Export pinned at the very
                 // bottom). Each band opens with a `panel_header` so the eight former peer
                 // accordions group into one intentional hierarchy.
+                // ----- Output (the core recolor decisions, always visible) -----
+                // Convert-to (output MODE) + Dither (pattern) live at the TOP of the pane now
+                // — they're what you change every recolor. Converter-specific parameters and the
+                // full palette library stay lower (rare / advanced).
+                panel_header(ui, "Output");
+                {
+                    let prev = self.dither_method;
+                    let is_conv = |m: u8| m >= crate::thumb::DITHER_ANSI;
+                    ui.horizontal(|ui| {
+                        ui.label("Convert to").on_hover_text(
+                            "Output style. “Full color” keeps RGB — use Palette / Reduce / \
+                             Dither. The others are hard converters to scene-art formats \
+                             (they do their own colour + shading).",
+                        );
+                        let mut choice: u8 =
+                            if is_conv(self.dither_method) { self.dither_method } else { 255 };
+                        egui::ComboBox::from_id_salt("convert_to")
+                            .selected_text(if choice == 255 {
+                                "Full color"
+                            } else {
+                                crate::thumb::DITHER_NAMES[choice as usize]
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut choice, 255, "Full color");
+                                ui.separator();
+                                for m in crate::thumb::DITHER_ANSI..=crate::thumb::DITHER_UNICODE {
+                                    ui.selectable_value(
+                                        &mut choice,
+                                        m,
+                                        crate::thumb::DITHER_NAMES[m as usize],
+                                    );
+                                }
+                            });
+                        if choice == 255 {
+                            if is_conv(self.dither_method) {
+                                self.dither_method = 0;
+                            }
+                        } else {
+                            self.dither_method = choice;
+                        }
+                    });
+                    // Auto-defaults when switching INTO a converter (unchanged behaviour).
+                    if matches!(
+                        self.dither_method,
+                        crate::thumb::DITHER_ANSI
+                            | crate::thumb::DITHER_ASCII
+                            | crate::thumb::DITHER_ATASCII
+                            | crate::thumb::DITHER_APPLE
+                            | crate::thumb::DITHER_REXFONT
+                    ) && prev != self.dither_method
+                        && self.custom_palette.is_none()
+                        && self.selected_palette.is_none()
+                        && !self.quantize_on
+                    {
+                        self.quantize_on = true;
+                        self.quantize_n = 16;
+                        self.quantize_cache = None;
+                        self.reduce_src = None;
+                    }
+                    if self.dither_method == crate::thumb::DITHER_PETSCII
+                        && prev != crate::thumb::DITHER_PETSCII
+                        && !self.petscii_use_selected
+                    {
+                        self.petscii_sync_selected_palette();
+                    }
+                    // Dither PATTERN — only for "Full color" (a converter does its own shading).
+                    if !is_conv(self.dither_method) {
+                        ui.horizontal(|ui| {
+                            ui.label("Dither");
+                            let mut m = self.dither_method as usize; // 0..=6
+                            let last = crate::thumb::DITHER_CUSTOM as usize;
+                            let cr = egui::ComboBox::from_id_salt("dither_method")
+                                .selected_text(
+                                    crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in
+                                        crate::thumb::DITHER_NAMES[..=last].iter().enumerate()
+                                    {
+                                        ui.selectable_value(&mut m, i, *name);
+                                    }
+                                });
+                            wheel_cycle(ui, &cr.response, &mut m, last + 1);
+                            self.dither_method = m as u8;
+                        });
+                    }
+                    if matches!(self.dither_method, 1..=6) {
+                        ui.horizontal(|ui| {
+                            ui.label("Amount");
+                            let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
+                            middle_reset(ui, &resp, &mut self.dither_amount, 1.0f32);
+                            wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
+                        });
+                    }
+                    if matches!(self.dither_method, 1..=3)
+                        || self.dither_method == crate::thumb::DITHER_CUSTOM
+                        || (self.is_ansi_grid_mode() && !self.shade_snap916 && !self.shade_vga50)
+                    {
+                        let mut sx = self.dither_scale_x;
+                        ui.horizontal(|ui| {
+                            ui.label("Cell W")
+                                .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
+                            let resp = ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
+                            middle_reset(ui, &resp, &mut sx, 1usize);
+                            wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
+                        });
+                        if sx != self.dither_scale_x {
+                            self.dither_scale_x = sx;
+                            if self.dither_scale_lock {
+                                self.dither_scale_y = sx;
+                            }
+                        }
+                        let mut sy = self.dither_scale_y;
+                        ui.horizontal(|ui| {
+                            ui.label("Cell H")
+                                .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
+                            let resp = ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
+                            middle_reset(ui, &resp, &mut sy, 1usize);
+                            wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
+                        });
+                        if sy != self.dither_scale_y {
+                            self.dither_scale_y = sy;
+                            if self.dither_scale_lock {
+                                self.dither_scale_x = sy;
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(self.dither_scale_lock, "🔒 Lock")
+                                .on_hover_text("Keep the dither cell square")
+                                .clicked()
+                            {
+                                self.dither_scale_lock = !self.dither_scale_lock;
+                                if self.dither_scale_lock {
+                                    self.dither_scale_y = self.dither_scale_x;
+                                }
+                            }
+                            if ui
+                                .button("Auto")
+                                .on_hover_text(
+                                    "Pick a dither cell for this art: its pixel grid (per axis) \
+                                     if it's upscaled pixel art, else scaled to the resolution.",
+                                )
+                                .clicked()
+                            {
+                                if let Some((ax, ay)) = self.detect_dither_scale(&entry.path) {
+                                    let (ax, ay) = if self.dither_scale_lock {
+                                        let s = ax.max(ay);
+                                        (s, s)
+                                    } else {
+                                        (ax, ay)
+                                    };
+                                    self.dither_scale_x = ax;
+                                    self.dither_scale_y = ay;
+                                    self.status = format!("Auto dither cell: {ax}×{ay}px");
+                                }
+                            }
+                        });
+                    }
+                }
+
                 panel_header(ui, "Resize & Upscale");
 
                 // ----- Resize / resample (downsample the art, run the whole pipeline
@@ -25806,191 +25967,10 @@ impl Kaleidotron {
                     });
                     self.quantize_n = self.quantize_n.clamp(2, 256);
 
-                    ui.add_space(4.0);
-                    // ----- Convert to (output MODE) + Dither (pattern) -----
-                    // Split out of the old single "Dither" combo: choosing a whole art
-                    // converter (PETSCII / ANSI / ASCII / …) is a MODE, not a dither, so it
-                    // gets its own top-level selector. Both still write the one
-                    // `dither_method` field — converters (7–13) and real dithers (0–6) are
-                    // disjoint values of it, so the pipeline is untouched.
-                    let prev = self.dither_method;
-                    let is_conv = |m: u8| m >= crate::thumb::DITHER_ANSI;
-                    ui.horizontal(|ui| {
-                        ui.label("Convert to").on_hover_text(
-                            "Output style. “Full color” keeps RGB — use Palette / Reduce / \
-                             Dither below. The others are hard converters to scene-art formats \
-                             (they do their own colour + shading).",
-                        );
-                        // 255 = the "Full color" sentinel (no converter); else the converter value.
-                        let mut choice: u8 =
-                            if is_conv(self.dither_method) { self.dither_method } else { 255 };
-                        egui::ComboBox::from_id_salt("convert_to")
-                            .selected_text(if choice == 255 {
-                                "Full color"
-                            } else {
-                                crate::thumb::DITHER_NAMES[choice as usize]
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut choice, 255, "Full color");
-                                ui.separator();
-                                for m in crate::thumb::DITHER_ANSI..=crate::thumb::DITHER_UNICODE {
-                                    ui.selectable_value(
-                                        &mut choice,
-                                        m,
-                                        crate::thumb::DITHER_NAMES[m as usize],
-                                    );
-                                }
-                            });
-                        // Apply: leaving converters for "Full color" resets the field to a
-                        // no-dither (0); the real Dither combo below then takes over.
-                        if choice == 255 {
-                            if is_conv(self.dither_method) {
-                                self.dither_method = 0;
-                            }
-                        } else {
-                            self.dither_method = choice;
-                        }
-                    });
-                    // Auto-defaults when switching INTO a converter (unchanged behaviour).
-                    // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple/Rex) need a
-                    // palette or they render nothing, so seed Reduce → 16 if none is active.
-                    if matches!(
-                        self.dither_method,
-                        crate::thumb::DITHER_ANSI
-                            | crate::thumb::DITHER_ASCII
-                            | crate::thumb::DITHER_ATASCII
-                            | crate::thumb::DITHER_APPLE
-                            | crate::thumb::DITHER_REXFONT
-                    ) && prev != self.dither_method
-                        && self.custom_palette.is_none()
-                        && self.selected_palette.is_none()
-                        && !self.quantize_on
-                    {
-                        self.quantize_on = true;
-                        self.quantize_n = 16;
-                        self.quantize_cache = None;
-                        self.reduce_src = None;
-                    }
-                    // Switching TO PETSCII auto-selects the matching C64 palette (needed for
-                    // the export/save buttons + swatches to match the converter's colours).
-                    if self.dither_method == crate::thumb::DITHER_PETSCII
-                        && prev != crate::thumb::DITHER_PETSCII
-                        && !self.petscii_use_selected
-                    {
-                        self.petscii_sync_selected_palette();
-                    }
-                    // Dither PATTERN — only meaningful for "Full color"; a converter does its
-                    // own shading, so the pattern combo is hidden while one is active.
-                    if !is_conv(self.dither_method) {
-                        ui.horizontal(|ui| {
-                            ui.label("Dither");
-                            let mut m = self.dither_method as usize; // 0..=6
-                            let last = crate::thumb::DITHER_CUSTOM as usize;
-                            let cr = egui::ComboBox::from_id_salt("dither_method")
-                                .selected_text(
-                                    crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for (i, name) in
-                                        crate::thumb::DITHER_NAMES[..=last].iter().enumerate()
-                                    {
-                                        ui.selectable_value(&mut m, i, *name);
-                                    }
-                                });
-                            wheel_cycle(ui, &cr.response, &mut m, last + 1);
-                            self.dither_method = m as u8;
-                        });
-                    }
-                    // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
-                    // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
-                    if matches!(self.dither_method, 1..=6) {
-                        ui.horizontal(|ui| {
-                            ui.label("Amount");
-                            let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
-                            middle_reset(ui, &resp, &mut self.dither_amount, 1.0f32);
-                            wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
-                        });
-                    }
-                    // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
-                    // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
-                    // Resize panel, since art isn't always square; enlarges each cell so a
-                    // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
-                    // Cell W/H apply to the ordered methods, and to ANSI Shade only
-                    // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
-                    if matches!(self.dither_method, 1..=3)
-                        || self.dither_method == crate::thumb::DITHER_CUSTOM
-                        || (self.is_ansi_grid_mode()
-                            && !self.shade_snap916
-                            && !self.shade_vga50)
-                    {
-                        // Width (cell X); a locked cell mirrors it to height.
-                        let mut sx = self.dither_scale_x;
-                        ui.horizontal(|ui| {
-                            ui.label("Cell W")
-                                .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
-                            let resp =
-                                ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
-                            middle_reset(ui, &resp, &mut sx, 1usize);
-                            wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
-                        });
-                        if sx != self.dither_scale_x {
-                            self.dither_scale_x = sx;
-                            if self.dither_scale_lock {
-                                self.dither_scale_y = sx;
-                            }
-                        }
-                        // Height (cell Y).
-                        let mut sy = self.dither_scale_y;
-                        ui.horizontal(|ui| {
-                            ui.label("Cell H")
-                                .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
-                            let resp =
-                                ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
-                            middle_reset(ui, &resp, &mut sy, 1usize);
-                            wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
-                        });
-                        if sy != self.dither_scale_y {
-                            self.dither_scale_y = sy;
-                            if self.dither_scale_lock {
-                                self.dither_scale_x = sy;
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(self.dither_scale_lock, "🔒 Lock")
-                                .on_hover_text("Keep the dither cell square")
-                                .clicked()
-                            {
-                                self.dither_scale_lock = !self.dither_scale_lock;
-                                if self.dither_scale_lock {
-                                    self.dither_scale_y = self.dither_scale_x; // unify on lock
-                                }
-                            }
-                            // Detect the art's native pixel size (per-axis) + match the cell.
-                            if ui
-                                .button("Auto")
-                                .on_hover_text(
-                                    "Pick a dither cell for this art: its pixel grid (per axis) \
-                                     if it's upscaled pixel art, else scaled to the resolution \
-                                     so the pattern reads on hi-res art.",
-                                )
-                                .clicked()
-                            {
-                                if let Some((ax, ay)) = self.detect_dither_scale(&entry.path) {
-                                    // Locked → keep it square (the coarser of the two).
-                                    let (ax, ay) = if self.dither_scale_lock {
-                                        let s = ax.max(ay);
-                                        (s, s)
-                                    } else {
-                                        (ax, ay)
-                                    };
-                                    self.dither_scale_x = ax;
-                                    self.dither_scale_y = ay;
-                                    self.status = format!("Auto dither cell: {ax}×{ay}px");
-                                }
-                            }
-                        });
-                    }
+                    // (Convert to + Dither moved UP to the "Output" section at the top of the
+                    // pane. The converter-specific parameter panels below still key off the
+                    // `dither_method` that Output sets.)
+
                     // ----- ANSI Shade controls (textmode shade-block rendering) -----
                     if self.dither_method == crate::thumb::DITHER_ANSI {
                         ui.horizontal(|ui| {
