@@ -21786,7 +21786,19 @@ impl Kaleidotron {
         {
             if let Some(pal) = palette {
                 let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
-                crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8);
+                // ASCII can render through a chosen font (REXPaint / TTF); ANSI shade stays CP437.
+                match (self.dither_method == crate::thumb::DITHER_ASCII)
+                    .then(|| self.ascii_render_font())
+                    .flatten()
+                {
+                    Some((font, None)) => {
+                        crate::thumb::ansi_render_grid_gf(&grid, &font, &mut work, tw, th)
+                    }
+                    Some((_, Some(vga50))) => {
+                        crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, vga50)
+                    }
+                    None => crate::thumb::ansi_render_grid(&grid, &mut work, tw, th, font_8x8),
+                }
                 // ANSI is a CHARACTER GRID: always show its cells at their true
                 // cols·cell_w × rows·cell_h px, whatever set the working resolution
                 // (Fit-to-chars OR the Resize slider). Fewer cells → a genuinely SMALLER
