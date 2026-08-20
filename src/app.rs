@@ -42288,6 +42288,66 @@ fn drag_handle(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::Grab)
 }
 
+// ===================================================================================
+// Shared visual language for the redesigned docked panes (Studio / Details /
+// Preferences). Free fns (like `value_slider`) so every pane — and the
+// thumbnailer-free dialogs — share ONE section idiom instead of three densities.
+// ===================================================================================
+
+/// Vertical breathing room BETWEEN sections in a docked pane.
+const PANE_SECTION_GAP: f32 = 12.0;
+/// Smaller gap before a group / between related rows.
+const PANE_ROW_GAP: f32 = 6.0;
+
+/// Spaced small-caps ("PRESETS" → "P R E S E T S"). egui has no letter-spacing
+/// property, so we interleave thin spaces (U+2009, rendered via the DejaVu fallback)
+/// — the one typographic move that makes a section label read as *designed* rather
+/// than as just another bold word.
+fn spaced_caps(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.to_uppercase().chars().enumerate() {
+        if i > 0 {
+            out.push('\u{2009}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A section title used across the redesigned panes: dimmed spaced-caps over a
+/// hairline rule. The weight/case/colour + the rule carry the "new section" read,
+/// so groups line up visually whether they hold sliders, swatches, or buttons.
+fn panel_header(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(PANE_SECTION_GAP);
+    let col = ui.visuals().weak_text_color();
+    ui.label(egui::RichText::new(spaced_caps(title)).strong().size(11.0).color(col));
+    ui.add_space(3.0);
+    let y = ui.cursor().top();
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        y,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    ui.add_space(6.0);
+}
+
+/// A consistently-styled collapsible section for the redesigned panes. Wraps
+/// `CollapsingHeader` with a strong title and a stable id (so open/close state
+/// persists and indents identically everywhere). Returns the body's value if open.
+fn studio_group<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    default_open: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    ui.add_space(PANE_ROW_GAP);
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+        .id_salt(("studio_group", title))
+        .default_open(default_open)
+        .show(ui, add)
+        .body_returned
+}
+
 /// While `resp` (a ComboBox header) holds the pointer, the mouse wheel steps
 /// `*index` through `0..len` (wheel up = previous, down = next), clamped at the
 /// ends. Consumes the scroll. Returns true if `*index` changed.
