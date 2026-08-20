@@ -1678,6 +1678,8 @@ pub struct Kaleidotron {
     petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
     petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
     petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
+    petscii_use_selected: bool, // render with the selected Palettes-list palette (like ANSI), not C64
+    petscii_pal16: [[u8; 4]; 16], // resolved 16-colour render palette (cache; refreshed each frame)
     petscii_mask: Vec<bool>,   // which C64 glyphs the matcher may use (all-on = all)
     petscii_picker: bool,      // PETSCII glyph-picker popup open
     // ASCII converter (DITHER_ASCII): brightness→glyph over a chosen character pool.
@@ -2535,6 +2537,7 @@ impl Kaleidotron {
     const REXFONT_KEY: &'static str = "rexfont"; // (rexfont_sel, rexfont_invert)
     const REXMASK_KEY: &'static str = "rexfont_mask"; // Vec<bool> of 256 glyph-enable flags
     const PETSCII_MASK_KEY: &'static str = "petscii_mask";
+    const PETSCII_USE_SEL_KEY: &'static str = "petscii_use_selected";
     const ATASCII_MASK_KEY: &'static str = "atascii_mask";
     const APPLE_MASK_KEY: &'static str = "apple_mask";
     const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert, ranges)
@@ -3771,6 +3774,8 @@ impl Kaleidotron {
             petscii_bg: petscii.5,
             petscii_export_format: 0,
             petscii_palette: petscii.6,
+            petscii_use_selected: get_bool(Self::PETSCII_USE_SEL_KEY).unwrap_or(false),
+            petscii_pal16: *crate::decode::petscii_palette(petscii.6),
             ascii_high: ascii.0,
             ascii_control: ascii.1,
             ascii_color: ascii.2,
@@ -20035,7 +20040,7 @@ impl Kaleidotron {
             } else {
                 Some(self.petscii_bg & 15)
             },
-            petscii_pal: self.petscii_pal(),
+            petscii_pal: self.petscii_pal16,
             petscii_allowed: self.petscii_allowed().map(|s| s.to_vec()),
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
@@ -20304,6 +20309,7 @@ impl Kaleidotron {
             petscii_bg_auto: self.petscii_bg_auto,
             petscii_bg: self.petscii_bg,
             petscii_palette: self.petscii_palette,
+            petscii_use_selected: self.petscii_use_selected,
             ascii_high: self.ascii_high,
             ascii_control: self.ascii_control,
             ascii_blocks: self.ascii_blocks,
@@ -20407,6 +20413,7 @@ impl Kaleidotron {
         self.petscii_bg_auto = p.petscii_bg_auto;
         self.petscii_bg = p.petscii_bg & 15;
         self.petscii_palette = p.petscii_palette.min(3);
+        self.petscii_use_selected = p.petscii_use_selected;
         // ASCII converter settings.
         self.ascii_high = p.ascii_high;
         self.ascii_control = p.ascii_control;
@@ -20573,7 +20580,7 @@ impl Kaleidotron {
         ) + &ssig
             + &if self.dither_method == crate::thumb::DITHER_PETSCII {
                 format!(
-                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}:m{:x}",
+                    "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}:us{}:pk{:x}:m{:x}",
                     self.petscii_cols,
                     self.petscii_rows,
                     self.petscii_purity,
@@ -20581,6 +20588,11 @@ impl Kaleidotron {
                     self.petscii_bg_auto as u8,
                     self.petscii_bg,
                     self.petscii_palette,
+                    self.petscii_use_selected as u8,
+                    // Fold the resolved palette in so switching the selected palette re-renders.
+                    self.petscii_pal16.iter().fold(0u64, |a, c| {
+                        a.wrapping_mul(31).wrapping_add(u32::from_le_bytes(*c) as u64)
+                    }),
                     mask_hash(&self.petscii_mask),
                 )
             } else {
@@ -20942,7 +20954,7 @@ impl Kaleidotron {
             petscii_page: 0,
             petscii_purity: 1.0,
             petscii_bg: None,
-            petscii_pal: crate::decode::petscii_palette(0),
+            petscii_pal: *crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_font: None,
@@ -21265,7 +21277,7 @@ impl Kaleidotron {
             self.petscii_page.min(1),
             self.petscii_purity,
             bg,
-            self.petscii_pal(),
+            &self.petscii_pal16,
             self.petscii_allowed(),
         )
     }
@@ -21286,6 +21298,27 @@ impl Kaleidotron {
     /// buttons appear). See [`Self::petscii_sync_selected_palette`].
     fn petscii_pal(&self) -> &'static [[u8; 4]; 16] {
         crate::decode::petscii_palette(self.petscii_palette)
+    }
+
+    /// Resolve the PETSCII render palette into `petscii_pal16` (cheap; called each frame). When
+    /// "use selected palette" is on and a palette is selected in the Palettes list / custom, PETSCII
+    /// renders in THOSE colours (coerced to 16) — the same way ANSI honours the active palette;
+    /// otherwise the authentic C64 VIC-II set the dropdown chose.
+    fn refresh_petscii_pal(&mut self) {
+        if self.petscii_use_selected {
+            let cols = if let Some(cp) = self.custom_palette.clone() {
+                Some(cp)
+            } else if let Some(sp) = self.selected_palette.clone() {
+                self.load_gpl(&sp)
+            } else {
+                None
+            };
+            if let Some(cols) = cols.filter(|c| !c.is_empty()) {
+                self.petscii_pal16 = coerce_palette_16(&cols);
+                return;
+            }
+        }
+        self.petscii_pal16 = *self.petscii_pal();
     }
 
     /// The bit-font spec for the current ATASCII / Apple ][ mode: `(font, glyph pool, invert)`.
@@ -21853,7 +21886,7 @@ impl Kaleidotron {
         // PETSCII preview: build the C64 char grid + render it (its own converter/palette).
         if self.dither_method == crate::thumb::DITHER_PETSCII {
             let grid = self.build_petscii_grid(w, h, &rgba);
-            let (pw, ph, px) = crate::thumb::petscii_render(&grid, self.petscii_pal());
+            let (pw, ph, px) = crate::thumb::petscii_render(&grid, &self.petscii_pal16);
             let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [pw, ph], &px, view_tex_opts());
             self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
             return Some(tt);
@@ -25646,6 +25679,7 @@ impl Kaleidotron {
                         // Colors swatches match the converter's colours.
                         if self.dither_method == crate::thumb::DITHER_PETSCII
                             && prev != crate::thumb::DITHER_PETSCII
+                            && !self.petscii_use_selected
                         {
                             self.petscii_sync_selected_palette();
                         }
@@ -26090,10 +26124,22 @@ impl Kaleidotron {
                                         }
                                     }
                                 });
-                            if changed {
+                            // Only re-sync the C64 palette to the quantize selection when NOT using
+                            // the selected palette (else it would fight the user's chosen palette).
+                            if changed && !self.petscii_use_selected {
                                 self.petscii_sync_selected_palette();
                             }
                         });
+                        // Render with any palette (like ANSI): when on, PETSCII colours come from the
+                        // palette selected in the Palettes list (or a Reduce/custom palette), coerced
+                        // to 16 — not the C64 VIC-II set above.
+                        ui.checkbox(&mut self.petscii_use_selected, "Use selected palette")
+                            .on_hover_text(
+                                "Render in the palette chosen in the Palettes list below (EGA, CGA, \
+                                 custom…), coerced to 16 colours — the same way ANSI honours it. \
+                                 Off = the authentic C64 palette above. (petmate/.seq export still \
+                                 assumes C64 colours.)",
+                            );
                         ui.horizontal(|ui| {
                             ui.label("Cols");
                             ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
@@ -26141,7 +26187,7 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.petscii_bg_auto, "Auto background");
                             if !self.petscii_bg_auto {
-                                let pal = self.petscii_pal();
+                                let pal = self.petscii_pal16;
                                 for c in 0u8..16 {
                                     let col = pal[c as usize];
                                     let (rect, resp) = ui.allocate_exact_size(
@@ -26914,7 +26960,7 @@ impl Kaleidotron {
             2 => std::fs::write(&dest, crate::thumb::petscii_grid_to_json(&grid))
                 .map_err(|e| e.to_string()),
             3 => {
-                let (pw, ph, px) = crate::thumb::petscii_render(&grid, self.petscii_pal());
+                let (pw, ph, px) = crate::thumb::petscii_render(&grid, &self.petscii_pal16);
                 image::save_buffer(&dest, &px, pw as u32, ph as u32, image::ColorType::Rgba8)
                     .map_err(|e| e.to_string())
             }
@@ -36745,6 +36791,8 @@ impl eframe::App for Kaleidotron {
         // Keep the resolved ASCII render font in sync with the selection + VGA50 toggle (cheap:
         // returns immediately when unchanged) so the pipeline always has it.
         self.refresh_ascii_font();
+        // Resolve the PETSCII render palette (C64 set, or the selected palette when that's on).
+        self.refresh_petscii_pal();
         // DEBUG_MODE=true → dock this instance to the bottom-right corner once the monitor
         // size is known (it's None on the very first frame), leaving a taskbar margin so a
         // dev test window stays out of the user's way.
@@ -39068,6 +39116,7 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
         eframe::set_value(storage, Self::PETSCII_MASK_KEY, &self.petscii_mask);
+        eframe::set_value(storage, Self::PETSCII_USE_SEL_KEY, &self.petscii_use_selected);
         eframe::set_value(storage, Self::ATASCII_MASK_KEY, &self.atascii_mask);
         eframe::set_value(storage, Self::APPLE_MASK_KEY, &self.apple_mask);
         eframe::set_value(
@@ -40241,7 +40290,7 @@ struct PipeAux<'a> {
     petscii_page: usize,
     petscii_purity: f32,
     petscii_bg: Option<u8>,
-    petscii_pal: &'static [[u8; 4]; 16],
+    petscii_pal: [[u8; 4]; 16],
     petscii_allowed: Option<Vec<bool>>, // glyph-picker mask (None = all)
     // ASCII pass params (only consulted when dither_method == DITHER_ASCII).
     ascii_cs: crate::thumb::AsciiCharset,
@@ -40328,7 +40377,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                         aux.petscii_page,
                         aux.petscii_purity,
                         aux.petscii_bg,
-                        aux.petscii_pal,
+                        &aux.petscii_pal,
                         aux.petscii_allowed.as_deref(),
                     );
                 } else if matches!(
@@ -40873,6 +40922,8 @@ struct FxPreset {
     petscii_bg: u8,
     #[serde(default)]
     petscii_palette: u8,
+    #[serde(default)]
+    petscii_use_selected: bool, // render PETSCII with the selected palette (like ANSI)
     // ASCII converter settings (DITHER_ASCII).
     #[serde(default = "default_true")]
     ascii_high: bool,
@@ -40998,6 +41049,7 @@ impl Default for FxPreset {
             petscii_bg_auto: true,
             petscii_bg: 0,
             petscii_palette: 0,
+            petscii_use_selected: false,
             ascii_high: true,
             ascii_control: false,
             ascii_blocks: false,
@@ -41359,7 +41411,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             petscii_page: 0,
             petscii_purity: 1.0,
             petscii_bg: None,
-            petscii_pal: crate::decode::petscii_palette(0),
+            petscii_pal: *crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_font: None,
@@ -42586,6 +42638,19 @@ fn is_gif(path: &std::path::Path) -> bool {
 
 /// Pick a pseudo-random element, seeded from the wall clock (no `rand` dependency —
 /// good enough for a screensaver's pack shuffle). None if empty.
+/// Coerce an arbitrary palette to exactly 16 colours for the PETSCII converter (fg/bg are 4-bit).
+/// ≥16 → the first 16; fewer → cycle the available colours to fill every slot (so a 4-colour palette
+/// paints in those 4, not 4-plus-black); empty → all black.
+fn coerce_palette_16(cols: &[[u8; 4]]) -> [[u8; 4]; 16] {
+    let mut out = [[0u8, 0, 0, 255]; 16];
+    if !cols.is_empty() {
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = cols[i % cols.len()];
+        }
+    }
+    out
+}
+
 /// Fisher-Yates shuffle seeded from the clock (no `rand` crate — good enough for a slideshow).
 fn shuffle_in_place<T>(v: &mut [T]) {
     let mut s = std::time::SystemTime::now()
@@ -49691,7 +49756,7 @@ fn preset_pipe_aux<'a>(
         petscii_page: 0,
         petscii_purity: 1.0,
         petscii_bg: None,
-        petscii_pal: crate::decode::petscii_palette(0),
+        petscii_pal: *crate::decode::petscii_palette(0),
         petscii_allowed: None,
         ascii_cs: crate::thumb::AsciiCharset::default(),
         ascii_font: None,
@@ -51237,6 +51302,19 @@ mod tests {
     }
 
     #[test]
+    fn coerce_palette_16_fills_all_slots() {
+        // ≥16 → first 16; fewer → cycle to fill; empty → black.
+        let many: Vec<[u8; 4]> = (0..20).map(|i| [i as u8, 0, 0, 255]).collect();
+        assert_eq!(coerce_palette_16(&many)[15], [15, 0, 0, 255]);
+        let four = [[10, 0, 0, 255], [20, 0, 0, 255], [30, 0, 0, 255], [40, 0, 0, 255]];
+        let c = coerce_palette_16(&four);
+        assert_eq!(c[0], four[0]);
+        assert_eq!(c[4], four[0], "cycles after 4");
+        assert_eq!(c[15], four[3], "every slot filled, none black");
+        assert_eq!(coerce_palette_16(&[]), [[0, 0, 0, 255]; 16]);
+    }
+
+    #[test]
     fn compact_picker_mask_drops_trivial() {
         assert_eq!(compact_picker_mask(&[]), Vec::<bool>::new());
         assert_eq!(compact_picker_mask(&[true, true, true]), Vec::<bool>::new(), "all-on → empty");
@@ -52091,7 +52169,7 @@ mod tests {
             petscii_page: 0,
             petscii_purity: 1.0,
             petscii_bg: None,
-            petscii_pal: crate::decode::petscii_palette(0),
+            petscii_pal: *crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_font: None,
@@ -52320,7 +52398,7 @@ mod tests {
             petscii_page: 0,
             petscii_purity: 1.0,
             petscii_bg: None,
-            petscii_pal: crate::decode::petscii_palette(0),
+            petscii_pal: *crate::decode::petscii_palette(0),
             petscii_allowed: None,
             ascii_cs: crate::thumb::AsciiCharset::default(),
             ascii_font: None,
