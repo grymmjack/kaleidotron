@@ -20331,6 +20331,8 @@ impl Kaleidotron {
             rexfont_mask: compact_picker_mask(&self.rexfont_mask),
             unicode_disabled: self.unicode_disabled.clone(),
             unicode_extra: self.unicode_extra.clone(),
+            ascii_font: self.ascii_font.clone(),
+            unicode_font: self.unicode_font.clone(),
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20435,6 +20437,12 @@ impl Kaleidotron {
         self.rexfont_mask = p.rexfont_mask.clone();
         self.unicode_disabled = p.unicode_disabled.clone();
         self.unicode_extra = p.unicode_extra.clone();
+        // Render fonts: set the selection, drop the resolved-font caches, and re-install the
+        // Unicode ramp source so the recalled look uses the preset's fonts immediately.
+        self.ascii_font = p.ascii_font.clone();
+        self.unicode_font = p.unicode_font.clone();
+        self.ascii_font_cache = None;
+        self.apply_ramp_src();
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -40923,6 +40931,11 @@ struct FxPreset {
     unicode_disabled: Vec<u32>,
     #[serde(default)]
     unicode_extra: String,
+    // Render fonts for the ASCII / Unicode-ramp converters (CP437 / REXPaint / TTF choice).
+    #[serde(default)]
+    ascii_font: AsciiFont,
+    #[serde(default)]
+    unicode_font: UniFont,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -41011,6 +41024,8 @@ impl Default for FxPreset {
             rexfont_mask: Vec::new(),
             unicode_disabled: Vec::new(),
             unicode_extra: String::new(),
+            ascii_font: AsciiFont::Cp437,
+            unicode_font: UniFont::Pdv,
             folder: None,
         }
     }
