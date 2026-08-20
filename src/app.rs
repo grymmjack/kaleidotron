@@ -49586,13 +49586,23 @@ fn serialize_textmode(
             (crate::thumb::ansi_grid_to_ans(grid, ice, 1), "ans", 0u8)
         }
         _ => {
-            let depth = if ega { 1 } else { 3 };
-            note = if ega {
-                " (Auto: ANSI 16-color)".into()
+            if ega {
+                note = " (Auto: ANSI 16-color)".into();
+                (crate::thumb::ansi_grid_to_ans(grid, ice, 1), "ans", 0u8)
             } else {
-                " (Auto: ANSI truecolor)".into()
-            };
-            (crate::thumb::ansi_grid_to_ans(grid, ice, depth), "ans", 0u8)
+                // A non-EGA palette — e.g. a custom Ink/Paper background or a reduced palette. If it
+                // fits in 16 colours, XBin EMBEDS that exact palette, so editors like Moebius show
+                // the custom background (a plain/truecolor .ans drops it to black). Only fall back
+                // to truecolor .ans when the art genuinely needs more than 16 colours.
+                let (xb, reduced) = crate::thumb::ansi_grid_to_xbin(grid, font_8x8, ice);
+                if reduced {
+                    note = " (Auto: ANSI truecolor — >16 colors)".into();
+                    (crate::thumb::ansi_grid_to_ans(grid, ice, 3), "ans", 0u8)
+                } else {
+                    note = " (Auto: XBin — embeds the custom palette)".into();
+                    (xb, "xb", 1u8)
+                }
+            }
         }
     };
     let filesize = bytes.len() as u32;
@@ -51194,6 +51204,36 @@ mod tests {
         // Read-only gate keys on the name, not the folder.
         assert!(is_builtin_fx_name("Gameboy"), "bundled preset is read-only");
         assert!(!is_builtin_fx_name("My Look"), "user preset is editable");
+    }
+
+    #[test]
+    fn auto_export_embeds_custom_background_as_xbin() {
+        // A grid whose background is a custom Ink/Paper colour (not an EGA colour) must NOT export
+        // as a plain/truecolor .ans (editors drop the bg to black) — Auto picks XBin, which embeds
+        // the palette so the custom background survives.
+        use crate::thumb::{AnsiCell, AnsiGrid};
+        let magenta = [200u8, 20, 180, 255];
+        let grid = AnsiGrid {
+            cols: 2,
+            rows: 1,
+            cell_w: 8,
+            cell_h: 16,
+            palette: vec![[220, 220, 220, 255], magenta], // ink 0, paper 1
+            cells: vec![
+                AnsiCell { fg: 0, bg: 1, ch: b'A' },
+                AnsiCell { fg: 0, bg: 1, ch: b'B' },
+            ],
+        };
+        let (bytes, ext, _) = serialize_textmode(&grid, 0 /* Auto */, false, false, "t", "20260101");
+        assert_eq!(ext, "xb", "custom-bg grid auto-exports as XBin");
+        assert_eq!(&bytes[..5], b"XBIN\x1a", "XBin header");
+        // The embedded palette (6-bit DAC, after the 11-byte header) contains the magenta paper.
+        let pal = &bytes[11..11 + 48];
+        let has_magenta = pal.chunks_exact(3).any(|c| {
+            let (r, g, b) = ((c[0] as u32) << 2, (c[1] as u32) << 2, (c[2] as u32) << 2);
+            r.abs_diff(200) < 12 && g.abs_diff(20) < 12 && b.abs_diff(180) < 12
+        });
+        assert!(has_magenta, "the custom paper colour is embedded in the XBin palette");
     }
 
     #[test]
