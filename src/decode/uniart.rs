@@ -1,63 +1,63 @@
 //! Unicode text-art glyphs for the "Ramp" style of the Unicode converter. We rasterize the
-//! **bundled DejaVu Sans Mono** (permissive license, see `assets/fonts/DejaVu-LICENSE.txt`) for
-//! the user-selected Unicode ranges into a [`GlyphFont`], so an image can be density-ramped over
-//! Box Drawing / Block Elements / Geometric Shapes / Braille / ASCII glyphs. A parallel codepoint
-//! list maps each glyph back to its `char` for real UTF-8 text output.
+//! **bundled Perfect DOS VGA 437 (Nerd Font)** — a pixel-perfect CP437 recreation, so its block,
+//! shade and box-drawing glyphs render crisp at their native 8×16 grid (no smooth-outline "crunch")
+//! and match the canonical CP437→Unicode codepoints used by editors like Moebius. The Nerd Font
+//! patch also carries thousands of icon glyphs, so the "codepoints" field can pull in arbitrary
+//! symbols. We rasterize the user-selected ranges (+ extra codepoints) into a [`GlyphFont`], with a
+//! parallel `char` list mapping each glyph back to its `char` for real UTF-8 text output. Any
+//! codepoint the font can't draw is skipped (no `.notdef` boxes).
 
 use super::rexfont::GlyphFont;
-use ab_glyph::{Font, FontRef, ScaleFont};
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
-const FONT: &[u8] = include_bytes!("../../assets/fonts/DejaVuSansMono.ttf");
-const CELL_W: usize = 9;
+const FONT: &[u8] = include_bytes!("../../assets/fonts/PerfectDOSVGA437NerdFontMono.ttf");
+const CELL_W: usize = 8; // Perfect DOS VGA's native glyph width
 const CELL_H: usize = 16;
 
-// Range bit flags (also the checkbox order) + their inclusive codepoint spans.
+// Range bit flags (also the checkbox order) + their inclusive codepoint spans. GEOM/BRAILLE remain
+// defined (older presets may carry the bits) but aren't offered as checkboxes — the CP437 font
+// doesn't contain them, so they'd render nothing.
 pub const R_ASCII: u8 = 1;
 pub const R_BOX: u8 = 2;
 pub const R_BLOCK: u8 = 4;
 pub const R_GEOM: u8 = 8;
 pub const R_BRAILLE: u8 = 16;
 
-/// The (name, flag, span) of each selectable range, in checkbox order.
-pub const RANGES: [(&str, u8, (u32, u32)); 5] = [
+/// The (name, flag, span) of each selectable range, in checkbox order. Box Drawing + Block Elements
+/// are the CP437 line/shade/block glyphs at their standard Unicode codepoints (what Moebius' UTF-8
+/// ANS export emits), so the ramp's output pastes cleanly into any terminal / text-art tool.
+pub const RANGES: [(&str, u8, (u32, u32)); 3] = [
     ("ASCII", R_ASCII, (0x20, 0x7E)),
     ("Box Drawing", R_BOX, (0x2500, 0x257F)),
     ("Block Elements", R_BLOCK, (0x2580, 0x259F)),
-    ("Geometric Shapes", R_GEOM, (0x25A0, 0x25FF)),
-    ("Braille", R_BRAILLE, (0x2800, 0x28FF)),
 ];
 
-/// The scaled DejaVu render context: the font, its px scale, the baseline, and the x-nudge that
-/// centres a full-block in the 9-wide cell. Shared by the range rasterizer and the single-glyph
-/// path (used for user codepoints), so both draw at exactly the same metrics.
-fn render_ctx() -> (FontRef<'static>, ab_glyph::PxScale, f32, f32) {
-    let font = FontRef::try_from_slice(FONT).expect("bundled DejaVu is a valid font");
-    // Scale so the em's line height maps to the cell (block glyphs then fill it — the ramp's dark
-    // end). The 9-wide cell gives DejaVu's ~8.3px advance a little breathing room so box-drawing
-    // and diagonal glyphs don't clip on the right; a small x nudge centres them.
-    let probe = font.as_scaled(ab_glyph::PxScale::from(CELL_H as f32));
-    let factor = CELL_H as f32 / probe.height().max(1.0);
-    let scale = ab_glyph::PxScale::from(CELL_H as f32 * factor);
-    let sf = font.as_scaled(scale);
-    let baseline = sf.ascent();
-    let pen_x = ((CELL_W as f32 - sf.h_advance(font.glyph_id('█'))) * 0.5).max(0.0);
-    (font, scale, baseline, pen_x)
+/// The scaled render context: the font, its px scale, and the baseline. Perfect DOS VGA is a
+/// pixel font on a 9-dot grid, so we scale Y to fill the 16-row cell exactly and squeeze X so a
+/// full block spans exactly `CELL_W` (8) px — giving crisp, seam-free block/half-block tiling.
+/// Shared by the range rasterizer and the single-glyph path so both draw at identical metrics.
+fn render_ctx() -> (FontRef<'static>, PxScale, f32) {
+    let font = FontRef::try_from_slice(FONT).expect("bundled Perfect DOS VGA is a valid font");
+    let sy = CELL_H as f32;
+    // The font's advance at an unsqueezed size — a full block's cell width. Squeeze X so it lands
+    // on CELL_W exactly (Perfect DOS VGA renders ~9px advance at 16px; we want 8).
+    let adv = font.as_scaled(PxScale::from(sy)).h_advance(font.glyph_id('█')).max(1.0);
+    let scale = PxScale { x: sy * CELL_W as f32 / adv, y: sy };
+    let baseline = font.as_scaled(scale).ascent().round();
+    (font, scale, baseline)
 }
 
-/// Rasterize a single `char` into one cell's worth of bit-rows (CELL_H rows).
-fn raster_glyph(
-    font: &FontRef<'static>,
-    scale: ab_glyph::PxScale,
-    baseline: f32,
-    pen_x: f32,
-    ch: char,
-) -> Vec<u32> {
+/// Rasterize a single `char` into one cell's worth of bit-rows (CELL_H rows). Returns `None` when
+/// the font has no glyph for it (`.notdef`), so callers skip it rather than emit a tofu box.
+fn raster_glyph(font: &FontRef<'static>, scale: PxScale, baseline: f32, ch: char) -> Option<Vec<u32>> {
+    let id = font.glyph_id(ch);
+    if id.0 == 0 && ch != ' ' {
+        return None; // no glyph in this font
+    }
     let mut rows = vec![0u32; CELL_H];
-    let g = font
-        .glyph_id(ch)
-        .with_scale_and_position(scale, ab_glyph::point(pen_x, baseline));
+    let g = id.with_scale_and_position(scale, ab_glyph::point(0.0, baseline));
     if let Some(o) = font.outline_glyph(g) {
         let bb = o.px_bounds();
         o.draw(|x, y, c| {
@@ -68,13 +68,14 @@ fn raster_glyph(
             }
         });
     }
-    rows
+    Some(rows)
 }
 
-/// Rasterize the codepoints of every range enabled in `mask` into a [`GlyphFont`] (9×16 cells) plus
-/// a parallel `char` list. A leading blank (space) anchors the ramp's light end.
+/// Rasterize the codepoints of every range enabled in `mask` into a [`GlyphFont`] (8×16 cells) plus
+/// a parallel `char` list. A leading blank (space) anchors the ramp's light end; codepoints the
+/// font can't draw are skipped.
 fn rasterize(mask: u8) -> (GlyphFont, Vec<char>) {
-    let (font, scale, baseline, pen_x) = render_ctx();
+    let (font, scale, baseline) = render_ctx();
     let mut glyphs: Vec<Vec<u32>> = vec![vec![0u32; CELL_H]]; // glyph 0 = blank
     let mut chars: Vec<char> = vec![' '];
     for (_, flag, (a, b)) in RANGES {
@@ -83,8 +84,10 @@ fn rasterize(mask: u8) -> (GlyphFont, Vec<char>) {
         }
         for cp in a..=b {
             let Some(ch) = char::from_u32(cp) else { continue };
-            glyphs.push(raster_glyph(&font, scale, baseline, pen_x, ch));
-            chars.push(ch);
+            if let Some(rows) = raster_glyph(&font, scale, baseline, ch) {
+                glyphs.push(rows);
+                chars.push(ch);
+            }
         }
     }
     (GlyphFont { cell_w: CELL_W, cell_h: CELL_H, glyphs }, chars)
@@ -99,7 +102,7 @@ pub fn ramp_font_owned(mask: u8, extra: &[u32]) -> Cow<'static, (GlyphFont, Vec<
     if extra.is_empty() {
         return Cow::Borrowed(base);
     }
-    let (font, scale, baseline, pen_x) = render_ctx();
+    let (font, scale, baseline) = render_ctx();
     let mut out_font = base.0.clone();
     let mut chars = base.1.clone();
     for &cp in extra {
@@ -107,8 +110,10 @@ pub fn ramp_font_owned(mask: u8, extra: &[u32]) -> Cow<'static, (GlyphFont, Vec<
         if chars.contains(&ch) {
             continue; // already covered by a range or an earlier extra
         }
-        out_font.glyphs.push(raster_glyph(&font, scale, baseline, pen_x, ch));
-        chars.push(ch);
+        if let Some(rows) = raster_glyph(&font, scale, baseline, ch) {
+            out_font.glyphs.push(rows);
+            chars.push(ch);
+        }
     }
     Cow::Owned((out_font, chars))
 }
@@ -203,12 +208,17 @@ mod tests {
 
     #[test]
     fn extra_codepoints_appended_and_deduped() {
-        // Extras beyond the ranges are appended; ones already in the range set are skipped.
+        // Extras beyond the ranges are appended; ones already in the set are skipped, and a
+        // codepoint the font can't draw is dropped (no tofu). The Nerd Font carries the Powerline
+        // separator U+E0B0 but not, say, a music note beyond its set.
         let base = ramp_font(R_ASCII).0.glyphs.len();
-        let owned = ramp_font_owned(R_ASCII, &['★' as u32, 0x41 /* 'A', already in ASCII */]);
+        let owned = ramp_font_owned(
+            R_ASCII,
+            &[0xE0B0 /* powerline, present */, 0x41 /* 'A', already in ASCII */],
+        );
         let (font, chars) = owned.as_ref();
-        assert_eq!(font.glyphs.len(), base + 1, "only the star is new");
-        assert_eq!(*chars.last().unwrap(), '★');
+        assert_eq!(font.glyphs.len(), base + 1, "only the powerline glyph is new");
+        assert_eq!(*chars.last().unwrap(), '\u{E0B0}');
     }
 
     #[test]

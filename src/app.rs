@@ -3218,8 +3218,7 @@ impl Kaleidotron {
                 false,
                 crate::decode::uniart::R_ASCII
                     | crate::decode::uniart::R_BOX
-                    | crate::decode::uniart::R_BLOCK
-                    | crate::decode::uniart::R_GEOM,
+                    | crate::decode::uniart::R_BLOCK,
             ));
         let shade_fit_cols = cc
             .storage
@@ -40201,10 +40200,7 @@ fn default_unicode_cols() -> usize {
     120
 }
 fn default_unicode_ranges() -> u8 {
-    crate::decode::uniart::R_ASCII
-        | crate::decode::uniart::R_BOX
-        | crate::decode::uniart::R_BLOCK
-        | crate::decode::uniart::R_GEOM
+    crate::decode::uniart::R_ASCII | crate::decode::uniart::R_BOX | crate::decode::uniart::R_BLOCK
 }
 fn default_petscii_rows() -> usize {
     25

@@ -1,0 +1,13 @@
+Perfect DOS VGA 437 — a pixel-perfect recreation of the IBM PC / DOS VGA
+text font (code page 437), by Zeh Fernando. Distributed as freeware,
+free to use in any project. https://www.zone38.net / https://zeh.com.br
+
+This bundle is the "Nerd Font" patched build (PerfectDOSVGA437NerdFontMono),
+which adds the Nerd Fonts icon glyph set (icons from Font Awesome, Devicons,
+Octicons, Powerline, Material Design, Weather, etc.). The Nerd Fonts patcher
+and its icon aggregation are released under the MIT License.
+Nerd Fonts: https://www.nerdfonts.com  (© Ryan L McIntyre, MIT)
+
+We use it here purely as a bitmap-accurate rasterization source for the
+Unicode text-art ("Ramp") converter — its CP437 block/shade/box glyphs and
+Nerd Font icons render crisply on their native pixel grid.
