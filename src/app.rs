@@ -125,6 +125,22 @@ struct PanelLayout {
     recolor: bool,
 }
 
+/// Which font the Unicode "Ramp" converter rasterizes its glyphs from. `Pdv` (Perfect DOS VGA,
+/// bundled) is crisp CP437 but has no Braille/Geometric; `DejaVu` (bundled) trades crispness for
+/// that coverage; `File` is any TTF/OTF the user browses to.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+enum UniFont {
+    Pdv,
+    DejaVu,
+    File(PathBuf),
+}
+
+impl Default for UniFont {
+    fn default() -> Self {
+        UniFont::Pdv
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Grid,
@@ -1683,6 +1699,8 @@ pub struct Kaleidotron {
     unicode_ranges: u8,  // Ramp style: enabled Unicode ranges (crate::decode::uniart::R_*)
     unicode_disabled: Vec<u32>, // Ramp glyph-picker: codepoints the user disabled
     unicode_extra: String,      // Ramp: user "codepoints" field — extra glyphs beyond the ranges
+    unicode_font: UniFont,      // Ramp: which font to rasterize glyphs from
+    unicode_font_bytes: Option<(PathBuf, std::sync::Arc<Vec<u8>>)>, // cached bytes for UniFont::File
     unicode_picker: bool,       // Unicode glyph-picker popup open
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
@@ -2497,6 +2515,7 @@ impl Kaleidotron {
     const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert, ranges)
     const UNI_DISABLED_KEY: &'static str = "unicode_disabled"; // Vec<u32> disabled ramp codepoints
     const UNI_EXTRA_KEY: &'static str = "unicode_extra"; // String of extra ramp codepoints
+    const UNI_FONT_KEY: &'static str = "unicode_font"; // UniFont: which font the ramp uses
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3775,6 +3794,11 @@ impl Kaleidotron {
                 .storage
                 .and_then(|s| eframe::get_value(s, Self::UNI_EXTRA_KEY))
                 .unwrap_or_default(),
+            unicode_font: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::UNI_FONT_KEY))
+                .unwrap_or_default(),
+            unicode_font_bytes: None,
             unicode_picker: false,
             pixelate_h,
             pixelate_lock,
@@ -4321,6 +4345,8 @@ impl Kaleidotron {
         // Prime the font-thumbnail sample text (the decoder reads a process-global — see
         // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
         crate::decode::font::set_thumb_sample(if app.font_preview_on { &app.font_preview_text } else { "" });
+        // Install the persisted Unicode-ramp font into the converter's process-global.
+        app.apply_ramp_src();
 
         // `settings.json` overrides the persisted defaults, then is (re)written so a fresh install
         // finds a documented file immediately rather than after a clean exit.
@@ -20505,12 +20531,14 @@ impl Kaleidotron {
             }
             + &if self.dither_method == crate::thumb::DITHER_UNICODE {
                 format!(
-                    "|UNIs{}:c{}:inv{}:r{}:d{}",
+                    "|UNIs{}:c{}:inv{}:r{}:d{}:f{}:x{}",
                     self.unicode_style,
                     self.unicode_cols,
                     self.unicode_invert as u8,
                     self.unicode_ranges,
                     self.unicode_disabled.len(),
+                    self.unicode_font_tag(),
+                    self.unicode_extra,
                 )
             } else {
                 String::new()
@@ -21179,6 +21207,61 @@ impl Kaleidotron {
         crate::decode::uniart::parse_codepoints(&self.unicode_extra)
     }
 
+    /// A short stable tag identifying the current Unicode-ramp font, for the render cache key.
+    fn unicode_font_tag(&self) -> String {
+        match &self.unicode_font {
+            UniFont::Pdv => "pdv".into(),
+            UniFont::DejaVu => "dejavu".into(),
+            UniFont::File(p) => format!("f{:016x}", path_hash(p)),
+        }
+    }
+
+    /// A display name for the current Unicode-ramp font.
+    fn unicode_font_name(&self) -> String {
+        match &self.unicode_font {
+            UniFont::Pdv => "Perfect DOS VGA".into(),
+            UniFont::DejaVu => "DejaVu Sans".into(),
+            UniFont::File(p) => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("(font)")
+                .to_string(),
+        }
+    }
+
+    /// Read + cache a user font file (`UniFont::File`), returning `(path-hash, bytes)`. `None` if the
+    /// file can't be read or isn't a valid font.
+    fn unicode_font_load(&mut self, path: &Path) -> Option<(u64, std::sync::Arc<Vec<u8>>)> {
+        if let Some((p, b)) = &self.unicode_font_bytes {
+            if p == path {
+                return Some((path_hash(path), b.clone()));
+            }
+        }
+        let bytes = std::fs::read(path).ok()?;
+        ab_glyph::FontRef::try_from_slice(&bytes).ok()?; // must parse as a font
+        let arc = std::sync::Arc::new(bytes);
+        self.unicode_font_bytes = Some((path.to_path_buf(), arc.clone()));
+        Some((path_hash(path), arc))
+    }
+
+    /// Resolve `unicode_font` into the converter's process-global ramp source (see
+    /// `uniart::set_ramp_src`). A user font that no longer reads falls back to the crisp default.
+    fn apply_ramp_src(&mut self) {
+        use crate::decode::uniart::RampSrc;
+        let src = match &self.unicode_font {
+            UniFont::Pdv => RampSrc::Pdv,
+            UniFont::DejaVu => RampSrc::DejaVu,
+            UniFont::File(path) => {
+                let path = path.clone();
+                match self.unicode_font_load(&path) {
+                    Some((h, bytes)) => RampSrc::File(h, bytes),
+                    None => RampSrc::Pdv,
+                }
+            }
+        };
+        crate::decode::uniart::set_ramp_src(src);
+    }
+
     /// The enabled-glyph pool for the Unicode Ramp: indices into the current ramp font (ranges +
     /// extra codepoints) whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is
     /// disabled — so the common case stays allocation-free and spans the whole font.
@@ -21186,7 +21269,7 @@ impl Kaleidotron {
         if self.unicode_disabled.is_empty() {
             return Vec::new();
         }
-        let rf = crate::decode::uniart::ramp_font_owned(
+        let rf = crate::decode::uniart::ramp(
             self.unicode_effective_ranges(),
             &self.unicode_extra_cps(),
         );
@@ -21357,7 +21440,7 @@ impl Kaleidotron {
         {
             return;
         }
-        let rf = crate::decode::uniart::ramp_font_owned(
+        let rf = crate::decode::uniart::ramp(
             self.unicode_effective_ranges(),
             &self.unicode_extra_cps(),
         );
@@ -26072,8 +26155,41 @@ impl Kaleidotron {
                             )
                             .on_hover_text("Density ramp over the enabled Unicode ranges below");
                         });
-                        // Ramp style: which Unicode ranges feed the glyph pool.
+                        // Ramp style: the font to rasterize from + which ranges feed the glyph pool.
                         if self.unicode_style == crate::thumb::UNI_RAMP {
+                            ui.horizontal(|ui| {
+                                ui.label("Font");
+                                let before = self.unicode_font.clone();
+                                egui::ComboBox::from_id_salt("uni_font")
+                                    .selected_text(self.unicode_font_name())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.unicode_font, UniFont::Pdv, "Perfect DOS VGA (crisp)")
+                                            .on_hover_text("Pixel-perfect CP437 + Nerd Font icons. No Braille/Geometric.");
+                                        ui.selectable_value(&mut self.unicode_font, UniFont::DejaVu, "DejaVu Sans (+Braille)")
+                                            .on_hover_text("Wide Unicode coverage — Braille + Geometric Shapes.");
+                                    });
+                                if ui.button("Browse…").on_hover_text("Use any .ttf/.otf font on disk").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .add_filter("Font", &["ttf", "otf", "ttc"])
+                                        .pick_file()
+                                    {
+                                        self.unicode_font = UniFont::File(p);
+                                    }
+                                }
+                                if !matches!(self.unicode_font, UniFont::Pdv)
+                                    && ui.small_button("✖").on_hover_text("Back to the default font").clicked()
+                                {
+                                    self.unicode_font = UniFont::Pdv;
+                                }
+                                if self.unicode_font != before {
+                                    // Load + install the new font, and drop the stale file cache if
+                                    // we moved off a browsed file.
+                                    if !matches!(self.unicode_font, UniFont::File(_)) {
+                                        self.unicode_font_bytes = None;
+                                    }
+                                    self.apply_ramp_src();
+                                }
+                            });
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Ranges");
                                 for (name, flag, _) in crate::decode::uniart::RANGES {
@@ -26696,7 +26812,11 @@ impl Kaleidotron {
         // Build the grid + text. Ramp goes through the DejaVu ramp font (glyph→codepoint map);
         // half-block / Braille build their shape grids directly.
         let (grid, colored) = if self.unicode_style == crate::thumb::UNI_RAMP {
-            let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
+            let rf = crate::decode::uniart::ramp(
+                self.unicode_effective_ranges(),
+                &self.unicode_extra_cps(),
+            );
+            let (font, chars) = rf.as_ref();
             let pal = self
                 .active_recolor(path)
                 .map(|(_, p)| p)
@@ -38694,6 +38814,7 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::UNI_DISABLED_KEY, &self.unicode_disabled);
         eframe::set_value(storage, Self::UNI_EXTRA_KEY, &self.unicode_extra);
+        eframe::set_value(storage, Self::UNI_FONT_KEY, &self.unicode_font);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -39087,6 +39208,14 @@ fn glyph_picker_window(
                 *drag = None;
             }
         });
+}
+
+/// A stable (run-to-run) hash of a path, for the Unicode-ramp font's cache tag / source id.
+fn path_hash(p: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.hash(&mut h);
+    h.finish()
 }
 
 /// Compact a glyph-picker mask for storage in a PixelFX preset. An all-on, all-off, or empty mask
@@ -39968,10 +40097,10 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                     }
                 } else if aux.dither_method == crate::thumb::DITHER_UNICODE {
                     if aux.unicode_style == crate::thumb::UNI_RAMP {
-                        // Ramp: density char-art over the enabled Unicode ranges (DejaVu-rendered).
-                        // Colours from the active Reduce/palette, or the full xterm-256 set if none.
-                        let rf =
-                            crate::decode::uniart::ramp_font_owned(aux.unicode_ranges, &aux.unicode_extra);
+                        // Ramp: density char-art over the enabled Unicode ranges, rendered from the
+                        // user-chosen ramp font (see uniart::set_ramp_src). Colours from the active
+                        // Reduce/palette, or the full xterm-256 set if none.
+                        let rf = crate::decode::uniart::ramp(aux.unicode_ranges, &aux.unicode_extra);
                         let (font, _) = rf.as_ref();
                         crate::thumb::unicode_ramp_pass(
                             rgba,
