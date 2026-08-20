@@ -2918,6 +2918,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apple_40_and_80_fonts_are_distinct() {
+        // PR#0 (PrintChar21) and PR#3 (PRNumber3) must be genuinely different glyph sets — an
+        // earlier regen accidentally emitted identical bytes, making the toggle a no-op.
+        let (f40, f80) = (apple_font(), apple_font_80());
+        assert_eq!(f40.len(), f80.len());
+        let text = apple_text_len();
+        let differing = (0..text).filter(|&i| f40[i] != f80[i]).count();
+        assert!(differing > text / 2, "PR#0 vs PR#3 differ on most glyphs ({differing}/{text})");
+        // A concrete check: the letter 'A' (code 0x21 in the Apple text set) differs.
+        assert_ne!(f40[0x21], f80[0x21], "'A' differs between the two fonts");
+    }
+
+    #[test]
     fn ascii_ramp_spans_blank_to_full() {
         // The ramp is coverage-sorted: lightest (space, 0.0) first. With High ASCII on it
         // reaches the full block █ (CP437 219, coverage 1.0) at the dark end.
