@@ -25658,7 +25658,7 @@ impl Kaleidotron {
                     };
                     egui::CollapsingHeader::new(header)
                         .id_salt("color_balance")
-                        .default_open(true)
+                        .default_open(false)
                         .show(ui, |ui| {
                             ui.weak(
                                 "Tints the image: 128 = neutral, >128 adds that channel, <128 removes it.",
@@ -25895,7 +25895,7 @@ impl Kaleidotron {
 
                 {
                     // ----- Color & convert (palette-swap / reduce / convert-to) -----
-                    panel_header(ui, "Color & Convert");
+                    panel_header(ui, "Palette & Reduce");
                     let has_own_palette = matches!(pal_state, Some(Some(_)));
                     // Reduce works on ANY image: with an extractable palette it
                     // median-cuts that; otherwise it synthesizes a palette from the
