@@ -20189,6 +20189,15 @@ impl Kaleidotron {
             unicode_cols: self.unicode_cols,
             unicode_invert: self.unicode_invert,
             unicode_ranges: self.unicode_ranges,
+            // Per-mode glyph-picker selections (compacted: a trivial "all/none" mask stores empty).
+            ansi_mask: compact_picker_mask(&self.ansi_mask),
+            ascii_mask: compact_picker_mask(&self.ascii_mask),
+            petscii_mask: compact_picker_mask(&self.petscii_mask),
+            atascii_mask: compact_picker_mask(&self.atascii_mask),
+            apple_mask: compact_picker_mask(&self.apple_mask),
+            rexfont_mask: compact_picker_mask(&self.rexfont_mask),
+            unicode_disabled: self.unicode_disabled.clone(),
+            unicode_extra: self.unicode_extra.clone(),
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -20282,6 +20291,17 @@ impl Kaleidotron {
         self.unicode_cols = p.unicode_cols.clamp(8, 400);
         self.unicode_invert = p.unicode_invert;
         self.unicode_ranges = p.unicode_ranges;
+        // Per-mode glyph-picker selections. An empty stored mask = "no restriction" (this mode's
+        // default set), which is exactly how the `*_allowed` helpers read an empty mask — so a
+        // preset saved before these existed just resets the pickers to default.
+        self.ansi_mask = p.ansi_mask.clone();
+        self.ascii_mask = p.ascii_mask.clone();
+        self.petscii_mask = p.petscii_mask.clone();
+        self.atascii_mask = p.atascii_mask.clone();
+        self.apple_mask = p.apple_mask.clone();
+        self.rexfont_mask = p.rexfont_mask.clone();
+        self.unicode_disabled = p.unicode_disabled.clone();
+        self.unicode_extra = p.unicode_extra.clone();
         // Invalidate derived caches so the recalled look rebuilds.
         self.flash = None;
         self.editing_color = None;
@@ -39069,6 +39089,18 @@ fn glyph_picker_window(
         });
 }
 
+/// Compact a glyph-picker mask for storage in a PixelFX preset. An all-on, all-off, or empty mask
+/// carries no restriction (the `*_allowed` helpers only honour a proper subset), so it's stored as
+/// an empty `Vec` — keeping the preset RON lean; a real subset is stored verbatim.
+fn compact_picker_mask(mask: &[bool]) -> Vec<bool> {
+    let on = mask.iter().filter(|b| **b).count();
+    if on == 0 || on == mask.len() {
+        Vec::new()
+    } else {
+        mask.to_vec()
+    }
+}
+
 /// A cheap order-sensitive hash of a glyph-enable mask, for cache keys (so toggling glyphs
 /// re-renders). Empty/all-on masks hash to 0.
 fn mask_hash(mask: &[bool]) -> u64 {
@@ -40477,6 +40509,26 @@ struct FxPreset {
     unicode_invert: bool,
     #[serde(default = "default_unicode_ranges")]
     unicode_ranges: u8,
+    // Per-mode glyph-picker masks ("Chars…") + Unicode extras, so a preset also captures which
+    // characters it uses. All `#[serde(default)]` → presets saved before these existed just carry
+    // empty (treated as "this mode's default set" on apply, so nothing breaks). A mask is stored
+    // empty when it's at the mode default, keeping the RON lean.
+    #[serde(default)]
+    ansi_mask: Vec<bool>,
+    #[serde(default)]
+    ascii_mask: Vec<bool>,
+    #[serde(default)]
+    petscii_mask: Vec<bool>,
+    #[serde(default)]
+    atascii_mask: Vec<bool>,
+    #[serde(default)]
+    apple_mask: Vec<bool>,
+    #[serde(default)]
+    rexfont_mask: Vec<bool>,
+    #[serde(default)]
+    unicode_disabled: Vec<u32>,
+    #[serde(default)]
+    unicode_extra: String,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -40557,6 +40609,14 @@ impl Default for FxPreset {
             unicode_invert: false,
             unicode_ranges: 5,
             rexfont_invert: false,
+            ansi_mask: Vec::new(),
+            ascii_mask: Vec::new(),
+            petscii_mask: Vec::new(),
+            atascii_mask: Vec::new(),
+            apple_mask: Vec::new(),
+            rexfont_mask: Vec::new(),
+            unicode_disabled: Vec::new(),
+            unicode_extra: String::new(),
             folder: None,
         }
     }
@@ -50705,6 +50765,42 @@ mod tests {
         // Read-only gate keys on the name, not the folder.
         assert!(is_builtin_fx_name("Gameboy"), "bundled preset is read-only");
         assert!(!is_builtin_fx_name("My Look"), "user preset is editable");
+    }
+
+    #[test]
+    fn compact_picker_mask_drops_trivial() {
+        assert_eq!(compact_picker_mask(&[]), Vec::<bool>::new());
+        assert_eq!(compact_picker_mask(&[true, true, true]), Vec::<bool>::new(), "all-on → empty");
+        assert_eq!(compact_picker_mask(&[false, false]), Vec::<bool>::new(), "all-off → empty");
+        assert_eq!(compact_picker_mask(&[true, false, true]), vec![true, false, true], "subset kept");
+    }
+
+    #[test]
+    fn preset_persists_char_selections() {
+        // A preset captures the "Use only chars" string, the per-mode glyph masks, and the Unicode
+        // codepoints, and survives the RON round-trip eframe uses to persist presets.
+        let mut p = FxPreset { name: "Chars".into(), ..Default::default() };
+        p.ascii_chars = " *".into();
+        p.ascii_mask = compact_picker_mask(&{
+            let mut m = vec![true; 256];
+            m[7] = false;
+            m
+        });
+        p.unicode_extra = "2588 2591-2593".into();
+        p.unicode_disabled = vec![0x2592];
+        let ron = ron::to_string(&p).expect("serialize");
+        let back: FxPreset = ron::from_str(&ron).expect("deserialize");
+        assert_eq!(back.ascii_chars, " *");
+        assert_eq!(back.ascii_mask.len(), 256);
+        assert!(!back.ascii_mask[7]);
+        assert_eq!(back.unicode_extra, "2588 2591-2593");
+        assert_eq!(back.unicode_disabled, vec![0x2592]);
+
+        // A preset saved before these fields existed (they're absent from the RON) still parses,
+        // filling the new fields with empty defaults.
+        let old = r#"(name:"Old",color:None,fg:None,adjust_vals:(0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0,0.0,2.0,0.0,0.0),blur:0.0,order:[],postfx:[],dither_method:0,dither_amount:1.0,dither_custom:[],dither_custom_n:4,dither_scale_x:1,dither_scale_y:1,dither_scale_lock:true,shade_f1:0.25,shade_f2:0.5,shade_f3:0.75,shade_half:true,shade_snap916:true,shade_f1_on:true,shade_f2_on:true,shade_f3_on:true,shade_half_on:(true,true,true,true),shade_half_use:(0.5,0.5,0.5,0.5),shade_vga50:false,shade_amount:1.0,shade_smooth:0.5,shade_detail:0.3,shade_ice:false,shade_invert:false,shade_export_format:0,shade_fit_chars:false,shade_fit_cols:80,shade_fit_rows:25,pixelate_h:0.0,pixelate_lock:true,balance_color:(128,128,128),balance_strength:0.0,resize_on:false,resize_fx:1.0,resize_fy:1.0,resize_lock:true,scale_algo:0,quantize_on:false,quantize_n:16,selected_palette:None,custom_palette:None,folder:None)"#;
+        let parsed: FxPreset = ron::from_str(old).expect("old preset still parses");
+        assert!(parsed.ascii_mask.is_empty() && parsed.unicode_extra.is_empty());
     }
 
     #[test]
