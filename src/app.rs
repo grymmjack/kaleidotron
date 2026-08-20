@@ -1998,6 +1998,7 @@ pub struct Kaleidotron {
     title_show_path: bool,
     title_last: String,
     idle_t: f32,   // seconds of mouse stillness (immersive cursor auto-hide)
+    imm_edges: (bool, bool, bool, bool), // last immersive chrome edges (top,bottom,left,right); frozen while a popup is open
     shuffle: bool, // screensaver: at a pack's end, load another random pack (persisted)
     // screensaver: a worker picking a random 16colo.rs pack → (year, name, download URL)
     random_rx: Option<std::sync::mpsc::Receiver<RandomPick>>,
@@ -4182,6 +4183,7 @@ impl Kaleidotron {
             title_show_path: get_bool(Self::TITLE_PATH_KEY).unwrap_or(true),
             title_last: String::new(),
             idle_t: 0.0,
+            imm_edges: (false, false, false, false),
             shuffle,
             random_rx: None,
             pending_autoplay: false,
@@ -37098,18 +37100,23 @@ impl eframe::App for Kaleidotron {
             self.want_repaint = true; // keep polling the pointer for edge reveal + idle
             // A menu/combo opened from an edge bar (e.g. the "Auto" popup) extends AWAY from the
             // edge — moving the pointer onto it would leave the 48px reveal zone and hide the bar,
-            // closing the menu. Keep every edge shown while any popup is open (and never hide the
-            // cursor then), so the menu stays reachable.
+            // closing the menu. So FREEZE the edge visibility while any popup is open (keep exactly
+            // the bar the menu opened from — don't reveal the others, which would relayout the whole
+            // view and flicker the menu shut), and never hide the cursor then.
             let popup_open = egui::Popup::is_any_open(&ctx);
             if popup_open {
                 hide_cursor = false;
+                self.imm_edges
+            } else {
+                let e = (
+                    p.is_some_and(|p| p.y - win.min.y < EDGE),
+                    p.is_some_and(|p| win.max.y - p.y < EDGE),
+                    p.is_some_and(|p| p.x - win.min.x < EDGE),
+                    p.is_some_and(|p| win.max.x - p.x < EDGE),
+                );
+                self.imm_edges = e;
+                e
             }
-            (
-                popup_open || p.is_some_and(|p| p.y - win.min.y < EDGE),
-                popup_open || p.is_some_and(|p| win.max.y - p.y < EDGE),
-                popup_open || p.is_some_and(|p| p.x - win.min.x < EDGE),
-                popup_open || p.is_some_and(|p| win.max.x - p.x < EDGE),
-            )
         } else {
             self.idle_t = 0.0;
             (true, true, true, true)
@@ -53545,3 +53552,4 @@ mod hold_test {
         assert_eq!(&merged[12..15], &[255, 255, 255]); // bottom-right untouched
     }
 }
+
