@@ -1,7 +1,7 @@
 //! Apple II 80-col (PR#3) text font — Kreative PRNumber3 (the Apple //e 80-column
-//! firmware character set). It's a double-height 7x14 design, so we rasterize with a
-//! wide x-scale and half y-scale (sx=16.5, sy=8) to land its authentic thin 7x8 glyphs
-//! in the 8x8 cell. Auto-generated. Do not edit by hand.
+//! firmware set). A double-height 7x14 design rasterized with a wide x / half y scale
+//! (sx=16.5, sy=8) to land its authentic thin 1px-stroke 80-column glyphs in the 8x8
+//! cell — clearly lighter/narrower than PR#0. Auto-generated. Do not edit by hand.
 
 pub const APPLE2_80_FONT: [[u8; 8]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // U+0020

@@ -2928,6 +2928,12 @@ mod tests {
         assert!(differing > text / 2, "PR#0 vs PR#3 differ on most glyphs ({differing}/{text})");
         // A concrete check: the letter 'A' (code 0x21 in the Apple text set) differs.
         assert_ne!(f40[0x21], f80[0x21], "'A' differs between the two fonts");
+        // PR#0 (40-col PrintChar21) is the bold/wide font; PR#3 (80-col PRNumber3) is thin. Guard
+        // the roles so a regen can't silently flip them: PR#0 lays down more ink over the letters.
+        let ink = |f: &[[u8; 8]]| -> u32 {
+            (0x21..0x3B).map(|i| f[i].iter().map(|b| b.count_ones()).sum::<u32>()).sum()
+        };
+        assert!(ink(f40) > ink(f80), "PR#0 is bolder than PR#3 ({} vs {})", ink(f40), ink(f80));
     }
 
     #[test]
