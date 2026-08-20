@@ -19956,16 +19956,20 @@ impl Kaleidotron {
             shade_amount: self.shade_amount,
             shade_smooth: self.shade_smooth,
             shade_detail: self.shade_detail,
-            // Effective cell + font, in precedence order: VGA50 (8×8 cell + 8×8 font)
-            // → snap 9×16 (8×16 font) → Cell W/H (8×16 font).
-            shade_cw: if self.shade_vga50 {
+            // Effective cell + font. ASCII adopts its chosen font's native cell; ANSI shade goes in
+            // precedence order: VGA50 (8×8) → snap 9×16 → Cell W/H (dither scale).
+            shade_cw: if self.dither_method == crate::thumb::DITHER_ASCII {
+                self.ascii_cell_dims().0
+            } else if self.shade_vga50 {
                 8
             } else if self.shade_snap916 {
                 9
             } else {
                 dscale_x.max(1)
             },
-            shade_ch: if self.shade_vga50 {
+            shade_ch: if self.dither_method == crate::thumb::DITHER_ASCII {
+                self.ascii_cell_dims().1
+            } else if self.shade_vga50 {
                 8
             } else if self.shade_snap916 {
                 16
@@ -20028,6 +20032,29 @@ impl Kaleidotron {
             (9, 16)
         } else {
             (self.dither_scale_x.max(1), self.dither_scale_y.max(1))
+        }
+    }
+
+    /// The ASCII converter's cell dimensions. A chosen REXPaint/TTF font renders at ITS native cell
+    /// (so a 16×16 font isn't squished into a 9×16 VGA cell), which also sets the cols×rows the ruler
+    /// reports; CP437 keeps the VGA cell the shade controls define.
+    fn ascii_cell_dims(&self) -> (usize, usize) {
+        match self.ascii_font {
+            AsciiFont::Cp437 => self.ansi_cell_dims(),
+            _ => self
+                .ascii_render_font()
+                .map(|(f, _)| (f.cell_w.max(1), f.cell_h.max(1)))
+                .unwrap_or_else(|| self.ansi_cell_dims()),
+        }
+    }
+
+    /// The effective character-cell for the current mode — the ASCII font's cell when in ASCII mode,
+    /// else the ANSI/shade cell. Drives `pipe_aux`, `build_ansi_grid`, and the viewer's char ruler.
+    fn textmode_cell_dims(&self) -> (usize, usize) {
+        if self.dither_method == crate::thumb::DITHER_ASCII {
+            self.ascii_cell_dims()
+        } else {
+            self.ansi_cell_dims()
         }
     }
 
@@ -20137,7 +20164,7 @@ impl Kaleidotron {
         // cols*cell_w × rows*cell_h px so the char grid is precisely cols×rows. Wins
         // over the resize slider, and may UP-scale (aspect is intentionally not kept).
         if self.shade_fit_chars && self.is_ansi_grid_mode() {
-            let (cw, ch) = self.ansi_cell_dims();
+            let (cw, ch) = self.textmode_cell_dims();
             return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
         }
         if !self.resize_on {
@@ -20154,7 +20181,7 @@ impl Kaleidotron {
     /// into a few cells).
     fn ansi_work_target(&self, w: usize, h: usize) -> (usize, usize) {
         if self.shade_fit_chars && self.is_ansi_grid_mode() {
-            let (cw, ch) = self.ansi_cell_dims();
+            let (cw, ch) = self.textmode_cell_dims();
             return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
         }
         (w, h)
@@ -21676,7 +21703,7 @@ impl Kaleidotron {
         // reduction below, so a resized-down image is "ANSI-fied" at full size looking like the
         // blocky preview, not squashed into a handful of cells.
         let (tw, th) = self.ansi_work_target(w, h);
-        let (cw, ch_) = self.ansi_cell_dims();
+        let (cw, ch_) = self.textmode_cell_dims();
         let font_8x8 = self.shade_vga50;
         let mut aux = self.pipe_aux(Some(palette), dsx, dsy);
         // Pre-shade buffer: run the value ops + resize but NOT the ANSI dither render or
@@ -25871,7 +25898,7 @@ impl Kaleidotron {
                                 }
                             }
                             // Resulting pixel size at the current cell dims.
-                            let (cw, ch) = self.ansi_cell_dims();
+                            let (cw, ch) = self.textmode_cell_dims();
                             ui.weak(format!(
                                 "→ {}×{} px",
                                 self.shade_fit_cols.max(1) * cw,
@@ -31226,7 +31253,7 @@ impl Kaleidotron {
         if img_w < 1.0 || img_h < 1.0 {
             return;
         }
-        let (cw, ch) = self.ansi_cell_dims();
+        let (cw, ch) = self.textmode_cell_dims();
         let (cwf, chf) = (cw.max(1) as f32, ch.max(1) as f32);
         let cols = (img_w / cwf).ceil() as usize;
         let rows = (img_h / chf).ceil() as usize;
