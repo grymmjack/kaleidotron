@@ -54,4 +54,24 @@ Every commit leaves the app compiling; each is independently revertable.
   local env flake (dir-watcher vs the 4-step kittest harness), not a regression.
 - Clippy: 2 pre-existing warnings (app.rs:138/155); my one type-complexity warning fixed.
 
+## Screenshots (`docs/redesign/`)
+
+Captured live from the running release binary on each branch.
+
+**The Dither anti-pattern, before & after** — the same dropdown opened on each branch:
+
+| `main` (before) | `redesign-1` (after) |
+| --- | --- |
+| ![old Dither dropdown](docs/redesign/dither-before.png) | ![new Convert to dropdown](docs/redesign/dither-after.png) |
+| One "Dither" combo mixing real dithers **and** whole converters (ANSI Shade / PETSCII / ASCII…). | **Convert to** = a clean mode list; **Dither** demoted beside it, patterns only. |
+
+Both write the same `dither_method` field (converters 7–13 vs patterns 0–6 are disjoint),
+so the split was pure UI — no pipeline change.
+
+- ![Studio overview](docs/redesign/studio-overview.png) — the redesigned viewer: contextual
+  toolbar above the art, Studio pane with the PixelFX preset strip.
+- ![Studio bands](docs/redesign/studio-pane.png) — PRESETS → RESIZE & UPSCALE → ADJUST →
+  EFFECTS → COLOR & CONVERT → EXPORT.
+- ![Preferences](docs/redesign/preferences.png) — task-based tabs + the search box.
+
 See `.claude/TASKS.md` for the task-by-task log with commit SHAs.
