@@ -2422,7 +2422,10 @@ use crate::decode::rexfont::GlyphFont;
 /// [`bitfont_ramp`] but reading the GlyphFont's own coverage.
 pub fn glyphfont_ramp(font: &GlyphFont, pool: &[u16]) -> Vec<(u16, f32)> {
     let total = (font.cell_w * font.cell_h).max(1) as f32;
-    let all: Vec<u16> = (0..256u16).collect();
+    // Empty pool = every glyph in the font. Span the font's real length (not a hardcoded 256) so
+    // fonts larger than 256 glyphs — e.g. the all-ranges Unicode ramp (~600) plus user codepoints —
+    // aren't silently truncated to their first 256 glyphs.
+    let all: Vec<u16> = (0..font.glyphs.len().min(u16::MAX as usize) as u16).collect();
     let candidates: &[u16] = if pool.is_empty() { &all } else { pool };
     let mut seen: std::collections::HashMap<u16, (u16, f32)> = std::collections::HashMap::new();
     for &gi in candidates {

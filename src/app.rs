@@ -1682,6 +1682,7 @@ pub struct Kaleidotron {
     unicode_invert: bool,
     unicode_ranges: u8,  // Ramp style: enabled Unicode ranges (crate::decode::uniart::R_*)
     unicode_disabled: Vec<u32>, // Ramp glyph-picker: codepoints the user disabled
+    unicode_extra: String,      // Ramp: user "codepoints" field — extra glyphs beyond the ranges
     unicode_picker: bool,       // Unicode glyph-picker popup open
     pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
     pixelate_lock: bool,     // lock the pixelate block square (height == width)
@@ -2495,6 +2496,7 @@ impl Kaleidotron {
     const APPLE_MASK_KEY: &'static str = "apple_mask";
     const UNICODE_KEY: &'static str = "unicode"; // (style, cols, invert, ranges)
     const UNI_DISABLED_KEY: &'static str = "unicode_disabled"; // Vec<u32> disabled ramp codepoints
+    const UNI_EXTRA_KEY: &'static str = "unicode_extra"; // String of extra ramp codepoints
     const DITHER_METHOD_KEY: &'static str = "dither_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
@@ -3214,7 +3216,10 @@ impl Kaleidotron {
                 0,
                 120,
                 false,
-                crate::decode::uniart::R_ASCII | crate::decode::uniart::R_BLOCK,
+                crate::decode::uniart::R_ASCII
+                    | crate::decode::uniart::R_BOX
+                    | crate::decode::uniart::R_BLOCK
+                    | crate::decode::uniart::R_GEOM,
             ));
         let shade_fit_cols = cc
             .storage
@@ -3766,6 +3771,10 @@ impl Kaleidotron {
             unicode_disabled: cc
                 .storage
                 .and_then(|s| eframe::get_value(s, Self::UNI_DISABLED_KEY))
+                .unwrap_or_default(),
+            unicode_extra: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, Self::UNI_EXTRA_KEY))
                 .unwrap_or_default(),
             unicode_picker: false,
             pixelate_h,
@@ -19939,6 +19948,7 @@ impl Kaleidotron {
             unicode_cols: self.unicode_cols,
             unicode_invert: self.unicode_invert,
             unicode_ranges: self.unicode_effective_ranges(),
+            unicode_extra: self.unicode_extra_cps(),
             unicode_pool: self.unicode_pool(),
             pixelate_h: self.pixelate_h,
             fx: self.postfx,
@@ -20784,6 +20794,7 @@ impl Kaleidotron {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_extra: Vec::new(),
             unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -21144,13 +21155,23 @@ impl Kaleidotron {
         }
     }
 
-    /// The enabled-glyph pool for the Unicode Ramp: indices into the current range-mask's ramp font
-    /// whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is disabled.
+    /// The user "codepoints" field parsed into a codepoint list (extra glyphs beyond the ranges).
+    fn unicode_extra_cps(&self) -> Vec<u32> {
+        crate::decode::uniart::parse_codepoints(&self.unicode_extra)
+    }
+
+    /// The enabled-glyph pool for the Unicode Ramp: indices into the current ramp font (ranges +
+    /// extra codepoints) whose codepoint isn't in `unicode_disabled`. Empty (= all) when nothing is
+    /// disabled — so the common case stays allocation-free and spans the whole font.
     fn unicode_pool(&self) -> Vec<u16> {
         if self.unicode_disabled.is_empty() {
             return Vec::new();
         }
-        let (_, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
+        let rf = crate::decode::uniart::ramp_font_owned(
+            self.unicode_effective_ranges(),
+            &self.unicode_extra_cps(),
+        );
+        let (_, chars) = rf.as_ref();
         chars
             .iter()
             .enumerate()
@@ -21226,6 +21247,7 @@ impl Kaleidotron {
             &default,
             &mut open,
             &mut self.glyph_drag,
+            None,
         );
         self.rexfont_picker = open;
     }
@@ -21242,7 +21264,7 @@ impl Kaleidotron {
         let mut open = self.petscii_picker;
         glyph_picker_window(
             ctx, "PETSCII glyphs", "petscii_atlas", &font, 256, &mut self.petscii_mask, &default,
-            &mut open, &mut self.glyph_drag,
+            &mut open, &mut self.glyph_drag, None,
         );
         self.petscii_picker = open;
     }
@@ -21258,7 +21280,7 @@ impl Kaleidotron {
         let mut open = self.atascii_picker;
         glyph_picker_window(
             ctx, "ATASCII glyphs", "atascii_atlas", &font, n, &mut self.atascii_mask, &default,
-            &mut open, &mut self.glyph_drag,
+            &mut open, &mut self.glyph_drag, None,
         );
         self.atascii_picker = open;
     }
@@ -21281,7 +21303,7 @@ impl Kaleidotron {
         let mut open = self.apple_picker;
         glyph_picker_window(
             ctx, "Apple ][ glyphs", "apple_atlas", &font, n, &mut self.apple_mask, &default,
-            &mut open, &mut self.glyph_drag,
+            &mut open, &mut self.glyph_drag, None,
         );
         self.apple_picker = open;
     }
@@ -21302,7 +21324,7 @@ impl Kaleidotron {
         let mut open = self.ascii_picker;
         glyph_picker_window(
             ctx, "ASCII / CP437 glyphs", "ascii_atlas", &font, 256, &mut self.ascii_mask, &default,
-            &mut open, &mut self.glyph_drag,
+            &mut open, &mut self.glyph_drag, None,
         );
         self.ascii_picker = open;
     }
@@ -21316,18 +21338,26 @@ impl Kaleidotron {
         {
             return;
         }
-        let (font, chars) = crate::decode::uniart::ramp_font(self.unicode_effective_ranges());
+        let rf = crate::decode::uniart::ramp_font_owned(
+            self.unicode_effective_ranges(),
+            &self.unicode_extra_cps(),
+        );
+        let (font, chars) = rf.as_ref();
         let n = font.glyphs.len();
-        // Build the index mask for the current range set from the disabled-codepoint list.
+        // Build the index mask for the current glyph set from the disabled-codepoint list.
         let mut mask: Vec<bool> = chars
             .iter()
             .map(|c| !self.unicode_disabled.contains(&(*c as u32)))
             .collect();
         let default = vec![true; n];
         let mut open = self.unicode_picker;
+        // Hover tooltip: the glyph's char + U+codepoint.
+        let label = |i: usize| -> String {
+            chars.get(i).map(|&c| format!("{c}  U+{:04X}", c as u32)).unwrap_or_default()
+        };
         glyph_picker_window(
             ctx, "Unicode glyphs", "unicode_atlas", font, n, &mut mask, &default, &mut open,
-            &mut self.glyph_drag,
+            &mut self.glyph_drag, Some(&label),
         );
         self.unicode_picker = open;
         // Sync the disabled-codepoint set back from the (possibly edited) mask.
@@ -21364,7 +21394,7 @@ impl Kaleidotron {
         let mut open = self.ansi_picker;
         glyph_picker_window(
             ctx, "ANSI Shade glyphs (block set)", "ansi_atlas", &font, 256, &mut self.ansi_mask,
-            &default, &mut open, &mut self.glyph_drag,
+            &default, &mut open, &mut self.glyph_drag, None,
         );
         self.ansi_picker = open;
     }
@@ -26039,6 +26069,37 @@ impl Kaleidotron {
                                 }
                                 if ui.button("Chars…").on_hover_text("Pick which glyphs the ramp may use").clicked() {
                                     self.unicode_picker = !self.unicode_picker;
+                                }
+                            });
+                            // Codepoint picker: add arbitrary glyphs beyond the ranges above.
+                            ui.horizontal(|ui| {
+                                ui.label("Codepoints").on_hover_text(
+                                    "Extra glyphs to add to the ramp. Type characters (★♥) or hex \
+                                     codepoints — single (2588 / U+2588), or ranges (2591-2593). \
+                                     Space- or comma-separated.",
+                                );
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.unicode_extra)
+                                        .hint_text("★♥ 2588 2591-2593")
+                                        .desired_width(200.0),
+                                );
+                                if resp.changed() {
+                                    // A codepoint the user removes from the field should no longer
+                                    // count as "disabled" (else re-adding it comes back off).
+                                    let live = self.unicode_extra_cps();
+                                    let ranges = self.unicode_effective_ranges();
+                                    self.unicode_disabled.retain(|cp| {
+                                        live.contains(cp)
+                                            || crate::decode::uniart::RANGES.iter().any(
+                                                |(_, flag, (a, b))| {
+                                                    ranges & flag != 0 && (*a..=*b).contains(cp)
+                                                },
+                                            )
+                                    });
+                                }
+                                let n = self.unicode_extra_cps().len();
+                                if n > 0 {
+                                    ui.weak(format!("+{n}"));
                                 }
                             });
                         }
@@ -38613,6 +38674,7 @@ impl eframe::App for Kaleidotron {
             ),
         );
         eframe::set_value(storage, Self::UNI_DISABLED_KEY, &self.unicode_disabled);
+        eframe::set_value(storage, Self::UNI_EXTRA_KEY, &self.unicode_extra);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
@@ -38889,6 +38951,7 @@ fn glyph_picker_window(
     default: &[bool],
     open: &mut bool,
     drag: &mut Option<bool>,
+    label_for: Option<&dyn Fn(usize) -> String>,
 ) {
     if mask.len() < count {
         mask.resize(count, true);
@@ -38896,7 +38959,12 @@ fn glyph_picker_window(
     let ncols = 16usize;
     let nrows = count.div_ceil(ncols);
     let (cw, ch) = (font.cell_w.max(1), font.cell_h.max(1));
-    let s = (24 / cw.max(ch)).max(2); // per-pixel zoom
+    // Per-source-pixel zoom, in *physical* pixels. We bake the zoom into the texture and then
+    // display it so 1 texel == 1 physical pixel (see `disp` below), which keeps nearest-neighbour
+    // sampling exact at any DPI — no fractional-`pixels_per_point` "crunch". Aim for a ~22-point
+    // cell on the larger axis.
+    let ppp = ctx.pixels_per_point().max(0.5);
+    let s = (((22.0 * ppp) / cw.max(ch) as f32).round() as usize).max(2);
     let (gcw, gch) = (cw * s + 1, ch * s + 1); // cell + 1px grid line
     let (aw, ah) = (ncols * gcw + 1, nrows * gch + 1);
     let grid_col = [60u8, 60, 68, 255];
@@ -38956,21 +39024,33 @@ fn glyph_picker_window(
                 ui.weak(format!("{on}/{count} enabled"));
             });
             ui.weak("Click to toggle · drag to paint a run. Bright = used, dim = skipped.");
+            // Display so each texel is exactly one physical pixel: crisp NEAREST at any DPI.
+            let disp = egui::vec2(aw as f32 / ppp, ah as f32 / ppp);
             let img = egui::Image::new(&tex)
-                .fit_to_exact_size(egui::vec2(aw as f32, ah as f32))
+                .fit_to_exact_size(disp)
                 .sense(egui::Sense::click_and_drag());
             let resp = ui.add(img);
-            // Cell under the pointer, if any.
+            // Cell under the pointer, if any — mapped proportionally so it's DPI-independent.
             let cell_at = |pos: egui::Pos2| -> Option<usize> {
                 let rel = pos - resp.rect.min;
-                if rel.x < 0.0 || rel.y < 0.0 {
+                let (rw, rh) = (resp.rect.width().max(1.0), resp.rect.height().max(1.0));
+                if rel.x < 0.0 || rel.y < 0.0 || rel.x >= rw || rel.y >= rh {
                     return None;
                 }
-                let gc = (rel.x as usize) / gcw;
-                let gr = (rel.y as usize) / gch;
+                let gc = (rel.x / rw * ncols as f32) as usize;
+                let gr = (rel.y / rh * nrows as f32) as usize;
                 let gi = gr * ncols + gc;
                 (gc < ncols && gi < count).then_some(gi)
             };
+            // Hover tooltip (e.g. the glyph's codepoint), when the caller supplies labels.
+            if let (Some(lbl), Some(pos)) = (label_for, resp.hover_pos()) {
+                if let Some(gi) = cell_at(pos) {
+                    let text = lbl(gi);
+                    if !text.is_empty() {
+                        resp.clone().on_hover_text(text);
+                    }
+                }
+            }
             if resp.drag_started() || resp.clicked() {
                 if let Some(gi) = resp.interact_pointer_pos().and_then(cell_at) {
                     let paint = !mask[gi]; // toggle the first cell; paint that value onward
@@ -39754,6 +39834,7 @@ struct PipeAux<'a> {
     unicode_cols: usize,
     unicode_invert: bool,
     unicode_ranges: u8,
+    unicode_extra: Vec<u32>, // Ramp: user codepoints appended to the ranges' glyph set
     unicode_pool: Vec<u16>,
     pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
@@ -39858,7 +39939,9 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                     if aux.unicode_style == crate::thumb::UNI_RAMP {
                         // Ramp: density char-art over the enabled Unicode ranges (DejaVu-rendered).
                         // Colours from the active Reduce/palette, or the full xterm-256 set if none.
-                        let (font, _) = crate::decode::uniart::ramp_font(aux.unicode_ranges);
+                        let rf =
+                            crate::decode::uniart::ramp_font_owned(aux.unicode_ranges, &aux.unicode_extra);
+                        let (font, _) = rf.as_ref();
                         crate::thumb::unicode_ramp_pass(
                             rgba,
                             w,
@@ -40118,7 +40201,10 @@ fn default_unicode_cols() -> usize {
     120
 }
 fn default_unicode_ranges() -> u8 {
-    crate::decode::uniart::R_ASCII | crate::decode::uniart::R_BLOCK
+    crate::decode::uniart::R_ASCII
+        | crate::decode::uniart::R_BOX
+        | crate::decode::uniart::R_BLOCK
+        | crate::decode::uniart::R_GEOM
 }
 fn default_petscii_rows() -> usize {
     25
@@ -40823,6 +40909,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_extra: Vec::new(),
             unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -49126,6 +49213,7 @@ fn preset_pipe_aux<'a>(
         unicode_cols: 120,
         unicode_invert: false,
         unicode_ranges: 5,
+        unicode_extra: Vec::new(),
         unicode_pool: Vec::new(),
         pixelate_h: p.pixelate_h,
         fx: PostFx::from_record(&p.postfx),
@@ -51457,6 +51545,7 @@ mod tests {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_extra: Vec::new(),
             unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
@@ -51683,6 +51772,7 @@ mod tests {
             unicode_cols: 120,
             unicode_invert: false,
             unicode_ranges: 5,
+            unicode_extra: Vec::new(),
             unicode_pool: Vec::new(),
             pixelate_h: 0.0,
             fx: PostFx::default(),
