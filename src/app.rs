@@ -18887,14 +18887,19 @@ impl Kaleidotron {
         self.clear_sel_history(); // a new file's editor starts with no selection history
         self.osd_t = 0.0; // restart the metadata OSD fade-in for the new image
         self.osd_dismissed = false; // a fresh image un-hides the OSD ([×] is per-view only)
-        let _ = self.cached_sauce(&path); // populate SAUCE (columns/lines/font/comment) for the OSD
-                                          // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
-                                          // downloaded 16colo piece reads its bytes from the local cache file instead.
+        let sauce = self.cached_sauce(&path); // populate SAUCE (columns/lines/font/comment) for the OSD
+                                              // `path` is the display identity (kept for stepping/ratings/full_tex keys); a
+                                              // downloaded 16colo piece reads its bytes from the local cache file instead.
         let src = self.resolve_local(&path);
         // Pick the remembered zoom for this image's kind: text-mode art (tiny 8×16
         // cells) opens at its own larger default, raster art at its own. Sticky fit,
         // when on, overrides both and re-fits the window.
-        self.viewing_textmode = is_textmode_ext(&path);
+        // Text-mode either by extension OR by content: scene art under a nonstandard
+        // extension (.tri/.ice/… — see the decoder's SAUCE fallback) carries a Character
+        // (1) / BinaryText (5) / XBin (6) SAUCE record, so it gets the crisp integer zoom +
+        // SAUCE panel too, not raster handling.
+        self.viewing_textmode = is_textmode_ext(&path)
+            || sauce.as_ref().is_some_and(|s| matches!(s.data_type, 1 | 5 | 6));
         if self.fit_mode {
             self.fit_requested = true;
         } else if self.auto_next && !self.viewing_textmode {
