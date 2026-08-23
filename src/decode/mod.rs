@@ -308,10 +308,10 @@ impl Registry {
             }
         }
         // 4) A nonstandard extension the sniff + extension passes both missed (.tri from
-        //    TRIBE, .ice, group-specific ones): a trailing SAUCE record is a reliable "this
-        //    is CP437/ANSI art" signal, so render it via the ANSI decoder like extensionless
-        //    art. (The listing includes such files via `sauce::file_has_record`.)
-        if crate::sauce::present(bytes) {
+        //    TRIBE, .ice, group-specific ones): if it *looks like* scene text art by content
+        //    (SAUCE, ANSI escapes, or CP437 block glyphs), render it via the ANSI decoder like
+        //    extensionless art. (The listing includes such files via `file_is_scene_art`.)
+        if looks_like_scene_art(bytes) {
             for d in &self.decoders {
                 if d.extensions().contains(&"ans") {
                     return decode_caught(d.as_ref(), bytes);
@@ -365,6 +365,55 @@ where
 /// Call a decoder, catching any panic so one bad file fails gracefully.
 fn decode_caught(d: &dyn Decoder, bytes: &[u8]) -> Result<PixImage, DecodeError> {
     caught(|| d.decode(bytes))
+}
+
+/// Heuristic: does `bytes` look like **scene text art** (ANSI / ASCII / CP437) even without a
+/// known extension? Scene groups shipped art under all sorts of extensions (`.tri`, `.ice`, …)
+/// and plenty of it has **no SAUCE**, so extension + SAUCE alone miss a lot. We accept a file
+/// as art when it isn't a binary AND carries one of the tell-tale art signatures — but stay
+/// conservative so ordinary text / binaries don't leak into the listing.
+pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
+    // 1) A trailing SAUCE record is the strongest signal.
+    if crate::sauce::present(bytes) {
+        return true;
+    }
+    let sample = &bytes[..bytes.len().min(64 * 1024)];
+    if sample.is_empty() {
+        return false;
+    }
+    // 2) Reject binaries: text art is (almost) all printable/CP437/whitespace; a binary carries
+    //    NUL + other C0 control bytes. >2% "hard" controls ⇒ not art. (CR/LF/TAB/ESC/FF/EOF ok.)
+    let hard = sample
+        .iter()
+        .filter(|&&b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0c | 0x1a | 0x1b))
+        .count();
+    if hard * 100 > sample.len() * 2 {
+        return false;
+    }
+    // 3a) A run of ANSI CSI escapes (`ESC[`) — the hallmark of .ans art; real screens have many.
+    if sample.windows(2).filter(|w| *w == b"\x1b[").count() >= 4 {
+        return true;
+    }
+    // 3b) CP437 shading/block glyphs (░▒▓ ▀▄█▌▐ = 0xB0-0xB2, 0xDB-0xDF) — the hallmark of CP437
+    //     "ASCII" art, and rare in ordinary text; a couple of % ⇒ art.
+    let blocks = sample
+        .iter()
+        .filter(|&&b| matches!(b, 0xB0..=0xB2 | 0xDB..=0xDF))
+        .count();
+    blocks * 100 >= sample.len() * 2
+}
+
+/// As [`looks_like_scene_art`] but for a file on disk: reads a bounded head chunk (enough for
+/// the escape/block heuristics + a small file's SAUCE) plus the tail for a large file's SAUCE.
+/// Cheap enough to sniff a folder of unknown-extension files while building the listing.
+pub fn file_is_scene_art(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 32 * 1024];
+    let n = std::io::Read::read(&mut f, &mut head).unwrap_or(0);
+    head.truncate(n);
+    looks_like_scene_art(&head) || crate::sauce::file_has_record(path)
 }
 
 #[cfg(test)]
@@ -474,22 +523,29 @@ mod tests {
     }
 
     #[test]
-    fn sauce_bearing_unknown_extension_decodes_as_ansi() {
-        // A .tri (TRIBE) file — an extension no decoder claims — still decodes as CP437/ANSI
-        // art because it carries a trailing SAUCE record (the content-sniff fallback).
-        let mut file = b"\x1b[1;37mTRIBE\x1b[0m".to_vec();
+    fn scene_art_detected_by_content_decodes_as_ansi() {
+        let reg = Registry::with_builtins();
+        // (a) SAUCE-bearing .tri.
+        let mut with_sauce = b"TRIBE".to_vec();
         let mut sauce = vec![0u8; 128];
         sauce[..7].copy_from_slice(b"SAUCE00");
-        sauce[94] = 1; // Character
-        file.extend_from_slice(&sauce);
-        let img = Registry::with_builtins()
-            .decode_bytes(&file, Path::new("LOGO.TRI"))
-            .expect("SAUCE-bearing .tri decodes via the ANSI fallback");
-        assert!(img.width > 0 && img.height > 0);
-        // A .tri with NO sauce and no ANSI content is still unsupported (not everything is art).
-        assert!(Registry::with_builtins()
-            .decode_bytes(b"\x00\x01\x02random binary", Path::new("x.tri"))
-            .is_err());
+        sauce[94] = 1;
+        with_sauce.extend_from_slice(&sauce);
+        assert!(reg.decode_bytes(&with_sauce, Path::new("A.TRI")).is_ok());
+        // (b) SAUCELESS ANSI (color codes + cursor moves) — the common .tri case.
+        let ansi = b"\x1b[2J\x1b[1;37mT\x1b[31mR\x1b[32mI\x1b[33mB\x1b[34mE\x1b[0m\r\n".repeat(3);
+        assert!(super::looks_like_scene_art(&ansi));
+        assert!(reg.decode_bytes(&ansi, Path::new("B.TRI")).is_ok());
+        // (c) SAUCELESS CP437 block art (░▒▓█) — no escapes at all.
+        let cp437 = b"\xB0\xB1\xB2\xDB\xDC\xDD\xDE\xDF ART \xDB\xB2\xB1\xB0\r\n".repeat(4);
+        assert!(super::looks_like_scene_art(&cp437));
+        assert!(reg.decode_bytes(&cp437, Path::new("C.TRI")).is_ok());
+        // Not art: a binary and plain prose stay unsupported / undetected.
+        assert!(!super::looks_like_scene_art(b"\x00\x01\x02\x00\x03random\x00binary\x00\x00"));
+        assert!(!super::looks_like_scene_art(
+            b"This is just a normal readme file with plain ASCII prose and nothing arty."
+        ));
+        assert!(reg.decode_bytes(b"\x00\x01\x02\x00 binary", Path::new("x.tri")).is_err());
     }
 
     #[test]
