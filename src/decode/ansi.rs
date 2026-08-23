@@ -22,6 +22,12 @@ const WRAP: usize = 80; // classic ANSI terminal width
 const MAX_COLS: usize = 20000;
 const MAX_ROWS: usize = 10000; // safety cap for very long files (canvas sizes to the
                                // *actual* content rows; this is only the upper bound)
+// Hard cap on the canvas *area* in cells, independent of the per-axis caps above. At a 9×16
+// cell that's ~144 Mpx / 576 MB RGBA worst case — big, but bounded. Its job is to stop a
+// corrupt SAUCE (see `TextStream::new`) or a runaway from allocating gigabytes and freezing
+// the app: ACIDVIEW.TXT declares TInfo1 = 8272 columns × 1296 rows ≈ 6 GB. Real scene art is
+// far below this (THE_BIG_PIRANHA, 800 wide, is ~0.5 M cells).
+const MAX_CANVAS_CELLS: usize = 1_000_000;
 
 /// Render the VGA font in a 9-dot-wide cell, the way real VGA text mode did —
 /// applies to BOTH the 8×16 font and the 8×8 VGA50/EGA43 cell (→ 9×16 / 9×8). The
@@ -173,8 +179,25 @@ impl TextStream {
         // *cursor* extent (≥ written rows), so trailing blank lines the cursor moved onto
         // are part of the canvas and baud auto-scroll can reach them. The full
         // SAUCE-declared width (TInfo1) is the canvas, not just the widest written row.
-        let rows = cursor_rows.max(25);
-        let cols = sauce_w.map_or(cols0, |dw| cols0.max(dw.clamp(1, MAX_COLS)));
+        let mut rows = cursor_rows.max(25);
+        // The SAUCE-declared width (TInfo1) is normally the canvas, so cursor-addressed art
+        // keeps its full width even where no single row is that long. But a *corrupt* SAUCE
+        // can declare an absurd one — ACIDVIEW.TXT's TInfo1 reads 8272 (a buggy 1998 writer
+        // left a space, 0x20, in the high byte of 80), which would size a ~6 GB canvas and
+        // freeze the app. Guard it in two steps:
+        //   1. If padding to the declared width would blow the cell budget while the real
+        //      content (`cols0`, the widest *written* column — cursor moves included) is far
+        //      narrower, the width is bogus: fall back to the content width. This only drops
+        //      empty padding, never real cells, so legitimate wide art is untouched.
+        //   2. If the canvas is still over budget (genuinely huge art / a runaway), trim the
+        //      row count so the allocation stays bounded.
+        let mut cols = sauce_w.map_or(cols0, |dw| cols0.max(dw.clamp(1, MAX_COLS)));
+        if cols.saturating_mul(rows) > MAX_CANVAS_CELLS && cols > cols0 {
+            cols = cols0;
+        }
+        if cols.saturating_mul(rows) > MAX_CANVAS_CELLS {
+            rows = (MAX_CANVAS_CELLS / cols.max(1)).max(25);
+        }
         Some(TextStream {
             content,
             wrap,
@@ -702,6 +725,33 @@ mod tests {
             img.width,
             800 * 8,
             "800-col SAUCE width renders full, not clamped to 300"
+        );
+    }
+
+    #[test]
+    fn corrupt_sauce_width_does_not_explode_the_canvas() {
+        // ACIDVIEW.TXT: a buggy 1998 SAUCE writer left a space (0x20) in the high byte of
+        // TInfo1, so 80 columns reads as 0x2050 = 8272. With 1296 rows that's a ~6 GB canvas
+        // that froze the app on open. The decoder must fall back to the real content width
+        // once the declared width would blow the cell budget, keeping the canvas bounded.
+        let mut file = b"XXXXXXXXXX\r\n".repeat(130); // 130 rows, 10 written columns
+        let mut s = vec![0u8; 128];
+        s[..7].copy_from_slice(b"SAUCE00");
+        s[94] = 1; // Character
+        s[95] = 0; // ASCII
+        s[96] = 0x50; // TInfo1 low byte = 80…
+        s[97] = 0x20; // …high byte a space → 0x2050 = 8272 (the corruption)
+        file.extend_from_slice(&s);
+        let img = AnsiDecoder.decode(&file).unwrap();
+        // Width collapses to the real content (10 cols), NOT the bogus 8272.
+        assert_eq!(
+            img.width,
+            10 * 8,
+            "bogus 8272-col width fell back to the content width"
+        );
+        assert!(
+            (img.width as usize) * (img.height as usize) <= MAX_CANVAS_CELLS * FONT_W * FONT_H,
+            "canvas stays within the cell budget"
         );
     }
 

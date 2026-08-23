@@ -552,6 +552,59 @@ pub fn fetch_group_pack_refs(group: &str) -> Result<Vec<(u32, String)>, String> 
     Ok(refs)
 }
 
+/// How to render a pack's FILE_ID art as its folder thumbnail. Either 16colo already has
+/// a pre-rendered preview PNG (`via_registry == false`, `url` = that PNG), or it doesn't
+/// (`.diz`/`.txt` aren't server-rendered) so we fetch the *raw* file and decode it locally
+/// (`via_registry == true`, `url` = the raw file). `filename` carries the real extension so
+/// the local decoder dispatches correctly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileIdThumb {
+    pub url: String,
+    pub via_registry: bool,
+    pub filename: String,
+}
+
+/// The render source for a pack's FILE_ID art, for use as the pack folder's thumbnail.
+/// Prefers `FILE_ID.ANS` (a colour render), then `.DIZ`, then `.TXT`, then any other
+/// `file_id.*` the pack carries (all matched case-insensitively). `None` only when the
+/// pack has no FILE_ID file at all. The pack JSON is cached forever (see [`json_ttl`]),
+/// so this costs one request per pack on first browse and nothing after.
+pub fn pack_file_id_thumb(pack: &str) -> Option<FileIdThumb> {
+    let v = get_json(&format!("{API}/pack/{}", enc(pack))).ok()?;
+    file_id_thumb_from_pieces(&pieces_from_pack_json(pack, "", 0, &v))
+}
+
+/// Pick the FILE_ID render source out of a pack's pieces (pure, so it's unit-testable
+/// without the network). See [`pack_file_id_thumb`] for the ordering rationale.
+fn file_id_thumb_from_pieces(pieces: &[Piece]) -> Option<FileIdThumb> {
+    let named = |want: &str| pieces.iter().find(|p| p.filename.eq_ignore_ascii_case(want));
+    let piece = named("file_id.ans")
+        .or_else(|| named("file_id.diz"))
+        .or_else(|| named("file_id.txt"))
+        .or_else(|| {
+            pieces
+                .iter()
+                .find(|p| p.filename.to_ascii_lowercase().starts_with("file_id."))
+        })?;
+    // Prefer 16colo's pre-rendered PNG; if it has none (a .diz/.txt it didn't render), fall
+    // back to the raw file and decode it locally through the registry.
+    if !piece.tn_url.is_empty() {
+        Some(FileIdThumb {
+            url: piece.tn_url.clone(),
+            via_registry: false,
+            filename: piece.filename.clone(),
+        })
+    } else if !piece.raw_url.is_empty() {
+        Some(FileIdThumb {
+            url: piece.raw_url.clone(),
+            via_registry: true,
+            filename: piece.filename.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Every piece in `pack` (via `/v1/pack/:pack`), stamped with `group` (the listing
 /// context). `year_hint` is used only if a result omits its year.
 pub fn fetch_pack_pieces(group: &str, year_hint: u32, pack: &str) -> Result<Vec<Piece>, String> {
@@ -722,6 +775,58 @@ mod tests {
         let p2 = &pieces_from_pack_json("p", "g", 0, &v2)[0];
         assert!(p2.sauce.is_none());
         assert_eq!(p2.filesize, 0);
+    }
+
+    #[test]
+    fn file_id_thumb_prefers_ans_then_diz_then_txt() {
+        let piece = |name: &str, raw: &str, tn: &str| Piece {
+            filename: name.to_string(),
+            artist: String::new(),
+            group: String::new(),
+            year: 0,
+            pack: "p".into(),
+            raw_url: raw.to_string(),
+            tn_url: tn.to_string(),
+            sauce: None,
+            filesize: 0,
+        };
+        // .ANS wins over .DIZ (case-insensitive match on the filename) and uses its render.
+        let ps = vec![
+            piece("ART.ANS", "r/art", "https://x/art.png"),
+            piece("FILE_ID.DIZ", "r/diz", "https://x/diz.png"),
+            piece("file_id.ans", "r/ans", "https://x/ans.png"),
+        ];
+        assert_eq!(
+            file_id_thumb_from_pieces(&ps),
+            Some(FileIdThumb {
+                url: "https://x/ans.png".into(),
+                via_registry: false,
+                filename: "file_id.ans".into(),
+            })
+        );
+        // A .DIZ with no server render (empty tn) falls back to its RAW file, rendered
+        // locally (via_registry) — the acdu0793 case that showed a plain folder before.
+        let ps = vec![
+            piece("ART.ANS", "r/a", "https://x/a.png"),
+            piece("File_Id.Diz", "https://16c/raw/File_Id.Diz", ""),
+        ];
+        assert_eq!(
+            file_id_thumb_from_pieces(&ps),
+            Some(FileIdThumb {
+                url: "https://16c/raw/File_Id.Diz".into(),
+                via_registry: true,
+                filename: "File_Id.Diz".into(),
+            })
+        );
+        // .TXT is picked when there's no .ans/.diz.
+        let ps = vec![piece("FILE_ID.TXT", "https://16c/raw/FILE_ID.TXT", "")];
+        assert_eq!(
+            file_id_thumb_from_pieces(&ps).map(|t| t.via_registry),
+            Some(true)
+        );
+        // No file_id at all → none (we don't fall back to arbitrary pack art).
+        let ps = vec![piece("COOL.ANS", "r/c", "https://x/c.png")];
+        assert_eq!(file_id_thumb_from_pieces(&ps), None);
     }
 
     #[test]

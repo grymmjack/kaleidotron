@@ -2088,6 +2088,13 @@ pub struct Kaleidotron {
     // the offset to apply *once* on the next grid frame (set on every folder switch).
     grid_scroll: HashMap<PathBuf, f32>,
     grid_scroll_pending: Option<f32>,
+    // "Where I just was": when you go *up* out of a folder, remember it so the parent
+    // listing scrolls back to (and briefly outlines) the tile you came from. Stored as
+    // (target parent path, child display path); resolved once the parent's entries are
+    // populated (which is async for 16colo listings) into `highlight_entry`.
+    came_from: Option<(PathBuf, PathBuf)>,
+    highlight_entry: Option<PathBuf>, // grid/table tile to outline as "you were here"
+    highlight_born: f64,              // ctx time the outline first painted (for the fade); <0 = unset
     search: Option<String>, // grid: live filename filter (vim-style '/')
     focus_search: bool,
     // advanced recursive search → a "Search results" grid
@@ -2365,6 +2372,32 @@ pub struct Kaleidotron {
     colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)>>,
     colo_sauce_done: HashSet<String>,
     colo_sauce_pending: usize, // in-flight pack-SAUCE fetches (for the busy spinner)
+    // FILE_ID.DIZ pack-folder thumbnails: with `colo_folder_diz` on, every 16colo pack
+    // folder tile in a listing shows the pack's FILE_ID.ANS/.DIZ art instead of the plain
+    // 📁. Enabling it starts a *prep job* (`diz_prep`) that walks the whole listing on a
+    // bounded worker pool, fetching each pack's FILE_ID render URL and handing it to
+    // `colo_thumbs` (the normal remote-thumb pool). The job reports progress (for the
+    // spinner/ETA) and is cancellable. `diz_prepped_for` is the listing folder we've
+    // already kicked prep for (so we don't restart it every frame); `diz_gen` tags each
+    // job so a stale worker's late message can't advance a newer job's counter. The
+    // channel message is (job gen, pack folder path, Some(render URL) | None).
+    colo_folder_diz: bool,
+    #[allow(clippy::type_complexity)]
+    colo_diz_tx: std::sync::mpsc::Sender<(u64, PathBuf, Option<crate::sixteen::FileIdThumb>)>,
+    #[allow(clippy::type_complexity)]
+    colo_diz_rx: std::sync::mpsc::Receiver<(u64, PathBuf, Option<crate::sixteen::FileIdThumb>)>,
+    diz_prep: Option<DizPrep>,
+    diz_prepped_for: Option<PathBuf>,
+    diz_gen: u64,
+}
+
+/// Progress state for a FILE_ID pack-thumbnail prep job (see `colo_folder_diz`).
+struct DizPrep {
+    gen: u64,                                   // which job this is (guards stale messages)
+    total: usize,                               // packs to prep
+    done: usize,                                // packs resolved so far
+    started_at: f64,                            // ctx time the job began (for the ETA)
+    cancel: Arc<std::sync::atomic::AtomicBool>, // set → workers stop
 }
 
 impl Kaleidotron {
@@ -2496,6 +2529,7 @@ impl Kaleidotron {
     const SLIDE_SHUFFLE_KEY: &'static str = "slide_shuffle";
     const GLOW_KEY: &'static str = "glow";
     const GLOW_AMT_KEY: &'static str = "glow_amt";
+    const COLO_DIZ_KEY: &'static str = "colo_folder_diz"; // FILE_ID.DIZ pack-folder thumbnails
     const SHUFFLE_KEY: &'static str = "shuffle";
     const ADJUST_KEY: &'static str = "adjust";
     const ADJUST_ORDER_KEY: &'static str = "adjust_order";
@@ -3431,6 +3465,8 @@ impl Kaleidotron {
 
         // Shared channel for background pack-SAUCE fetches (see `ensure_colo_sauce`).
         let (colo_sauce_tx, colo_sauce_rx) = std::sync::mpsc::channel();
+        // Channel for background FILE_ID-render lookups (pack folder thumbnails).
+        let (colo_diz_tx, colo_diz_rx) = std::sync::mpsc::channel();
         // Shared channel for background archive-thumbnail (montage) builds.
         let (archive_montage_tx, archive_montage_rx) = std::sync::mpsc::channel();
 
@@ -4380,6 +4416,16 @@ impl Kaleidotron {
             colo_sauce_rx,
             colo_sauce_done: HashSet::new(),
             colo_sauce_pending: 0,
+            // Default OFF: it costs one pack-JSON fetch per pack folder (cached after).
+            colo_folder_diz: get_bool(Self::COLO_DIZ_KEY).unwrap_or(false),
+            colo_diz_tx,
+            colo_diz_rx,
+            diz_prep: None,
+            diz_prepped_for: None,
+            diz_gen: 0,
+            came_from: None,
+            highlight_entry: None,
+            highlight_born: -1.0,
         };
 
         // Prime the font-thumbnail sample text (the decoder reads a process-global — see
@@ -5021,6 +5067,10 @@ impl Kaleidotron {
         self.path_edit = None;
         self.set_mode(Mode::Grid);
         self.rebuild_view();
+        // If we navigated *up* into here, outline (and, in table view, scroll to) the tile
+        // we came from. For async 16colo listings `entries` is empty now, so this is a
+        // no-op and `poll_remote` retries once the packs arrive.
+        self.resolve_came_from();
         self.start_git_status(); // compute this folder's git status off-thread
         self.refresh_tasks(); // pick up this project's .vscode/tasks.json, if it has one
     }
@@ -5433,6 +5483,212 @@ impl Kaleidotron {
             }
             self.want_repaint = true;
         }
+    }
+
+    /// Is `path` a 16colo.rs *pack* folder (a `<year>/<pack>` or `latest/<pack>` tile)?
+    /// Group/artist name folders (`groups/<name>`, `artists/<name>`) are *not* packs —
+    /// entering them starts a flat piece listing, so they must be excluded (their
+    /// `/pack/<name>` fetch would just 404).
+    fn is_colo_pack_folder(path: &Path) -> bool {
+        let parts = crate::sixteen::rel_parts(path);
+        parts.len() == 2
+            && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
+    }
+
+    /// Is `folder` a 16colo.rs *pack listing* — a year (`<year>`) or `latest`, whose tiles
+    /// are pack folders we can prep FILE_ID art for? (Group/artist listings are flat piece
+    /// tables, and the year *root* lists years, so neither qualifies.)
+    fn is_colo_pack_listing(folder: &Path) -> bool {
+        let parts = crate::sixteen::rel_parts(folder);
+        parts.len() == 1
+            && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
+    }
+
+    /// Keep the FILE_ID prep job in sync with the toggle + the current listing, once per
+    /// frame: start a job when the toggle is on over a pack listing that hasn't been
+    /// prepped, and cancel a running one when the toggle goes off or we navigate away.
+    fn sync_diz_prep(&mut self, ctx: &egui::Context) {
+        let want = self.colo_folder_diz
+            && !self.entries.is_empty()
+            && self
+                .folder
+                .as_deref()
+                .is_some_and(Self::is_colo_pack_listing);
+        let target = if want { self.folder.clone() } else { None };
+        if self.diz_prepped_for != target {
+            // Toggle flipped, or we moved to a different listing: stop the old job.
+            if let Some(p) = self.diz_prep.take() {
+                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.diz_prepped_for = target.clone();
+            if target.is_some() {
+                self.start_diz_prep(ctx);
+            }
+        }
+    }
+
+    /// Start a FILE_ID prep job for the current listing: gather every pack folder that
+    /// doesn't already have a thumbnail and fetch its FILE_ID render URL across a small
+    /// worker pool (bounded concurrency, cancellable), streaming results back to
+    /// `poll_colo_folder_thumb`. No-op (and no spinner) when everything's already cached.
+    fn start_diz_prep(&mut self, ctx: &egui::Context) {
+        // (pack folder path, pack name) for each tile still needing art.
+        let packs: Vec<(PathBuf, String)> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && Self::is_colo_pack_folder(&e.path))
+            .filter(|e| !self.thumb_tex.contains_key(&e.path))
+            .filter_map(|e| {
+                crate::sixteen::rel_parts(&e.path)
+                    .get(1)
+                    .map(|pack| (e.path.clone(), pack.clone()))
+            })
+            .collect();
+        if packs.is_empty() {
+            self.diz_prep = None; // all cached → nothing to show
+            return;
+        }
+        self.diz_gen += 1;
+        let gen = self.diz_gen;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.diz_prep = Some(DizPrep {
+            gen,
+            total: packs.len(),
+            done: 0,
+            started_at: ctx.input(|i| i.time),
+            cancel: cancel.clone(),
+        });
+        // Round-robin the packs across a few workers (≤6) so we prep in parallel without
+        // opening dozens of sockets. Each worker fetches sequentially, checking `cancel`.
+        let workers = packs.len().min(6);
+        let mut chunks: Vec<Vec<(PathBuf, String)>> = (0..workers).map(|_| Vec::new()).collect();
+        for (i, item) in packs.into_iter().enumerate() {
+            chunks[i % workers].push(item);
+        }
+        for chunk in chunks {
+            let tx = self.colo_diz_tx.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                for (path, pack) in chunk {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let thumb = crate::sixteen::pack_file_id_thumb(&pack);
+                    if tx.send((gen, path, thumb)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        self.want_repaint = true;
+    }
+
+    /// Cancel a running FILE_ID prep job (the ✕ button next to the toggle). Leaves the
+    /// listing marked as prepped so it doesn't auto-restart; re-toggling re-preps.
+    fn cancel_diz_prep(&mut self) {
+        if let Some(p) = self.diz_prep.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drain finished FILE_ID lookups: enqueue each render URL into the remote-thumb pool
+    /// (keyed by the pack folder path, so the finished PNG lands in `thumb_tex` for that
+    /// tile) and advance the prep progress. A pack with no FILE_ID art keeps its plain 📁.
+    fn poll_colo_folder_thumb(&mut self) {
+        while let Ok((gen, path, thumb)) = self.colo_diz_rx.try_recv() {
+            if let Some(t) = thumb {
+                if t.via_registry {
+                    // No server render (a .diz/.txt): fetch the raw file and decode it
+                    // locally. Key by the pack folder path, but decode with the real
+                    // filename's extension so the registry picks the right decoder.
+                    let decode_as = path.join(&t.filename);
+                    self.colo_thumbs
+                        .request_as(&path, &decode_as, &t.url, THUMB_PX, true);
+                } else {
+                    self.colo_thumbs.request(&path, &t.url, THUMB_PX, false);
+                }
+            }
+            // Advance only the *current* job (a cancelled/replaced job's stragglers arrive
+            // with an old gen and are ignored, so they can't skew the count/ETA).
+            if let Some(p) = self.diz_prep.as_mut().filter(|p| p.gen == gen) {
+                p.done += 1;
+                if p.done >= p.total {
+                    self.diz_prep = None; // finished
+                }
+            }
+            self.want_repaint = true;
+        }
+    }
+
+    /// Navigate up to the current folder's parent (in *display* space, so leaving an
+    /// archive/pack lands in its real parent), remembering the folder we left so the
+    /// parent listing scrolls back to and outlines it. Shared by the Up menu action, the
+    /// Backspace key, and mouse-back.
+    fn navigate_up(&mut self) {
+        let Some(folder) = self.folder.clone() else {
+            return;
+        };
+        let disp = self.to_display(&folder);
+        if let Some(parent) = disp.parent() {
+            let real = self.real_path(parent);
+            self.came_from = Some((real.clone(), disp.clone()));
+            self.open_folder(real);
+        }
+    }
+
+    /// Resolve a pending `came_from` (set when navigating up) against the now-populated
+    /// parent listing: outline the tile we came from, and — in table view, which has no
+    /// per-folder scroll restore — scroll it into view. Kept pending until the (possibly
+    /// async) entries arrive; dropped if we've navigated somewhere other than the target.
+    fn resolve_came_from(&mut self) {
+        let Some((target, child)) = self.came_from.clone() else {
+            return;
+        };
+        if self.folder.as_deref() != Some(target.as_path()) {
+            self.came_from = None; // navigated elsewhere before it resolved
+            return;
+        }
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .position(|e| self.to_display(&e.path) == child)
+        {
+            self.highlight_entry = Some(self.entries[idx].path.clone());
+            self.highlight_born = -1.0; // stamp the fade start on first paint
+            // Grid restores the exact scroll offset (grid_scroll), which already exposes
+            // this tile; the table has no offset restore, so reveal it by index.
+            if self.table_view {
+                self.scroll_target = Some(idx);
+            }
+            self.came_from = None;
+            self.want_repaint = true;
+        }
+        // else: entries not populated yet (async 16colo listing) — try again next drain.
+    }
+
+    /// Fade alpha for the "you were here" outline: full during the hold, easing to 0 over
+    /// the fade, then `None` (which also clears the highlight so it stops repainting). The
+    /// start time is stamped on the first paint after the highlight is set. Shared by the
+    /// grid and table renderers.
+    fn highlight_alpha(&mut self, ctx: &egui::Context) -> Option<f32> {
+        self.highlight_entry.as_ref()?;
+        let now = ctx.input(|i| i.time);
+        if self.highlight_born < 0.0 {
+            self.highlight_born = now;
+        }
+        const HOLD: f64 = 2.5;
+        const FADE: f64 = 1.2;
+        let age = now - self.highlight_born;
+        if age > HOLD + FADE {
+            self.highlight_entry = None;
+            self.highlight_born = -1.0;
+            return None;
+        }
+        Some(if age <= HOLD {
+            1.0
+        } else {
+            (1.0 - (age - HOLD) / FADE) as f32
+        })
     }
 
     /// Drain a "Download file/pack" save thread's final status message.
@@ -17223,6 +17479,15 @@ impl Kaleidotron {
                     self.status = format!("{} items", entries.len());
                     self.all_entries = entries;
                     self.rebuild_view();
+                    // The listing arrived *after* show_folder consumed the restore offset
+                    // (it ran on the empty frame), so re-apply it now — else back-nav to a
+                    // 16colo year always snapped to the top. `came_from` (if navigating up)
+                    // takes over the scroll; otherwise restore the remembered position.
+                    self.resolve_came_from();
+                    if self.scroll_target.is_none() {
+                        self.grid_scroll_pending =
+                            Some(self.grid_scroll.get(&dir).copied().unwrap_or(0.0));
+                    }
                 }
             }
             Ok(RemoteMsg::PackZip(vpath, zip)) => {
@@ -18257,6 +18522,13 @@ impl Kaleidotron {
         };
         if let Some(pos) = target {
             let dir = self.dir_history[pos].clone();
+            // Going back = remember the folder we're leaving, so the destination outlines
+            // and scrolls to it (only for back; forward has no "where I was" to show).
+            if back {
+                if let Some(cur) = self.folder.clone() {
+                    self.came_from = Some((dir.clone(), self.to_display(&cur)));
+                }
+            }
             self.dir_pos = pos;
             self.suppress_history = true; // don't re-record this hop
             self.open_folder(dir);
@@ -19366,6 +19638,7 @@ impl Kaleidotron {
             0
         };
         let mut want_bulk = false;
+        let mut want_diz_cancel = false;
         // Plain-text labels: the bundled egui font renders many emoji as tofu (see the
         // font gotcha in CLAUDE.md), so avoid 📅/👥/🎨 here.
         ui.horizontal(|ui| {
@@ -19390,6 +19663,39 @@ impl Kaleidotron {
                 .clicked()
             {
                 nav = Some(root.join(sixteen::ARTISTS));
+            }
+            // FILE_ID art as pack-folder thumbnails — offered when a pack listing is on
+            // screen (inside a year, or Latest), where it actually takes effect.
+            let showing_packs = !self.colo_flat
+                && (parts.len() == 1 && (in_years || first == Some(sixteen::LATEST)));
+            if showing_packs {
+                ui.separator();
+                ui.checkbox(&mut self.colo_folder_diz, "FILE_ID.DIZ")
+                    .on_hover_text(
+                        "Show each pack's FILE_ID.ANS / FILE_ID.DIZ art as its folder thumbnail\n\
+                         (fetches one small render per pack the first time; cached after)",
+                    );
+                // While a prep job runs: a spinner, a done/total count + ETA, and Cancel.
+                if let Some(p) = &self.diz_prep {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    let (done, total) = (p.done, p.total);
+                    let eta = if done > 0 {
+                        let elapsed = ui.input(|i| i.time) - p.started_at;
+                        let remain = elapsed / done as f64 * (total - done) as f64;
+                        format!(" · ~{}", fmt_eta(remain))
+                    } else {
+                        String::new()
+                    };
+                    ui.label(format!("FILE_ID {done}/{total}{eta}"))
+                        .on_hover_text("Fetching each pack's FILE_ID art");
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Cancel FILE_ID prep")
+                        .clicked()
+                    {
+                        want_diz_cancel = true;
+                    }
+                }
             }
             ui.separator();
             // The search is scoped to the active facet: on the Artists tab it matches
@@ -19444,6 +19750,9 @@ impl Kaleidotron {
             if let Some((job, label)) = self.current_flat_bulk_job() {
                 self.start_bulk_download(job, label);
             }
+        }
+        if want_diz_cancel {
+            self.cancel_diz_prep();
         }
         if let Some(p) = nav {
             self.open_folder(p);
@@ -27447,72 +27756,94 @@ impl Kaleidotron {
                         ui.painter().rect_filled(rect, 4.0, bg);
 
                         if entry.is_dir {
-                            let info = self
-                                .folder_info
-                                .entry(path.clone())
-                                .or_insert_with(|| scan_folder_info(path))
-                                .clone();
-                            if info.previews.is_empty() {
-                                ui.painter_at(rect).text(
-                                    rect.center() - egui::vec2(0.0, tile * 0.10),
-                                    egui::Align2::CENTER_CENTER,
-                                    "📁",
-                                    egui::FontId::proportional(tile * 0.42),
-                                    ui.visuals().text_color(),
-                                );
-                            } else {
-                                // 2×2 montage (previews may come from subdirs — request #4).
-                                let inner = rect.shrink(7.0);
-                                let half = inner.size() * 0.5;
-                                let origins = [
-                                    inner.min,
-                                    inner.min + egui::vec2(half.x, 0.0),
-                                    inner.min + egui::vec2(0.0, half.y),
-                                    inner.min + half,
-                                ];
-                                for (qi, ppath) in info.previews.iter().enumerate().take(4) {
-                                    let cell =
-                                        egui::Rect::from_min_size(origins[qi], half).shrink(2.0);
-                                    if let Some(tex) = self.thumb_tex.get(ppath) {
-                                        let fit = fit_centered(cell, tex.size_vec2());
-                                        ui.painter().image(
-                                            tex.id(),
-                                            fit,
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(0.0, 0.0),
-                                                egui::pos2(1.0, 1.0),
-                                            ),
-                                            egui::Color32::WHITE,
-                                        );
-                                    } else {
-                                        self.thumbs.request(ppath, THUMB_PX);
-                                        self.want_repaint = true;
-                                    }
-                                }
-                            }
-                            // Count badge (top-left): direct images and subfolders, so
-                            // even an image-less folder shows there's content (request #4).
-                            let mut parts: Vec<String> = Vec::new();
-                            if info.images > 0 {
-                                parts.push(format!("{}", info.images));
-                            }
-                            if info.subdirs > 0 {
-                                parts.push(format!("📁{}", info.subdirs));
-                            }
-                            if !parts.is_empty() {
-                                let p = ui.painter_at(rect);
-                                let pos = rect.left_top() + egui::vec2(5.0, 4.0);
-                                let galley = p.layout_no_wrap(
-                                    parts.join("  "),
-                                    egui::FontId::proportional(11.0),
+                            // FILE_ID.DIZ pack-folder thumbnail (opt-in): a 16colo pack
+                            // folder shows its FILE_ID.ANS/.DIZ art instead of the plain 📁.
+                            // The prep job (`sync_diz_prep`) fills `thumb_tex`; here we just
+                            // paint whatever's ready.
+                            let folder_art = (self.colo_folder_diz
+                                && Self::is_colo_pack_folder(path))
+                            .then(|| self.thumb_tex.get(path).cloned())
+                            .flatten();
+                            if let Some(tex) = folder_art {
+                                let fit = fit_centered(rect.shrink(4.0), tex.size_vec2());
+                                ui.painter().image(
+                                    tex.id(),
+                                    fit,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
                                     egui::Color32::WHITE,
                                 );
-                                p.rect_filled(
-                                    egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
-                                    3.0,
-                                    egui::Color32::from_black_alpha(150),
-                                );
-                                p.galley(pos, galley, egui::Color32::WHITE);
+                            } else {
+                                let info = self
+                                    .folder_info
+                                    .entry(path.clone())
+                                    .or_insert_with(|| scan_folder_info(path))
+                                    .clone();
+                                if info.previews.is_empty() {
+                                    ui.painter_at(rect).text(
+                                        rect.center() - egui::vec2(0.0, tile * 0.10),
+                                        egui::Align2::CENTER_CENTER,
+                                        "📁",
+                                        egui::FontId::proportional(tile * 0.42),
+                                        ui.visuals().text_color(),
+                                    );
+                                } else {
+                                    // 2×2 montage (previews may come from subdirs).
+                                    let inner = rect.shrink(7.0);
+                                    let half = inner.size() * 0.5;
+                                    let origins = [
+                                        inner.min,
+                                        inner.min + egui::vec2(half.x, 0.0),
+                                        inner.min + egui::vec2(0.0, half.y),
+                                        inner.min + half,
+                                    ];
+                                    for (qi, ppath) in info.previews.iter().enumerate().take(4)
+                                    {
+                                        let cell = egui::Rect::from_min_size(origins[qi], half)
+                                            .shrink(2.0);
+                                        if let Some(tex) = self.thumb_tex.get(ppath) {
+                                            let fit = fit_centered(cell, tex.size_vec2());
+                                            ui.painter().image(
+                                                tex.id(),
+                                                fit,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            self.thumbs.request(ppath, THUMB_PX);
+                                            self.want_repaint = true;
+                                        }
+                                    }
+                                }
+                                // Count badge (top-left): direct images and subfolders, so
+                                // even an image-less folder shows there's content.
+                                let mut parts: Vec<String> = Vec::new();
+                                if info.images > 0 {
+                                    parts.push(format!("{}", info.images));
+                                }
+                                if info.subdirs > 0 {
+                                    parts.push(format!("📁{}", info.subdirs));
+                                }
+                                if !parts.is_empty() {
+                                    let p = ui.painter_at(rect);
+                                    let pos = rect.left_top() + egui::vec2(5.0, 4.0);
+                                    let galley = p.layout_no_wrap(
+                                        parts.join("  "),
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    p.rect_filled(
+                                        egui::Rect::from_min_size(pos, galley.size()).expand(2.0),
+                                        3.0,
+                                        egui::Color32::from_black_alpha(150),
+                                    );
+                                    p.galley(pos, galley, egui::Color32::WHITE);
+                                }
                             }
                             // (folder name is rendered in the caption strip below)
                         } else if entry.is_archive {
@@ -27997,6 +28328,22 @@ impl Kaleidotron {
                                 stroke,
                                 egui::StrokeKind::Inside,
                             );
+                        }
+                        // "You were here": a bright outline on the tile we just navigated up
+                        // out of, so it's easy to see where you were. Holds, then fades out.
+                        if self.highlight_entry.as_deref() == Some(path.as_path()) {
+                            if let Some(a) = self.highlight_alpha(ui.ctx()) {
+                                ui.painter().rect_stroke(
+                                    cell_rect.shrink(1.0),
+                                    5.0,
+                                    egui::Stroke::new(
+                                        3.0,
+                                        egui::Color32::from_rgb(120, 220, 255).gamma_multiply(a),
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+                                self.want_repaint = true;
+                            }
                         }
                         if resp.hovered() {
                             hovered = Some(idx);
@@ -29043,6 +29390,22 @@ impl Kaleidotron {
                     for c in cols.iter().take(cols.len().saturating_sub(1)) {
                         x += c.w;
                         p.vline(x, row_rect.y_range(), divider);
+                    }
+                }
+
+                // "You were here": outline the row we navigated up out of (fades out).
+                if self.highlight_entry.as_deref() == Some(path.as_path()) {
+                    if let Some(a) = self.highlight_alpha(ui.ctx()) {
+                        ui.painter().rect_stroke(
+                            row_rect.shrink(1.0),
+                            0.0,
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgb(120, 220, 255).gamma_multiply(a),
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        self.want_repaint = true;
                     }
                 }
 
@@ -35199,17 +35562,7 @@ impl Kaleidotron {
                 self.show_hidden = !self.show_hidden;
                 self.rebuild_view();
             }
-            MenuAction::Up => {
-                // Compute the parent in *display* space so "up" from an archive root
-                // lands in the archive's real parent folder, not its temp dir.
-                if let Some(folder) = self.folder.clone() {
-                    let disp = self.to_display(&folder);
-                    if let Some(parent) = disp.parent() {
-                        let real = self.real_path(parent);
-                        self.open_folder(real);
-                    }
-                }
-            }
+            MenuAction::Up => self.navigate_up(),
             MenuAction::AmigaFonts => self.open_amiga_fonts(),
             MenuAction::Home => {
                 if let Some(h) = home_dir() {
@@ -37165,6 +37518,8 @@ impl eframe::App for Kaleidotron {
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();
+        self.poll_colo_folder_thumb();
+        self.sync_diz_prep(&ctx);
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         self.poll_text_follow(&ctx); // tail -f: re-read a growing file
@@ -37359,15 +37714,9 @@ impl eframe::App for Kaleidotron {
                 }
             }
             if back {
-                // Parent in display space (see MenuAction::Up) so leaving an archive
-                // returns to its real parent folder.
-                if let Some(folder) = self.folder.clone() {
-                    let disp = self.to_display(&folder);
-                    if let Some(parent) = disp.parent() {
-                        let real = self.real_path(parent);
-                        self.open_folder(real);
-                    }
-                }
+                // Parent in display space (see navigate_up) so leaving an archive
+                // returns to its real parent folder, remembering where we were.
+                self.navigate_up();
             }
         }
 
@@ -39034,6 +39383,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SLIDE_SHUFFLE_KEY, &self.slide_shuffle);
         eframe::set_value(storage, Self::GLOW_KEY, &self.glow);
         eframe::set_value(storage, Self::GLOW_AMT_KEY, &self.glow_amt);
+        eframe::set_value(storage, Self::COLO_DIZ_KEY, &self.colo_folder_diz);
         eframe::set_value(storage, Self::SHUFFLE_KEY, &self.shuffle);
         self.ratings.save(); // belt-and-suspenders; set_rating already flushes
 
@@ -42867,6 +43217,18 @@ fn fit_centered(into: egui::Rect, content: egui::Vec2) -> egui::Rect {
     let scale = (into.width() / content.x).min(into.height() / content.y);
     let size = content * scale;
     egui::Rect::from_center_size(into.center(), size)
+}
+
+/// Format a seconds estimate compactly for a progress ETA: `~8s`, `~1m 20s`, `~2m`.
+fn fmt_eta(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{s}s")
+    } else if s % 60 == 0 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}m {:02}s", s / 60, s % 60)
+    }
 }
 
 /// A non-archive file we mount as a **virtual folder of samples**: SoundFont (`.sf2`), SFZ

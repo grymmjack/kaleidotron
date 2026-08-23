@@ -20,6 +20,10 @@ pub struct RemoteThumbResult {
 
 struct Job {
     path: PathBuf,
+    // Path whose *extension* drives the registry decoder for a `via_registry` job. Usually
+    // the same as `path`, but a pack folder's FILE_ID thumbnail keys by the folder path
+    // while decoding a `FILE_ID.DIZ`/`.TXT` — so the decoder hint carries the real filename.
+    decode_as: PathBuf,
     url: String,
     target: u32,
     // 16colo has no pre-rendered PNG for a PDF piece (its `tn`/`x1` render 404s), so
@@ -74,10 +78,25 @@ impl RemoteThumbs {
     /// with the `image` crate; `true` = `url` is a raw asset the `image` crate can't read (a PDF,
     /// an SVG icon) → decode it through the registry (SvgDecoder / pdfium-poppler) instead.
     pub fn request(&mut self, path: &Path, url: &str, target: u32, via_registry: bool) {
+        self.request_as(path, path, url, target, via_registry);
+    }
+
+    /// As [`request`], but decode a `via_registry` job with `decode_as`'s extension while
+    /// still keying the result by `path`. Used for a pack folder's FILE_ID thumbnail: keyed
+    /// by the folder path, decoded as the `FILE_ID.DIZ`/`.TXT` the registry needs to pick.
+    pub fn request_as(
+        &mut self,
+        path: &Path,
+        decode_as: &Path,
+        url: &str,
+        target: u32,
+        via_registry: bool,
+    ) {
         if self.requested.insert(path.to_path_buf()) {
             let (lock, cvar) = &*self.queue;
             lock.lock().unwrap().push(Job {
                 path: path.to_path_buf(),
+                decode_as: decode_as.to_path_buf(),
                 url: url.to_string(),
                 target,
                 via_registry,
@@ -102,6 +121,7 @@ impl RemoteThumbs {
             let (lock, cvar) = &*self.queue;
             lock.lock().unwrap().push(Job {
                 path: path.to_path_buf(),
+                decode_as: path.to_path_buf(),
                 url: url.to_string(),
                 target,
                 via_registry,
@@ -138,7 +158,7 @@ fn fetch(job: &Job, registry: &Registry) -> Option<RemoteThumbResult> {
     }
     let buf = crate::cache::get_bytes(&job.url, None).ok()?;
     if job.via_registry {
-        let img = registry.decode_bytes(&buf, &job.path).ok()?;
+        let img = registry.decode_bytes(&buf, &job.decode_as).ok()?;
         let (w, h, rgba) = crate::thumb::make_thumb(&img, job.target);
         return Some(RemoteThumbResult {
             path: job.path.clone(),
