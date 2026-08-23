@@ -758,7 +758,11 @@ impl Stream {
         } else if matches!(
             ext,
             Some("ans" | "asc" | "nfo" | "diz" | "ice" | "cia" | "txt") | None
-        ) {
+        ) || crate::decode::looks_like_ansi_text(bytes)
+        {
+            // …or a nonstandard extension whose *content* is ANSI/CP437 text (a sauceless
+            // .tri, .ice, …) — so it gets the baud "type-out" too. `looks_like_ansi_text`
+            // rejects the binary scene formats (XBin/BIN/…), which keep their cell-reveal.
             crate::decode::TextStream::new(bytes).map(Stream::Text)
         } else {
             None
@@ -5663,11 +5667,11 @@ impl Kaleidotron {
         {
             self.highlight_entry = Some(self.entries[idx].path.clone());
             self.highlight_born = -1.0; // stamp the fade start on first paint
-            // Grid restores the exact scroll offset (grid_scroll), which already exposes
-            // this tile; the table has no offset restore, so reveal it by index.
-            if self.table_view {
-                self.scroll_target = Some(idx);
-            }
+            // Scroll straight to the tile we came from (grid AND table). This beats the
+            // remembered scroll *offset*: if the listing changed shape — a `/` filter that's
+            // since cleared, a re-sort — the old offset points nowhere near the tile (it lands
+            // at the top), whereas its index always exposes it.
+            self.scroll_target = Some(idx);
             self.came_from = None;
             self.want_repaint = true;
         }

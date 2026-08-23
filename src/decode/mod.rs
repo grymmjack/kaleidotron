@@ -367,22 +367,18 @@ fn decode_caught(d: &dyn Decoder, bytes: &[u8]) -> Result<PixImage, DecodeError>
     caught(|| d.decode(bytes))
 }
 
-/// Heuristic: does `bytes` look like **scene text art** (ANSI / ASCII / CP437) even without a
-/// known extension? Scene groups shipped art under all sorts of extensions (`.tri`, `.ice`, …)
-/// and plenty of it has **no SAUCE**, so extension + SAUCE alone miss a lot. We accept a file
-/// as art when it isn't a binary AND carries one of the tell-tale art signatures — but stay
-/// conservative so ordinary text / binaries don't leak into the listing.
-pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
-    // 1) A trailing SAUCE record is the strongest signal.
-    if crate::sauce::present(bytes) {
-        return true;
-    }
+/// Does `bytes` look like an ANSI/CP437 **text stream** (the kind `TextStream` renders and can
+/// animate at a baud rate)? Unlike [`looks_like_scene_art`] this does NOT accept on a SAUCE
+/// record alone — the *binary* scene formats (XBin/BIN/Tundra/…) carry SAUCE too but are RLE/
+/// header blobs, not byte streams, so we require actual text content: few control bytes, plus a
+/// run of ANSI CSI escapes (colour codes / cursor moves) or a real fraction of CP437 block glyphs.
+pub fn looks_like_ansi_text(bytes: &[u8]) -> bool {
     let sample = &bytes[..bytes.len().min(64 * 1024)];
     if sample.is_empty() {
         return false;
     }
-    // 2) Reject binaries: text art is (almost) all printable/CP437/whitespace; a binary carries
-    //    NUL + other C0 control bytes. >2% "hard" controls ⇒ not art. (CR/LF/TAB/ESC/FF/EOF ok.)
+    // Reject binaries: text art is (almost) all printable/CP437/whitespace; a binary carries NUL
+    // + other C0 control bytes. >2% "hard" controls ⇒ not text. (CR/LF/TAB/ESC/FF/EOF ok.)
     let hard = sample
         .iter()
         .filter(|&&b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0c | 0x1a | 0x1b))
@@ -390,17 +386,25 @@ pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
     if hard * 100 > sample.len() * 2 {
         return false;
     }
-    // 3a) A run of ANSI CSI escapes (`ESC[`) — the hallmark of .ans art; real screens have many.
+    // (a) A run of ANSI CSI escapes (`ESC[`) — the hallmark of .ans art; real screens have many.
     if sample.windows(2).filter(|w| *w == b"\x1b[").count() >= 4 {
         return true;
     }
-    // 3b) CP437 shading/block glyphs (░▒▓ ▀▄█▌▐ = 0xB0-0xB2, 0xDB-0xDF) — the hallmark of CP437
-    //     "ASCII" art, and rare in ordinary text; a couple of % ⇒ art.
+    // (b) CP437 shading/block glyphs (░▒▓ ▀▄█▌▐ = 0xB0-0xB2, 0xDB-0xDF) — the hallmark of CP437
+    //     "ASCII" art, rare in ordinary text; a couple of % ⇒ art.
     let blocks = sample
         .iter()
         .filter(|&&b| matches!(b, 0xB0..=0xB2 | 0xDB..=0xDF))
         .count();
     blocks * 100 >= sample.len() * 2
+}
+
+/// Heuristic: does `bytes` look like **scene text art** (ANSI / ASCII / CP437) even without a
+/// known extension? Scene groups shipped art under all sorts of extensions (`.tri`, `.ice`, …)
+/// and plenty of it has **no SAUCE**, so extension + SAUCE alone miss a lot. Accept a trailing
+/// SAUCE record OR ANSI/CP437 text content — conservative, so binaries/prose don't leak in.
+pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
+    crate::sauce::present(bytes) || looks_like_ansi_text(bytes)
 }
 
 /// As [`looks_like_scene_art`] but for a file on disk: reads a bounded head chunk (enough for
@@ -546,6 +550,13 @@ mod tests {
             b"This is just a normal readme file with plain ASCII prose and nothing arty."
         ));
         assert!(reg.decode_bytes(b"\x00\x01\x02\x00 binary", Path::new("x.tri")).is_err());
+
+        // A SAUCE-bearing *binary* (XBin-like) counts as scene art, but is NOT an ANSI text
+        // stream — so `for_file` won't mis-route it to TextStream (it keeps its cell-reveal).
+        let mut bin = vec![0u8; 200]; // lots of NUL/control bytes = binary
+        bin.extend_from_slice(&sauce);
+        assert!(super::looks_like_scene_art(&bin)); // via SAUCE
+        assert!(!super::looks_like_ansi_text(&bin)); // but not a text stream
     }
 
     #[test]
