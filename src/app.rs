@@ -2372,26 +2372,22 @@ pub struct Kaleidotron {
     colo_sauce_rx: std::sync::mpsc::Receiver<Vec<(PathBuf, Option<crate::sauce::Sauce>, u64)>>,
     colo_sauce_done: HashSet<String>,
     colo_sauce_pending: usize, // in-flight pack-SAUCE fetches (for the busy spinner)
-    // FILE_ID.DIZ pack-folder thumbnails: with `colo_folder_diz` on, every 16colo pack
-    // folder tile in a listing shows the pack's FILE_ID.ANS/.DIZ art instead of the plain
-    // 📁. Enabling it starts a *prep job* (`diz_prep`) that walks the whole listing on a
-    // bounded worker pool, fetching each pack's FILE_ID render URL and handing it to
-    // `colo_thumbs` (the normal remote-thumb pool). The job reports progress (for the
-    // spinner/ETA) and is cancellable. `diz_prepped_for` is the listing folder we've
-    // already kicked prep for (so we don't restart it every frame); `diz_gen` tags each
-    // job so a stale worker's late message can't advance a newer job's counter. The
-    // channel message is (job gen, pack folder path, Some(render URL) | None).
+    // FILE_ID.DIZ pack-folder thumbnails: with `colo_folder_diz` on, a 16colo pack folder
+    // tile shows the pack's FILE_ID.ANS/.DIZ art instead of the plain 📁. **Demand-driven**
+    // (lazy), so we never flood 16colo: each frame `sync_diz` enqueues only the pack folders
+    // *visible* (plus a small margin) that still need art. A persistent pool of workers pulls
+    // from `diz_queue` the pack **nearest the viewport** (`diz_target`, updated by the grid),
+    // fetches + decodes its FILE_ID thumbnail, and returns it over `colo_diz_rx`. `diz_requested`
+    // dedups so a pack is enqueued once; `diz_no_art` marks packs with no FILE_ID (or a failed
+    // fetch) so they stop spinning; `diz_view` is the visible entry-index range.
     colo_folder_diz: bool,
-    colo_diz_tx: std::sync::mpsc::Sender<(u64, PathBuf, DizOutcome)>,
-    colo_diz_rx: std::sync::mpsc::Receiver<(u64, PathBuf, DizOutcome)>,
-    diz_prep: Option<DizPrep>,
-    diz_prepped_for: Option<PathBuf>,
-    diz_gen: u64,
+    colo_diz_rx: std::sync::mpsc::Receiver<(PathBuf, DizOutcome)>,
+    #[allow(clippy::type_complexity)]
+    diz_queue: Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)>,
+    diz_requested: HashSet<PathBuf>,
     diz_no_art: HashSet<PathBuf>, // pack folders resolved without a thumb (no art / failed → 📁)
-    // The entry index at the centre of the grid viewport, updated every frame. The prep
-    // workers pull the pack *nearest* this each time, so FILE_ID thumbnails load for what
-    // you're looking at first and expand outward — and re-prioritise as you scroll.
-    diz_target: Arc<std::sync::atomic::AtomicUsize>,
+    diz_target: Arc<std::sync::atomic::AtomicUsize>, // viewport-centre entry index (priority)
+    diz_view: (usize, usize),                        // visible entry-index range [first, last)
 }
 
 /// The result of prepping one pack's FILE_ID thumbnail (see `colo_folder_diz`): a decoded
@@ -2399,15 +2395,6 @@ pub struct Kaleidotron {
 enum DizOutcome {
     Art(usize, usize, Vec<u8>), // (width, height, rgba)
     None,
-}
-
-/// Progress state for a FILE_ID pack-thumbnail prep job (see `colo_folder_diz`).
-struct DizPrep {
-    gen: u64,                                   // which job this is (guards stale messages)
-    total: usize,                               // packs to prep
-    done: usize,                                // packs resolved so far
-    started_at: f64,                            // ctx time the job began (for the ETA)
-    cancel: Arc<std::sync::atomic::AtomicBool>, // set → workers stop
 }
 
 impl Kaleidotron {
@@ -3475,8 +3462,59 @@ impl Kaleidotron {
 
         // Shared channel for background pack-SAUCE fetches (see `ensure_colo_sauce`).
         let (colo_sauce_tx, colo_sauce_rx) = std::sync::mpsc::channel();
-        // Channel for background FILE_ID-render lookups (pack folder thumbnails).
+        // Demand-driven FILE_ID pack-thumbnail pool: a persistent set of workers pull the
+        // pack nearest the viewport (`diz_target`) off `diz_queue`, fetch + decode its
+        // thumbnail, and return it over this channel. See the `colo_folder_diz` field.
         let (colo_diz_tx, colo_diz_rx) = std::sync::mpsc::channel();
+        let diz_queue: Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)> =
+            Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let diz_target = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..6 {
+            let queue = Arc::clone(&diz_queue);
+            let target = Arc::clone(&diz_target);
+            let registry = Arc::clone(&registry);
+            let tx = colo_diz_tx.clone();
+            std::thread::spawn(move || loop {
+                // Wait for work, then take the pack nearest the current viewport centre.
+                let (path, pack) = {
+                    let (lock, cvar) = &*queue;
+                    let mut q = lock.lock().unwrap();
+                    while q.is_empty() {
+                        q = cvar.wait(q).unwrap();
+                    }
+                    let t = target.load(std::sync::atomic::Ordering::Relaxed) as isize;
+                    let best = q
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (idx, _, _))| (*idx as isize - t).abs())
+                        .map(|(j, _)| j)
+                        .unwrap();
+                    let (_, path, pack) = q.swap_remove(best);
+                    (path, pack)
+                };
+                // Resolve the FILE_ID render source AND fetch+decode it here (single-stage),
+                // so the viewport priority holds end-to-end.
+                let outcome = match crate::sixteen::pack_file_id_thumb(&pack) {
+                    Some(t) => {
+                        let decode_as = path.join(&t.filename);
+                        match crate::colo_thumb::fetch_thumb_bytes(
+                            &t.url,
+                            &decode_as,
+                            t.via_registry,
+                            THUMB_PX,
+                            &registry,
+                        ) {
+                            Some((w, h, rgba)) => DizOutcome::Art(w, h, rgba),
+                            None => DizOutcome::None,
+                        }
+                    }
+                    None => DizOutcome::None,
+                };
+                if tx.send((path, outcome)).is_err() {
+                    break;
+                }
+            });
+        }
         // Shared channel for background archive-thumbnail (montage) builds.
         let (archive_montage_tx, archive_montage_rx) = std::sync::mpsc::channel();
 
@@ -4428,13 +4466,12 @@ impl Kaleidotron {
             colo_sauce_pending: 0,
             // Default OFF: it costs one pack-JSON fetch per pack folder (cached after).
             colo_folder_diz: get_bool(Self::COLO_DIZ_KEY).unwrap_or(false),
-            colo_diz_tx,
             colo_diz_rx,
-            diz_prep: None,
-            diz_prepped_for: None,
-            diz_gen: 0,
+            diz_queue,
+            diz_requested: HashSet::new(),
             diz_no_art: HashSet::new(),
-            diz_target: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            diz_target,
+            diz_view: (0, 0),
             came_from: None,
             highlight_entry: None,
             highlight_born: -1.0,
@@ -5056,6 +5093,7 @@ impl Kaleidotron {
         self.hotswap_pad = None;
         self.hotswap_orig = None;
         self.shuffle_bag.clear(); // a new folder gets a fresh shuffle pass
+        self.reset_diz(); // a new listing re-requests FILE_ID art only for what IT shows
         self.all_entries = entries;
         // Record in the back/forward history unless we're navigating *via* it.
         if !self.suppress_history {
@@ -5516,166 +5554,69 @@ impl Kaleidotron {
             && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
     }
 
-    /// Keep the FILE_ID prep job in sync with the toggle + the current listing, once per
-    /// frame: start a job when the toggle is on over a pack listing that hasn't been
-    /// prepped, and cancel a running one when the toggle goes off or we navigate away.
-    fn sync_diz_prep(&mut self, ctx: &egui::Context) {
-        // Toggle off → stop everything.
-        if !self.colo_folder_diz {
-            if let Some(p) = self.diz_prep.take() {
-                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.diz_prepped_for = None;
-            return;
-        }
-        // On a pack listing → ensure a prep for *this* listing. Crucially we do NOT cancel
-        // when we've merely navigated *off* a listing (e.g. into a pack to inspect it): the
-        // prep keeps running in the background and fills `thumb_tex` (persistent), so the
-        // thumbnails are ready when we come back. Only a *different* pack listing supersedes
-        // the current job — otherwise browsing packs would cancel the year's prep every hop.
-        let on_listing = !self.entries.is_empty()
-            && self
+    /// Lazily enqueue FILE_ID thumbnails for the pack folders **in view** (plus a small
+    /// margin), once per frame. Demand-driven so browsing a huge year never floods 16colo:
+    /// packs you never scroll to are never fetched. `diz_requested` dedups; already-cached
+    /// (`thumb_tex`) or resolved-empty (`diz_no_art`) packs are skipped. The pool workers
+    /// (spawned in `new`) pull the enqueued pack nearest the viewport first.
+    fn sync_diz(&mut self) {
+        if !self.colo_folder_diz
+            || !self
                 .folder
                 .as_deref()
-                .is_some_and(Self::is_colo_pack_listing);
-        if on_listing && self.diz_prepped_for.as_deref() != self.folder.as_deref() {
-            if let Some(p) = self.diz_prep.take() {
-                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.diz_prepped_for = self.folder.clone();
-            self.start_diz_prep(ctx);
-        }
-    }
-
-    /// Start a FILE_ID prep job for the current listing: gather every pack folder that
-    /// doesn't already have a thumbnail and fetch its FILE_ID render URL across a small
-    /// worker pool (bounded concurrency, cancellable), streaming results back to
-    /// `poll_colo_folder_thumb`. No-op (and no spinner) when everything's already cached.
-    fn start_diz_prep(&mut self, ctx: &egui::Context) {
-        // (entry index, pack folder path, pack name) for each tile still needing art. The
-        // index lets the workers prioritise by distance to the viewport (see below).
-        let packs: Vec<(usize, PathBuf, String)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.is_dir && Self::is_colo_pack_folder(&e.path))
-            .filter(|(_, e)| !self.thumb_tex.contains_key(&e.path))
-            .filter_map(|(i, e)| {
-                crate::sixteen::rel_parts(&e.path)
-                    .get(1)
-                    .map(|pack| (i, e.path.clone(), pack.clone()))
-            })
-            .collect();
-        if packs.is_empty() {
-            self.diz_prep = None; // all cached → nothing to show
+                .is_some_and(Self::is_colo_pack_listing)
+        {
             return;
         }
-        // Re-evaluate "no art" for this fresh sweep (a pack could be added, or a prior run
-        // cancelled/failed before resolving) so those retry instead of staying a plain 📁.
-        self.diz_no_art.clear();
-        self.diz_gen += 1;
-        let gen = self.diz_gen;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.diz_prep = Some(DizPrep {
-            gen,
-            total: packs.len(),
-            done: 0,
-            started_at: ctx.input(|i| i.time),
-            cancel: cancel.clone(),
-        });
-        // A shared queue the workers pull from **nearest the viewport first** (`diz_target`,
-        // updated every frame by the grid): the packs you're looking at get their FILE_ID
-        // thumbnail first, and it expands outward — re-prioritising live as you scroll,
-        // rather than churning top-to-bottom in listing order.
-        let queue = Arc::new(std::sync::Mutex::new(packs));
-        let workers = queue.lock().unwrap().len().min(6);
-        for _ in 0..workers {
-            let tx = self.colo_diz_tx.clone();
-            let cancel = cancel.clone();
-            let queue = Arc::clone(&queue);
-            let target = Arc::clone(&self.diz_target);
-            let registry = Arc::clone(&self.registry);
-            std::thread::spawn(move || loop {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let job = {
-                    let mut q = queue.lock().unwrap();
-                    if q.is_empty() {
-                        break;
-                    }
-                    let t = target.load(std::sync::atomic::Ordering::Relaxed) as isize;
-                    // Pop the pack whose row is closest to the current viewport centre.
-                    let best = q
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (idx, _, _))| (*idx as isize - t).abs())
-                        .map(|(j, _)| j)
-                        .unwrap();
-                    q.swap_remove(best)
-                };
-                let (_, path, pack) = job;
-                // Single-stage: resolve the FILE_ID render URL AND fetch+decode it here, so
-                // the viewport priority holds end-to-end (handing the PNG to the shared LIFO
-                // thumb pool would fetch the *last*-requested — farthest — packs first).
-                let outcome = match crate::sixteen::pack_file_id_thumb(&pack) {
-                    Some(t) => {
-                        let decode_as = path.join(&t.filename); // extension for a via_registry decode
-                        match crate::colo_thumb::fetch_thumb_bytes(
-                            &t.url,
-                            &decode_as,
-                            t.via_registry,
-                            THUMB_PX,
-                            &registry,
-                        ) {
-                            Some((w, h, rgba)) => DizOutcome::Art(w, h, rgba),
-                            None => DizOutcome::None, // fetch/decode failed → plain 📁 (retried on re-prep)
-                        }
-                    }
-                    None => DizOutcome::None, // no FILE_ID file in the pack
-                };
-                if tx.send((gen, path, outcome)).is_err() {
-                    break;
-                }
-            });
+        const MARGIN: usize = 24; // a row or two beyond the viewport, so scrolling stays ahead
+        let (first, last) = self.diz_view;
+        let lo = first.saturating_sub(MARGIN);
+        let hi = (last + MARGIN).min(self.entries.len());
+        let mut jobs: Vec<(usize, PathBuf, String)> = Vec::new();
+        for idx in lo..hi {
+            let path = self.entries[idx].path.clone();
+            if !self.entries[idx].is_dir
+                || !Self::is_colo_pack_folder(&path)
+                || self.thumb_tex.contains_key(&path)
+                || self.diz_no_art.contains(&path)
+                || !self.diz_requested.insert(path.clone())
+            {
+                continue;
+            }
+            if let Some(pack) = crate::sixteen::rel_parts(&path).get(1).cloned() {
+                jobs.push((idx, path, pack));
+            }
         }
-        self.want_repaint = true;
-    }
-
-    /// Cancel a running FILE_ID prep job (the ✕ button next to the toggle). Leaves the
-    /// listing marked as prepped so it doesn't auto-restart; re-toggling re-preps.
-    fn cancel_diz_prep(&mut self) {
-        if let Some(p) = self.diz_prep.take() {
-            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !jobs.is_empty() {
+            let (lock, cvar) = &*self.diz_queue;
+            lock.lock().unwrap().extend(jobs);
+            cvar.notify_all();
+            self.want_repaint = true;
         }
     }
 
-    /// Drain finished FILE_ID prep results into the thumbnail cache (keyed by the pack folder
-    /// path, so the tile finds it) and advance the prep progress. A pack with no FILE_ID art
-    /// (or whose fetch failed) is recorded in `diz_no_art` so it stops spinning and shows 📁.
+    /// Forget every pending/enqueued FILE_ID request (on navigation / hard refresh) so a new
+    /// listing re-requests only what *it* shows. `thumb_tex` (the decoded art) is kept.
+    fn reset_diz(&mut self) {
+        self.diz_requested.clear();
+        self.diz_queue.0.lock().unwrap().clear();
+    }
+
+    /// Drain finished FILE_ID results into the thumbnail cache (keyed by the pack folder path,
+    /// so the tile finds it). A pack with no FILE_ID art (or a failed fetch) is recorded in
+    /// `diz_no_art` so it stops spinning and shows a plain 📁.
     fn poll_colo_folder_thumb(&mut self, ctx: &egui::Context) {
-        while let Ok((gen, path, outcome)) = self.colo_diz_rx.try_recv() {
+        while let Ok((path, outcome)) = self.colo_diz_rx.try_recv() {
             match outcome {
                 DizOutcome::Art(w, h, rgba) => {
                     let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                    let tex = ctx.load_texture(
-                        path.to_string_lossy(),
-                        color,
-                        egui::TextureOptions::LINEAR,
-                    );
+                    let tex =
+                        ctx.load_texture(path.to_string_lossy(), color, egui::TextureOptions::LINEAR);
                     self.thumb_rgba.insert(path.clone(), (w, h, rgba));
                     self.thumb_tex.insert(path.clone(), tex);
                 }
                 DizOutcome::None => {
                     self.diz_no_art.insert(path.clone());
-                }
-            }
-            // Advance only the *current* job (a cancelled/replaced job's stragglers arrive
-            // with an old gen and are ignored, so they can't skew the count/ETA).
-            if let Some(p) = self.diz_prep.as_mut().filter(|p| p.gen == gen) {
-                p.done += 1;
-                if p.done >= p.total {
-                    self.diz_prep = None; // finished
                 }
             }
             self.want_repaint = true;
@@ -9871,15 +9812,12 @@ impl Kaleidotron {
         if let Some(f) = self.folder.clone() {
             self.folder_info.remove(&f);
         }
-        // FILE_ID pack-folder thumbnails: cancel any running prep and clear its state so the
-        // hard refresh re-preps the current listing (the `colo_thumbs.forget` above lets each
-        // thumbnail re-fetch). NB the 16colo HTTP *disk* cache — the pack JSON + rendered
-        // PNGs — is intentionally kept, so this reloads fast from disk; a full network
-        // re-download needs "Clear cache" in Preferences.
-        if let Some(p) = self.diz_prep.take() {
-            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.diz_prepped_for = None;
+        // FILE_ID pack-folder thumbnails: forget requests + "no art" so the hard refresh
+        // re-fetches the visible packs (the `colo_thumbs.forget` above + the cleared thumb
+        // textures mean each re-decodes). NB the 16colo HTTP *disk* cache — the pack JSON +
+        // rendered PNGs — is intentionally kept, so this reloads fast from disk; a full
+        // network re-download needs "Clear cache" in Preferences.
+        self.reset_diz();
         self.diz_no_art.clear();
         // Re-scan disk so added/removed files are caught too, then report (open_folder
         // clears status, so set it AFTER — same ordering as the file-op handlers).
@@ -19710,7 +19648,6 @@ impl Kaleidotron {
             0
         };
         let mut want_bulk = false;
-        let mut want_diz_cancel = false;
         // Plain-text labels: the bundled egui font renders many emoji as tofu (see the
         // font gotcha in CLAUDE.md), so avoid 📅/👥/🎨 here.
         ui.horizontal(|ui| {
@@ -19747,26 +19684,11 @@ impl Kaleidotron {
                         "Show each pack's FILE_ID.ANS / FILE_ID.DIZ art as its folder thumbnail\n\
                          (fetches one small render per pack the first time; cached after)",
                     );
-                // While a prep job runs: a spinner, a done/total count + ETA, and Cancel.
-                if let Some(p) = &self.diz_prep {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    let (done, total) = (p.done, p.total);
-                    let eta = if done > 0 {
-                        let elapsed = ui.input(|i| i.time) - p.started_at;
-                        let remain = elapsed / done as f64 * (total - done) as f64;
-                        format!(" · ~{}", fmt_eta(remain))
-                    } else {
-                        String::new()
-                    };
-                    ui.label(format!("FILE_ID {done}/{total}{eta}"))
-                        .on_hover_text("Fetching each pack's FILE_ID art");
-                    if ui
-                        .small_button("✕")
-                        .on_hover_text("Cancel FILE_ID prep")
-                        .clicked()
-                    {
-                        want_diz_cancel = true;
-                    }
+                // A small spinner while any FILE_ID thumbnails are still fetching (lazy —
+                // only the packs in view, so there's no total to count toward).
+                if !self.diz_queue.0.lock().unwrap().is_empty() {
+                    ui.add(egui::Spinner::new().size(14.0))
+                        .on_hover_text("Fetching FILE_ID art for the packs in view");
                 }
             }
             ui.separator();
@@ -19822,9 +19744,6 @@ impl Kaleidotron {
             if let Some((job, label)) = self.current_flat_bulk_job() {
                 self.start_bulk_download(job, label);
             }
-        }
-        if want_diz_cancel {
-            self.cancel_diz_prep();
         }
         if let Some(p) = nav {
             self.open_folder(p);
@@ -27789,13 +27708,14 @@ impl Kaleidotron {
         // still used for scroll-offset math, and matches show_rows' internal `cell_h + gap_y`.)
         ui.spacing_mut().item_spacing.y = gap_y;
         let grid_out = scroll_area.show_rows(ui, cell_h, rows, |ui, row_range| {
-            // Tell the FILE_ID prep workers what's on screen: the entry index at the centre
-            // of the visible rows, so they thumbnail the packs you're looking at first.
+            // Tell the FILE_ID prep what's on screen: the visible entry-index range (so
+            // `sync_diz` only fetches those, lazily) and its centre (so the workers pull
+            // the pack nearest what you're looking at first).
+            let n = self.entries.len();
+            self.diz_view = ((row_range.start * per_row).min(n), (row_range.end * per_row).min(n));
             let vis_center = (row_range.start + row_range.end) / 2 * per_row + per_row / 2;
-            self.diz_target.store(
-                vis_center.min(self.entries.len().saturating_sub(1)),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.diz_target
+                .store(vis_center.min(n.saturating_sub(1)), std::sync::atomic::Ordering::Relaxed);
             for row in row_range {
                 ui.horizontal(|ui| {
                     // Match the spacing the per_row math assumed (else the row's real
@@ -27837,7 +27757,7 @@ impl Kaleidotron {
                         if entry.is_dir {
                             // FILE_ID.DIZ pack-folder thumbnail (opt-in): a 16colo pack
                             // folder shows its FILE_ID.ANS/.DIZ art instead of the plain 📁.
-                            // The prep job (`sync_diz_prep`) fills `thumb_tex`; here we just
+                            // The lazy prep (`sync_diz`) fills `thumb_tex`; here we just
                             // paint whatever's ready.
                             let folder_art = (self.colo_folder_diz
                                 && Self::is_colo_pack_folder(path))
@@ -27859,14 +27779,11 @@ impl Kaleidotron {
                                 // small spinner (same colour as the 📁) so it reads as "coming",
                                 // not "empty". A pack resolved to have no FILE_ID art, or a
                                 // cancelled prep, falls through to the plain 📁.
-                                // A pack whose FILE_ID thumbnail is still pending spins. Only
-                                // *visible* tiles are painted (the grid is virtualised), so a
-                                // spinner only ever shows for what's on screen — and viewport
-                                // priority resolves those first. Resolved (art / no-art / failed)
-                                // packs stop spinning.
+                                // A visible pack we've requested but not yet resolved spins.
+                                // (We're already in the no-thumbnail branch; a resolved-empty
+                                // pack is in `diz_no_art` and stops.)
                                 let loading = self.colo_folder_diz
-                                    && Self::is_colo_pack_folder(path)
-                                    && self.diz_prep.is_some()
+                                    && self.diz_requested.contains(path)
                                     && !self.diz_no_art.contains(path);
                                 let info = self
                                     .folder_info
@@ -37621,7 +37538,7 @@ impl eframe::App for Kaleidotron {
         self.poll_bulk_download();
         self.poll_colo_sauce();
         self.poll_colo_folder_thumb(&ctx);
-        self.sync_diz_prep(&ctx);
+        self.sync_diz();
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         self.poll_text_follow(&ctx); // tail -f: re-read a growing file
@@ -43361,18 +43278,6 @@ fn fit_centered(into: egui::Rect, content: egui::Vec2) -> egui::Rect {
     let scale = (into.width() / content.x).min(into.height() / content.y);
     let size = content * scale;
     egui::Rect::from_center_size(into.center(), size)
-}
-
-/// Format a seconds estimate compactly for a progress ETA: `~8s`, `~1m 20s`, `~2m`.
-fn fmt_eta(secs: f64) -> String {
-    let s = secs.max(0.0).round() as u64;
-    if s < 60 {
-        format!("{s}s")
-    } else if s % 60 == 0 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{}m {:02}s", s / 60, s % 60)
-    }
 }
 
 /// A non-archive file we mount as a **virtual folder of samples**: SoundFont (`.sf2`), SFZ
