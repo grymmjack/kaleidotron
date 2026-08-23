@@ -5011,6 +5011,11 @@ impl Kaleidotron {
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
                     || (self.plugin_audio && is_kit_ext(&p))
+                    // Scene art under a nonstandard extension (.tri from TRIBE, .ice, group-
+                    // specific ones): the extension list can't cover them all, so sniff the
+                    // content — a trailing SAUCE record is a reliable "this is art" signal
+                    // (cheap: reads only the file's tail). Decoded via the ANSI/CP437 path.
+                    || crate::sauce::file_has_record(&p)
                 // saved kits (click → load)
                 {
                     all.push(make_entry(p, false));

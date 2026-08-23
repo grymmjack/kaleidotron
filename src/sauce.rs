@@ -90,6 +90,36 @@ fn sauce_offset(data: &[u8]) -> Option<usize> {
     })
 }
 
+/// Does `data` (a whole file) carry a trailing SAUCE record? A cheap "is this scene art?"
+/// test — scene groups shipped art under all sorts of extensions (`.tri`, `.ice`, …), but
+/// almost all of it ends in a SAUCE record, so this is more reliable than an extension list.
+pub fn present(data: &[u8]) -> bool {
+    sauce_offset(data).is_some()
+}
+
+/// Like [`present`] but for a file on disk, reading **only the tail** — so it's cheap enough
+/// to sniff a whole folder of unknown-extension files while building the listing.
+pub fn file_has_record(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    if len < 128 {
+        return false;
+    }
+    // The record is the last 128 bytes (+ up to a few trailing bytes); 256 covers it, and
+    // `sauce_offset` measures from the slice end, which is the file end.
+    let tail = 256.min(len);
+    if f.seek(SeekFrom::End(-(tail as i64))).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; tail as usize];
+    f.read_exact(&mut buf).is_ok() && sauce_offset(&buf).is_some()
+}
+
 /// Parse the trailing SAUCE record, if present. `data` is the whole file.
 pub fn parse(data: &[u8]) -> Option<Sauce> {
     let start = sauce_offset(data)?;
@@ -242,6 +272,23 @@ mod tests {
         s[..7].copy_from_slice(b"SAUCE00");
         set(&mut s);
         s
+    }
+
+    #[test]
+    fn present_and_file_has_record_detect_a_trailing_sauce() {
+        // A "TRIBE.TRI"-style file: some art bytes + a SAUCE record. `present` (in-memory)
+        // and `file_has_record` (tail-only, on disk) must both see it; a plain file mustn't.
+        let mut art = b"\x1b[31mART\x1b[0m".to_vec();
+        art.extend_from_slice(&rec(|s| s[94] = 1)); // Character-type SAUCE
+        assert!(present(&art));
+        assert!(!present(b"just some text, no sauce here at all........................"));
+
+        let path = std::env::temp_dir().join(format!("kt_sauce_{}.tri", std::process::id()));
+        std::fs::write(&path, &art).unwrap();
+        assert!(file_has_record(&path));
+        std::fs::write(&path, b"not art, no record").unwrap();
+        assert!(!file_has_record(&path)); // < 128 bytes → no record
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

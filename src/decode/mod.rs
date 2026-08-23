@@ -307,6 +307,17 @@ impl Registry {
                 }
             }
         }
+        // 4) A nonstandard extension the sniff + extension passes both missed (.tri from
+        //    TRIBE, .ice, group-specific ones): a trailing SAUCE record is a reliable "this
+        //    is CP437/ANSI art" signal, so render it via the ANSI decoder like extensionless
+        //    art. (The listing includes such files via `sauce::file_has_record`.)
+        if crate::sauce::present(bytes) {
+            for d in &self.decoders {
+                if d.extensions().contains(&"ans") {
+                    return decode_caught(d.as_ref(), bytes);
+                }
+            }
+        }
         Err(DecodeError::Unsupported)
     }
 }
@@ -460,6 +471,25 @@ mod tests {
             decode_caught(&Boom, b"x").is_err(),
             "a decoder panic must become a decode error"
         );
+    }
+
+    #[test]
+    fn sauce_bearing_unknown_extension_decodes_as_ansi() {
+        // A .tri (TRIBE) file — an extension no decoder claims — still decodes as CP437/ANSI
+        // art because it carries a trailing SAUCE record (the content-sniff fallback).
+        let mut file = b"\x1b[1;37mTRIBE\x1b[0m".to_vec();
+        let mut sauce = vec![0u8; 128];
+        sauce[..7].copy_from_slice(b"SAUCE00");
+        sauce[94] = 1; // Character
+        file.extend_from_slice(&sauce);
+        let img = Registry::with_builtins()
+            .decode_bytes(&file, Path::new("LOGO.TRI"))
+            .expect("SAUCE-bearing .tri decodes via the ANSI fallback");
+        assert!(img.width > 0 && img.height > 0);
+        // A .tri with NO sauce and no ANSI content is still unsupported (not everything is art).
+        assert!(Registry::with_builtins()
+            .decode_bytes(b"\x00\x01\x02random binary", Path::new("x.tri"))
+            .is_err());
     }
 
     #[test]
