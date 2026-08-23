@@ -2389,6 +2389,8 @@ pub struct Kaleidotron {
     diz_prep: Option<DizPrep>,
     diz_prepped_for: Option<PathBuf>,
     diz_gen: u64,
+    diz_loading: HashSet<PathBuf>, // pack folders whose FILE_ID thumb is fetching (→ spinner)
+    diz_no_art: HashSet<PathBuf>,  // pack folders resolved to have no FILE_ID art (→ plain 📁)
 }
 
 /// Progress state for a FILE_ID pack-thumbnail prep job (see `colo_folder_diz`).
@@ -4423,6 +4425,8 @@ impl Kaleidotron {
             diz_prep: None,
             diz_prepped_for: None,
             diz_gen: 0,
+            diz_loading: HashSet::new(),
+            diz_no_art: HashSet::new(),
             came_from: None,
             highlight_entry: None,
             highlight_born: -1.0,
@@ -5508,22 +5512,30 @@ impl Kaleidotron {
     /// frame: start a job when the toggle is on over a pack listing that hasn't been
     /// prepped, and cancel a running one when the toggle goes off or we navigate away.
     fn sync_diz_prep(&mut self, ctx: &egui::Context) {
-        let want = self.colo_folder_diz
-            && !self.entries.is_empty()
+        // Toggle off → stop everything.
+        if !self.colo_folder_diz {
+            if let Some(p) = self.diz_prep.take() {
+                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.diz_prepped_for = None;
+            return;
+        }
+        // On a pack listing → ensure a prep for *this* listing. Crucially we do NOT cancel
+        // when we've merely navigated *off* a listing (e.g. into a pack to inspect it): the
+        // prep keeps running in the background and fills `thumb_tex` (persistent), so the
+        // thumbnails are ready when we come back. Only a *different* pack listing supersedes
+        // the current job — otherwise browsing packs would cancel the year's prep every hop.
+        let on_listing = !self.entries.is_empty()
             && self
                 .folder
                 .as_deref()
                 .is_some_and(Self::is_colo_pack_listing);
-        let target = if want { self.folder.clone() } else { None };
-        if self.diz_prepped_for != target {
-            // Toggle flipped, or we moved to a different listing: stop the old job.
+        if on_listing && self.diz_prepped_for.as_deref() != self.folder.as_deref() {
             if let Some(p) = self.diz_prep.take() {
                 p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.diz_prepped_for = target.clone();
-            if target.is_some() {
-                self.start_diz_prep(ctx);
-            }
+            self.diz_prepped_for = self.folder.clone();
+            self.start_diz_prep(ctx);
         }
     }
 
@@ -5548,6 +5560,9 @@ impl Kaleidotron {
             self.diz_prep = None; // all cached → nothing to show
             return;
         }
+        // Re-evaluate "no art" for this fresh sweep (a pack could be added, or a prior run
+        // cancelled before resolving); `diz_loading` is pruned as thumbs land.
+        self.diz_no_art.clear();
         self.diz_gen += 1;
         let gen = self.diz_gen;
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5597,6 +5612,11 @@ impl Kaleidotron {
     fn poll_colo_folder_thumb(&mut self) {
         while let Ok((gen, path, thumb)) = self.colo_diz_rx.try_recv() {
             if let Some(t) = thumb {
+                // Clear any prior (possibly failed/interrupted) request for this folder so a
+                // retry actually re-fetches — `colo_thumbs` dedups by path forever otherwise,
+                // which would leave a pack whose first fetch got cut off a plain 📁 for good.
+                self.colo_thumbs.forget(&path);
+                self.diz_loading.insert(path.clone()); // thumb in flight → show a spinner
                 if t.via_registry {
                     // No server render (a .diz/.txt): fetch the raw file and decode it
                     // locally. Key by the pack folder path, but decode with the real
@@ -5607,6 +5627,8 @@ impl Kaleidotron {
                 } else {
                     self.colo_thumbs.request(&path, &t.url, THUMB_PX, false);
                 }
+            } else {
+                self.diz_no_art.insert(path.clone()); // resolved: this pack has no FILE_ID art
             }
             // Advance only the *current* job (a cancelled/replaced job's stragglers arrive
             // with an old gen and are ignored, so they can't skew the count/ETA).
@@ -27776,6 +27798,15 @@ impl Kaleidotron {
                                     egui::Color32::WHITE,
                                 );
                             } else {
+                                // A pack folder whose FILE_ID thumbnail is still loading gets a
+                                // small spinner (same colour as the 📁) so it reads as "coming",
+                                // not "empty". A pack resolved to have no FILE_ID art, or a
+                                // cancelled prep, falls through to the plain 📁.
+                                let loading = self.colo_folder_diz
+                                    && Self::is_colo_pack_folder(path)
+                                    && !self.diz_no_art.contains(path)
+                                    && (self.diz_prep.is_some()
+                                        || self.diz_loading.contains(path));
                                 let info = self
                                     .folder_info
                                     .entry(path.clone())
@@ -27789,6 +27820,16 @@ impl Kaleidotron {
                                         egui::FontId::proportional(tile * 0.42),
                                         ui.visuals().text_color(),
                                     );
+                                    if loading {
+                                        paint_spinner(
+                                            ui.painter(),
+                                            rect.center() + egui::vec2(0.0, tile * 0.24),
+                                            tile * 0.09,
+                                            ui.ctx().input(|i| i.time),
+                                            ui.visuals().text_color(),
+                                        );
+                                        self.want_repaint = true;
+                                    }
                                 } else {
                                     // 2×2 montage (previews may come from subdirs).
                                     let inner = rect.shrink(7.0);
@@ -37582,6 +37623,7 @@ impl eframe::App for Kaleidotron {
             // PixelFX / reduce / dither, "Apply to grid" + the details preview) can run
             // on a 16colo piece — it's a rendered preview, not our decode, but recoloring
             // it gives live feedback without downloading the raw art.
+            self.diz_loading.remove(&r.path); // a pack folder thumb landed → stop its spinner
             self.thumb_rgba
                 .insert(r.path.clone(), (r.width, r.height, r.rgba));
             self.thumb_tex.insert(r.path, tex);
