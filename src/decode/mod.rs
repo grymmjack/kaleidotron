@@ -411,6 +411,14 @@ pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
 /// the escape/block heuristics + a small file's SAUCE) plus the tail for a large file's SAUCE.
 /// Cheap enough to sniff a folder of unknown-extension files while building the listing.
 pub fn file_is_scene_art(path: &Path) -> bool {
+    // A known source-code extension is source, full stop — never sniff it as scene art. DOS-era
+    // Pascal/BASIC/C often carry CP437 box-drawing comment banners (═══) that the block-glyph
+    // heuristic would otherwise read as ANSI art, sending a `.pas` to the image viewer.
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if code::CODE_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+    }
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
@@ -557,6 +565,34 @@ mod tests {
         bin.extend_from_slice(&sauce);
         assert!(super::looks_like_scene_art(&bin)); // via SAUCE
         assert!(!super::looks_like_ansi_text(&bin)); // but not a text stream
+    }
+
+    /// A Pascal source file with a DOS box-drawing comment banner (CP437 blocks) must NOT be
+    /// mistaken for ANSI art: the block-glyph heuristic would say "scene art", but a known code
+    /// extension overrides it, so `.pas` routes to the text viewer/editor. Regression for a
+    /// Turbo Pascal `.PAS` that opened in the image viewer.
+    #[test]
+    fn pascal_with_a_cp437_banner_is_code_not_scene_art() {
+        // A comment banner drawn with CP437 double-line box glyphs (═ = 0xCD, block 0xDB), then
+        // real Pascal — the block glyphs alone would trip `looks_like_ansi_text`.
+        let mut src = b"{ \xC9\xCD\xCD\xCD\xCD\xCD\xCD\xBB\r\n".to_vec();
+        src.extend_from_slice(b"  \xBA \xDB\xDB HELLO \xDB\xDB \xBA }\r\n");
+        src.extend_from_slice(b"program Hello;\r\nbegin\r\n  WriteLn('hi');\r\nend.\r\n");
+
+        let dir = std::env::temp_dir().join(format!("pv_pas_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("HELLO.PAS");
+        std::fs::write(&f, &src).unwrap();
+        // The extension guard wins over the content heuristic.
+        assert!(
+            !super::file_is_scene_art(&f),
+            "a .pas is source code, not scene art, even with a CP437 banner"
+        );
+        // And it's advertised as a known (code) extension, so the listing shows it.
+        let reg = Registry::with_builtins();
+        assert!(reg.known_extension("pas"));
+        assert!(reg.known_extension("PAS")); // case-insensitive
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

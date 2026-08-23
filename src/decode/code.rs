@@ -193,6 +193,23 @@ const ASM: LangSpec = LangSpec {
     decl_words: &[],
     upper_is_type: true,
 };
+/// Pascal / Turbo Pascal / Delphi / Free Pascal / Lazarus. Case-insensitive (like BASIC), strings
+/// in single quotes, `//` line comments + `{ … }` block comments (the `(* … *)` form and the
+/// `{$…}` compiler directive both read as a brace comment — close enough for a viewer). Compiler
+/// directives aren't `#`/`$word`, so both preproc flags stay off.
+const PASCAL: LangSpec = LangSpec {
+    line: &["//"],
+    block: Some(("{", "}")),
+    raw: &[],
+    quotes: &['\''],
+    preproc_hash: false,
+    highlight: true,
+    keywords: Some(PASCAL_KEYWORDS),
+    control: Some(PASCAL_CONTROL),
+    preproc_dollar: false,
+    decl_words: &["procedure", "function", "constructor", "destructor"],
+    upper_is_type: false,
+};
 const CSS: LangSpec = LangSpec {
     line: &[],
     block: Some(("/*", "*/")),
@@ -382,6 +399,7 @@ fn lang_for(ext: &str) -> &'static LangSpec {
         | "toml" | "ini" | "cfg" | "conf" | "r" | "jl" | "ex" | "exs" | "coffee" | "tcl"
         | "ps1" | "cmake" | "mk" | "makefile" | "dockerfile" => &HASH,
         "lua" => &LUA,
+        "pas" | "pp" | "dpr" | "dpk" | "lpr" | "lfm" | "dfm" | "p" | "pascal" => &PASCAL,
         "bas" | "bm" | "bi" | "vb" | "vbs" | "qb" | "frm" => &BASIC,
         "asm" | "s" | "nasm" | "a51" => &ASM,
         "css" | "scss" | "sass" | "less" => &CSS,
@@ -404,6 +422,32 @@ enum Carry {
 /// TextMate grammar so the split matches what the editor extension does. The grammar spells the
 /// compound forms (`End If`, `Exit Do`) as phrases; a word-at-a-time lexer can't match those, so
 /// `END` and `EXIT` are listed on their own — they are overwhelmingly used as part of one.
+/// Pascal control-flow words (checked before `PASCAL_KEYWORDS` so a shared word lands on the more
+/// specific kind). Case-insensitive — Pascal, like BASIC, is not case-sensitive.
+const PASCAL_CONTROL: &[&str] = &[
+    "if", "then", "else", "case", "of", "for", "to", "downto", "do", "while", "repeat", "until",
+    "break", "continue", "exit", "goto", "with", "try", "except", "finally", "raise",
+];
+
+/// Pascal / Delphi / Free Pascal reserved words + common built-in types, matched case-insensitively
+/// in addition to the shared union.
+const PASCAL_KEYWORDS: &[&str] = &[
+    "program", "unit", "uses", "interface", "implementation", "initialization", "finalization",
+    "library", "exports", "var", "const", "type", "procedure", "function", "begin", "end",
+    "record", "array", "set", "file", "packed", "object", "class", "property", "constructor",
+    "destructor", "inherited", "virtual", "override", "overload", "reintroduce", "abstract",
+    "sealed", "static", "private", "protected", "public", "published", "automated", "and", "or",
+    "not", "xor", "div", "mod", "shl", "shr", "in", "is", "as", "nil", "true", "false", "out",
+    "label", "asm", "threadvar", "resourcestring", "operator", "generic", "specialize", "helper",
+    "forward", "external", "cdecl", "stdcall", "register", "assembler", "read", "write", "default",
+    "index", "stored", "message", "dispid", "absolute",
+    // built-in types
+    "integer", "real", "boolean", "char", "byte", "word", "longint", "longword", "cardinal",
+    "shortint", "smallint", "int64", "qword", "single", "double", "extended", "string",
+    "ansistring", "widestring", "unicodestring", "shortstring", "pchar", "pointer", "comp",
+    "currency", "variant", "olevariant", "text", "textfile", "dword",
+];
+
 const QB64PE_CONTROL: &[&str] = &[
     "_ANDALSO", "_CONTINUE", "_DELAY", "_LIMIT", "_NEGATE", "_ORELSE", "AND", "CASE", "CONTINUE",
     "DELAY", "DO", "EACH", "ELSE", "ELSEIF", "END", "EXIT", "FOR", "IF", "IIF", "KEY", "LIMIT",
@@ -1260,6 +1304,86 @@ pub const CODE_EXTS: &[&str] = &[
     "cmake",
     "mk",
     "lua",
+    // Pascal / Turbo Pascal / Delphi / Free Pascal / Lazarus
+    "pas",
+    "pp",
+    "dpr",
+    "dpk",
+    "lpr",
+    "lfm",
+    "dfm",
+    "pascal",
+    // Other compiled/scripting languages (source, not data — open in the text viewer/editor)
+    "f",
+    "for",
+    "f77",
+    "f90",
+    "f95",
+    "f03",
+    "f08",
+    "ftn",
+    "d",
+    "nim",
+    "nims",
+    "zig",
+    "cr",
+    "hs",
+    "lhs",
+    "erl",
+    "hrl",
+    "fs",
+    "fsi",
+    "fsx",
+    "ml",
+    "mli",
+    "clj",
+    "cljs",
+    "cljc",
+    "edn",
+    "scm",
+    "ss",
+    "lisp",
+    "lsp",
+    "el",
+    "rkt",
+    "sql",
+    "graphql",
+    "gql",
+    "proto",
+    "groovy",
+    "gradle",
+    "sol",
+    "elm",
+    "purs",
+    "hx",
+    "hxml",
+    "v",
+    "sv",
+    "svh",
+    "vhd",
+    "vhdl",
+    "re",
+    "rei",
+    "res",
+    "resi",
+    "vala",
+    "bat",
+    "cmd",
+    "awk",
+    "sed",
+    "fish",
+    "nu",
+    "tf",
+    "tfvars",
+    "hcl",
+    "ron",
+    "vim",
+    "ahk",
+    "adb",
+    "ads",
+    "cob",
+    "cbl",
+    "pde",
     "bas",
     "bm",
     "bi",

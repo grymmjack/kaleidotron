@@ -249,6 +249,7 @@ struct Entry {
 /// display identity) and the temp directory its contents were extracted into.
 /// `to_display`/`real_path` translate between the two so breadcrumbs read
 /// `…/pack.zip/sub` while I/O still targets the real temp files.
+#[derive(Clone)]
 struct ArchiveMount {
     archive: PathBuf,
     temp_root: PathBuf,
@@ -2029,7 +2030,13 @@ pub struct Kaleidotron {
     dir_history: Vec<PathBuf>, // visited folders, for mouse back/forward
     dir_pos: usize,
     suppress_history: bool, // set while navigating *via* history (don't re-record)
-    archive_mount: Option<ArchiveMount>, // the archive currently browsed as a folder
+    archive_mount: Option<ArchiveMount>, // the innermost mount for the CURRENT folder (derived)
+    // Every archive/pack mount seen this session (temp dir ↔ its composed display path),
+    // NEVER torn down. `to_display`/`real_path` translate through this by longest-prefix, and
+    // `recompute_mount` derives `archive_mount` from it on each navigation — so backing out to
+    // a parent pack, or history-forwarding straight into a nested zip's temp dir (which bypasses
+    // `enter_archive`), still maps back to the `16colo.rs › year › pack › zip` breadcrumb.
+    archive_mounts: Vec<ArchiveMount>,
     // Git status of the current local folder's repo (badge / column / details / tint).
     // Computed off-thread on each folder change; None when not a repo or disabled.
     git_enabled: bool, // Preferences toggle (persisted); off = feature fully inert
@@ -2357,6 +2364,10 @@ pub struct Kaleidotron {
     // Preferences-editable so it can live on an external drive; kept separate from the
     // 16colo/HTTP cache since videos get large.
     yt_download_dir: Option<PathBuf>,
+    // Path to the DOSBox / DOSBox-Staging binary (Preferences-editable, persisted). When set, DOS
+    // executables (`.com`/`.exe`/`.bat`) list in the grid and run in DOSBox on double-click /
+    // right-click "Run in DOSBox". None = the feature is off (they aren't listed as runnable).
+    dosbox_path: Option<PathBuf>,
     yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
     yt_open_folder_after: bool, // reveal the file in the OS file manager once a download finishes
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
@@ -2427,6 +2438,7 @@ impl Kaleidotron {
     const PLUGIN_3D_KEY: &'static str = "plugin_3d";
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
+    const DOSBOX_PATH_KEY: &'static str = "dosbox_path";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
@@ -2725,6 +2737,10 @@ impl Kaleidotron {
         let yt_download_dir = cc
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::YT_DIR_KEY))
+            .flatten();
+        let dosbox_path = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::DOSBOX_PATH_KEY))
             .flatten();
         let yt_max_height = cc
             .storage
@@ -4287,6 +4303,7 @@ impl Kaleidotron {
             focus_path: false,
             dir_history: Vec::new(),
             archive_mount: None,
+            archive_mounts: Vec::new(),
             remote_rx: None,
             remote_urls: HashMap::new(),
             remote_cache: HashMap::new(),
@@ -4461,6 +4478,7 @@ impl Kaleidotron {
             steam_detail: None,
             steam_names: HashMap::new(),
             yt_download_dir,
+            dosbox_path,
             yt_max_height,
             yt_open_folder_after,
             bulk_dl: None,
@@ -4626,6 +4644,7 @@ impl Kaleidotron {
             // Paths
             e(PA, "palette_dir", self.palette_dir.clone(), "extra folder scanned for .gpl palettes"),
             e(PA, "yt_download_dir", self.yt_download_dir.clone(), "where YouTube downloads land (null = default)"),
+            e(PA, "dosbox_path", self.dosbox_path.clone(), "path to the DOSBox binary (null = off; enables Run in DOSBox for .com/.exe/.bat)"),
             e(PA, "yt_max_height", self.yt_max_height, "YouTube download resolution cap, e.g. 720"),
             e(PA, "git_enabled", self.git_enabled, "show git status badges in local repos"),
             e(PA, "tasks_enabled", self.tasks_enabled, "read .vscode/tasks.json and offer its tasks"),
@@ -4800,6 +4819,9 @@ impl Kaleidotron {
         if let Some(v) = m.get("yt_download_dir") {
             self.yt_download_dir = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
         }
+        if let Some(v) = m.get("dosbox_path") {
+            self.dosbox_path = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+        }
         if let Some(v) = st::get_string(&m, "palette_dir") {
             if !v.trim().is_empty() {
                 self.palette_dir = PathBuf::from(v);
@@ -4878,8 +4900,7 @@ impl Kaleidotron {
                 // breadcrumb still shows the archive as the mount root).
                 match crate::archive::extract_to_cache(&path) {
                     Ok(temp_root) => {
-                        self.archive_mount =
-                            Some(ArchiveMount { archive: path.clone(), temp_root: temp_root.clone() });
+                        self.register_mount(self.to_display(&path), temp_root.clone());
                         let sub = temp_root.join(cat);
                         self.open_folder(if sub.is_dir() { sub } else { temp_root });
                     }
@@ -4980,16 +5001,10 @@ impl Kaleidotron {
             self.enter_xi(dir);
             return;
         }
-        // Opening a real local folder. If we were inside a mounted archive / 16colo.rs
-        // pack and this folder is *outside* that mount's extracted tree, we've left it —
-        // drop the stale mount so the 16colo.rs nav bar (and the archive breadcrumb)
-        // don't linger over a plain local folder. Navigating *within* the extracted tree
-        // (dir under temp_root) keeps the mount, so subfolders of an archive still work.
-        if let Some(m) = &self.archive_mount {
-            if !dir.starts_with(&m.temp_root) {
-                self.archive_mount = None;
-            }
-        }
+        // Opening a real local folder. `show_folder` recomputes `archive_mount` from the
+        // registry (the innermost mount whose temp dir contains `dir`, else None), so entering
+        // an archive, backing out to a parent pack, and history-forwarding straight into a
+        // nested zip's temp dir all land with the correct mount + breadcrumb.
         let all = self.scan_dir_entries(&dir);
         self.show_folder(dir, all);
     }
@@ -5015,6 +5030,8 @@ impl Kaleidotron {
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
                     || (self.plugin_audio && is_kit_ext(&p))
+                    // DOS executables become runnable tiles once a DOSBox binary is configured.
+                    || (self.dosbox_path.is_some() && is_dos_executable(&p))
                     // Scene art under a nonstandard extension (.tri from TRIBE, .ice, group-
                     // specific ones): the extension list can't cover them all, so sniff the
                     // content — a SAUCE record, ANSI escape codes, or CP437 block glyphs.
@@ -5078,6 +5095,10 @@ impl Kaleidotron {
     /// reset selection, and switch to the grid. Shared by `open_folder` and the
     /// virtual 16colo.rs views.
     fn show_folder(&mut self, dir: PathBuf, entries: Vec<Entry>) {
+        // Derive the current mount from the registry (innermost temp dir containing `dir`, or
+        // None outside every mount). This is the single place `archive_mount` is set for
+        // navigation, so back/forward/crumb/favorite all agree — regardless of how we got here.
+        self.recompute_mount(&dir);
         self.note_recent(&dir);
         self.focus_rail_for(&dir);
         // Folder counts are rendered live in the status bar; clear any transient
@@ -5125,6 +5146,11 @@ impl Kaleidotron {
         self.anchor = None;
         self.path_edit = None;
         self.set_mode(Mode::Grid);
+        // `set_mode` may have marked a "returning from the viewer" highlight, but this is a folder
+        // *navigation* — drop it so a fresh folder doesn't outline tile 0; `resolve_came_from`
+        // re-sets the highlight/scroll to the came-from tile when we navigated *up*.
+        self.highlight_entry = None;
+        self.scroll_target = None;
         self.rebuild_view();
         // If we navigated *up* into here, outline (and, in table view, scroll to) the tile
         // we came from. For async 16colo listings `entries` is empty now, so this is a
@@ -17425,10 +17451,7 @@ impl Kaleidotron {
     fn enter_remote_pack(&mut self, vpath: PathBuf, zip: PathBuf) {
         match crate::archive::extract_to_cache(&zip) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: vpath.clone(),
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(vpath.clone(), temp_root.clone());
                 self.open_folder(temp_root);
                 self.status = format!("Opened {}", short_name(&vpath));
             }
@@ -17537,10 +17560,7 @@ impl Kaleidotron {
         let display = self.to_display(&archive);
         match crate::archive::extract_to_cache(&archive) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: display,
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(display, temp_root.clone());
                 self.open_folder(temp_root); // not an archive path → normal scan
                 self.status = format!("Opened {}", short_name(&archive));
             }
@@ -17554,10 +17574,7 @@ impl Kaleidotron {
     fn enter_soundfont(&mut self, sf2: PathBuf) {
         match crate::soundfont::extract_to_cache(&sf2) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: sf2.clone(),
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(self.to_display(&sf2), temp_root.clone());
                 self.open_folder(temp_root);
                 let n = crate::soundfont::info(&sf2).map(|i| i.samples).unwrap_or(0);
                 self.status = format!("Opened {} · {n} samples", short_name(&sf2));
@@ -17571,10 +17588,7 @@ impl Kaleidotron {
     fn enter_sfz(&mut self, sfz: PathBuf) {
         match crate::sfz::mount_to_cache(&sfz) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: sfz.clone(),
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(self.to_display(&sfz), temp_root.clone());
                 self.open_folder(temp_root);
                 let n = crate::sfz::info(&sfz).map(|i| i.samples).unwrap_or(0);
                 self.status = format!("Opened {} · {n} samples", short_name(&sfz));
@@ -17587,10 +17601,7 @@ impl Kaleidotron {
     fn enter_dls(&mut self, dls: PathBuf) {
         match crate::dls::extract_to_cache(&dls) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: dls.clone(),
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(self.to_display(&dls), temp_root.clone());
                 self.open_folder(temp_root);
                 let n = crate::dls::info(&dls).map(|i| i.samples).unwrap_or(0);
                 self.status = format!("Opened {} · {n} samples", short_name(&dls));
@@ -17603,10 +17614,7 @@ impl Kaleidotron {
     fn enter_xi(&mut self, xi: PathBuf) {
         match crate::xi::extract_to_cache(&xi) {
             Ok(temp_root) => {
-                self.archive_mount = Some(ArchiveMount {
-                    archive: xi.clone(),
-                    temp_root: temp_root.clone(),
-                });
+                self.register_mount(self.to_display(&xi), temp_root.clone());
                 self.open_folder(temp_root);
                 let n = crate::xi::info(&xi).map(|i| i.samples).unwrap_or(0);
                 self.status = format!("Opened {} · {n} samples", short_name(&xi));
@@ -17615,26 +17623,51 @@ impl Kaleidotron {
         }
     }
 
-    /// Map a real path (possibly inside the mounted archive's temp dir) to the path
-    /// shown to the user — the archive *file* stands in for its temp dir, so the
-    /// breadcrumb reads `…/pack.zip/sub` instead of a temp hash.
-    fn to_display(&self, real: &Path) -> PathBuf {
-        if let Some(m) = &self.archive_mount {
-            if let Ok(rel) = real.strip_prefix(&m.temp_root) {
-                return m.archive.join(rel);
-            }
-        }
-        real.to_path_buf()
+    /// Register a mount in the session-lived registry (dedup by temp dir) and set it as the
+    /// current one. Every `enter_*` funnels through this so nesting is recorded once and
+    /// `to_display`/`real_path` can translate any path we've ever mounted, not just the last.
+    fn register_mount(&mut self, archive: PathBuf, temp_root: PathBuf) {
+        self.archive_mounts.retain(|m| m.temp_root != temp_root);
+        let mount = ArchiveMount { archive, temp_root };
+        self.archive_mounts.push(mount.clone());
+        self.archive_mount = Some(mount);
     }
 
-    /// Inverse of [`to_display`]: map a user-facing path back to the real on-disk path.
+    /// Derive `archive_mount` (the innermost mount for the folder we're about to show) from the
+    /// registry: the mount whose temp dir is the longest prefix of `dir`, else None (we've left
+    /// every mount). Called on each navigation, so back/forward both land with the right mount.
+    fn recompute_mount(&mut self, dir: &Path) {
+        self.archive_mount = self
+            .archive_mounts
+            .iter()
+            .filter(|m| dir.starts_with(&m.temp_root))
+            .max_by_key(|m| m.temp_root.as_os_str().len())
+            .cloned();
+    }
+
+    /// Map a real path (possibly inside a mounted archive's temp dir) to the path shown to the
+    /// user — the archive *file* stands in for its temp dir, so the breadcrumb reads
+    /// `…/pack.zip/sub` instead of a temp hash. Uses the whole registry (longest temp-dir prefix
+    /// wins), so a nested zip inside a 16colo pack still resolves after back/forward navigation.
+    fn to_display(&self, real: &Path) -> PathBuf {
+        self.archive_mounts
+            .iter()
+            .filter_map(|m| real.strip_prefix(&m.temp_root).ok().map(|rel| (m, rel)))
+            .max_by_key(|(m, _)| m.temp_root.as_os_str().len())
+            .map(|(m, rel)| m.archive.join(rel))
+            .unwrap_or_else(|| real.to_path_buf())
+    }
+
+    /// Inverse of [`to_display`]: map a user-facing path back to the real on-disk path. The
+    /// longest matching *display* prefix wins, so a path inside a nested zip resolves to the
+    /// inner temp dir rather than its parent pack's.
     fn real_path(&self, disp: &Path) -> PathBuf {
-        if let Some(m) = &self.archive_mount {
-            if let Ok(rel) = disp.strip_prefix(&m.archive) {
-                return m.temp_root.join(rel);
-            }
-        }
-        disp.to_path_buf()
+        self.archive_mounts
+            .iter()
+            .filter_map(|m| disp.strip_prefix(&m.archive).ok().map(|rel| (m, rel)))
+            .max_by_key(|(m, _)| m.archive.as_os_str().len())
+            .map(|(m, rel)| m.temp_root.join(rel))
+            .unwrap_or_else(|| disp.to_path_buf())
     }
 
     /// The stable view-history key for a path (its display identity as a string), so a
@@ -19375,6 +19408,10 @@ impl Kaleidotron {
             } else {
                 self.start_steam_open(entry.path);
             }
+        } else if self.dosbox_path.is_some() && is_dos_executable(&entry.path) {
+            // A DOS program with DOSBox configured → run it (there's nothing to "view").
+            self.selected = idx;
+            self.run_in_dosbox(&entry.path);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -27683,6 +27720,7 @@ impl Kaleidotron {
         let task_items = self.task_items();
         // Ditto the explicit "open this as…" pick.
         let mut open_as: Option<(usize, OpenAs)> = None;
+        let mut dosbox_on: Option<usize> = None; // "Run in DOSBox" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -27945,6 +27983,37 @@ impl Kaleidotron {
                             if !ext.is_empty() {
                                 paint_format_badge(
                                     &ui.painter_at(rect),
+                                    rect.left_top() + egui::vec2(5.0, 4.0),
+                                    ext,
+                                    crate::format_color::color32(ext),
+                                );
+                            }
+                        } else if self.dosbox_path.is_some() && is_dos_executable(path) {
+                            // A DOS executable: nothing to decode, so paint a "DOS" label + a ▶ run
+                            // pill + the format badge instead of requesting a thumbnail that would
+                            // spin forever. ("DOS" text renders on any font; a monitor emoji may not.)
+                            let p = ui.painter_at(rect);
+                            p.text(
+                                rect.center() - egui::vec2(0.0, tile * 0.02),
+                                egui::Align2::CENTER_CENTER,
+                                "DOS",
+                                egui::FontId::proportional(tile * 0.26),
+                                ui.visuals().weak_text_color(),
+                            );
+                            let r = (tile * 0.10).clamp(9.0, 15.0);
+                            let c = rect.right_bottom() + egui::vec2(-(r + 5.0), -(r + 5.0));
+                            p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+                            p.text(
+                                c,
+                                egui::Align2::CENTER_CENTER,
+                                "▶",
+                                egui::FontId::proportional(r * 1.1),
+                                egui::Color32::WHITE,
+                            );
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if !ext.is_empty() {
+                                paint_format_badge(
+                                    &p,
                                     rect.left_top() + egui::vec2(5.0, 4.0),
                                     ext,
                                     crate::format_color::color32(ext),
@@ -28427,6 +28496,8 @@ impl Kaleidotron {
                                     &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
                                         .to_ascii_lowercase().as_str(),
                                 );
+                            let is_dosbox_entry =
+                                self.dosbox_path.is_some() && is_dos_executable(&entry.path);
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -28445,6 +28516,7 @@ impl Kaleidotron {
                                 ph_hdri,
                                 &task_items,
                                 is_code_entry,
+                                is_dosbox_entry,
                             ) {
                                 match pick {
                                     p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -28473,6 +28545,7 @@ impl Kaleidotron {
                                     TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                                     TilePick::Task(l) => run_task_on = Some((idx, l)),
                                     TilePick::Open(m) => open_as = Some((idx, m)),
+                                    TilePick::RunInDosbox => dosbox_on = Some(idx),
                                 }
                             }
                         });
@@ -28601,6 +28674,11 @@ impl Kaleidotron {
                 self.force_open = Some(mode);
                 let ctx = ui.ctx().clone();
                 self.load_full(&ctx, p);
+            }
+        }
+        if let Some(i) = dosbox_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.run_in_dosbox(&p);
             }
         }
         if pin_current {
@@ -28949,6 +29027,7 @@ impl Kaleidotron {
         let task_items = self.task_items();
         // Ditto the explicit "open this as…" pick.
         let mut open_as: Option<(usize, OpenAs)> = None;
+        let mut dosbox_on: Option<usize> = None; // "Run in DOSBox" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -29492,6 +29571,8 @@ impl Kaleidotron {
                                 &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
                                     .to_ascii_lowercase().as_str(),
                             );
+                        let is_dosbox_entry =
+                            self.dosbox_path.is_some() && is_dos_executable(&entry.path);
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -29510,6 +29591,7 @@ impl Kaleidotron {
                             ph_hdri,
                             &task_items,
                             is_code_entry,
+                            is_dosbox_entry,
                         ) {
                             match pick {
                                 p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -29538,6 +29620,7 @@ impl Kaleidotron {
                                 TilePick::YtQuality(h) => yt_quality = Some((idx, h)),
                                 TilePick::Task(l) => run_task_on = Some((idx, l)),
                                 TilePick::Open(m) => open_as = Some((idx, m)),
+                                TilePick::RunInDosbox => dosbox_on = Some(idx),
                             }
                         }
                     });
@@ -29714,6 +29797,11 @@ impl Kaleidotron {
                 self.force_open = Some(mode);
                 let ctx = ui.ctx().clone();
                 self.load_full(&ctx, p);
+            }
+        }
+        if let Some(i) = dosbox_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.run_in_dosbox(&p);
             }
         }
         if pin_current {
@@ -32932,6 +33020,33 @@ impl Kaleidotron {
         }
     }
 
+    /// Run a DOS executable (`.com`/`.exe`/`.bat`) in DOSBox. DOSBox-Staging auto-mounts the
+    /// program's containing directory as `C:` and runs it when the path is passed as an argument;
+    /// `-exit` quits DOSBox when the program does. Spawned detached (no wait) so the UI stays live.
+    /// `resolve_local` handles a file inside an archive / 16colo pack (its real temp copy).
+    fn run_in_dosbox(&mut self, path: &Path) {
+        let Some(dosbox) = self.dosbox_path.clone() else {
+            self.status = "Set the DOSBox path in Preferences → Paths first".into();
+            return;
+        };
+        if !dosbox.exists() {
+            self.status = format!("DOSBox not found at {}", dosbox.display());
+            return;
+        }
+        let real = self.resolve_local(path);
+        // Run from the program's own folder so relative data paths resolve as they would on C:.
+        let cwd = real.parent().map(|p| p.to_path_buf());
+        let mut cmd = std::process::Command::new(&dosbox);
+        cmd.arg(&real).arg("-exit");
+        if let Some(dir) = &cwd {
+            cmd.current_dir(dir);
+        }
+        match cmd.spawn() {
+            Ok(_) => self.status = format!("Running {} in DOSBox", short_name(path)),
+            Err(e) => self.status = format!("Couldn't launch DOSBox: {e}"),
+        }
+    }
+
     /// Launch an external program on `path` — but if it's a 16colo.rs flat-listing piece
     /// not yet downloaded, fetch its `raw` file first (`start_piece_open`) and defer the
     /// launch to `poll_colo_open` once the real file lands (`pending_external`).
@@ -33668,6 +33783,18 @@ impl Kaleidotron {
     fn set_mode(&mut self, new: Mode) {
         if self.mode == new {
             return;
+        }
+        // Returning from a viewer (image / 3D / compare) to the grid: mark the file we were
+        // looking at so the grid scrolls to it and outlines it — the same "you were here" bearing
+        // aid as navigating up to a parent folder. A folder *navigation* also passes through here
+        // (via `show_folder`), but it clears this immediately afterwards and lets `came_from` win.
+        if new == Mode::Grid && matches!(self.mode, Mode::Single | Mode::ThreeD | Mode::Compare) {
+            if let Some(e) = self.entries.get(self.selected) {
+                self.highlight_entry = Some(e.path.clone());
+                self.highlight_born = -1.0; // stamp the fade start on first paint
+                self.scroll_target = Some(self.selected);
+                self.want_repaint = true;
+            }
         }
         self.panel_layouts.insert(mode_id(self.mode), self.current_layout());
         self.mode = new;
@@ -38628,6 +38755,33 @@ impl eframe::App for Kaleidotron {
                                     );
                                 }
 
+                                // DOSBox path → run DOS .com/.exe/.bat programs (double-click or
+                                // right-click "Run in DOSBox"). Off until a binary is set.
+                                ui.add_space(8.0);
+                                ui.label("DOSBox");
+                                let cur = self
+                                    .dosbox_path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "Not set — .com/.exe/.bat won't run".into());
+                                ui.weak(format!("Binary: {cur}"));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Choose…").clicked() {
+                                        if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                            self.dosbox_path = Some(f);
+                                            prefs_refresh = true; // re-scan so .com/.exe tiles appear
+                                        }
+                                    }
+                                    if self.dosbox_path.is_some() && ui.button("Clear").clicked() {
+                                        self.dosbox_path = None;
+                                        prefs_refresh = true; // re-scan so they drop from the listing
+                                    }
+                                });
+                                ui.weak(
+                                    "Point at the DOSBox / DOSBox-Staging binary. DOS programs then \
+                                     run in DOSBox (its folder is mounted as C:).",
+                                );
+
                                 // ModArchive API key — OPTIONAL. Browsing already works without
                                 // one (the public search page is parsed); a key just upgrades to
                                 // the XML API's richer metadata (artist / genre / size).
@@ -39256,6 +39410,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_3D_KEY, &self.plugin_3d);
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
+        eframe::set_value(storage, Self::DOSBOX_PATH_KEY, &self.dosbox_path);
         eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
         eframe::set_value(
             storage,
@@ -47813,6 +47968,7 @@ enum TilePick {
     YtQuality(u32),        // a YouTube result → (re)download at this resolution cap (0 = best)
     AddToList(String),     // add this video to the named list (Watch Later / a custom list)
     AddToNewList,          // add this video to a brand-new list (prompt for its name)
+    RunInDosbox,           // a DOS .com/.exe/.bat → run it in DOSBox
 }
 
 /// Which slice of the Steam library to list.
@@ -48279,8 +48435,21 @@ fn entry_context_menu(
     ph_hdri: bool,          // this entry is a Poly Haven HDRI (→ offer the real .hdr download)
     tasks: &[TaskItem],     // the project's .vscode tasks (→ "Tasks ▸", run with ${file} = entry)
     is_code: bool,          // a source/text file → offer Preview (image) / View / Edit as text
+    dosbox_run: bool,       // a DOS .com/.exe/.bat with DOSBox configured → offer "Run in DOSBox"
 ) -> Option<TilePick> {
     let mut pick = None;
+    // A DOS program → run it in DOSBox (top of the menu; it's the primary action for these).
+    if dosbox_run {
+        if ui
+            .button("\u{25b6} Run in DOSBox")
+            .on_hover_text("Launch this DOS program in DOSBox (mounts its folder as C:)")
+            .clicked()
+        {
+            pick = Some(TilePick::RunInDosbox);
+            ui.close();
+        }
+        ui.separator();
+    }
     // A source/text file reads two ways and both are wanted: the rasterised page (pannable, with
     // the navigator) and the real editor. Offered explicitly rather than guessed — and it is also
     // the escape hatch when one of them can't handle a particular file.
@@ -49307,6 +49476,16 @@ fn read_file_tail(path: &Path, n: u64) -> Option<Vec<u8>> {
         f.read_exact(&mut buf).ok()?;
         Some(buf)
     }
+}
+
+/// DOS executables we can hand to DOSBox: `.com`/`.exe`/`.bat` (case-insensitive). Gated by a
+/// configured `dosbox_path` before we list or run them, so a random Windows `.exe` in a normal
+/// folder doesn't sprout a run affordance unless the user has opted in.
+fn is_dos_executable(p: &std::path::Path) -> bool {
+    matches!(
+        p.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()).as_deref(),
+        Some("com" | "exe" | "bat")
+    )
 }
 
 /// Does this path look like an image we can (or soon will) decode?
@@ -53520,21 +53699,31 @@ mod gui_tests {
         std::fs::create_dir_all(&outside).unwrap();
 
         let st = harness.state_mut();
-        st.archive_mount = Some(ArchiveMount {
-            archive: PathBuf::from("<16colo.rs>/2023/somepack"),
-            temp_root: mount.clone(),
-        });
+        st.register_mount(PathBuf::from("<16colo.rs>/2023/somepack"), mount.clone());
         // Browsing a subfolder *within* the extracted tree keeps the mount…
         st.open_folder(inside);
         assert!(
             st.archive_mount.is_some(),
             "navigating within the archive's tree must keep the mount"
         );
-        // …navigating to a folder outside it drops the mount (nav bar then hides).
+        // …navigating to a folder outside it drops the *current* mount (nav bar then hides),
+        // though the registry keeps the entry so returning to the tree re-derives it.
         st.open_folder(outside.clone());
         assert!(
             st.archive_mount.is_none(),
-            "leaving the archive's tree must clear the stale mount"
+            "leaving the archive's tree must clear the current mount"
+        );
+        // Returning to the tree re-derives the mount from the registry (the forward-history
+        // case that showed a raw /tmp breadcrumb before this was registry-backed).
+        st.open_folder(mount.join("sub"));
+        assert!(
+            st.archive_mount.is_some(),
+            "returning into a previously-mounted tree must re-derive the mount"
+        );
+        assert_eq!(
+            st.to_display(&mount.join("sub")),
+            PathBuf::from("<16colo.rs>/2023/somepack/sub"),
+            "breadcrumb must map back to the pack, not the raw temp dir"
         );
 
         std::fs::remove_dir_all(&mount).ok();
