@@ -5642,9 +5642,11 @@ impl Kaleidotron {
         };
         let disp = self.to_display(&folder);
         if let Some(parent) = disp.parent() {
-            let real = self.real_path(parent);
-            self.came_from = Some((real.clone(), disp.clone()));
-            self.open_folder(real);
+            // Remember where we came from in *display* space, so it survives a re-mount when
+            // going up out of a nested archive (the parent re-opens by its virtual path, and
+            // `self.folder` lands on a fresh temp dir that maps back to that same display).
+            self.came_from = Some((parent.to_path_buf(), disp.clone()));
+            self.open_folder(self.real_path(parent));
         }
     }
 
@@ -5656,7 +5658,10 @@ impl Kaleidotron {
         let Some((target, child)) = self.came_from.clone() else {
             return;
         };
-        if self.folder.as_deref() != Some(target.as_path()) {
+        // Compare in display space: a re-mounted archive/pack lands on a fresh temp `folder`
+        // that maps back to the same virtual display path we recorded as the target.
+        let here = self.folder.as_ref().map(|f| self.to_display(f));
+        if here.as_deref() != Some(target.as_path()) {
             self.came_from = None; // navigated elsewhere before it resolved
             return;
         }
@@ -17525,10 +17530,15 @@ impl Kaleidotron {
     /// Enter an archive: extract it to a temp dir (cached), mount it, and browse
     /// that dir. The breadcrumb still shows the archive's name via `to_display`.
     fn enter_archive(&mut self, archive: PathBuf) {
+        // Mount under the archive's *display* identity, resolved in the CURRENT mount — so a
+        // zip nested inside a 16colo pack keeps the `16colo.rs › year › pack › LO-POO.ZIP`
+        // breadcrumb instead of showing the raw /tmp extraction path. (For a top-level local
+        // archive there's no mount, so `to_display` is the real path unchanged.)
+        let display = self.to_display(&archive);
         match crate::archive::extract_to_cache(&archive) {
             Ok(temp_root) => {
                 self.archive_mount = Some(ArchiveMount {
-                    archive: archive.clone(),
+                    archive: display,
                     temp_root: temp_root.clone(),
                 });
                 self.open_folder(temp_root); // not an archive path → normal scan
@@ -18542,10 +18552,11 @@ impl Kaleidotron {
         if let Some(pos) = target {
             let dir = self.dir_history[pos].clone();
             // Going back = remember the folder we're leaving, so the destination outlines
-            // and scrolls to it (only for back; forward has no "where I was" to show).
+            // and scrolls to it (only for back; forward has no "where I was" to show). Both
+            // in display space (see `navigate_up`) so it survives an archive re-mount.
             if back {
                 if let Some(cur) = self.folder.clone() {
-                    self.came_from = Some((dir.clone(), self.to_display(&cur)));
+                    self.came_from = Some((self.to_display(&dir), self.to_display(&cur)));
                 }
             }
             self.dir_pos = pos;
