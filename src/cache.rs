@@ -294,9 +294,101 @@ pub fn clear() {
     }
 }
 
+/// Recursively copy everything in `src` into `dst` (created if absent). Returns
+/// `(files, bytes)` copied. Shared by backup + restore.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(u64, u64), String> {
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let (path, target) = (entry.path(), dst.join(entry.file_name()));
+        if path.is_dir() {
+            let (f, b) = copy_dir_all(&path, &target)?;
+            files += f;
+            bytes += b;
+        } else {
+            bytes += std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+            files += 1;
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Back up the whole cache (index + blobs) into `dest`. Holds the index lock across the
+/// copy so no write lands mid-flight (SQLite's file is consistent at rest, so a locked
+/// copy is a clean snapshot). Returns `(files, bytes)` written. Restore with [`restore_from`].
+pub fn backup_to(dest: &Path) -> Result<(u64, u64), String> {
+    let c = cache().ok_or("cache not initialised")?;
+    let _guard = c.db.lock().map_err(|_| "cache busy".to_string())?; // freeze writes during copy
+    copy_dir_all(&c.dir, dest)
+}
+
+/// Restore a backup made by [`backup_to`] from `src` (which must contain a `cache.db`):
+/// copy its blob files into the live cache dir and **merge** its index rows on top of the
+/// current ones, then evict back down to the cap. Merging (not replacing) means restoring
+/// into a non-empty cache is safe. Returns `(rows merged, total bytes cached now)`. Holds
+/// the index lock across the whole operation, so in-flight fetches wait rather than race it.
+pub fn restore_from(src: &Path) -> Result<(i64, i64), String> {
+    let c = cache().ok_or("cache not initialised")?;
+    let src_db = src.join("cache.db");
+    if !src_db.exists() {
+        return Err(format!("no cache.db in {}", src.display()));
+    }
+    let db = c.db.lock().map_err(|_| "cache busy".to_string())?;
+    // Copy the backup's blobs into the live cache dir (its own db is merged below, not copied).
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some("cache.db") {
+            continue;
+        }
+        let target = c.dir.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+        }
+    }
+    // Merge the backup's index rows into the live index, so the copied blobs are known.
+    db.execute("ATTACH DATABASE ?1 AS bk", [src_db.to_string_lossy().as_ref()])
+        .map_err(|e| e.to_string())?;
+    let rows = db
+        .execute(
+            "INSERT OR REPLACE INTO cache(url, file, fetched, used, bytes)
+             SELECT url, file, fetched, used, bytes FROM bk.cache",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    let _ = db.execute("DETACH DATABASE bk", []);
+    evict(&c.dir, &db);
+    let total: i64 = db
+        .query_row("SELECT COALESCE(SUM(bytes), 0) FROM cache", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok((rows as i64, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_dir_all_recreates_the_tree() {
+        let base = std::env::temp_dir().join(format!("kt_copy_test_{}", std::process::id()));
+        let (src, dst) = (base.join("src"), base.join("dst"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("files/abc")).unwrap();
+        std::fs::write(src.join("a.bin"), b"hello").unwrap();
+        std::fs::write(src.join("files/abc/ART.ANS"), b"world!!").unwrap();
+        let (files, bytes) = copy_dir_all(&src, &dst).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 5 + 7);
+        assert_eq!(std::fs::read(dst.join("a.bin")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(dst.join("files/abc/ART.ANS")).unwrap(),
+            b"world!!"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn key_is_stable_and_hex() {

@@ -38921,6 +38921,48 @@ impl eframe::App for Kaleidotron {
                                         self.status = "Cache cleared".into();
                                     }
                                 });
+                                // Backup / restore, so "Clear cache" isn't a one-way door — snapshot
+                                // the whole cache to a folder (e.g. an external drive) and bring it back.
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("Backup cache…")
+                                        .on_hover_text(
+                                            "Copy the whole 16colo.rs cache to a folder you pick \
+                                             (into a 'kaleidotron-cache' subfolder there)",
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                            let dest = dir.join("kaleidotron-cache");
+                                            self.status = match crate::cache::backup_to(&dest) {
+                                                Ok((n, bytes)) => format!(
+                                                    "Backed up {n} files ({}) → {}",
+                                                    human_size(bytes),
+                                                    dest.display()
+                                                ),
+                                                Err(e) => format!("Backup failed: {e}"),
+                                            };
+                                        }
+                                    }
+                                    if ui
+                                        .button("Restore…")
+                                        .on_hover_text(
+                                            "Restore a backup: pick its 'kaleidotron-cache' folder. \
+                                             Merges into the current cache (doesn't wipe it first)",
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                            self.status = match crate::cache::restore_from(&dir) {
+                                                Ok((rows, total)) => format!(
+                                                    "Restored {rows} entries — cache now {}",
+                                                    human_size(total.max(0) as u64)
+                                                ),
+                                                Err(e) => format!("Restore failed: {e}"),
+                                            };
+                                        }
+                                    }
+                                });
 
                                 ui.add_space(10.0);
                                 }
