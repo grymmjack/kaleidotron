@@ -136,7 +136,14 @@ impl Decoder for AnsiDecoder {
     fn extensions(&self) -> &'static [&'static str] {
         // .ice = iCE-colors ANSI, .cia = CIA-group ANSI — same CP437/SGR rendering.
         // .txt = plain ASCII/ANSI art (common in scene packs alongside readmes).
-        &["ans", "asc", "nfo", "diz", "ice", "cia", "txt"]
+        // .ace = an ACiD-era ANSI art extension on 16colo.rs (NOT a WinACE archive).
+        // The rest are classic scene/BBS readme + documentation extensions (READ.ME,
+        // README.1ST, READ.NOW, *.DOC/*.DOX/*.MSG/*.CAP/*.INF) — plain text or ANSI, both
+        // render fine through the CP437 path, so they show up and open like any scene doc.
+        &[
+            "ans", "asc", "nfo", "diz", "ice", "cia", "txt", "ace", "doc", "dox", "me", "1st",
+            "now", "msg", "cap", "inf", "grp", "fyi",
+        ]
     }
 
     fn sniff(&self, _header: &[u8]) -> bool {

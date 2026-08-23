@@ -14,8 +14,13 @@ use std::path::{Path, PathBuf};
 /// Browsable (multi-entry) archive extensions, lower-case. Single-file
 /// compressions (`.gz`/`.bz2`/`.Z`/`.ice`/`.pi9`/`.sq*`) are intentionally
 /// excluded — they decompress to one file, not a folder.
+///
+/// `.ace` is deliberately NOT here: on the scene archives (16colo.rs) it's ANSI/ASCII
+/// **art** (an ACiD-era extension), not a WinACE archive, so it routes to the text-mode
+/// decoder instead. The real ACE archive format is essentially extinct and not worth the
+/// collision in an art browser.
 const ARCHIVE_EXTS: &[&str] = &[
-    "zip", "7z", "rar", "lha", "lzh", "tar", "ace", "arj", "arc", "zoo", "ha", "uc2", "sqz", "hyp",
+    "zip", "7z", "rar", "lha", "lzh", "tar", "arj", "arc", "zoo", "ha", "uc2", "sqz", "hyp",
     "tgz", "tbz", // Renoise song / instrument are ZIP containers (browse their SampleData/):
     "xrns", "xrni",
 ];

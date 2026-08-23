@@ -5030,8 +5030,9 @@ impl Kaleidotron {
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
                     || (self.plugin_audio && is_kit_ext(&p))
-                    // DOS executables become runnable tiles once a DOSBox binary is configured.
-                    || (self.dosbox_path.is_some() && is_dos_executable(&p))
+                    // DOS executables always list as runnable tiles; the run action prompts to
+                    // set the DOSBox binary if it isn't configured yet.
+                    || is_dos_executable(&p)
                     // Scene art under a nonstandard extension (.tri from TRIBE, .ice, group-
                     // specific ones): the extension list can't cover them all, so sniff the
                     // content — a SAUCE record, ANSI escape codes, or CP437 block glyphs.
@@ -19408,8 +19409,9 @@ impl Kaleidotron {
             } else {
                 self.start_steam_open(entry.path);
             }
-        } else if self.dosbox_path.is_some() && is_dos_executable(&entry.path) {
-            // A DOS program with DOSBox configured → run it (there's nothing to "view").
+        } else if is_dos_executable(&entry.path) {
+            // A DOS program → run it in DOSBox (there's nothing to "view"). If DOSBox isn't
+            // configured yet, `run_in_dosbox` sets a status telling the user where to set it.
             self.selected = idx;
             self.run_in_dosbox(&entry.path);
         } else {
@@ -27988,7 +27990,7 @@ impl Kaleidotron {
                                     crate::format_color::color32(ext),
                                 );
                             }
-                        } else if self.dosbox_path.is_some() && is_dos_executable(path) {
+                        } else if is_dos_executable(path) {
                             // A DOS executable: nothing to decode, so paint a "DOS" label + a ▶ run
                             // pill + the format badge instead of requesting a thumbnail that would
                             // spin forever. ("DOS" text renders on any font; a monitor emoji may not.)
@@ -28497,7 +28499,7 @@ impl Kaleidotron {
                                         .to_ascii_lowercase().as_str(),
                                 );
                             let is_dosbox_entry =
-                                self.dosbox_path.is_some() && is_dos_executable(&entry.path);
+                                is_dos_executable(&entry.path);
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -29572,7 +29574,7 @@ impl Kaleidotron {
                                     .to_ascii_lowercase().as_str(),
                             );
                         let is_dosbox_entry =
-                            self.dosbox_path.is_some() && is_dos_executable(&entry.path);
+                            is_dos_executable(&entry.path);
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -49478,13 +49480,13 @@ fn read_file_tail(path: &Path, n: u64) -> Option<Vec<u8>> {
     }
 }
 
-/// DOS executables we can hand to DOSBox: `.com`/`.exe`/`.bat` (case-insensitive). Gated by a
-/// configured `dosbox_path` before we list or run them, so a random Windows `.exe` in a normal
-/// folder doesn't sprout a run affordance unless the user has opted in.
+/// DOS executables we can hand to DOSBox: `.com`/`.exe` (case-insensitive). `.bat`/`.cmd` are
+/// intentionally NOT here — they stay viewable/editable text (they're also in `CODE_EXTS`), and
+/// a game's launcher is usually its `.exe` anyway.
 fn is_dos_executable(p: &std::path::Path) -> bool {
     matches!(
         p.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()).as_deref(),
-        Some("com" | "exe" | "bat")
+        Some("com" | "exe")
     )
 }
 
@@ -49493,7 +49495,8 @@ fn is_image_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
         "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
-        "nfo", "diz", "txt", "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
+        "nfo", "diz", "txt", "ace", "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi",
+        "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
         "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
@@ -49523,8 +49526,9 @@ fn is_image_ext(p: &std::path::Path) -> bool {
 /// the viewer opens it at `textmode_zoom` (not 1:1) and offers the CRT aspect.
 fn is_textmode_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
-        "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "xb", "xbin", "bin", "tnd", "idf", "adf",
-        "seq", "pet", "petscii", "petmate", "xp",
+        "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "ace", "doc", "dox", "me", "1st", "now",
+        "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin", "tnd", "idf", "adf", "seq", "pet",
+        "petscii", "petmate", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => EXTS.contains(&x.to_ascii_lowercase().as_str()),
