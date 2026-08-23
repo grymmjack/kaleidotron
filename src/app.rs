@@ -2391,6 +2391,10 @@ pub struct Kaleidotron {
     diz_gen: u64,
     diz_loading: HashSet<PathBuf>, // pack folders whose FILE_ID thumb is fetching (→ spinner)
     diz_no_art: HashSet<PathBuf>,  // pack folders resolved to have no FILE_ID art (→ plain 📁)
+    // The entry index at the centre of the grid viewport, updated every frame. The prep
+    // workers pull the pack *nearest* this each time, so FILE_ID thumbnails load for what
+    // you're looking at first and expand outward — and re-prioritise as you scroll.
+    diz_target: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Progress state for a FILE_ID pack-thumbnail prep job (see `colo_folder_diz`).
@@ -4427,6 +4431,7 @@ impl Kaleidotron {
             diz_gen: 0,
             diz_loading: HashSet::new(),
             diz_no_art: HashSet::new(),
+            diz_target: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             came_from: None,
             highlight_entry: None,
             highlight_born: -1.0,
@@ -5544,16 +5549,18 @@ impl Kaleidotron {
     /// worker pool (bounded concurrency, cancellable), streaming results back to
     /// `poll_colo_folder_thumb`. No-op (and no spinner) when everything's already cached.
     fn start_diz_prep(&mut self, ctx: &egui::Context) {
-        // (pack folder path, pack name) for each tile still needing art.
-        let packs: Vec<(PathBuf, String)> = self
+        // (entry index, pack folder path, pack name) for each tile still needing art. The
+        // index lets the workers prioritise by distance to the viewport (see below).
+        let packs: Vec<(usize, PathBuf, String)> = self
             .entries
             .iter()
-            .filter(|e| e.is_dir && Self::is_colo_pack_folder(&e.path))
-            .filter(|e| !self.thumb_tex.contains_key(&e.path))
-            .filter_map(|e| {
+            .enumerate()
+            .filter(|(_, e)| e.is_dir && Self::is_colo_pack_folder(&e.path))
+            .filter(|(_, e)| !self.thumb_tex.contains_key(&e.path))
+            .filter_map(|(i, e)| {
                 crate::sixteen::rel_parts(&e.path)
                     .get(1)
-                    .map(|pack| (e.path.clone(), pack.clone()))
+                    .map(|pack| (i, e.path.clone(), pack.clone()))
             })
             .collect();
         if packs.is_empty() {
@@ -5573,25 +5580,40 @@ impl Kaleidotron {
             started_at: ctx.input(|i| i.time),
             cancel: cancel.clone(),
         });
-        // Round-robin the packs across a few workers (≤6) so we prep in parallel without
-        // opening dozens of sockets. Each worker fetches sequentially, checking `cancel`.
-        let workers = packs.len().min(6);
-        let mut chunks: Vec<Vec<(PathBuf, String)>> = (0..workers).map(|_| Vec::new()).collect();
-        for (i, item) in packs.into_iter().enumerate() {
-            chunks[i % workers].push(item);
-        }
-        for chunk in chunks {
+        // A shared queue the workers pull from **nearest the viewport first** (`diz_target`,
+        // updated every frame by the grid): the packs you're looking at get their FILE_ID
+        // thumbnail first, and it expands outward — re-prioritising live as you scroll,
+        // rather than churning top-to-bottom in listing order.
+        let queue = Arc::new(std::sync::Mutex::new(packs));
+        let workers = queue.lock().unwrap().len().min(6);
+        for _ in 0..workers {
             let tx = self.colo_diz_tx.clone();
             let cancel = cancel.clone();
-            std::thread::spawn(move || {
-                for (path, pack) in chunk {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let queue = Arc::clone(&queue);
+            let target = Arc::clone(&self.diz_target);
+            std::thread::spawn(move || loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let job = {
+                    let mut q = queue.lock().unwrap();
+                    if q.is_empty() {
                         break;
                     }
-                    let thumb = crate::sixteen::pack_file_id_thumb(&pack);
-                    if tx.send((gen, path, thumb)).is_err() {
-                        break;
-                    }
+                    let t = target.load(std::sync::atomic::Ordering::Relaxed) as isize;
+                    // Pop the pack whose row is closest to the current viewport centre.
+                    let best = q
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (idx, _, _))| (*idx as isize - t).abs())
+                        .map(|(j, _)| j)
+                        .unwrap();
+                    q.swap_remove(best)
+                };
+                let (_, path, pack) = job;
+                let thumb = crate::sixteen::pack_file_id_thumb(&pack);
+                if tx.send((gen, path, thumb)).is_err() {
+                    break;
                 }
             });
         }
@@ -9831,6 +9853,17 @@ impl Kaleidotron {
         if let Some(f) = self.folder.clone() {
             self.folder_info.remove(&f);
         }
+        // FILE_ID pack-folder thumbnails: cancel any running prep and clear its state so the
+        // hard refresh re-preps the current listing (the `colo_thumbs.forget` above lets each
+        // thumbnail re-fetch). NB the 16colo HTTP *disk* cache — the pack JSON + rendered
+        // PNGs — is intentionally kept, so this reloads fast from disk; a full network
+        // re-download needs "Clear cache" in Preferences.
+        if let Some(p) = self.diz_prep.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.diz_prepped_for = None;
+        self.diz_loading.clear();
+        self.diz_no_art.clear();
         // Re-scan disk so added/removed files are caught too, then report (open_folder
         // clears status, so set it AFTER — same ordering as the file-op handlers).
         self.refresh();
@@ -27739,6 +27772,13 @@ impl Kaleidotron {
         // still used for scroll-offset math, and matches show_rows' internal `cell_h + gap_y`.)
         ui.spacing_mut().item_spacing.y = gap_y;
         let grid_out = scroll_area.show_rows(ui, cell_h, rows, |ui, row_range| {
+            // Tell the FILE_ID prep workers what's on screen: the entry index at the centre
+            // of the visible rows, so they thumbnail the packs you're looking at first.
+            let vis_center = (row_range.start + row_range.end) / 2 * per_row + per_row / 2;
+            self.diz_target.store(
+                vis_center.min(self.entries.len().saturating_sub(1)),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             for row in row_range {
                 ui.horizontal(|ui| {
                     // Match the spacing the per_row math assumed (else the row's real
