@@ -143,6 +143,41 @@ impl RemoteThumbs {
     }
 }
 
+/// Fetch + decode one thumbnail synchronously and return `(w, h, rgba)`, box-downscaled to
+/// `target`. `via_registry` decodes a raw asset through the registry using `decode_as`'s
+/// extension (a `.diz`/`.txt` FILE_ID); otherwise it decodes a pre-rendered raster (PNG).
+/// `None` on any network/decode error. This is the same work [`fetch`] does, exposed so the
+/// 16colo FILE_ID folder-thumbnail prep can fetch on its **own** viewport-prioritised worker
+/// instead of this shared LIFO pool (whose ordering would otherwise undo that priority).
+pub fn fetch_thumb_bytes(
+    url: &str,
+    decode_as: &Path,
+    via_registry: bool,
+    target: u32,
+    registry: &Registry,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let buf = crate::cache::get_bytes(url, None).ok()?;
+    if via_registry {
+        let img = registry.decode_bytes(&buf, decode_as).ok()?;
+        return Some(crate::thumb::make_thumb(&img, target));
+    }
+    let img = image::load_from_memory(&buf).ok()?.to_rgba8();
+    let (sw, sh) = (img.width() as usize, img.height() as usize);
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let rgba = img.into_raw();
+    let target = target.max(1) as usize;
+    Some(if sw.max(sh) > target {
+        let scale = target as f32 / sw.max(sh) as f32;
+        let dw = ((sw as f32 * scale).round() as usize).max(1);
+        let dh = ((sh as f32 * scale).round() as usize).max(1);
+        (dw, dh, crate::thumb::box_downscale(&rgba, sw, sh, dw, dh))
+    } else {
+        (sw, sh, rgba)
+    })
+}
+
 /// Download + decode one thumbnail, area-downscaling if it's bigger than `target`. A
 /// PDF piece (`via_registry`) downloads its raw file and renders page 1 through the registry
 /// (poppler `pdftoppm`, with a labeled placeholder fallback), since 16colo has no PDF

@@ -2382,19 +2382,23 @@ pub struct Kaleidotron {
     // job so a stale worker's late message can't advance a newer job's counter. The
     // channel message is (job gen, pack folder path, Some(render URL) | None).
     colo_folder_diz: bool,
-    #[allow(clippy::type_complexity)]
-    colo_diz_tx: std::sync::mpsc::Sender<(u64, PathBuf, Option<crate::sixteen::FileIdThumb>)>,
-    #[allow(clippy::type_complexity)]
-    colo_diz_rx: std::sync::mpsc::Receiver<(u64, PathBuf, Option<crate::sixteen::FileIdThumb>)>,
+    colo_diz_tx: std::sync::mpsc::Sender<(u64, PathBuf, DizOutcome)>,
+    colo_diz_rx: std::sync::mpsc::Receiver<(u64, PathBuf, DizOutcome)>,
     diz_prep: Option<DizPrep>,
     diz_prepped_for: Option<PathBuf>,
     diz_gen: u64,
-    diz_loading: HashSet<PathBuf>, // pack folders whose FILE_ID thumb is fetching (→ spinner)
-    diz_no_art: HashSet<PathBuf>,  // pack folders resolved to have no FILE_ID art (→ plain 📁)
+    diz_no_art: HashSet<PathBuf>, // pack folders resolved without a thumb (no art / failed → 📁)
     // The entry index at the centre of the grid viewport, updated every frame. The prep
     // workers pull the pack *nearest* this each time, so FILE_ID thumbnails load for what
     // you're looking at first and expand outward — and re-prioritise as you scroll.
     diz_target: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The result of prepping one pack's FILE_ID thumbnail (see `colo_folder_diz`): a decoded
+/// thumbnail, or nothing (no FILE_ID art, or the fetch/decode failed → the tile keeps its 📁).
+enum DizOutcome {
+    Art(usize, usize, Vec<u8>), // (width, height, rgba)
+    None,
 }
 
 /// Progress state for a FILE_ID pack-thumbnail prep job (see `colo_folder_diz`).
@@ -4429,7 +4433,6 @@ impl Kaleidotron {
             diz_prep: None,
             diz_prepped_for: None,
             diz_gen: 0,
-            diz_loading: HashSet::new(),
             diz_no_art: HashSet::new(),
             diz_target: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             came_from: None,
@@ -5568,7 +5571,7 @@ impl Kaleidotron {
             return;
         }
         // Re-evaluate "no art" for this fresh sweep (a pack could be added, or a prior run
-        // cancelled before resolving); `diz_loading` is pruned as thumbs land.
+        // cancelled/failed before resolving) so those retry instead of staying a plain 📁.
         self.diz_no_art.clear();
         self.diz_gen += 1;
         let gen = self.diz_gen;
@@ -5591,6 +5594,7 @@ impl Kaleidotron {
             let cancel = cancel.clone();
             let queue = Arc::clone(&queue);
             let target = Arc::clone(&self.diz_target);
+            let registry = Arc::clone(&self.registry);
             std::thread::spawn(move || loop {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -5611,8 +5615,26 @@ impl Kaleidotron {
                     q.swap_remove(best)
                 };
                 let (_, path, pack) = job;
-                let thumb = crate::sixteen::pack_file_id_thumb(&pack);
-                if tx.send((gen, path, thumb)).is_err() {
+                // Single-stage: resolve the FILE_ID render URL AND fetch+decode it here, so
+                // the viewport priority holds end-to-end (handing the PNG to the shared LIFO
+                // thumb pool would fetch the *last*-requested — farthest — packs first).
+                let outcome = match crate::sixteen::pack_file_id_thumb(&pack) {
+                    Some(t) => {
+                        let decode_as = path.join(&t.filename); // extension for a via_registry decode
+                        match crate::colo_thumb::fetch_thumb_bytes(
+                            &t.url,
+                            &decode_as,
+                            t.via_registry,
+                            THUMB_PX,
+                            &registry,
+                        ) {
+                            Some((w, h, rgba)) => DizOutcome::Art(w, h, rgba),
+                            None => DizOutcome::None, // fetch/decode failed → plain 📁 (retried on re-prep)
+                        }
+                    }
+                    None => DizOutcome::None, // no FILE_ID file in the pack
+                };
+                if tx.send((gen, path, outcome)).is_err() {
                     break;
                 }
             });
@@ -5628,29 +5650,25 @@ impl Kaleidotron {
         }
     }
 
-    /// Drain finished FILE_ID lookups: enqueue each render URL into the remote-thumb pool
-    /// (keyed by the pack folder path, so the finished PNG lands in `thumb_tex` for that
-    /// tile) and advance the prep progress. A pack with no FILE_ID art keeps its plain 📁.
-    fn poll_colo_folder_thumb(&mut self) {
-        while let Ok((gen, path, thumb)) = self.colo_diz_rx.try_recv() {
-            if let Some(t) = thumb {
-                // Clear any prior (possibly failed/interrupted) request for this folder so a
-                // retry actually re-fetches — `colo_thumbs` dedups by path forever otherwise,
-                // which would leave a pack whose first fetch got cut off a plain 📁 for good.
-                self.colo_thumbs.forget(&path);
-                self.diz_loading.insert(path.clone()); // thumb in flight → show a spinner
-                if t.via_registry {
-                    // No server render (a .diz/.txt): fetch the raw file and decode it
-                    // locally. Key by the pack folder path, but decode with the real
-                    // filename's extension so the registry picks the right decoder.
-                    let decode_as = path.join(&t.filename);
-                    self.colo_thumbs
-                        .request_as(&path, &decode_as, &t.url, THUMB_PX, true);
-                } else {
-                    self.colo_thumbs.request(&path, &t.url, THUMB_PX, false);
+    /// Drain finished FILE_ID prep results into the thumbnail cache (keyed by the pack folder
+    /// path, so the tile finds it) and advance the prep progress. A pack with no FILE_ID art
+    /// (or whose fetch failed) is recorded in `diz_no_art` so it stops spinning and shows 📁.
+    fn poll_colo_folder_thumb(&mut self, ctx: &egui::Context) {
+        while let Ok((gen, path, outcome)) = self.colo_diz_rx.try_recv() {
+            match outcome {
+                DizOutcome::Art(w, h, rgba) => {
+                    let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                    let tex = ctx.load_texture(
+                        path.to_string_lossy(),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumb_rgba.insert(path.clone(), (w, h, rgba));
+                    self.thumb_tex.insert(path.clone(), tex);
                 }
-            } else {
-                self.diz_no_art.insert(path.clone()); // resolved: this pack has no FILE_ID art
+                DizOutcome::None => {
+                    self.diz_no_art.insert(path.clone());
+                }
             }
             // Advance only the *current* job (a cancelled/replaced job's stragglers arrive
             // with an old gen and are ignored, so they can't skew the count/ETA).
@@ -9862,7 +9880,6 @@ impl Kaleidotron {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.diz_prepped_for = None;
-        self.diz_loading.clear();
         self.diz_no_art.clear();
         // Re-scan disk so added/removed files are caught too, then report (open_folder
         // clears status, so set it AFTER — same ordering as the file-op handlers).
@@ -27842,11 +27859,15 @@ impl Kaleidotron {
                                 // small spinner (same colour as the 📁) so it reads as "coming",
                                 // not "empty". A pack resolved to have no FILE_ID art, or a
                                 // cancelled prep, falls through to the plain 📁.
+                                // A pack whose FILE_ID thumbnail is still pending spins. Only
+                                // *visible* tiles are painted (the grid is virtualised), so a
+                                // spinner only ever shows for what's on screen — and viewport
+                                // priority resolves those first. Resolved (art / no-art / failed)
+                                // packs stop spinning.
                                 let loading = self.colo_folder_diz
                                     && Self::is_colo_pack_folder(path)
-                                    && !self.diz_no_art.contains(path)
-                                    && (self.diz_prep.is_some()
-                                        || self.diz_loading.contains(path));
+                                    && self.diz_prep.is_some()
+                                    && !self.diz_no_art.contains(path);
                                 let info = self
                                     .folder_info
                                     .entry(path.clone())
@@ -37599,7 +37620,7 @@ impl eframe::App for Kaleidotron {
         self.poll_colo_save();
         self.poll_bulk_download();
         self.poll_colo_sauce();
-        self.poll_colo_folder_thumb();
+        self.poll_colo_folder_thumb(&ctx);
         self.sync_diz_prep(&ctx);
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
@@ -37663,7 +37684,6 @@ impl eframe::App for Kaleidotron {
             // PixelFX / reduce / dither, "Apply to grid" + the details preview) can run
             // on a 16colo piece — it's a rendered preview, not our decode, but recoloring
             // it gives live feedback without downloading the raw art.
-            self.diz_loading.remove(&r.path); // a pack folder thumb landed → stop its spinner
             self.thumb_rgba
                 .insert(r.path.clone(), (r.width, r.height, r.rgba));
             self.thumb_tex.insert(r.path, tex);
