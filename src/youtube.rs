@@ -152,6 +152,7 @@ pub fn fetch_video_meta(id: &str, cookies: Option<&str>) -> Option<YtMeta> {
         .arg(&watch)
         .stderr(Stdio::null());
     push_cookie_args(&mut cmd, cookies);
+    push_runtime_args(&mut cmd);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
@@ -258,6 +259,7 @@ pub fn fetch_comments(id: &str, n: usize, cookies: Option<&str>) -> Vec<YtCommen
     .arg(&watch)
     .stderr(Stdio::null());
     push_cookie_args(&mut cmd, cookies);
+    push_runtime_args(&mut cmd);
     let Ok(out) = cmd.output() else {
         return Vec::new();
     };
@@ -321,6 +323,7 @@ pub fn fetch_captions(id: &str, cookies: Option<&str>) -> Option<String> {
     .stdout(Stdio::null())
     .stderr(Stdio::null());
     push_cookie_args(&mut cmd, cookies);
+    push_runtime_args(&mut cmd);
     let _ = cmd.status();
     // Pick the best English VTT: prefer `<id>.en.vtt`, then `en-orig`, then any `.en*.vtt`.
     let mut best: Option<(u8, std::path::PathBuf)> = None;
@@ -470,6 +473,7 @@ fn flat_list<T>(target: &str, n: usize, cookies: Option<&str>, f: impl Fn(&str) 
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
     push_cookie_args(&mut cmd, cookies);
+    push_runtime_args(&mut cmd);
     let Ok(out) = cmd.output() else {
         return Vec::new();
     };
@@ -510,6 +514,41 @@ fn push_cookie_args(cmd: &mut Command, cookies: Option<&str>) {
         if !b.trim().is_empty() {
             cmd.args(["--cookies-from-browser", b.trim()]);
         }
+    }
+}
+
+/// Find an executable named `bin` on `$PATH` (returns its full path). A tiny `which` so we can
+/// hand yt-dlp an ABSOLUTE runtime path — a GUI launched from a desktop entry often has a leaner
+/// `$PATH` than the shell that installed node/deno, so `--js-runtimes node` alone can miss it.
+fn which(bin: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let p = dir.join(bin);
+        p.is_file().then(|| p.to_string_lossy().into_owned())
+    })
+}
+
+/// yt-dlp needs a **JavaScript runtime** to solve YouTube's player challenge, and since 2025 it
+/// enables only `deno` by default — extraction without one is deprecated and now 403s on the
+/// actual media. Detect a runtime on `$PATH` (deno preferred, then node, then bun) once and cache
+/// the `name:/abs/path` arg. `None` ⇒ none installed (yt-dlp will warn + likely fail; the
+/// download error then points the user at the README / install-deps.sh).
+fn js_runtime_arg() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static RT: OnceLock<Option<String>> = OnceLock::new();
+    RT.get_or_init(|| {
+        ["deno", "node", "bun"]
+            .into_iter()
+            .find_map(|name| which(name).map(|path| format!("{name}:{path}")))
+    })
+    .as_deref()
+}
+
+/// Append `--js-runtimes <name>:<path>` when a runtime is available (see [`js_runtime_arg`]).
+/// A no-op when none is found, so yt-dlp still runs (and its own warning explains the gap).
+fn push_runtime_args(cmd: &mut Command) {
+    if let Some(rt) = js_runtime_arg() {
+        cmd.args(["--js-runtimes", rt]);
     }
 }
 
@@ -652,6 +691,7 @@ pub fn download(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     push_cookie_args(&mut cmd, cookies);
+    push_runtime_args(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|_| "yt-dlp not found on PATH — install it (see the README).".to_string())?;
@@ -703,6 +743,17 @@ pub fn download(
             .to_string())
     } else if low.contains("age") && low.contains("confirm") {
         Err("Age-restricted — set “YouTube cookies from browser” in Preferences.".to_string())
+    } else if low.contains("javascript runtime") || (low.contains("nsig") && low.contains("runtime"))
+    {
+        // yt-dlp couldn't find a JS runtime to solve YouTube's player challenge → the media 403s.
+        Err("YouTube needs a JavaScript runtime (deno or node) for yt-dlp. Install one: \
+             `curl -fsSL https://deno.land/install.sh | sh` (or `install-deps.sh`), then retry."
+            .to_string())
+    } else if low.contains("403") || low.contains("forbidden") {
+        // A 403 after extraction is almost always the missing-runtime case (or a stale yt-dlp).
+        Err("YouTube download blocked (403) — usually a missing JS runtime. Install deno or node \
+             (see README), and update yt-dlp (`pip install -U yt-dlp`)."
+            .to_string())
     } else {
         Err("YouTube download failed — update yt-dlp (`yt-dlp -U` / pip install -U yt-dlp).".to_string())
     }

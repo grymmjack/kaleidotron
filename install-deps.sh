@@ -28,6 +28,27 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 OS="$(uname -s)"
 
+install_js_runtime() {
+  # yt-dlp needs a JavaScript runtime to solve YouTube's player challenge (since 2025 it enables
+  # only `deno` by default). Without one, downloads 403. kaleidotron auto-detects deno/node/bun,
+  # so ANY of them works — only install deno if none is already present.
+  if have deno || have node || have bun; then
+    say "JS runtime for yt-dlp: found ($(command -v deno node bun 2>/dev/null | head -1))"
+    return
+  fi
+  say "Installing deno (JS runtime yt-dlp needs for YouTube)"
+  if have curl; then
+    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1 || \
+      warn "deno install failed — install deno or node yourself (YouTube downloads need one)."
+    case ":$PATH:" in
+      *":$HOME/.deno/bin:"*) : ;;
+      *) warn "Add ~/.deno/bin to your PATH so yt-dlp can find deno." ;;
+    esac
+  else
+    warn "No curl — install deno (https://deno.land) or node for YouTube downloads."
+  fi
+}
+
 install_yt_dlp() {
   # Prefer pipx / pip so we get the LATEST yt-dlp — distro packages lag and today's YouTube
   # (SABR + rotating signatures) breaks old versions ("Requested format is not available").
@@ -47,6 +68,7 @@ install_yt_dlp() {
   else
     warn "No pipx/python3 found — install a current yt-dlp yourself for the YouTube browser."
   fi
+  install_js_runtime
 }
 
 case "$OS" in

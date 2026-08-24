@@ -411,14 +411,20 @@ builds and runs fine.
 |---|---|---|
 | **ffmpeg / ffprobe** | **Video** plugin — thumbnails, the in-app player, PNG/audio export, lossless trim + join, YouTube playback | a labeled placeholder tile; no playback |
 | **yt-dlp** *(keep it current!)* | **YouTube** browser — search + download-in-place | no results / "update yt-dlp" |
+| **deno** or **node** | JS runtime yt-dlp needs to unlock YouTube media | YouTube downloads 403 / "needs a JavaScript runtime" |
 | **poppler** (`pdftoppm`) | **PDF** plugin — first-page render | metadata + placeholder tile |
 | **blender** | `.blend` tiles — on-demand frame render | branded placeholder |
 | **DOSBox** / DOSBox-Staging | **Run in DOSBox** — launch `.com`/`.exe`/`.bat`/`.cmd` | the tiles still list; the run action prompts you to set the binary in Preferences |
 
-> **yt-dlp must be recent.** YouTube changes frequently (SABR, rotating signatures) and an
-> old yt-dlp fails with *"Requested format is not available."* Distro packages lag badly —
-> prefer `pipx install yt-dlp` / `pip install -U yt-dlp` (what `install-deps.sh` does), and
-> update it with `pipx upgrade yt-dlp` when YouTube playback stops working.
+> **yt-dlp must be recent, and needs a JS runtime.** YouTube changes frequently (SABR, rotating
+> signatures) and an old yt-dlp fails with *"Requested format is not available."* Distro packages
+> lag badly — prefer `pipx install yt-dlp` / `pip install -U yt-dlp` (what `install-deps.sh` does),
+> and update it with `pipx upgrade yt-dlp` when YouTube stops working. Since 2025 yt-dlp also needs
+> a **JavaScript runtime** (it enables only **deno** by default) to solve YouTube's player
+> challenge — without one, downloads fail with **HTTP 403**. Install `deno`
+> (`curl -fsSL https://deno.land/install.sh | sh`) or `node`; kaleidotron auto-detects **deno /
+> node / bun** on your `PATH` and passes it to yt-dlp, so any one works. `install-deps.sh`
+> installs deno for you if none is present.
 
 The build also **compiles the bundled [libxmp](https://github.com/libxmp/libxmp)** (MIT, vendored
 under `vendor/libxmp`) from source for the extra tracker formats — this needs only a **C compiler**
@@ -1457,21 +1463,19 @@ src/
   theme.rs           themes/*.json, including VS Code theme import
   secrets.rs         secrets.json — API keys, 0600, kept out of the shared settings
 
-  # web sources (keyless except DeviantArt; all share cache.rs + netpolicy.rs)
+  # web sources (each keyless; all share cache.rs + netpolicy.rs)
   netpolicy.rs       robots.txt, per-host rate limiting, backoff — the single choke point
   cache.rs           persistent SQLite-indexed HTTP cache (2 GiB, LRU)
   sixteen.rs         16colo.rs JSON API (years/packs/artists/groups/search)
   colo_thumb.rs      worker pool fetching remote thumbnails
   polyhaven.rs       Poly Haven CC0 models / textures / HDRIs
   gfonts.rs          Google Fonts
-  lospec.rs          Lospec palettes (tag-union search + filters)
-  lospec_gallery.rs  Lospec art gallery (path-segment filters + POST paging)
+  lospec.rs          Lospec palettes
   modarchive.rs      The Mod Archive (tracker modules)
   audiosearch.rs     Openverse audio / images / GIFs
   httpfs.rs          browse any URL as a folder tree (page introspection)
   youtube.rs         yt-dlp search + download
   steam.rs           local Steam library → YouTube bridge
-  deviantart.rs      DeviantArt official OAuth2 API (client-credentials)
 ```
 
 For the deep internals — the recolor pipeline, the pixel-perfect blit math, the RIP
