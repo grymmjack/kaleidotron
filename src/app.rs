@@ -1425,6 +1425,9 @@ pub struct Kaleidotron {
     thumb_rgba: HashMap<PathBuf, (usize, usize, Vec<u8>)>, // thumb CPU pixels (for grid recolor)
     grid_recolor: HashMap<PathBuf, (String, egui::TextureHandle)>, // recolored grid tiles, per recolor key
     folder_info: HashMap<PathBuf, FolderInfo>, // cached montage previews + counts per folder
+    // Best-effort type label for a non-renderable file shown in a mount (magic-byte / extension id),
+    // computed once per path. Feeds the generic file tile so "show everything" isn't a wall of ?s.
+    file_id_cache: HashMap<PathBuf, String>,
     // Archive thumbnails: extract-to-cache on a worker, then a folder-style montage of the contents
     // (clutch for font .zips). Keyed by the archive path; a pending set dedupes the workers.
     archive_montage: HashMap<PathBuf, FolderInfo>,
@@ -3658,6 +3661,7 @@ impl Kaleidotron {
             thumb_rgba: HashMap::new(),
             grid_recolor: HashMap::new(),
             folder_info: HashMap::new(),
+            file_id_cache: HashMap::new(),
             archive_montage: HashMap::new(),
             archive_montage_pending: std::collections::HashSet::new(),
             archive_montage_tx,
@@ -5043,6 +5047,14 @@ impl Kaleidotron {
     /// Scan a real on-disk `dir` into folder + viewable-file `Entry`s (with ratings
     /// resolved). Shared by `open_folder` and the auto-refresh `auto_rescan`.
     fn scan_dir_entries(&self, dir: &Path) -> Vec<Entry> {
+        // Inside a mounted archive / 16colo pack, show **everything** — a pack bundles readmes,
+        // executables, data files, source, sub-archives, and all sorts under extensions we don't
+        // decode, and hiding them loses real content. Non-viewable files get a generic tile with a
+        // best-effort type id (see `identify_file`). A plain local folder keeps the filtered view.
+        let in_mount = self
+            .archive_mount
+            .as_ref()
+            .is_some_and(|m| dir.starts_with(&m.temp_root));
         let mut all: Vec<Entry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -5052,12 +5064,13 @@ impl Kaleidotron {
                 // `rebuild_view`). Default off = a Dolphin-like clean view.
                 if p.is_dir() {
                     all.push(make_entry(p, true));
-                } else if p
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    // No extension → scene/BBS art is often extensionless; show it
-                    // (decoded as CP437 text). A known extension must actually match.
-                    .is_none_or(|x| self.registry.known_extension(x))
+                } else if in_mount
+                    || p
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        // No extension → scene/BBS art is often extensionless; show it
+                        // (decoded as CP437 text). A known extension must actually match.
+                        .is_none_or(|x| self.registry.known_extension(x))
                     || crate::archive::is_archive(&p)
                     || is_sample_bank(&p)
                     || (self.plugin_audio && is_kit_ext(&p))
@@ -5082,6 +5095,20 @@ impl Kaleidotron {
             e.rating = self.read_rating(&e.path);
         }
         all
+    }
+
+    /// Does this file have a rendering path (a thumbnail the decoder can produce)? Extensionless
+    /// files render as CP437 text; everything else is checked against the image/scene/code/audio
+    /// families and the registry. When false — a data/binary file surfaced by a mount's
+    /// "show everything" listing — the grid paints a generic type-id tile instead of spinning on a
+    /// thumbnail that will never arrive.
+    fn can_render(&self, path: &Path) -> bool {
+        match path.extension().and_then(|x| x.to_str()) {
+            None => true, // extensionless → CP437 text render
+            Some(ext) => {
+                is_image_ext(path) || self.registry.known_extension(&ext.to_ascii_lowercase())
+            }
+        }
     }
 
     /// Poll the current local folder for filesystem changes (new/removed/modified files —
@@ -19445,6 +19472,11 @@ impl Kaleidotron {
             // configured yet, `run_in_dosbox` sets a status telling the user where to set it.
             self.selected = idx;
             self.run_in_dosbox(&entry.path);
+        } else if !self.can_render(&entry.path) {
+            // A file we can't decode (a data/binary surfaced by a mount's "show everything"
+            // listing) — hand it to the OS default app rather than a blank viewer.
+            self.selected = idx;
+            self.open_in_default_app(&entry.path);
         } else {
             self.selected = idx;
             self.load_full(ctx, entry.path); // load_full sets the mode (Single, or ThreeD for a mesh)
@@ -28055,6 +28087,39 @@ impl Kaleidotron {
                                     crate::format_color::color32(ext),
                                 );
                             }
+                        } else if !self.can_render(path) {
+                            // A file we can't decode (surfaced by a mount's "show everything"
+                            // listing): a document glyph + a best-effort type id, no thumbnail
+                            // request (which would spin forever on an undecodable file).
+                            let label = self
+                                .file_id_cache
+                                .entry(path.clone())
+                                .or_insert_with(|| identify_file(path))
+                                .clone();
+                            let p = ui.painter_at(rect);
+                            p.text(
+                                rect.center() - egui::vec2(0.0, tile * 0.08),
+                                egui::Align2::CENTER_CENTER,
+                                "\u{1f4c4}", // 📄 page glyph (renders via the emoji font)
+                                egui::FontId::proportional(tile * 0.40),
+                                ui.visuals().weak_text_color(),
+                            );
+                            let font = egui::FontId::proportional((tile * 0.11).clamp(9.0, 15.0));
+                            let galley = p.layout_no_wrap(
+                                label,
+                                font,
+                                ui.visuals().strong_text_color(),
+                            );
+                            let at = egui::pos2(
+                                rect.center().x - galley.size().x * 0.5,
+                                rect.center().y + tile * 0.18,
+                            );
+                            p.rect_filled(
+                                egui::Rect::from_min_size(at, galley.size()).expand(3.0),
+                                3.0,
+                                egui::Color32::from_black_alpha(140),
+                            );
+                            p.galley(at, galley, ui.visuals().strong_text_color());
                         } else if self
                             .video_hover
                             .as_ref()
@@ -29301,11 +29366,22 @@ impl Kaleidotron {
                                 Self::WEB_THUMB_MAX_BYTES,
                             );
                         }
-                    } else if !any_remote(&path) {
+                    } else if !any_remote(&path) && self.can_render(&path) {
                         self.thumbs.request(&path, THUMB_PX);
                     }
                     self.want_repaint = true;
                 }
+                // A non-renderable file (a mount's "show everything" data/binary) gets a type-id
+                // label in the thumb cell instead of an endless spinner. Computed here (row-level
+                // `&mut self`) so the deep cell closure needn't borrow the cache mutably.
+                let file_id = (!entry.is_dir && tex.is_none() && !colo_audio && !any_remote(&path)
+                    && !self.can_render(&path))
+                .then(|| {
+                    self.file_id_cache
+                        .entry(path.clone())
+                        .or_insert_with(|| identify_file(&path))
+                        .clone()
+                });
 
                 // Predict the row rect to highlight on hover the same frame it's drawn.
                 let row_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail, row_h));
@@ -29421,6 +29497,26 @@ impl Kaleidotron {
                                     .and_then(|e| e.to_str())
                                     .unwrap_or("");
                                 paint_audio_tile(&ui.painter_at(rect), rect, ext);
+                            } else if let Some(id) = &file_id {
+                                // A non-renderable file: a document glyph + best-effort type id.
+                                let p = ui.painter_at(rect);
+                                p.text(
+                                    rect.center() - egui::vec2(0.0, row_h * 0.12),
+                                    egui::Align2::CENTER_CENTER,
+                                    "\u{1f4c4}",
+                                    egui::FontId::proportional(row_h * 0.4),
+                                    ui.visuals().weak_text_color(),
+                                );
+                                let galley = p.layout_no_wrap(
+                                    id.clone(),
+                                    egui::FontId::proportional(7.5),
+                                    ui.visuals().strong_text_color(),
+                                );
+                                let pos = egui::pos2(
+                                    rect.center().x - galley.size().x * 0.5,
+                                    rect.bottom() - galley.size().y - 2.0,
+                                );
+                                p.galley(pos, galley, ui.visuals().strong_text_color());
                             } else if !entry.is_dir {
                                 // Spinner while the row's thumbnail loads (the request was
                                 // already issued above when tex was None).
@@ -49664,6 +49760,74 @@ const DOSBOX_MACHINES: &[(&str, &str, u32)] = &[
     ("Pentium 90", "pentium", 52000),
     ("Pentium MMX 200", "pentium_mmx", 120000),
 ];
+
+/// Best-effort type label for a file we don't render — a magic-byte sniff of the first bytes, then
+/// the uppercase extension, then a text/binary guess. Shown on the generic tile so a mount's
+/// "show everything" listing identifies its contents instead of a wall of unknowns.
+fn identify_file(path: &Path) -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
+    let b = &buf[..n];
+    let is = |sig: &[u8]| b.starts_with(sig);
+    // Magic bytes for common container/binary types the viewer can't (or doesn't) render.
+    let by_magic = if is(b"PK\x03\x04") || is(b"PK\x05\x06") {
+        Some("ZIP")
+    } else if is(b"Rar!") {
+        Some("RAR")
+    } else if is(b"7z\xBC\xAF\x27\x1C") {
+        Some("7Z")
+    } else if is(&[0x1f, 0x8b]) {
+        Some("GZIP")
+    } else if is(b"BZh") {
+        Some("BZIP2")
+    } else if is(b"\xFD7zXZ") {
+        Some("XZ")
+    } else if is(b"MZ") {
+        Some("DOS/EXE")
+    } else if is(b"\x7fELF") {
+        Some("ELF")
+    } else if is(b"%PDF") {
+        Some("PDF")
+    } else if is(b"OggS") {
+        Some("OGG")
+    } else if is(b"fLaC") {
+        Some("FLAC")
+    } else if is(b"MThd") {
+        Some("MIDI")
+    } else if is(b"ID3") {
+        Some("MP3")
+    } else if is(b"RIFF") {
+        Some("RIFF")
+    } else if is(b"\x89PNG") {
+        Some("PNG")
+    } else if is(b"GIF8") {
+        Some("GIF")
+    } else if is(&[0xFF, 0xD8, 0xFF]) {
+        Some("JPEG")
+    } else if is(b"II*\0") || is(b"MM\0*") {
+        Some("TIFF")
+    } else if n == 0 {
+        Some("EMPTY")
+    } else {
+        None
+    };
+    if let Some(l) = by_magic {
+        return l.to_string();
+    }
+    // Fall back to the extension (upper-cased), else a text/binary guess.
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if !ext.is_empty() {
+            return ext.to_ascii_uppercase();
+        }
+    }
+    // No extension, no magic: printable-ratio heuristic (mirrors the ANSI text sniff's spirit).
+    let ctrl = b
+        .iter()
+        .filter(|&&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1a | 0x1b))
+        .count();
+    if ctrl * 100 <= b.len() * 2 { "TEXT" } else { "BINARY" }.to_string()
+}
 
 /// DOS executables we can hand to DOSBox: `.com`/`.exe` (case-insensitive). `.bat`/`.cmd` are
 /// intentionally NOT here — they stay viewable/editable text (they're also in `CODE_EXTS`), and
