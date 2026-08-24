@@ -2301,6 +2301,7 @@ pub struct Kaleidotron {
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
+    export_include_keys: bool, // Advanced → Export: include API keys in the bundle (transient, default off)
     themes_dir: PathBuf,       // <data>/themes/*.json
     theme_name: String,        // selected theme; empty = egui's built-in dark/light
     /// Which half of a theme to apply: 0 = all, 1 = syntax only, 2 = chrome only. A VS Code theme
@@ -4476,6 +4477,7 @@ impl Kaleidotron {
             keybindings_file: kb_file,
             settings_file,
             secrets_file,
+            export_include_keys: false,
             themes_dir,
             theme_name: String::new(),
             theme_scope: 0,
@@ -4734,8 +4736,17 @@ impl Kaleidotron {
     /// Overlay `settings.json` onto the already-loaded defaults. A missing or wrong-typed value
     /// leaves the existing setting untouched, so a partial or hand-mangled file degrades gracefully.
     fn apply_settings_file(&mut self) {
+        let Some(m) = crate::settings::load(&self.settings_file) else {
+            return;
+        };
+        self.apply_settings_map(m);
+    }
+
+    /// Apply a settings map — from `settings.json` on startup, or from an imported setup bundle —
+    /// to the live state: assigns every field and syncs the registry plugin flags. Taken by value
+    /// so the body can keep borrowing `&m`.
+    fn apply_settings_map(&mut self, m: std::collections::HashMap<String, serde_json::Value>) {
         use crate::settings as st;
-        let Some(m) = st::load(&self.settings_file) else { return };
         if let Some(v) = st::get_u64(&m, "theme") {
             self.theme = v as u8;
         }
@@ -4956,6 +4967,124 @@ impl Kaleidotron {
         if let Err(e) = crate::settings::save(&self.settings_file, &self.settings_entries()) {
             eprintln!("settings.json: {e}");
         }
+    }
+
+    /// Serialise the whole setup — every setting + the keybindings, and (only when `include_secrets`)
+    /// the API keys — into one portable pretty-printed JSON bundle. Keys are OFF by default because
+    /// the file is plain text: anyone it's shared with (or a synced/backed-up copy) can read them.
+    fn export_setup_json(&self, include_secrets: bool) -> String {
+        use serde_json::{Map, Value};
+        let mut settings = Map::new();
+        for e in self.settings_entries() {
+            settings.insert(e.key.to_string(), e.value);
+        }
+        let mut keys = Map::new();
+        for a in Action::ALL {
+            if let Some(k) = self.keymap.get(&a) {
+                keys.insert(a.id().to_string(), Value::String(k.name().to_string()));
+            }
+        }
+        let mut root = Map::new();
+        root.insert("kaleidotron_export".to_string(), Value::from(1u8));
+        root.insert("settings".to_string(), Value::Object(settings));
+        root.insert("keybindings".to_string(), Value::Object(keys));
+        if include_secrets {
+            let mut sec = Map::new();
+            if !self.steam_api_key.trim().is_empty() {
+                sec.insert("steam_api_key".to_string(), Value::String(self.steam_api_key.clone()));
+            }
+            if !self.ma_key.trim().is_empty() {
+                sec.insert("ma_key".to_string(), Value::String(self.ma_key.clone()));
+            }
+            root.insert("secrets".to_string(), Value::Object(sec));
+        }
+        serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// Export the setup bundle to a user-chosen file (Advanced → Export).
+    fn export_setup(&mut self, include_secrets: bool) {
+        let json = self.export_setup_json(include_secrets);
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_file_name("kaleidotron-setup.json")
+            .add_filter("kaleidotron setup", &["json"])
+            .save_file()
+        {
+            match std::fs::write(&dest, json) {
+                Ok(()) => {
+                    self.status = format!(
+                        "Exported settings → {}{}",
+                        dest.display(),
+                        if include_secrets { "  ⚠ includes your API keys" } else { "" }
+                    );
+                }
+                Err(e) => self.status = format!("Export failed: {e}"),
+            }
+        }
+    }
+
+    /// Import a setup bundle written by [`export_setup`], applying it to the live session and
+    /// persisting it. Anything the file omits (e.g. API keys on a key-less export) is left as-is.
+    fn import_setup(&mut self, ctx: &egui::Context) {
+        let Some(src) = rfd::FileDialog::new()
+            .add_filter("kaleidotron setup", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&src) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Import failed: {e}");
+                return;
+            }
+        };
+        let root: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = format!("Not a valid setup file: {e}");
+                return;
+            }
+        };
+        if root.get("kaleidotron_export").is_none() {
+            self.status = "Not a kaleidotron setup file".into();
+            return;
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(obj) = root.get("settings").and_then(|v| v.as_object()) {
+            let m: std::collections::HashMap<String, serde_json::Value> =
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.apply_settings_map(m); // sets fields + syncs registry plugin flags
+            parts.push("settings");
+        }
+        if let Some(obj) = root.get("keybindings").and_then(|v| v.as_object()) {
+            for (aid, v) in obj {
+                if let (Some(a), Some(k)) =
+                    (Action::from_id(aid), v.as_str().and_then(egui::Key::from_name))
+                {
+                    self.keymap.insert(a, k);
+                }
+            }
+            parts.push("keybindings");
+        }
+        if let Some(obj) = root.get("secrets").and_then(|v| v.as_object()) {
+            if let Some(s) = obj.get("steam_api_key").and_then(|v| v.as_str()) {
+                self.steam_api_key = s.to_string();
+            }
+            if let Some(s) = obj.get("ma_key").and_then(|v| v.as_str()) {
+                self.ma_key = s.to_string();
+            }
+            parts.push("API keys");
+        }
+        // Persist + re-apply the theme (the imported settings may change it), then repaint.
+        self.write_settings_file();
+        self.apply_theme(ctx);
+        self.rebuild_view();
+        self.want_repaint = true;
+        self.status = if parts.is_empty() {
+            "Nothing to import (empty setup file)".into()
+        } else {
+            format!("Imported {} from {}", parts.join(", "), short_name(&src))
+        };
     }
 
     /// Scan `dir` into folder + image entries (directories first, then images,
@@ -38597,6 +38726,8 @@ impl eframe::App for Kaleidotron {
             let mut color_change: Option<(String, [u8; 3])> = None; // a format-color edit
             let mut reset_colors = false; // "Reset" the format colors
             let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
+            let mut do_export_setup: Option<bool> = None; // Some(include_secrets) → export bundle
+            let mut do_import_setup = false; // "Import setup…" clicked
             let mut font_preview_changed = false; // font-tile sample text edited → refresh tiles
             let mut theme_apply = false; // theme picked → re-install Visuals after the closure
             let mut open_config: Option<PathBuf> = None; // Config-files tab → open this path
@@ -39398,6 +39529,52 @@ impl eframe::App for Kaleidotron {
                                 ui.add_space(10.0);
                                 }
                                 if sec == 6 {
+                                ui.label("Backup & sync setup");
+                                ui.weak(
+                                    "Save your whole setup — every setting in this dialog plus your \
+                                     keybindings — to one portable JSON file, and import it on \
+                                     another machine.",
+                                );
+                                ui.checkbox(
+                                    &mut self.export_include_keys,
+                                    "Include API keys (Steam · ModArchive)",
+                                )
+                                .on_hover_text(
+                                    "Off by default. Your API keys are normally kept out of the \
+                                     exported file.",
+                                );
+                                if self.export_include_keys {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 120, 80),
+                                        "⚠ The file will hold your API keys in PLAIN TEXT — anyone \
+                                         you send it to, or any cloud/dotfile/backup copy, can read \
+                                         them. Only include keys for a private local backup, never \
+                                         for something you'll share or commit.",
+                                    );
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button("Export setup…")
+                                        .on_hover_text("Write the bundle to a file you choose")
+                                        .clicked()
+                                    {
+                                        do_export_setup = Some(self.export_include_keys);
+                                    }
+                                    if ui
+                                        .button("Import setup…")
+                                        .on_hover_text(
+                                            "Load a bundle and apply it now. Overwrites your current \
+                                             settings; anything the file omits (e.g. keys) is left \
+                                             alone.",
+                                        )
+                                        .clicked()
+                                    {
+                                        do_import_setup = true;
+                                    }
+                                });
+                                ui.weak("The bundle is plain JSON — open it in the viewer to inspect it.");
+
+                                ui.add_space(10.0);
                                 ui.label("Git status");
                                 if ui
                                     .checkbox(
@@ -39663,6 +39840,12 @@ impl eframe::App for Kaleidotron {
                 // Editing the Preferences text implies "use it".
                 self.font_preview_on = true;
                 self.refresh_font_thumbs();
+            }
+            if let Some(include_secrets) = do_export_setup {
+                self.export_setup(include_secrets);
+            }
+            if do_import_setup {
+                self.import_setup(&ctx);
             }
         }
 
