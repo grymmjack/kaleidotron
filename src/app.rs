@@ -35394,6 +35394,8 @@ impl Kaleidotron {
             17
         } else if crate::lospec::is_remote(dir) {
             11
+        } else if crate::lospec_gallery::is_remote(dir) {
+            18
         } else if crate::polyhaven::is_remote(dir) {
             12
         } else if crate::gfonts::is_remote(dir) {
