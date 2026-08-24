@@ -21965,26 +21965,72 @@ impl Kaleidotron {
         path: &Path,
         key: &str,
     ) -> Option<egui::TextureHandle> {
+        // Compute the zoom factor from DIMS ONLY (no buffer clone) so a cache hit is cheap.
+        // Recalc at the on-screen tile size: a tile zoomed BIGGER than its thumbnail buffer
+        // would otherwise just NEAREST-upscale a small render (chunky dither / ANSI-cell
+        // artifacts). So upscale the source toward the display size and re-run the pipeline
+        // there. Bucketed to 128px so a 1px zoom nudge doesn't rebuild every tile; capped so
+        // a tiny sprite blown up huge doesn't cost a 4K render.
+        let f = self.scale_algo.factor();
+        let (bw, bh, _) = self.thumb_rgba.get(path)?;
+        let orig_long = (bw.max(bh) * f).max(1);
+        let ppp = ctx.pixels_per_point();
+        let disp_px = (self.thumb_size * ppp).round() as usize;
+        let disp_target = disp_px.div_ceil(128) * 128;
+        let up = ((disp_target as f32 / orig_long as f32).clamp(1.0, 4.0) * 100.0).round() / 100.0;
+        // Only re-render larger when it actually helps (>~5% bigger); otherwise keep the
+        // original buffer + the plain cache key (small-tile behaviour is unchanged).
+        let key = if up > 1.05 {
+            std::borrow::Cow::Owned(format!("{key}|z{disp_target}"))
+        } else {
+            std::borrow::Cow::Borrowed(key)
+        };
         if let Some((k, tex)) = self.grid_recolor.get(path) {
-            if k == key {
+            if k.as_str() == key.as_ref() {
                 return Some(tex.clone());
             }
         }
+        // Cache miss → now do the real work (clone + pipeline).
         let (w, h, rgba) = self.thumb_rgba.get(path)?.clone();
         let palette = self.tile_palette(path);
         // Pixel-art upscale (if any) first, then the pipeline on the enlarged tile.
         let (w, h, mut rgba) = self.scale_source(w, h, rgba);
-        let f = self.scale_algo.factor();
         let (native_w, native_h) = self
             .img_meta
             .get(path)
             .map(|m| (m.w as usize * f, m.h as usize * f))
             .unwrap_or((w, h));
-        let dsx = self.eff_dither_scale(self.dither_scale_x, w, native_w);
-        let dsy = self.eff_dither_scale(self.dither_scale_y, h, native_h);
+        // Dither cells are sized at the ORIGINAL buffer resolution first; if we then render
+        // at a higher (zoomed) resolution, they scale by the same factor so the crosshatch
+        // keeps its relative size.
+        let dsx0 = self.eff_dither_scale(self.dither_scale_x, w, native_w);
+        let dsy0 = self.eff_dither_scale(self.dither_scale_y, h, native_h);
+        let (w, h) = if up > 1.05 {
+            let nw = (w as f32 * up).round() as usize;
+            let nh = (h as f32 * up).round() as usize;
+            rgba = bilinear_up(&rgba, w, h, nw, nh);
+            (nw, nh)
+        } else {
+            (w, h)
+        };
+        let dsx = ((dsx0 as f32 * up).round() as usize).max(1);
+        let dsy = ((dsy0 as f32 * up).round() as usize).max(1);
         let (tw, th) = self.resize_target(w, h);
-        let aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
-        apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
+        let mut aux = self.pipe_aux(palette.as_deref(), dsx, dsy);
+        // Pixelate is an absolute block size — scale it with the render so the mosaic
+        // keeps the same relative size at zoom (only when it's actually enabled).
+        if up > 1.05 && aux.pixelate_h >= 2.0 {
+            aux.pixelate_h *= up;
+        }
+        let mut adj_owned;
+        let adj: &Adjust = if up > 1.05 && self.adjust.pixelate >= 2.0 {
+            adj_owned = self.adjust.clone();
+            adj_owned.pixelate *= up;
+            &adj_owned
+        } else {
+            &self.adjust
+        };
+        apply_pipeline_resized(&mut rgba, w, h, tw, th, adj, &aux);
         let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         // Match the plain-thumb path: a downscaled (area-averaged) tile displays
         // LINEAR so it isn't re-aliased; a source-res sprite stays crisp NEAREST. A
@@ -43251,6 +43297,38 @@ fn apply_pipeline_resized(
     }
 }
 
+/// Smooth (bilinear) upscale of an RGBA buffer to `dw`×`dh`. Used by the grid recolor to
+/// enlarge a small thumbnail toward the on-screen tile size *before* the colorize pipeline,
+/// so dither / ANSI cells are computed crisply at zoom instead of nearest-upscaling a small
+/// render. Half-pixel-centered sampling; edges clamp. Only ever called to grow a buffer.
+fn bilinear_up(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dw * dh * 4];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let wy = fy - y0 as f32;
+        for x in 0..dw {
+            let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let wx = fx - x0 as f32;
+            let (i00, i10) = ((y0 * sw + x0) * 4, (y0 * sw + x1) * 4);
+            let (i01, i11) = ((y1 * sw + x0) * 4, (y1 * sw + x1) * 4);
+            let d = (y * dw + x) * 4;
+            for c in 0..4 {
+                let top = src[i00 + c] as f32 + (src[i10 + c] as f32 - src[i00 + c] as f32) * wx;
+                let bot = src[i01 + c] as f32 + (src[i11 + c] as f32 - src[i01 + c] as f32) * wx;
+                out[d + c] = (top + (bot - top) * wy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// Per-channel additive offset ("color balance"): `out = in + off`, clamped. A zero
 /// offset (neutral color or zero strength) is a no-op. Transparent pixels untouched.
 fn color_balance(rgba: &mut [u8], off: [i16; 3]) {
@@ -54642,6 +54720,23 @@ mod tests {
         let mut r_last = src.to_vec();
         apply_pipeline_resized(&mut r_last, 4, 1, 2, 1, &sharp_full, &aux);
         assert_ne!(r_first, r_last, "the Resize marker's position changes the result");
+    }
+
+    #[test]
+    fn bilinear_up_grows_and_interpolates() {
+        // 2×1: black → white. Upscale to 4×1: half-pixel centers sample a smooth ramp,
+        // endpoints clamp to the source extremes, and the middle interpolates.
+        let src = vec![0u8, 0, 0, 255, 255, 255, 255, 255];
+        let out = bilinear_up(&src, 2, 1, 4, 1);
+        assert_eq!(out.len(), 4 * 4);
+        assert_eq!(out[0], 0, "left edge clamps to black");
+        assert_eq!(out[12], 255, "right edge clamps to white");
+        // Monotonic non-decreasing red channel across the row.
+        let reds: Vec<u8> = (0..4).map(|x| out[x * 4]).collect();
+        assert!(reds.windows(2).all(|w| w[0] <= w[1]), "ramp is monotonic: {reds:?}");
+        assert!(out[3] == 255 && out[7] == 255, "alpha preserved");
+        // A 1:1 "upscale" reproduces the source exactly.
+        assert_eq!(bilinear_up(&src, 2, 1, 2, 1), src, "identity size is a copy");
     }
 
     #[test]
