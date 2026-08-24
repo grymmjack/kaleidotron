@@ -23,18 +23,20 @@
 //! Not implemented deliberately: we never ignore `robots.txt` for "just one file", and there is no
 //! setting to disable this — a politeness layer that can be switched off is one that will be.
 //!
-//! **One principled exception — documented JSON APIs ([`API_HOSTS`]).** RFC 9309 is the *robots*
+//! **One principled exception — the integrated sources ([`API_HOSTS`]).** RFC 9309 is the *robots*
 //! exclusion protocol: it governs "automatic clients known as **crawlers**" that discover and index
 //! content by following links. A first-party client making a *user-initiated* request to a
-//! **documented, keyless REST API** is not a crawler — the API is the product, meant to be called
-//! programmatically (Openverse even issues keys for it). Some API operators `Disallow: /v1/` purely
-//! to keep *crawlers* from indexing API responses (often alongside anti-AI-scraper `GPTBot`/`CCBot`
-//! blocks); enforcing that against a legitimate API client just breaks the feature (image + audio
-//! search returned nothing). So for the specific API hosts this app integrates, we **skip the
-//! robots path block only** — every other courtesy (per-host rate limit, `Crawl-delay`, `429`/
-//! `Retry-After`, the honest `User-Agent`) still applies, which is the part that actually protects
-//! the server from load. This is not a general opt-out: it's a fixed, code-level allowlist of hosts
-//! whose API we are a documented client of.
+//! **documented API or an intended file-download** is not a crawler — the API is the product, meant
+//! to be called programmatically. Many sites `Disallow` their API / download paths purely to keep
+//! *crawlers* out (Wikimedia `Disallow: /w/`, Iconify `Disallow: /`, ModArchive `/download.php`,
+//! Lospec `/palette-list/*.gpl$`, Openverse `/v1/…` next to anti-AI-scraper `GPTBot`/`CCBot`
+//! blocks); enforcing those against the app's own documented clients just makes the feature silently
+//! return nothing. So for the specific hosts this app integrates as a source, we **skip the robots
+//! path block only** — every other courtesy (per-host rate limit, `Crawl-delay`, `429`/`Retry-After`,
+//! the honest `User-Agent`) still applies, which is the part that actually protects the server from
+//! load. This is NOT a general opt-out: it's a fixed, code-level allowlist. The **HTTP browser**
+//! (arbitrary user URLs — genuine crawling of sites we have no relationship with) is deliberately
+//! excluded, so it stays fully robots-gated.
 //!
 //! [RFC 9309]: https://www.rfc-editor.org/rfc/rfc9309.html
 
@@ -50,11 +52,23 @@ pub const MAX_WAIT: Duration = Duration::from_secs(5);
 /// The product token we match `robots.txt` groups against.
 pub const UA_TOKEN: &str = "kaleidotron";
 
-/// Documented, keyless JSON APIs this app is a first-party client of, where the robots.txt *path*
-/// block is skipped (see the module docs). Rate-limiting / Crawl-delay / 429 handling still apply.
-/// `api.openverse.org` backs BOTH image search (`/v1/images/`) and audio search (`/v1/audio/`), and
-/// its robots.txt `Disallow: /v1/…` (an anti-crawler rule) otherwise makes both return nothing.
-pub const API_HOSTS: &[&str] = &["api.openverse.org"];
+/// Hosts of the **integrated web sources** this app is a documented first-party client of, where the
+/// robots.txt *path* block is skipped (see the module docs). Rate-limiting / Crawl-delay / 429
+/// handling still apply — only the crawler-oriented path block is lifted. Every one of these serves
+/// a documented API or an intended user-download whose robots.txt `Disallow` targets bulk crawlers,
+/// not a desktop client fetching one thing on a user's action — and enforcing it just makes the
+/// feature silently return nothing. A listed host matches its exact host or any subdomain.
+///
+/// NB the **HTTP browser** (arbitrary user-entered URLs — the one place we genuinely *are* crawling
+/// a site we have no relationship with) is deliberately NOT here, so it stays fully robots-gated.
+pub const API_HOSTS: &[&str] = &[
+    "api.openverse.org",     // image + audio + GIF search (JSON API; Disallow: /v1/…)
+    "commons.wikimedia.org", // vector (SVG) search — the MediaWiki API (Disallow: /w/)
+    "upload.wikimedia.org",  // Wikimedia file + thumbnail downloads
+    "api.iconify.design",    // icon search (JSON API; Disallow: /)
+    "lospec.com",            // palette browser + .gpl/.png downloads (Disallow: /palette-list/*.gpl$…)
+    "modarchive.org",        // tracker-module search + downloads (covers api.modarchive.org)
+];
 
 /// The bare host of an origin like `https://api.openverse.org` → `api.openverse.org`.
 fn origin_host(origin: &str) -> &str {
@@ -324,12 +338,19 @@ mod tests {
 
     #[test]
     fn documented_apis_are_exempt_from_robots_path_block() {
-        // The exact host and its subdomains match; unrelated hosts don't.
-        assert!(is_documented_api("https://api.openverse.org"));
-        assert!(is_documented_api("https://api.openverse.org")); // used for /v1/images/ + /v1/audio/
-        assert!(is_documented_api("https://cdn.api.openverse.org"));
+        // Every integrated source host (and its subdomains) is exempt.
+        assert!(is_documented_api("https://api.openverse.org")); // /v1/images/ + /v1/audio/
+        assert!(is_documented_api("https://cdn.api.openverse.org")); // subdomain
+        assert!(is_documented_api("https://commons.wikimedia.org")); // vector search (/w/api.php)
+        assert!(is_documented_api("https://upload.wikimedia.org")); // Wikimedia files
+        assert!(is_documented_api("https://api.iconify.design")); // icon search
+        assert!(is_documented_api("https://lospec.com")); // palette downloads
+        assert!(is_documented_api("https://modarchive.org")); // module downloads
+        assert!(is_documented_api("https://api.modarchive.org")); // subdomain of modarchive.org
+        // Unrelated hosts and spoofs are NOT exempt (the HTTP browser stays robots-gated).
         assert!(!is_documented_api("https://openverse.org")); // the site, not the API host
         assert!(!is_documented_api("https://api.openverse.org.evil.com")); // suffix spoof
+        assert!(!is_documented_api("https://en.wikipedia.org")); // not a listed source host
         assert!(!is_documented_api("https://example.org"));
     }
 
