@@ -23,6 +23,19 @@
 //! Not implemented deliberately: we never ignore `robots.txt` for "just one file", and there is no
 //! setting to disable this — a politeness layer that can be switched off is one that will be.
 //!
+//! **One principled exception — documented JSON APIs ([`API_HOSTS`]).** RFC 9309 is the *robots*
+//! exclusion protocol: it governs "automatic clients known as **crawlers**" that discover and index
+//! content by following links. A first-party client making a *user-initiated* request to a
+//! **documented, keyless REST API** is not a crawler — the API is the product, meant to be called
+//! programmatically (Openverse even issues keys for it). Some API operators `Disallow: /v1/` purely
+//! to keep *crawlers* from indexing API responses (often alongside anti-AI-scraper `GPTBot`/`CCBot`
+//! blocks); enforcing that against a legitimate API client just breaks the feature (image + audio
+//! search returned nothing). So for the specific API hosts this app integrates, we **skip the
+//! robots path block only** — every other courtesy (per-host rate limit, `Crawl-delay`, `429`/
+//! `Retry-After`, the honest `User-Agent`) still applies, which is the part that actually protects
+//! the server from load. This is not a general opt-out: it's a fixed, code-level allowlist of hosts
+//! whose API we are a documented client of.
+//!
 //! [RFC 9309]: https://www.rfc-editor.org/rfc/rfc9309.html
 
 use std::collections::HashMap;
@@ -36,6 +49,26 @@ pub const MIN_HOST_INTERVAL: Duration = Duration::from_millis(500);
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 /// The product token we match `robots.txt` groups against.
 pub const UA_TOKEN: &str = "kaleidotron";
+
+/// Documented, keyless JSON APIs this app is a first-party client of, where the robots.txt *path*
+/// block is skipped (see the module docs). Rate-limiting / Crawl-delay / 429 handling still apply.
+/// `api.openverse.org` backs BOTH image search (`/v1/images/`) and audio search (`/v1/audio/`), and
+/// its robots.txt `Disallow: /v1/…` (an anti-crawler rule) otherwise makes both return nothing.
+pub const API_HOSTS: &[&str] = &["api.openverse.org"];
+
+/// The bare host of an origin like `https://api.openverse.org` → `api.openverse.org`.
+fn origin_host(origin: &str) -> &str {
+    origin.split_once("://").map(|(_, h)| h).unwrap_or(origin)
+}
+
+/// Is this origin one of the documented APIs we call as a first-party client (so the robots.txt
+/// path block doesn't apply)? Matches the exact host or a subdomain of a listed host.
+pub fn is_documented_api(origin: &str) -> bool {
+    let host = origin_host(origin);
+    API_HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
 
 /// What a host's `robots.txt` tells us.
 #[derive(Clone, Debug, Default)]
@@ -183,9 +216,13 @@ pub fn before_request(url: &str) -> Result<(), String> {
     let wait = {
         let mut map = hosts().lock().map_err(|_| "lock")?;
         let st = map.entry(origin.clone()).or_default();
-        if let Some(r) = &st.robots {
-            if !r.allows(&path) {
-                return Err(format!("blocked by robots.txt: {path}"));
+        // Honour robots.txt path blocks — EXCEPT for the documented APIs we're a first-party client
+        // of (a crawler-exclusion rule shouldn't forbid a documented API call; see module docs).
+        if !is_documented_api(&origin) {
+            if let Some(r) = &st.robots {
+                if !r.allows(&path) {
+                    return Err(format!("blocked by robots.txt: {path}"));
+                }
             }
         }
         let now = Instant::now();
@@ -283,6 +320,17 @@ mod tests {
         // `User-agent: a` + `User-agent: *` on consecutive lines = one group covering both.
         let r = parse_robots("User-agent: SomeBot\nUser-agent: *\nDisallow: /shared\n");
         assert!(!r.allows("/shared"));
+    }
+
+    #[test]
+    fn documented_apis_are_exempt_from_robots_path_block() {
+        // The exact host and its subdomains match; unrelated hosts don't.
+        assert!(is_documented_api("https://api.openverse.org"));
+        assert!(is_documented_api("https://api.openverse.org")); // used for /v1/images/ + /v1/audio/
+        assert!(is_documented_api("https://cdn.api.openverse.org"));
+        assert!(!is_documented_api("https://openverse.org")); // the site, not the API host
+        assert!(!is_documented_api("https://api.openverse.org.evil.com")); // suffix spoof
+        assert!(!is_documented_api("https://example.org"));
     }
 
     #[test]
