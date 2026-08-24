@@ -136,8 +136,110 @@ pub fn parse(bytes: &[u8]) -> Vec<LospecPalette> {
         .collect()
 }
 
-/// Browse/search Lospec for `query`, up to `want` palettes (paged in 10s; cached 1 day).
+/// Browse/search Lospec for `query`, up to `want` palettes (cached 1 day).
+///
+/// **Two paths, because Lospec's `load?tag=` index is incomplete.** A blank query browses the main
+/// list via the JSON `load` endpoint (fast, colours inline). A tag query instead scrapes the
+/// authoritative `/palette-list/tag/<tag>` PAGE — `load?tag=ansi` silently returns nothing while
+/// `/tag/ansi` correctly lists `ansi32` etc. — then fetches each palette's `.json` for its colours
+/// (the tag page has none inline).
 pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
+    if query.trim().is_empty() {
+        browse_all(want)
+    } else {
+        search_by_tag(query.trim(), want)
+    }
+}
+
+/// Tag search as the **union** of both of Lospec's tag sources, deduped by slug — because neither is
+/// complete on its own: the fast JSON `load?tag=` index misses some tags (e.g. "ansi" → nothing),
+/// while the `/palette-list/tag/<tag>` page lists them all (incl. `ansi32`) but needs a `.json` per
+/// palette for colours. Query both, take load's inline-colour results first, then fill from the tag
+/// page whatever load didn't already have — so everything shows up, once.
+pub fn search_by_tag(tag: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
+    let want = want.clamp(1, 120);
+    let mut out: Vec<LospecPalette> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // 1) `load?tag=` — inline colours, paged, no per-palette fetch. Complete for common tags.
+    for page in 1..=want.div_ceil(PER_PAGE) {
+        let Ok(body) = crate::cache::get_bytes(&browse_url(tag, page), Some(86_400)) else {
+            break;
+        };
+        let batch = parse(&body);
+        if batch.is_empty() {
+            break;
+        }
+        for p in batch {
+            if seen.insert(p.slug.clone()) {
+                out.push(p);
+            }
+        }
+        if out.len() >= want {
+            break;
+        }
+    }
+    // 2) `/palette-list/tag/<tag>` page — the complete index; union in anything (1) missed, fetching
+    //    each palette's `.json` for its colours.
+    if out.len() < want {
+        if let Ok(body) = crate::cache::get_bytes(&format!("{DL}/tag/{}", enc(tag)), Some(86_400)) {
+            for slug in scrape_tag_slugs(&String::from_utf8_lossy(&body)) {
+                if out.len() >= want {
+                    break;
+                }
+                if !seen.contains(&slug) {
+                    if let Ok(p) = fetch_palette(&slug) {
+                        seen.insert(slug);
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out.truncate(want);
+    Ok(out)
+}
+
+/// Pull every `data-palette="<slug>"` out of a `/tag/<tag>` page (deduped, in order).
+fn scrape_tag_slugs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for chunk in html.split("data-palette=\"").skip(1) {
+        if let Some(end) = chunk.find('"') {
+            let slug = &chunk[..end];
+            if !slug.is_empty() && seen.insert(slug.to_string()) {
+                out.push(slug.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Fetch one palette's `.json` (`name` + `colors`; the tag page carries no inline colours).
+fn fetch_palette(slug: &str) -> Result<LospecPalette, String> {
+    let body = crate::cache::get_bytes(&format!("{DL}/{slug}.json"), Some(86_400))?;
+    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    let colors: Vec<[u8; 3]> = v["colors"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|c| parse_hex(c.as_str()?)).collect())
+        .unwrap_or_default();
+    if colors.is_empty() {
+        return Err("no colours".into());
+    }
+    Ok(LospecPalette {
+        title: v["name"].as_str().unwrap_or("Untitled").to_string(),
+        slug: slug.to_string(),
+        colors,
+        description: String::new(),
+        downloads: String::new(),
+        likes: 0,
+        tags: Vec::new(),
+        examples: Vec::new(),
+    })
+}
+
+/// Browse the main palette list (blank query) via the JSON `load` endpoint, up to `want` (paged in
+/// 10s; cached 1 day; partial-tolerant).
+fn browse_all(want: usize) -> Result<Vec<LospecPalette>, String> {
     let want = want.clamp(1, 120);
     let pages = want.div_ceil(PER_PAGE);
     let mut out = Vec::new();
@@ -145,7 +247,7 @@ pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
     for page in 1..=pages {
         // A later page failing (Lospec 500s on some edge requests) must NOT discard the pages that
         // already succeeded — break with what we have instead of `?`-ing the whole browse away.
-        let body = match crate::cache::get_bytes(&browse_url(query, page), Some(86_400)) {
+        let body = match crate::cache::get_bytes(&browse_url("", page), Some(86_400)) {
             Ok(b) => b,
             Err(e) => {
                 if page == 1 {
