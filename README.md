@@ -3,9 +3,9 @@
 A fast, **pixel-art-first** media **browser** for Linux/macOS/Windows, written in
 Rust with [egui/eframe](https://github.com/emilk/egui).
 
-It started as an image viewer. It now also renders 3D models, plays and trims
-video, edits samples and MIDI drum kits, browses eight web sources, and edits
-text — hence the name.
+It started as an image viewer. It now also converts images to ANSI/PETSCII/ASCII art,
+renders 3D models, plays and trims video, edits samples and MIDI drum kits, browses
+eleven web sources, and edits text — hence the name.
 
 
 > I wrote this to accompany my https://github.com/grymmjack/pixelmon so I could easily see my generated AI art and rate it fast.
@@ -38,6 +38,7 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 ## Table of contents
 
 - [Highlights](#highlights)
+- [Complete feature list](#complete-feature-list)
 - [Supported formats](#supported-formats)
 - [Install & build](#install--build)
 - [Quick start](#quick-start)
@@ -47,6 +48,8 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   - [The single-image viewer](#the-single-image-viewer)
   - [Pixel-perfect rendering](#pixel-perfect-rendering)
   - [Recolor / colorizer pane](#recolor--colorizer-pane)
+  - [Crop tool](#crop-tool)
+  - [Image → text-art converters](#image--text-art-converters)
   - [Palettes](#palettes)
   - [Star ratings](#star-ratings)
   - [Search & smart filters](#search--smart-filters)
@@ -148,6 +151,109 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   group's oddball extension (`.hpe`/`.ad`/`.mir`/…) still renders as scene art. And you can
   **run `.com`/`.exe`/`.bat` DOS programs in DOSBox** — period-accurate machine presets,
   pack folder auto-mounted as `C:`.
+
+---
+
+## Complete feature list
+
+Everything the app does, grouped. (The [Feature tour](#feature-tour) below explains the
+big ones in prose; this is the exhaustive index.)
+
+**Browsing & navigation**
+- Folder navigation with breadcrumbs, back/forward/up history, and a `~` Home jump
+- Drag-reorderable **favorites** bar; right-click to remove; per-favorite **color tags**
+- Left **activity rail** (VS Code-style) toggling the explorer / details / recolor docks
+- **Explorer** dock: lazy expandable folder tree + a live filter box
+- **Details** dock: fit thumbnail, palette swatches, `.GPL` export, full metadata, git status, view count
+- **Places** dock with sub-tabs: Local · PixelFX · 16colo.rs · Kits · Samples, each with pins
+- Filename search (`/`), recursive **advanced search**, and saved **smart filters**
+- Recursive folder **montages** + file-count badges on folder tiles
+
+**Thumbnail grid & table**
+- Virtualized grid that scrolls smoothly through thousands of files
+- Independent **Ctrl+wheel** tile sizing; configurable per-tile captions; optional tile borders
+- Sortable / resizable / **reorderable-column** table view (Grid⇄Table toggle, persisted)
+- Transparency backdrop (checkerboard or solid) behind transparent thumbnails
+- Hover-to-play animated GIFs; hover-scrub video storyboard; DOS / generic / format-badge tiles
+- Loading spinners; view-history **check badges**; git-status corner badges + filename tint
+
+**The viewer**
+- Nearest-neighbor zoom — device-pixel steps for text-mode art, remembered `%` for raster
+- **Fit** (F, sticky/auto) and **Fit-width** modes; navigator minimap; multi-tile huge-image support
+- Arrow / Home / End / PageUp-Down scrolling for tall art; Left/Right = prev/next image
+- Fading, positionable **metadata OSD** with clickable artist / group / pack links
+- **Immersive** fullscreen (F11, auto-hiding chrome + cursor); slideshow; random-pack screensaver
+
+**Pixel-perfect & CRT rendering**
+- Integer device-pixel snap + origin grid-snap so dithering never warps on HiDPI
+- Authentic IBM VGA CP437 font; **9-dot VGA cell** and **CRT aspect** (~1.2× vertical) toggles
+- Baked-or-live CRT effects: **scanlines**, **phosphor glow**, black background
+
+**Recolor / colorizer pipeline** (fully reorderable)
+- Adjustments: brightness, contrast, gamma, shadows, highlights, posterize, hue, saturation, **vibrance**, sharpen, **invert**
+- **Pixelate** (per-axis W×H + lock), **palette remap**, **reduce-to-N** (works on any image)
+- **Dithering**: ordered/Bayer, editable **custom matrix**, error-diffusion (Floyd–Steinberg / Atkinson), per-axis cell + **Auto-detect**
+- **Color balance** (per-channel offset), **resize/resample** at reduced resolution
+- **Pixel-art upscalers**: Scale2x/3x, Eagle, xBR 2×/3×/4×, HQ2x/3x/4x, 2xSaI / Super2xSaI / SuperEagle
+- **CRT post-FX** (bakeable, positionable): scanlines, glow (contour profiles), vignette, phosphor
+- **PixelFX presets** — save the whole stack; folders; **83 Factory presets** bundled; applies to 16colo.rs art too
+
+**Crop** — non-destructive & per-image, zoom/pan placement, Thirds/Golden/Grid/Spiral guides, Free/4:3/16:9/16:10 aspect + flip, named presets, optional bake-to-file
+
+**Image → text-art converters** — **ANSI Shade**, **ASCII**, **Unicode** (half-block / Braille / ramp), **PETSCII**, **ATASCII**, **Apple ][**, and **REXPaint font** (45 bundled fonts); a shared drag-select **glyph picker**; exports to `.ans` / `.xb` / `.tnd` / `.xp` / `.petmate` / `.seq` / `.json` / `.txt` / `.png`
+
+**Palettes** — 55 bundled (CGA/EGA/VGA/Game Boy/NES/C64/PICO-8/DawnBringer/Endesga/…), `.GPL` import/export, palette-preserving decoders
+
+**Ratings & history** — KDE Baloo xattr ratings (Gwenview-compatible) + a cross-platform sidecar for virtual art; view-history with visited link colours, count and last-viewed
+
+**Search** — background recursive search on name / type / dimensions / size / date / rating / SAUCE text; saveable smart filters; in-memory filtering of remote listings
+
+**File operations** — copy / cut / paste, new folder, rename, trash + **Ctrl+Z undo**; drag-reorder favorites; pin folders to Places
+
+**External integration**
+- **Open in…** per-extension program associations (+ "Other program…"); "Open in default app"
+- **`tasks.json` runner** — run a folder's VS Code build/tool tasks (Ctrl+Shift+B), with an output panel
+- **DOSBox** — run `.com`/`.exe`/`.bat`/`.cmd`; pack-root mounted as `C:`; keep-open; machine presets (XT → Pentium MMX); SVGA mode; banner/autoexec suppressed; never auto-launched
+
+**Source code & text** (plugin) — ~100 languages syntax-highlighted; Preview-image / View-text / Edit-text / **Open-as-text-art** open modes; find/replace; `tail -f` follow; UTF-8 / CP437 / Latin-1 encodings; CRLF preserved; custom code font + current-line highlight; VS Code theme colours
+
+**PDF** (plugin) — real first-page tiles, in-app 1-/2-page viewer, pseudo-vector re-render on zoom
+
+**Audio** (plugin)
+- In-app **waveform player**: loop / seek / region select, playhead, autoplay, spacebar transport
+- **Sampler keyboard** (auto-ranging, click-to-audition, pitch via octave keys)
+- **Hardware MIDI input** (midir) — play the sampler from a controller
+- **Trackers** (MOD/XM/S3M/IT via xmrs; 669/FAR/OKT/MED/… via bundled libxmp) with a **per-sample explorer / WAV export**
+- **MIDI** synthesized through a General MIDI **SoundFont**; **RAD** via a built-in **OPL3** FM emulator
+- **Sample banks** — SoundFont `.sf2`, SFZ, DLS, FastTracker `.xi`, Renoise `.xrns`/`.xrni` browsed as a folder of samples
+- Master volume / mute in the menu bar; **PANIC** (Shift+Esc)
+
+**Sample-pad sampler** (plugin) — a 16-pad Battery-style grid: per-pad pitch / loop / pan / choke group / amp+pitch+cutoff+res **envelopes** (ADSR **and** free-form MSEG) / **LFOs** / low-pass filter; velocity; MIDI-learn; drag-drop & drag-to-swap/clone pads; **kits** (`.pvkit`) save/load; **native SFZ export**; a standalone kit editor; a pro **waveform editor** (transient/BPM detection, musical grid, zero-crossing snap, slice play, selection undo/redo)
+
+**3D models** (plugin) — obj/stl/ply/gltf/glb/dae via a **CPU rasterizer** (same renderer for tile & viewport); orbit **or FPS free-fly**; textured / wireframe; light presets; PNG export; `.mtl` swatch grid; `.blend` render-in-place via headless Blender
+
+**Video** (plugin, ffmpeg) — real frame thumbnails, hover-scrub; in-app player with **A/V sync**, speed, audio-scrubbing seek; **lossless trim & join**; frame / audio export; **`.md` chapter markers** that paste into a YouTube description
+
+**Image compare** — side-by-side per-pixel diff, tolerance + opacity overlay in a picked colour, synced pan/zoom, **layered PSD export** (editable in Photoshop/GIMP), save/recall named comparisons
+
+**Mind maps** — `.xmind` rendered from the file's own theme, with markers, notes, embedded images, boundaries, relationships and multiple sheets
+
+**Fonts & type** — TheDraw font library, **Amiga ColorFonts** (a logo maker + DRAW CBF export), COLR/CPAL colour fonts, and IFF ILBM font previews
+
+**AI generation** (plugin) — generate images from a prompt into the current folder
+
+**Git status** — per-folder `git status` surfaced as grid badges, a table column, a Details line, and filename tint (inert outside a repo)
+
+**Archives & the scene**
+- Browse `.zip`/`.7z`/`.rar`/`.lha`/`.arj`/… as **virtual folders** (every member listed with type ID)
+- **16colo.rs** mounted as a virtual disk — years / packs / artists / groups / search; flat piece tables; **FILE_ID pack thumbnails**; **bulk download** an artist/pack for an offline corpus
+- SAUCE-aware textmode rendering, **baud-rate ANSImation / RIP playback**, content-sniff detection
+
+**Web sources** (each a keyless plugin) — Poly Haven, Google Fonts, Lospec, The Mod Archive, Openverse, Iconify, Wikimedia, an **HTTP browser** (any URL → a browsable tree with wildcard batch download), plus **YouTube** (yt-dlp) and your local **Steam** library; robots.txt-respecting with a 2 GiB LRU cache (backup/restore)
+
+**Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; persisted window geometry
+
+**Command line** — headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind)
 
 ---
 
@@ -484,6 +590,74 @@ looks and slam any of them onto an image in one click.
 
 The whole pipeline — adjustments, PixelFX presets, reduce, dither, post-FX — also
 works while **browsing 16colo.rs** (both the details preview and *Apply to grid*).
+
+### Crop tool
+
+A **non-destructive** crop that's **remembered per image** — the rectangle you draw is
+stored (normalized) and re-applied every time you open that file, and it feeds the
+preview, the recolor pipeline, export and batch render. It lives on the Details thumbnail
+as a zoom/pan surface:
+
+- **Zoom into the thumbnail** (mouse-wheel, up to 40×) to place the box precisely;
+  middle-drag pans. A *"Zoom N× — crop follows the view"* readout, with a reset.
+- **Handles** — four corners + four edges + drag-to-move, appearing once you draw a sub-region.
+- **Composition guides** — **Thirds / Golden / Grid / Spiral / None** overlays.
+- **Aspect** — **Free / 4:3 / 16:9 / 16:10**, plus a **⇄** flip (landscape ↔ portrait —
+  handy for tall ANSI).
+- **Named crop presets** — save the current rect under a name, then apply / rename / delete
+  it on any image (presets are normalized, so one works at any size).
+- **Pixel X/Y/W/H** fields when the native size is known.
+- **Apply crop to file** bakes it to disk (optionally writing a `<name>.<ext>.bak` first);
+  otherwise it stays a non-destructive overlay.
+
+The crop runs **first** — before the pixel-art upscaler and the recolor stack — so
+everything downstream (recolor, dither, text-art conversion, Save) works on the cropped
+region.
+
+### Image → text-art converters
+
+Turn any raster image into **scene-style character art**. The converters are extra entries
+at the bottom of the Recolor pane's **Dither** dropdown, so they run inside the *same*
+reorderable pipeline as adjustments, palette-remap and ordinary dithering (crop and the
+pixel-art upscaler happen first; the on-screen preview and the exported file are
+cell-identical). Choosing one sets a sensible default automatically — 16-colour **Reduce**
+for the block/char modes, or the matching **C64 palette** for PETSCII.
+
+Every mode shares a **glyph picker** — a click-to-toggle, drag-to-paint grid of the mode's
+actual font (matched to the 8×8 or 8×16 cell), with **All / None / Invert / Restore** — so
+you decide exactly which characters the matcher may use. And a **PixelFX preset** captures
+the *entire* converter state (mode, every option, the chosen font, and the glyph-picker
+selection), so a whole look is one click to re-apply.
+
+- **ANSI Shade** — classic block-shade art (`░▒▓█` + half-blocks `▀▄▌▐`). Authentic
+  **9×16** or **8×8 (VGA50)** cells, **iCE color**, **Invert** (inverse video), per-shade
+  threshold sliders (F1 `░` / F2 `▒` / F3 `▓` + half-block usage), Shading / Smoothness /
+  Detail, and **fit-to-cols/rows** with chips (40×25 … 160×80). Named **dither presets**
+  (save / rename / delete, independent of PixelFX). **Exports** `.ans` (16 / 256 /
+  truecolor), **XBin** `.xb`, **TundraDraw** `.tnd`, or **REXPaint** `.xp`, via a Format
+  dropdown (*Auto* picks the tightest).
+- **ASCII** — brightness → character density. Pick the render **font** (CP437, any bundled
+  REXPaint font, or your own **TTF/OTF**), type a **"use only chars"** set or toggle
+  categories (High / Control / Blocks / Box-drawing), plus **Invert**, an **8×8** cell
+  option and a per-cell colour. Exports as ANSI art.
+- **Unicode** — copy-pasteable UTF-8, in three styles: **Half-block `▀`** (two colour
+  pixels per char), **Braille `⠿`** (2×4 mono dots), or a **Ramp** with a selectable font
+  (crisp Perfect DOS VGA, DejaVu +Braille, or any TTF), range toggles, and an
+  extra-codepoints field. Exports `.txt` (xterm-256 colour for half-block / ramp).
+- **PETSCII** — Commodore C64 hi-res char art. Pick the **C64 palette** (petmate / colodore
+  / pepto / VICE), the **Upper-graphics** or **Lower** charset, a **Purity** slider (clean
+  block art → full photographic charset), and an auto or hand-picked background colour.
+  **Exports** `.petmate`, `.seq`, `.json`, or a rendered `.png`.
+- **ATASCII** — Atari 8-bit character art (colour, invert, glyph pick). Rendered **PNG**.
+- **Apple ][** — Apple II character art with a **PR#0 (40-col)** / **PR#3 (80-col)** font
+  toggle, optional **MouseText** glyphs, and the shared Ink/Paper colours. Rendered **PNG**.
+- **REXPaint font** — render through any of **45 bundled fonts**: 24 REXPaint fonts (ZX
+  Spectrum, SAM Coupe, PETSCII, Teletext, Unifont, …), CP437 8×8 & 8×16, and 19 FONTRAPTION
+  `.F08`/`.F16` fonts (Topaz, mO'sOul, P0T-NOoDLE, MicroKnight, the GJ "scientific" sets,
+  …). Rendered **PNG**.
+
+REXPaint `.xp` files also **decode and view** natively, and the Details toolbar lets you
+choose the **viewer render font** from those same 45.
 
 ### Palettes
 
