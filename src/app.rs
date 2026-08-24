@@ -49678,9 +49678,10 @@ fn is_dos_executable(p: &std::path::Path) -> bool {
 /// Does this path look like an image we can (or soon will) decode?
 fn is_image_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "bmp", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
-        "pnm", "qoi", "pcx", "psd", "aseprite", "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
-        "nfo", "diz", "txt", "ace", "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi",
+        "png", "jpg", "jpeg", "gif", "bmp", "webp", "web", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
+        "pnm", "qoi", "hdr", "dds", "exr", "ff", "bsv", "bsave", "pcx", "psd", "aseprite", "ase",
+        "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
+        "nfo", "diz", "txt", "ace", "hyp", "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi",
         "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
         "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm", "xp",
     ];
@@ -49711,9 +49712,9 @@ fn is_image_ext(p: &std::path::Path) -> bool {
 /// the viewer opens it at `textmode_zoom` (not 1:1) and offers the CRT aspect.
 fn is_textmode_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
-        "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "ace", "doc", "dox", "me", "1st", "now",
-        "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "xp",
+        "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "ace", "hyp", "doc", "dox", "me", "1st",
+        "now", "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin", "tnd", "idf", "adf", "seq",
+        "pet", "petscii", "petmate", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => EXTS.contains(&x.to_ascii_lowercase().as_str()),

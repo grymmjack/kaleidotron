@@ -14,8 +14,8 @@ impl Decoder for ImageCrateDecoder {
 
     fn extensions(&self) -> &'static [&'static str] {
         &[
-            "png", "gif", "bmp", "jpg", "jpeg", "webp", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
-            "pnm", "qoi", "ico", "cur",
+            "png", "gif", "bmp", "jpg", "jpeg", "webp", "web", "tga", "tif", "tiff", "ppm", "pgm",
+            "pbm", "pnm", "qoi", "ico", "cur", "hdr", "dds", "exr", "ff",
             // A DRAW project (.draw) is a valid PNG with an extra ancillary `drAw`
             // chunk (ignored by PNG decoders), so the flattened preview decodes here.
             "draw",

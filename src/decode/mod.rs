@@ -9,6 +9,7 @@ mod ansi;
 mod aseprite;
 mod audio;
 mod bin;
+mod bsave;
 mod builtin;
 mod c64_font;
 mod atascii_font; // Atari 8-bit ATASCII 8×8 ROM (rasterized from the bundled Atari Classic TTF)
@@ -149,7 +150,8 @@ impl Registry {
             video_on: std::sync::atomic::AtomicBool::new(true),
             decoders: vec![
                 Box::new(pcx::PcxDecoder),            // hand-written, palette-preserving
-                Box::new(iff::IlbmDecoder),           // .iff/.ilbm/.lbm Amiga ILBM (palette-preserving)
+                Box::new(bsave::BsaveDecoder),        // .bsv BSAVE screen dump (CGA / mode 13h)
+                Box::new(iff::IlbmDecoder),           // .iff/.ilbm/.lbm Amiga ILBM + PC chunky PBM
                 Box::new(aseprite::AsepriteDecoder),  // .aseprite/.ase (asefile crate)
                 Box::new(psd::PsdDecoder),            // .psd flattened (psd crate)
                 Box::new(xcf::XcfDecoder),            // .xcf composited (xcf crate)

@@ -141,8 +141,8 @@ impl Decoder for AnsiDecoder {
         // README.1ST, READ.NOW, *.DOC/*.DOX/*.MSG/*.CAP/*.INF) — plain text or ANSI, both
         // render fine through the CP437 path, so they show up and open like any scene doc.
         &[
-            "ans", "asc", "nfo", "diz", "ice", "cia", "txt", "ace", "doc", "dox", "me", "1st",
-            "now", "msg", "cap", "inf", "grp", "fyi",
+            "ans", "asc", "nfo", "diz", "ice", "cia", "txt", "ace", "hyp", "doc", "dox", "me",
+            "1st", "now", "msg", "cap", "inf", "grp", "fyi",
         ]
     }
 

@@ -14,6 +14,7 @@ eframe = { version = "0.34", features = ["persistence"] }
 # Only the formats we actually want; keeps the dep tree (and build time) smaller.
 image = { version = "0.25", default-features = false, features = [
     "png", "gif", "bmp", "jpeg", "webp", "tga", "tiff", "pnm", "qoi", "ico",
+    "hdr", "dds", "exr", "ff", # Radiance HDR, DirectDraw DDS, OpenEXR, farbfeld
 ] }
 psd = "0.3.5"
 resvg = "0.47.0"

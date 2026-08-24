@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// decoder instead. The real ACE archive format is essentially extinct and not worth the
 /// collision in an art browser.
 const ARCHIVE_EXTS: &[&str] = &[
-    "zip", "7z", "rar", "lha", "lzh", "tar", "arj", "arc", "zoo", "ha", "uc2", "sqz", "hyp",
+    "zip", "7z", "rar", "lha", "lzh", "tar", "arj", "arc", "zoo", "ha", "uc2", "sqz",
     "tgz", "tbz", // Renoise song / instrument are ZIP containers (browse their SampleData/):
     "xrns", "xrni",
 ];
