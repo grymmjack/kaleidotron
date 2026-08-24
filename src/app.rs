@@ -2381,6 +2381,9 @@ pub struct Kaleidotron {
     // Emulated CPU/speed preset: an index into `DOSBOX_MACHINES`. 0 = Auto (no override). Persisted.
     // Lets a program run at a period-accurate speed (e.g. a 486 DX2/66) instead of DOSBox's default.
     dosbox_machine: usize,
+    // Force an SVGA (S3 Trio + VESA) video adapter for Run in DOSBox — for high-res viewers/demos
+    // that need modes beyond plain VGA. Persisted; default OFF (leave DOSBox's own machine default).
+    dosbox_svga: bool,
     yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
     yt_open_folder_after: bool, // reveal the file in the OS file manager once a download finishes
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
@@ -2454,6 +2457,7 @@ impl Kaleidotron {
     const DOSBOX_PATH_KEY: &'static str = "dosbox_path";
     const DOSBOX_KEEP_OPEN_KEY: &'static str = "dosbox_keep_open";
     const DOSBOX_MACHINE_KEY: &'static str = "dosbox_machine";
+    const DOSBOX_SVGA_KEY: &'static str = "dosbox_svga";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
@@ -2766,6 +2770,10 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<usize>(s, Self::DOSBOX_MACHINE_KEY))
             .filter(|&i| i < DOSBOX_MACHINES.len())
             .unwrap_or(0);
+        let dosbox_svga = cc
+            .storage
+            .and_then(|s| eframe::get_value::<bool>(s, Self::DOSBOX_SVGA_KEY))
+            .unwrap_or(false);
         let yt_max_height = cc
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::YT_QUALITY_KEY))
@@ -4507,6 +4515,7 @@ impl Kaleidotron {
             dosbox_path,
             dosbox_keep_open,
             dosbox_machine,
+            dosbox_svga,
             yt_max_height,
             yt_open_folder_after,
             bulk_dl: None,
@@ -4675,6 +4684,7 @@ impl Kaleidotron {
             e(PA, "dosbox_path", self.dosbox_path.clone(), "path to the DOSBox binary (null = off; enables Run in DOSBox for .com/.exe/.bat)"),
             e(PA, "dosbox_keep_open", self.dosbox_keep_open, "keep the DOSBox window open after a program exits (press a key), so outro screens are readable"),
             e(PA, "dosbox_machine", self.dosbox_machine as u64, "emulated CPU preset index (0=Auto, 4=486DX2/66 — see the Preferences dropdown)"),
+            e(PA, "dosbox_svga", self.dosbox_svga, "force an SVGA (S3 Trio + VESA) video adapter in DOSBox for high-res viewers/demos"),
             e(PA, "yt_max_height", self.yt_max_height, "YouTube download resolution cap, e.g. 720"),
             e(PA, "git_enabled", self.git_enabled, "show git status badges in local repos"),
             e(PA, "tasks_enabled", self.tasks_enabled, "read .vscode/tasks.json and offer its tasks"),
@@ -4860,6 +4870,9 @@ impl Kaleidotron {
             if i < DOSBOX_MACHINES.len() {
                 self.dosbox_machine = i;
             }
+        }
+        if let Some(v) = st::get_bool(&m, "dosbox_svga") {
+            self.dosbox_svga = v;
         }
         if let Some(v) = st::get_string(&m, "palette_dir") {
             if !v.trim().is_empty() {
@@ -33228,6 +33241,12 @@ impl Kaleidotron {
         let q = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };
         let mut cmd = std::process::Command::new(&dosbox);
         cmd.arg("--noautoexec");
+        // SVGA: force an S3 Trio (with VESA) video adapter so high-res viewers/demos that need modes
+        // beyond plain VGA work. `machine` is a startup config setting (the video hardware is built
+        // once at boot), so it's set just like `cputype`.
+        if self.dosbox_svga {
+            cmd.arg("--set").arg("machine=svga_s3");
+        }
         // Emulated-machine preset (CPU type + fixed cycles) so speed-sensitive DOS programs run at a
         // period-accurate rate. Index 0 (Auto) adds nothing.
         if let Some((_, cputype, cycles)) = DOSBOX_MACHINES.get(self.dosbox_machine) {
@@ -39045,7 +39064,7 @@ impl eframe::App for Kaleidotron {
                                         );
                                     }
                                     None => {
-                                        ui.weak("Not set — .com/.exe won't run.");
+                                        ui.weak("Not set — .com/.exe/.bat won't run.");
                                     }
                                 }
                                 ui.weak(
@@ -39082,6 +39101,12 @@ impl eframe::App for Kaleidotron {
                                      possible; the era presets slow it to period-accurate cycles \
                                      (so speed-sensitive DOS programs behave).",
                                 );
+                                ui.checkbox(&mut self.dosbox_svga, "SVGA mode")
+                                    .on_hover_text(
+                                        "Emulate an S3 Trio SVGA card with VESA support, for high-res \
+                                         viewers / demos that need modes beyond plain VGA. Off leaves \
+                                         DOSBox's own default video adapter.",
+                                    );
 
                                 // ModArchive API key — OPTIONAL. Browsing already works without
                                 // one (the public search page is parsed); a key just upgrades to
@@ -39714,6 +39739,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::DOSBOX_PATH_KEY, &self.dosbox_path);
         eframe::set_value(storage, Self::DOSBOX_KEEP_OPEN_KEY, &self.dosbox_keep_open);
         eframe::set_value(storage, Self::DOSBOX_MACHINE_KEY, &self.dosbox_machine);
+        eframe::set_value(storage, Self::DOSBOX_SVGA_KEY, &self.dosbox_svga);
         eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
         eframe::set_value(
             storage,
@@ -49881,13 +49907,14 @@ fn identify_file(path: &Path) -> String {
     if ctrl * 100 <= b.len() * 2 { "TEXT" } else { "BINARY" }.to_string()
 }
 
-/// DOS executables we can hand to DOSBox: `.com`/`.exe` (case-insensitive). `.bat`/`.cmd` are
-/// intentionally NOT here — they stay viewable/editable text (they're also in `CODE_EXTS`), and
-/// a game's launcher is usually its `.exe` anyway.
+/// DOS programs we can hand to DOSBox: `.com`/`.exe`/`.bat`/`.cmd` (case-insensitive). A `.bat`
+/// launcher (`RUNME.BAT`) is the common way a scene pack drives its own viewer, so it runs on a
+/// double-click / "Run in DOSBox" like a binary and is skipped by prev-next/slideshow. `.bat`/`.cmd`
+/// are also in `CODE_EXTS`, so the right-click **View / Edit (text)** items still open their source.
 fn is_dos_executable(p: &std::path::Path) -> bool {
     matches!(
         p.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()).as_deref(),
-        Some("com" | "exe")
+        Some("com" | "exe" | "bat" | "cmd")
     )
 }
 
