@@ -412,6 +412,7 @@ builds and runs fine.
 | **yt-dlp** *(keep it current!)* | **YouTube** browser — search + download-in-place | no results / "update yt-dlp" |
 | **poppler** (`pdftoppm`) | **PDF** plugin — first-page render | metadata + placeholder tile |
 | **blender** | `.blend` tiles — on-demand frame render | branded placeholder |
+| **DOSBox** / DOSBox-Staging | **Run in DOSBox** — launch `.com`/`.exe`/`.bat`/`.cmd` | the tiles still list; the run action prompts you to set the binary in Preferences |
 
 > **yt-dlp must be recent.** YouTube changes frequently (SABR, rotating signatures) and an
 > old yt-dlp fails with *"Requested format is not available."* Distro packages lag badly —
@@ -827,6 +828,10 @@ you can keep the viewer lean.
 - **[16colo.rs](https://16colo.rs) as a virtual disk** — a Places entry with a nav
   bar (Years / Latest / Groups / Artists, plus a facet-scoped Search). A **Year** lists
   **Packs**, and pack art is auto-downloaded and shown like any local folder.
+- **Pack-folder thumbnails from `FILE_ID`** — a pack tile is rendered from the pack's own
+  `FILE_ID.ANS` (the scene's traditional description art), falling back to `FILE_ID.DIZ` →
+  `.TXT` → any `file_id.*`. It's fetched **lazily** (only for packs scrolled into view) on a
+  viewport-prioritised worker, so browsing a big year doesn't hammer the server.
 - **Artist / Group / Search → a table of pieces** — instead of listing pack folders,
   these flatten to a **sortable table of individual artworks** (thumbnail · filename ·
   artist · type · year · group · pack), streamed from the JSON API with no pack download.
@@ -835,7 +840,8 @@ you can keep the viewer lean.
   disk. Pin an artist/group/search to Places to bookmark it.
 - **Persistent on-disk cache** — JSON, thumbnails, downloaded files and pack zips are
   cached (SQLite-indexed, LRU-evicted, 2 GiB cap) so re-browsing doesn't re-fetch.
-  *Preferences* shows the cache size and a **Clear cache** button.
+  *Preferences* shows the cache size with **Clear**, **Backup…** and **Restore…** (a merge,
+  not a wipe) — so clearing the cache isn't a one-way door.
 - **PDF pieces** (e.g. ANSI-calendar releases) have no server-side render, so their
   first page is rendered locally (poppler) for the grid/table thumbnail.
 - **The full Recolor pipeline works here too** — adjustments, PixelFX presets, reduce,
