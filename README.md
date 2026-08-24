@@ -1470,9 +1470,10 @@ Two GitHub Actions workflows live in `.github/workflows/`:
 - **`ci.yml`** — builds + runs the headless test suite on Linux for every push/PR (plus a
   best-effort GUI-screenshot artifact).
 - **`release.yml`** — builds standalone binaries for **Linux x86-64**, **Windows x86-64**,
-  and **macOS** (Intel *and* Apple Silicon). Run it manually (Actions → *Release* → *Run
-  workflow*) to get the four archives as downloadable workflow artifacts, or **push a
-  version tag** to build them *and* publish a GitHub Release:
+  and a **universal macOS** binary (Intel + Apple Silicon fused with `lipo`). Run it
+  manually (Actions → *Release* → *Run workflow*) to get the archives as downloadable
+  workflow artifacts, or **push a version tag** to build them *and* publish a GitHub
+  Release:
 
   ```sh
   git tag v0.1.0 && git push origin v0.1.0
