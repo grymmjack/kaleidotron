@@ -5,7 +5,7 @@ Rust with [egui/eframe](https://github.com/emilk/egui).
 
 It started as an image viewer. It now also converts images to ANSI/PETSCII/ASCII art,
 renders 3D models, plays and trims video, edits samples and MIDI drum kits, browses
-eleven web sources, and edits text — hence the name.
+a dozen web sources, and edits text — hence the name.
 
 
 > I wrote this to accompany my https://github.com/grymmjack/pixelmon so I could easily see my generated AI art and rate it fast.
@@ -121,10 +121,11 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 - **Text editing, opt-in** — source files open in a real, selectable, syntax-highlighted
   text view; an `✎ Edit` button turns on saving, find/replace and `tail -f` follow. Until
   you press it, nothing can overwrite a file.
-- **Nine web sources**, all keyless — 16colo.rs, Poly Haven, Google Fonts, Lospec, The Mod
-  Archive, Openverse, Iconify, Wikimedia, plus an **HTTP browser** that turns any URL into
-  a browsable tree with wildcard batch download. Also YouTube (via yt-dlp) and your local
-  Steam library.
+- **Twelve web sources** — 16colo.rs, Poly Haven, Google Fonts, **Lospec** (palette list
+  *and* the art gallery), The Mod Archive, Openverse, Iconify, Wikimedia, plus an **HTTP
+  browser** that turns any URL into a browsable tree with wildcard batch download. Also
+  YouTube (via yt-dlp), your local Steam library, and **DeviantArt** (the official API).
+  All keyless except DeviantArt, which uses free app credentials you paste in once.
 - **A VS Code-shaped interface** — activity rail, command palette (`Ctrl+Shift+P`), quick
   open (`Ctrl+P`), per-mode panel layouts, toasts, recents, and four editable config files.
   **Drop a VS Code theme in and it just works**, for the app chrome, the syntax
@@ -249,7 +250,7 @@ big ones in prose; this is the exhaustive index.)
 - **16colo.rs** mounted as a virtual disk — years / packs / artists / groups / search; flat piece tables; **FILE_ID pack thumbnails**; **bulk download** an artist/pack for an offline corpus
 - SAUCE-aware textmode rendering, **baud-rate ANSImation / RIP playback**, content-sniff detection
 
-**Web sources** (each a keyless plugin) — Poly Haven, Google Fonts, Lospec, The Mod Archive, Openverse, Iconify, Wikimedia, an **HTTP browser** (any URL → a browsable tree with wildcard batch download), plus **YouTube** (yt-dlp) and your local **Steam** library; robots.txt-respecting with a 2 GiB LRU cache (backup/restore)
+**Web sources** (each a plugin) — Poly Haven, Google Fonts, **Lospec Palettes** (tag search across the full list + tag cloud + colour-count / sorting filters) and **Lospec Gallery** (browse pixel/voxel/low-poly/textmode art with the site's own medium/category/sorting/time/tag/masterpiece filters), The Mod Archive, Openverse, Iconify, Wikimedia, an **HTTP browser** (any URL → a browsable tree with wildcard batch download), **YouTube** (yt-dlp), your local **Steam** library, and **DeviantArt** (official OAuth2 API — Daily Deviations / Home / Tag / Topic, save searches); all keyless except DeviantArt (free app credentials); robots.txt-respecting with a 2 GiB LRU cache (backup/restore)
 
 **Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; **export / import your whole setup** to one JSON file (API keys excluded by default); persisted window geometry
 
@@ -1136,11 +1137,13 @@ no API token.
 | **[16colo.rs](https://16colo.rs)** | the ANSI archive as a virtual folder — years, packs, groups, artists, search; bulk-download an artist or pack for offline use |
 | **[Poly Haven](https://polyhaven.com)** | CC0 3D models, textures and HDRIs. Models arrive as bundles (glTF + `.bin` + textures) and are materialised so they just open |
 | **[Google Fonts](https://fonts.google.com)** | browse the whole library — each tile renders a live sample of the actual font; open one to download the `.ttf` into the font viewer |
-| **[Lospec](https://lospec.com)** | palette browser, with a detail view — author, colours, downloads |
+| **[Lospec Palettes](https://lospec.com/palette-list)** | palette browser — **tag search across the whole list**, a tag cloud built from results, colour-count + sorting filters, and a detail view (author, colours, downloads) |
+| **[Lospec Gallery](https://lospec.com/gallery)** | browse the art gallery with the site's own filters — **medium** (pixel / voxel / low-poly / textmode), **category**, **sorting**, **time**, **tag**, and monthly-**masterpiece**-only |
 | **[The Mod Archive](https://modarchive.org)** | tracker modules, playable in place |
 | **[Openverse](https://openverse.org)** | CC-licensed images, audio and animated GIFs |
 | **[Iconify](https://iconify.design)** | icon search across many sets |
 | **Wikimedia** | vector/SVG art search |
+| **[DeviantArt](https://www.deviantart.com)** | browse via the official API — Daily Deviations, Home, Tag search, Topic; full-size view + link-back; **needs free app credentials** (below) |
 | **HTTP browser** | point it at *any* URL and browse it like a folder tree |
 
 ![web browser](docs/screenshots/web-browser.png)
@@ -1156,6 +1159,17 @@ export all apply. Downloads go to a configurable folder kept **out** of the HTTP
 **Steam** reads your local Steam library — no API key, no login — lists installed games
 as tiles, and routes a click to a YouTube search for that game. Right-click to launch
 the game, or open its store page, hub or discussions.
+
+**DeviantArt** is the one source that needs credentials — DeviantArt's API requires
+them even for public browsing. Register a **free** app at
+[deviantart.com/developers](https://www.deviantart.com/developers) (client type
+*Confidential*; the redirect URI is unused by this app — any valid URL works), then paste
+the **client_id** + **client_secret** into **Preferences → Plugins**. kaleidotron mints a
+short-lived app token itself (the client-credentials flow — no user login, no OAuth
+redirect dance), so once the two values are in, **Browse** with *Daily Deviations* works
+with no query. Tag and Topic search by name; opening a piece shows the full-size image and
+links back to the artist's page. The credentials live in `secrets.json` and are **excluded
+from setup export by default**.
 
 ### Being a good citizen
 
@@ -1443,19 +1457,21 @@ src/
   theme.rs           themes/*.json, including VS Code theme import
   secrets.rs         secrets.json — API keys, 0600, kept out of the shared settings
 
-  # web sources (each keyless; all share cache.rs + netpolicy.rs)
+  # web sources (keyless except DeviantArt; all share cache.rs + netpolicy.rs)
   netpolicy.rs       robots.txt, per-host rate limiting, backoff — the single choke point
   cache.rs           persistent SQLite-indexed HTTP cache (2 GiB, LRU)
   sixteen.rs         16colo.rs JSON API (years/packs/artists/groups/search)
   colo_thumb.rs      worker pool fetching remote thumbnails
   polyhaven.rs       Poly Haven CC0 models / textures / HDRIs
   gfonts.rs          Google Fonts
-  lospec.rs          Lospec palettes
+  lospec.rs          Lospec palettes (tag-union search + filters)
+  lospec_gallery.rs  Lospec art gallery (path-segment filters + POST paging)
   modarchive.rs      The Mod Archive (tracker modules)
   audiosearch.rs     Openverse audio / images / GIFs
   httpfs.rs          browse any URL as a folder tree (page introspection)
   youtube.rs         yt-dlp search + download
   steam.rs           local Steam library → YouTube bridge
+  deviantart.rs      DeviantArt official OAuth2 API (client-credentials)
 ```
 
 For the deep internals — the recolor pipeline, the pixel-perfect blit math, the RIP
