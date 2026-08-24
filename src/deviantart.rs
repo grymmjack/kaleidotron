@@ -132,7 +132,12 @@ pub fn browse_url(facet: &str, query: &str, offset: usize, limit: usize) -> Stri
     let mut u = format!("{API}/browse/{facet}?limit={limit}&offset={offset}&mature_content=false");
     let q = query.trim();
     if !q.is_empty() && q != "-" {
-        let key = if facet == "topic" { "topic" } else { "tag" };
+        // Per-facet query param: tags → `tag`, topic → `topic`, popular/newest → `q` (keyword search).
+        let key = match facet {
+            "tags" => "tag",
+            "topic" => "topic",
+            _ => "q",
+        };
         u.push_str(&format!("&{key}={}", enc(q)));
     }
     u
@@ -210,6 +215,9 @@ mod tests {
         );
         assert!(browse_url("tags", "pixel art", 24, 24).contains("&tag=pixel%20art"));
         assert!(browse_url("topic", "pixel-art", 0, 24).contains("&topic=pixel-art"));
+        // popular/newest use `q` for keyword search.
+        assert!(browse_url("popular", "dragon", 0, 24).contains("&q=dragon"));
+        assert!(browse_url("newest", "cat girl", 0, 24).contains("&q=cat%20girl"));
     }
 
     #[test]

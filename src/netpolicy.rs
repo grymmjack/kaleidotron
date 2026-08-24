@@ -68,6 +68,7 @@ pub const API_HOSTS: &[&str] = &[
     "api.iconify.design",    // icon search (JSON API; Disallow: /)
     "lospec.com",            // palette browser + .gpl/.png downloads (Disallow: /palette-list/*.gpl$…)
     "modarchive.org",        // tracker-module search + downloads (covers api.modarchive.org)
+    "deviantart.com",        // official OAuth2 API we hold app credentials for (Disallow: /api/)
 ];
 
 /// The bare host of an origin like `https://api.openverse.org` → `api.openverse.org`.

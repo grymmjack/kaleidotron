@@ -37393,7 +37393,6 @@ impl Kaleidotron {
                             }
                         }
                         let mut da_go = false;
-                        let needs_q = matches!(self.da_facet, 2 | 3); // Tag / Topic need a query
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("da_facet")
                                 .selected_text(da::FACETS.get(self.da_facet).map_or("Popular", |f| f.1))
@@ -37402,16 +37401,21 @@ impl Kaleidotron {
                                         ui.selectable_value(&mut self.da_facet, i, *label);
                                     }
                                 });
-                            if needs_q {
-                                let te = ui.add(
-                                    egui::TextEdit::singleline(&mut self.da_query)
-                                        .hint_text(if self.da_facet == 3 { "topic…" } else { "tag…" })
-                                        .desired_width(110.0),
-                                );
-                                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    self.da_want = 48;
-                                    da_go = true;
-                                }
+                            // The query box is a keyword search for Popular/Newest, a tag for Tag,
+                            // a topic for Topic (interpreted per facet in browse_url).
+                            let hint = match self.da_facet {
+                                2 => "tag…",
+                                3 => "topic…",
+                                _ => "keyword…",
+                            };
+                            let te = ui.add(
+                                egui::TextEdit::singleline(&mut self.da_query)
+                                    .hint_text(hint)
+                                    .desired_width(120.0),
+                            );
+                            if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                self.da_want = 48;
+                                da_go = true;
                             }
                         });
                         ui.horizontal(|ui| {
@@ -37422,6 +37426,16 @@ impl Kaleidotron {
                             if !self.da_devs.is_empty() && ui.button("Load more").clicked() {
                                 self.da_want = (self.da_want + 48).min(240);
                                 da_go = true;
+                            }
+                            // Save the current browse as a Places favorite (re-runs on click).
+                            let cur = self.da_browse_path();
+                            let saved = self.favorites.contains(&cur);
+                            if ui
+                                .add_enabled(!saved, egui::Button::new(if saved { "★ Saved" } else { "★ Save" }))
+                                .on_hover_text("Pin this DeviantArt search to Places")
+                                .clicked()
+                            {
+                                self.favorites.push(cur);
                             }
                         });
                         ui.weak("Official DeviantArt API — click a piece for a full-size view; each links back.");
