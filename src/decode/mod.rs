@@ -409,6 +409,13 @@ pub fn looks_like_scene_art(bytes: &[u8]) -> bool {
     crate::sauce::present(bytes) || looks_like_ansi_text(bytes)
 }
 
+/// Force-decode arbitrary bytes as ANSI/CP437 text art, regardless of extension or content sniff.
+/// Backs the "Open as text art" override — for a file the user *knows* is scene art but that the
+/// automatic detection misses (an odd group extension with no SAUCE + few escapes).
+pub fn decode_as_ansi(bytes: &[u8]) -> Result<PixImage, DecodeError> {
+    ansi::AnsiDecoder.decode(bytes)
+}
+
 /// As [`looks_like_scene_art`] but for a file on disk: reads a bounded head chunk (enough for
 /// the escape/block heuristics + a small file's SAUCE) plus the tail for a large file's SAUCE.
 /// Cheap enough to sniff a folder of unknown-extension files while building the listing.

@@ -1428,6 +1428,9 @@ pub struct Kaleidotron {
     // Best-effort type label for a non-renderable file shown in a mount (magic-byte / extension id),
     // computed once per path. Feeds the generic file tile so "show everything" isn't a wall of ?s.
     file_id_cache: HashMap<PathBuf, String>,
+    // Whether a file can produce a thumbnail (known type OR content-sniffed scene art), cached per
+    // path — the content sniff reads the file, so it must not run per frame.
+    render_cache: HashMap<PathBuf, bool>,
     // Archive thumbnails: extract-to-cache on a worker, then a folder-style montage of the contents
     // (clutch for font .zips). Keyed by the archive path; a pending set dedupes the workers.
     archive_montage: HashMap<PathBuf, FolderInfo>,
@@ -3662,6 +3665,7 @@ impl Kaleidotron {
             grid_recolor: HashMap::new(),
             folder_info: HashMap::new(),
             file_id_cache: HashMap::new(),
+            render_cache: HashMap::new(),
             archive_montage: HashMap::new(),
             archive_montage_pending: std::collections::HashSet::new(),
             archive_montage_tx,
@@ -5109,6 +5113,24 @@ impl Kaleidotron {
                 is_image_ext(path) || self.registry.known_extension(&ext.to_ascii_lowercase())
             }
         }
+    }
+
+    /// As [`can_render`], but also accepts a file whose **content** the decoder can handle even
+    /// though its extension isn't known — the group-specific scene-art extensions (`.hpe`, `.ad`,
+    /// `.img`, …) are ANSI/CP437 art that `decode_bytes` reaches through its content fallback (and
+    /// which the Details pane already renders). Without this, "show everything" mislabels them as
+    /// generic data files in the grid/table even though a real thumbnail is available. The content
+    /// sniff reads the file, so the result is cached per path (only unknown extensions ever read).
+    fn is_renderable(&mut self, path: &Path) -> bool {
+        if self.can_render(path) {
+            return true;
+        }
+        if let Some(&r) = self.render_cache.get(path) {
+            return r;
+        }
+        let r = crate::decode::file_is_scene_art(path);
+        self.render_cache.insert(path.to_path_buf(), r);
+        r
     }
 
     /// Poll the current local folder for filesystem changes (new/removed/modified files —
@@ -18942,7 +18964,11 @@ impl Kaleidotron {
         let want = self.force_open.take();
         let is_code = crate::decode::CODE_EXTS
             .contains(&path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase().as_str());
-        if is_code && self.plugin_code && want != Some(OpenAs::Image) {
+        if is_code
+            && self.plugin_code
+            && want != Some(OpenAs::Image)
+            && want != Some(OpenAs::TextArt)
+        {
             let real = self.resolve_local(&path);
             const MAX_TEXT: u64 = 4 * 1024 * 1024;
             let small = std::fs::metadata(&real).map(|m| m.len() <= MAX_TEXT).unwrap_or(false);
@@ -19005,8 +19031,9 @@ impl Kaleidotron {
         // extension (.tri/.ice/… — see the decoder's content fallback) gets the crisp integer
         // zoom + text-mode handling too, not raster. Content covers sauceless ANSI/CP437 art.
         // Only checked for unknown extensions — `is_textmode_ext` short-circuits the read.
-        self.viewing_textmode =
-            is_textmode_ext(&path) || crate::decode::file_is_scene_art(&src);
+        self.viewing_textmode = want == Some(OpenAs::TextArt)
+            || is_textmode_ext(&path)
+            || crate::decode::file_is_scene_art(&src);
         if self.fit_mode {
             self.fit_requested = true;
         } else if self.auto_next && !self.viewing_textmode {
@@ -19176,8 +19203,16 @@ impl Kaleidotron {
                 Player::new(path.clone(), stream, baud != Baud::None)
             });
 
-        // Static image.
-        match self.registry.decode_path(&src) {
+        // Static image. "Open as text art" forces the ANSI/CP437 decoder for a file the automatic
+        // detection missed; otherwise the registry routes by sniff → extension → scene-art content.
+        let decoded = if want == Some(OpenAs::TextArt) {
+            std::fs::read(&src)
+                .map_err(|e| e.to_string())
+                .and_then(|b| crate::decode::decode_as_ansi(&b).map_err(|e| e.to_string()))
+        } else {
+            self.registry.decode_path(&src).map_err(|e| e.to_string())
+        };
+        match decoded {
             Ok(img) => {
                 let size = [img.width as usize, img.height as usize];
                 let rgba = img.rgba_bytes();
@@ -19472,7 +19507,7 @@ impl Kaleidotron {
             // configured yet, `run_in_dosbox` sets a status telling the user where to set it.
             self.selected = idx;
             self.run_in_dosbox(&entry.path);
-        } else if !self.can_render(&entry.path) {
+        } else if !self.is_renderable(&entry.path) {
             // A file we can't decode (a data/binary surfaced by a mount's "show everything"
             // listing) — hand it to the OS default app rather than a blank viewer.
             self.selected = idx;
@@ -28087,7 +28122,7 @@ impl Kaleidotron {
                                     crate::format_color::color32(ext),
                                 );
                             }
-                        } else if !self.can_render(path) {
+                        } else if !self.is_renderable(path) {
                             // A file we can't decode (surfaced by a mount's "show everything"
                             // listing): a document glyph + a best-effort type id, no thumbnail
                             // request (which would spin forever on an undecodable file).
@@ -29366,7 +29401,7 @@ impl Kaleidotron {
                                 Self::WEB_THUMB_MAX_BYTES,
                             );
                         }
-                    } else if !any_remote(&path) && self.can_render(&path) {
+                    } else if !any_remote(&path) && self.is_renderable(&path) {
                         self.thumbs.request(&path, THUMB_PX);
                     }
                     self.want_repaint = true;
@@ -29375,7 +29410,7 @@ impl Kaleidotron {
                 // label in the thumb cell instead of an endless spinner. Computed here (row-level
                 // `&mut self`) so the deep cell closure needn't borrow the cache mutably.
                 let file_id = (!entry.is_dir && tex.is_none() && !colo_audio && !any_remote(&path)
-                    && !self.can_render(&path))
+                    && !self.is_renderable(&path))
                 .then(|| {
                     self.file_id_cache
                         .entry(path.clone())
@@ -48208,6 +48243,9 @@ enum OpenAs {
     Text,
     /// The text viewer, with editing already switched on.
     TextEdit,
+    /// Force-decode the file as ANSI/CP437 **text art** (the group-specific scene extensions that
+    /// auto-detection misses), shown in the image viewer with the crisp text-mode treatment.
+    TextArt,
 }
 
 enum TilePick {
@@ -48714,6 +48752,20 @@ fn entry_context_menu(
             .clicked()
         {
             pick = Some(TilePick::RunInDosbox);
+            ui.close();
+        }
+        ui.separator();
+    }
+    // "Open as text art": force the ANSI/CP437 decoder for any file — the scene minted a new art
+    // extension per group (.hpe / .ad / .lgc / .mir / …); most auto-detect, this is the manual
+    // override for the ones that don't.
+    if !entry.is_dir && !entry.is_archive {
+        if ui
+            .button("\u{25a4} Open as text art")
+            .on_hover_text("Force-decode this file as ANSI/CP437 art (for an unrecognised scene extension)")
+            .clicked()
+        {
+            pick = Some(TilePick::Open(OpenAs::TextArt));
             ui.close();
         }
         ui.separator();
