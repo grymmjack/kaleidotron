@@ -131,6 +131,43 @@ pub fn get_bytes(url: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Uncached netpolicy-gated GET — for one-shot fetches that must NOT be cached (an OAuth2 token
+/// response, which carries a short-lived credential). Honest UA.
+pub fn fetch_uncached(url: &str) -> Result<Vec<u8>, String> {
+    http_get(url)
+}
+
+/// Cached GET that sends `Authorization: Bearer <token>` — for OAuth2 APIs (DeviantArt). Cached by
+/// URL (the token is auth, not content, so two tokens hitting the same URL share the entry). Honest
+/// UA — an official API we hold registered credentials for, not a site to masquerade at.
+pub fn get_bytes_bearer(url: &str, token: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = read_blob(url, ttl) {
+        return Ok(bytes);
+    }
+    crate::netpolicy::before_request(url)?;
+    let resp = match ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            if code == 429 || code == 503 {
+                crate::netpolicy::note_throttled(url, r.header("Retry-After"));
+            }
+            return Err(format!("HTTP {code}"));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(FETCH_CAP)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    write_blob(url, &buf);
+    Ok(buf)
+}
+
 /// A recent Firefox/Linux User-Agent for the few endpoints that are browser-only AJAX and reject or
 /// throttle non-browser clients (Lospec's gallery paging POST). Used ONLY there — a request shaped
 /// exactly like the browser one the endpoint is built for — while the rest of the app keeps the

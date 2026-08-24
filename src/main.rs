@@ -7,6 +7,7 @@ mod audiosearch;
 mod cache;
 mod colo_thumb;
 mod decode;
+mod deviantart;
 mod dls;
 mod format_color;
 mod gfonts;
