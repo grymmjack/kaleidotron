@@ -36,6 +36,7 @@ mod video;
 mod imgsearch;
 mod assetsearch;
 mod lospec;
+mod lospec_gallery;
 mod viewdb;
 mod xi;
 mod youtube;
