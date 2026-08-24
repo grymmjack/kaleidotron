@@ -24936,17 +24936,66 @@ impl Kaleidotron {
         }
     }
 
-    /// Save a copy of `path` to a user-chosen location via a Save dialog. Works for any
-    /// inspected file: a plain local file, an extracted archive member, or a 16colo.rs
-    /// piece — all are real files on disk by the time they're shown (packs/archives are
-    /// downloaded + unzipped to a temp dir first), so a byte copy is all it takes.
+    /// The source download URL + a nice filename for a **remote search result** (audio / image /
+    /// icon / vector) that hasn't been fetched to disk yet — so ⬇ Save can fetch it on demand
+    /// instead of failing because the user hasn't opened the item first. `None` for anything that
+    /// is (or will be) a real local file already.
+    fn remote_result_url(&self, path: &Path) -> Option<(String, String)> {
+        if let Some(r) = self.snd_results.get(path) {
+            return Some((r.url.clone(), r.filename()));
+        }
+        if let Some(r) = self.img_results.get(path) {
+            return Some((r.img_url.clone(), r.filename()));
+        }
+        if let Some(r) = self.asset_results.get(path) {
+            return Some((r.download_url.clone(), r.filename()));
+        }
+        None
+    }
+
+    /// Save a copy of `path` to a user-chosen location via a Save dialog. Handles a plain local
+    /// file, an extracted archive member, an already-opened 16colo.rs / YouTube download — and a
+    /// **remote search result not yet fetched** (audio / image / icon / vector): those aren't on
+    /// disk until opened, so ⬇ Save fetches them from their source URL first (the bug where the
+    /// audio-result ⬇ menu "did nothing" — it was reading a virtual path with no file behind it).
     fn download_file(&mut self, path: &Path) {
-        let real = self.real_path(path);
-        let name = real
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("download")
-            .to_string();
+        // A real file already on disk? (local, archive member, or an already-downloaded result.)
+        let mut real = self.real_path(path);
+        if !real.exists() {
+            let rl = self.resolve_local(path);
+            if rl.exists() {
+                real = rl;
+            }
+        }
+        // Default save-dialog name: the result's readable filename if remote, else the on-disk name.
+        let mut name = self
+            .remote_result_url(path)
+            .map(|(_, f)| f)
+            .or_else(|| real.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .unwrap_or_else(|| "download".to_string());
+        // Not on disk yet → a remote result the user hasn't opened. Fetch it from its source URL
+        // (synchronous + cached; the Save dialog blocks anyway, so a brief fetch is fine).
+        if !real.exists() {
+            match self.remote_result_url(path) {
+                Some((url, fname)) => {
+                    self.status = format!("Fetching {fname}…");
+                    match crate::cache::get_file(&url, &fname) {
+                        Ok(f) => {
+                            real = f;
+                            name = fname;
+                        }
+                        Err(e) => {
+                            self.status = format!("Couldn't fetch {fname}: {e}");
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    self.status = format!("Couldn't read {name}: not downloaded");
+                    return;
+                }
+            }
+        }
         let bytes = match std::fs::read(&real) {
             Ok(b) => b,
             Err(e) => {
