@@ -132,9 +132,29 @@ pub fn get_bytes(url: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
 }
 
 /// Uncached netpolicy-gated GET — for one-shot fetches that must NOT be cached (an OAuth2 token
-/// response, which carries a short-lived credential). Honest UA.
+/// response, a credential). **Does not follow redirects**: an OAuth2 token endpoint that 3xx-
+/// redirects is rejecting the request (bad/empty client_id/secret) and would otherwise land on an
+/// HTML error page that fails to parse as a token — surface the rejection clearly instead.
 pub fn fetch_uncached(url: &str) -> Result<Vec<u8>, String> {
-    http_get(url)
+    crate::netpolicy::before_request(url)?;
+    let agent = ureq::builder().redirects(0).build();
+    let resp = match agent.get(url).set("User-Agent", USER_AGENT).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) if (300..400).contains(&code) => {
+            return Err("request rejected (redirect) — check your credentials".into());
+        }
+        Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+        Err(e) => return Err(e.to_string()),
+    };
+    if (300..400).contains(&resp.status()) {
+        return Err("request rejected (redirect) — check your credentials".into());
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(FETCH_CAP)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    Ok(buf)
 }
 
 /// Cached GET that sends `Authorization: Bearer <token>` — for OAuth2 APIs (DeviantArt). Cached by
@@ -147,6 +167,7 @@ pub fn get_bytes_bearer(url: &str, token: &str, ttl: Option<i64>) -> Result<Vec<
     crate::netpolicy::before_request(url)?;
     let resp = match ureq::get(url)
         .set("User-Agent", USER_AGENT)
+        .set("Accept", "application/json")
         .set("Authorization", &format!("Bearer {token}"))
         .call()
     {
@@ -155,7 +176,21 @@ pub fn get_bytes_bearer(url: &str, token: &str, ttl: Option<i64>) -> Result<Vec<
             if code == 429 || code == 503 {
                 crate::netpolicy::note_throttled(url, r.header("Retry-After"));
             }
-            return Err(format!("HTTP {code}"));
+            // Surface the API's own JSON error message (e.g. "user_api_threshold", an expired token)
+            // instead of a bare status — it's what tells the user what to fix.
+            let body = r.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v["error_description"]
+                        .as_str()
+                        .or(v["error"].as_str())
+                        .map(String::from)
+                });
+            return Err(match detail {
+                Some(d) => format!("HTTP {code}: {d}"),
+                None => format!("HTTP {code}"),
+            });
         }
         Err(e) => return Err(e.to_string()),
     };

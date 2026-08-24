@@ -312,6 +312,9 @@ enum GalleryMsg {
 enum DaMsg {
     Hit(Entry, Box<crate::deviantart::DaDeviation>),
     Done(usize),
+    /// The API rejected the request (bad token, throttle, dead facet) — carries the reason so the
+    /// status bar tells the user *why* a browse returned nothing.
+    Error(String),
 }
 
 /// Messages from a Poly Haven browse worker (`ph_walk`): one CC0 asset per hit, then the count.
@@ -6952,7 +6955,7 @@ impl Kaleidotron {
 
     /// The virtual browse path for the current facet + query.
     fn da_browse_path(&self) -> PathBuf {
-        let facet = crate::deviantart::FACETS.get(self.da_facet).map_or("popular", |f| f.0);
+        let facet = crate::deviantart::FACETS.get(self.da_facet).map_or("dailydeviations", |f| f.0);
         crate::deviantart::browse_path(facet, &self.da_query)
     }
 
@@ -6969,11 +6972,14 @@ impl Kaleidotron {
 
     fn start_da_browse(&mut self, dir: PathBuf) {
         let Some(token) = self.da_ensure_token() else {
+            // da_ensure_token set a clear status (creds/token error); show_folder would clobber it.
+            let msg = self.status.clone();
             self.show_folder(dir, Vec::new());
+            self.status = msg;
             return;
         };
         let parts = crate::deviantart::rel_parts(&dir);
-        let facet = parts.get(1).cloned().unwrap_or_else(|| "popular".into());
+        let facet = parts.get(1).cloned().unwrap_or_else(|| "dailydeviations".into());
         let query = parts.get(2).filter(|q| *q != "-").cloned().unwrap_or_default();
         let want = self.da_want;
         self.show_folder(dir.clone(), Vec::new());
@@ -7003,6 +7009,11 @@ impl Kaleidotron {
                 }
                 Ok(DaMsg::Done(n)) => {
                     self.status = format!("{n} deviation(s) — click one to view full size");
+                    done = true;
+                    break;
+                }
+                Ok(DaMsg::Error(msg)) => {
+                    self.status = msg;
                     done = true;
                     break;
                 }
@@ -37380,7 +37391,7 @@ impl Kaleidotron {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 19 {
-                        // DeviantArt: a facet dropdown (Popular / Newest / Tag / Topic) + a query box.
+                        // DeviantArt: a facet dropdown (Daily / Home / Tag / Topic) + a query box.
                         use crate::deviantart as da;
                         if self.da_client_id.trim().is_empty() || self.da_client_secret.trim().is_empty() {
                             ui.colored_label(
@@ -37395,25 +37406,27 @@ impl Kaleidotron {
                         let mut da_go = false;
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("da_facet")
-                                .selected_text(da::FACETS.get(self.da_facet).map_or("Popular", |f| f.1))
+                                .selected_text(da::FACETS.get(self.da_facet).map_or("Daily Deviations", |f| f.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in da::FACETS.iter().enumerate() {
                                         ui.selectable_value(&mut self.da_facet, i, *label);
                                     }
                                 });
-                            // The query box is a keyword search for Popular/Newest, a tag for Tag,
-                            // a topic for Topic (interpreted per facet in browse_url).
+                            // Tag/Topic search by name; Daily/Home take no query (DeviantArt's API has
+                            // no general keyword search — Tag is the keyword path).
+                            let needs_q = matches!(self.da_facet, 2 | 3);
                             let hint = match self.da_facet {
                                 2 => "tag…",
                                 3 => "topic…",
-                                _ => "keyword…",
+                                _ => "(no query)",
                             };
-                            let te = ui.add(
+                            let te = ui.add_enabled(
+                                needs_q,
                                 egui::TextEdit::singleline(&mut self.da_query)
                                     .hint_text(hint)
                                     .desired_width(120.0),
                             );
-                            if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            if needs_q && te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 self.da_want = 48;
                                 da_go = true;
                             }
@@ -47871,11 +47884,26 @@ fn da_walk(
             return;
         }
         let url = crate::deviantart::browse_url(&facet, &query, offset, 24);
-        let Ok(body) = crate::cache::get_bytes_bearer(&url, &token, Some(3600)) else {
-            break;
+        let body = match crate::cache::get_bytes_bearer(&url, &token, Some(3600)) {
+            Ok(b) => b,
+            Err(e) => {
+                // Report the reason on the first page (later pages just stop paging).
+                if offset == 0 {
+                    let _ = tx.send(DaMsg::Error(format!("DeviantArt: {e}")));
+                    return;
+                }
+                break;
+            }
         };
-        let Ok(page) = crate::deviantart::parse(&body) else {
-            break;
+        let page = match crate::deviantart::parse(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                if offset == 0 {
+                    let _ = tx.send(DaMsg::Error(format!("DeviantArt: {e}")));
+                    return;
+                }
+                break;
+            }
         };
         if page.items.is_empty() {
             break;

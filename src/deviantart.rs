@@ -4,8 +4,10 @@
 //! is minted from those and sent as `Authorization: Bearer …` on each browse request; the app.rs
 //! side caches the token with its expiry and re-mints on demand.
 //!
-//! Browse facets → the API's `browse/*` endpoints: **popular**, **newest**, **tags** (a single tag),
-//! **topic** (a named topic). Each returns `{results:[deviation…], has_more, next_offset}`; a
+//! Browse facets → the API's real `browse/*` endpoints: **dailydeviations** (today's curated set),
+//! **home** (the homepage feed), **tags** (a single tag), **topic** (a named topic). There is no
+//! `browse/popular`/`browse/newest` — those were removed. Each returns
+//! `{results:[deviation…], has_more, next_offset}`; a
 //! deviation gives a thumbnail (`thumbs[]`), a full-view image (`content.src`), the DeviantArt page
 //! (`url`, the link-back) and the author.
 //!
@@ -22,11 +24,13 @@ pub const BROWSE: &str = "browse";
 const API: &str = "https://www.deviantart.com/api/v1/oauth2";
 const TOKEN_URL: &str = "https://www.deviantart.com/oauth2/token";
 
-/// The browse facets (slug, label). `popular`/`newest` ignore the query; `tags`/`topic` need it.
+/// The browse facets (slug, label) — the **real** DeviantArt `browse/*` endpoints (there is no
+/// `popular`/`newest`; those were removed). `dailydeviations`/`home` take no query; `tags`/`topic`
+/// search by tag/topic name.
 pub const FACETS: &[(&str, &str)] = &[
-    ("popular", "Popular"),
-    ("newest", "Newest"),
-    ("tags", "Tag"),
+    ("dailydeviations", "Daily Deviations"),
+    ("home", "Home"),
+    ("tags", "Tag search"),
     ("topic", "Topic"),
 ];
 
@@ -126,21 +130,23 @@ pub fn parse_token(bytes: &[u8]) -> Result<(String, i64), String> {
 }
 
 /// Build a browse request URL for a facet + query + paging window. `mature_content=false` keeps it
-/// SFW; `popular`/`newest` ignore the query.
+/// SFW. `dailydeviations`/`home` take no query; `tags` needs `&tag=`, `topic` needs `&topic=`.
+/// (DeviantArt's browse API has **no general keyword search** — searching by tag is the closest.)
 pub fn browse_url(facet: &str, query: &str, offset: usize, limit: usize) -> String {
     let limit = limit.clamp(1, 24);
-    let mut u = format!("{API}/browse/{facet}?limit={limit}&offset={offset}&mature_content=false");
     let q = query.trim();
-    if !q.is_empty() && q != "-" {
-        // Per-facet query param: tags → `tag`, topic → `topic`, popular/newest → `q` (keyword search).
-        let key = match facet {
-            "tags" => "tag",
-            "topic" => "topic",
-            _ => "q",
-        };
-        u.push_str(&format!("&{key}={}", enc(q)));
+    match facet {
+        "tags" => format!(
+            "{API}/browse/tags?tag={}&limit={limit}&offset={offset}&mature_content=false",
+            enc(if q.is_empty() || q == "-" { "pixelart" } else { q })
+        ),
+        "topic" => format!(
+            "{API}/browse/topic?topic={}&limit={limit}&offset={offset}&mature_content=false",
+            enc(if q.is_empty() || q == "-" { "pixel-art" } else { q })
+        ),
+        // dailydeviations / home (and any future no-query facet): paged by offset/limit, no query.
+        _ => format!("{API}/browse/{facet}?limit={limit}&offset={offset}&mature_content=false"),
     }
-    u
 }
 
 /// A parsed browse page: the deviations, whether more exist, and the offset for the next page.
@@ -209,15 +215,21 @@ mod tests {
 
     #[test]
     fn browse_url_shapes() {
+        // No-query facets page by offset/limit and carry no query param.
         assert_eq!(
-            browse_url("popular", "-", 0, 24),
-            "https://www.deviantart.com/api/v1/oauth2/browse/popular?limit=24&offset=0&mature_content=false"
+            browse_url("dailydeviations", "-", 0, 24),
+            "https://www.deviantart.com/api/v1/oauth2/browse/dailydeviations?limit=24&offset=0&mature_content=false"
         );
-        assert!(browse_url("tags", "pixel art", 24, 24).contains("&tag=pixel%20art"));
-        assert!(browse_url("topic", "pixel-art", 0, 24).contains("&topic=pixel-art"));
-        // popular/newest use `q` for keyword search.
-        assert!(browse_url("popular", "dragon", 0, 24).contains("&q=dragon"));
-        assert!(browse_url("newest", "cat girl", 0, 24).contains("&q=cat%20girl"));
+        assert_eq!(
+            browse_url("home", "-", 24, 24),
+            "https://www.deviantart.com/api/v1/oauth2/browse/home?limit=24&offset=24&mature_content=false"
+        );
+        // Tag/topic search carry the query in the facet's own param.
+        assert!(browse_url("tags", "pixel art", 24, 24).contains("tag=pixel%20art"));
+        assert!(browse_url("topic", "pixel-art", 0, 24).contains("topic=pixel-art"));
+        // An empty tag/topic falls back to a sensible default rather than erroring.
+        assert!(browse_url("tags", "-", 0, 24).contains("tag=pixelart"));
+        assert!(browse_url("topic", "", 0, 24).contains("topic=pixel-art"));
     }
 
     #[test]
