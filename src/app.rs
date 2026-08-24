@@ -308,6 +308,12 @@ enum GalleryMsg {
     Done(usize),
 }
 
+/// Messages from a **DeviantArt** browse worker (`da_walk`): one deviation per hit, then the count.
+enum DaMsg {
+    Hit(Entry, Box<crate::deviantart::DaDeviation>),
+    Done(usize),
+}
+
 /// Messages from a Poly Haven browse worker (`ph_walk`): one CC0 asset per hit, then the count.
 enum PhMsg {
     Hit(Entry, Box<crate::polyhaven::PhAsset>),
@@ -998,6 +1004,7 @@ impl RailSection {
             (10, "\u{270E}", "Vectors", "Vector art search"),
             (11, "\u{1F3A8}", "Lospec Palettes", "Lospec palettes"),
             (18, "\u{1F5BC}", "Lospec Gallery", "Lospec Gallery — pixel / voxel / textmode art"),
+            (19, "\u{1F3A8}", "DeviantArt", "DeviantArt — browse public art"),
             (12, icons::CUBE, "3D / CC0", "Poly Haven — 3D / textures / HDRIs"),
             (13, "\u{1F170}", "Fonts", "Google Fonts"),
             (14, "\u{1F50A}", "Audio", "Free audio search"),
@@ -1019,6 +1026,7 @@ impl RailSection {
                 (10, "Vectors"),
                 (11, "Lospec Palettes"),
                 (18, "Lospec Gallery"),
+                (19, "DeviantArt"),
                 (12, "3D / CC0"),
                 (13, "Fonts"),
                 (14, "Audio"),
@@ -2275,6 +2283,21 @@ pub struct Kaleidotron {
     gallery_tag: String,                      // optional tag filter (blank = none)
     gallery_masterpiece: bool,                // "Monthly masterpieces only"
     gallery_want: usize,                      // how many pieces to fetch (Load more bumps this)
+    // DeviantArt (official OAuth2 client-credentials API — browse public art).
+    da_client_id: String,     // registered app credentials (secrets.json, like the Steam key)
+    da_client_secret: String,
+    da_token: String,         // cached app-only access token
+    da_token_expires: i64,    // unix seconds when the token lapses (re-minted on demand)
+    da_devs: HashMap<PathBuf, crate::deviantart::DaDeviation>,
+    da_rx: Option<std::sync::mpsc::Receiver<DaMsg>>,
+    da_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[allow(clippy::type_complexity)]
+    da_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    da_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded full image
+    da_dir: PathBuf,                     // <data>/deviantart — downloaded pieces
+    da_facet: usize,                     // index into deviantart::FACETS
+    da_query: String,                    // tag/topic (blank for popular/newest)
+    da_want: usize,                      // how many to fetch (Load more bumps this)
     #[allow(clippy::type_complexity)]
     lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     // Poly Haven (CC0 3D models / textures / HDRIs). A model is a *bundle* (gltf manifest + .bin +
@@ -2372,6 +2395,7 @@ pub struct Kaleidotron {
     plugin_steam: bool,      // Steam library → video search
     plugin_images: bool,     // Openverse image search
     plugin_audiosearch: bool, // Openverse audio search
+    plugin_deviantart: bool, // DeviantArt (official OAuth2 API)
     gif_recolor: bool, // run the Recolor/PixelFX stack on animated GIF frames
     gif_speed: f32,    // GIF playback rate (0.25×–4×), like the video player's Speed
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
@@ -2524,6 +2548,7 @@ impl Kaleidotron {
     const PLUGIN_STEAM_KEY: &'static str = "plugin_steam";
     const PLUGIN_IMAGES_KEY: &'static str = "plugin_images";
     const PLUGIN_AUDIOSEARCH_KEY: &'static str = "plugin_audiosearch";
+    const PLUGIN_DA_KEY: &'static str = "plugin_deviantart";
     const GIF_RECOLOR_KEY: &'static str = "gif_recolor";
     const GIF_SPEED_KEY: &'static str = "gif_speed";
     /// Audio preview: start on select + loop until stopped.
@@ -3462,6 +3487,7 @@ impl Kaleidotron {
         // palette you grabbed last session is still in the Recolor list this session.
         let lospec_dir = data_dir.join("lospec");
         let gallery_dir = data_dir.join("lospec-gallery");
+        let da_dir = data_dir.join("deviantart");
         // Downloaded Poly Haven bundles / audio clips / Google Fonts. These are real files the user
         // keeps (a 3D model bundle or a font is not throwaway cache), so they live beside the
         // palettes under the data dir rather than in the 2 GiB HTTP blob cache.
@@ -4475,6 +4501,19 @@ impl Kaleidotron {
             gallery_tag: String::new(),
             gallery_masterpiece: false,
             gallery_want: 128,
+            da_client_id: String::new(),
+            da_client_secret: String::new(),
+            da_token: String::new(),
+            da_token_expires: 0,
+            da_devs: HashMap::new(),
+            da_rx: None,
+            da_cancel: None,
+            da_open_rx: None,
+            da_files: HashMap::new(),
+            da_dir,
+            da_facet: 0,
+            da_query: String::new(),
+            da_want: 48,
             lospec_detail: None,
             lospec_authors: HashMap::new(),
             lospec_author_rx: None,
@@ -4555,6 +4594,7 @@ impl Kaleidotron {
             plugin_steam: load_bool(Self::PLUGIN_STEAM_KEY, false),
             plugin_images: load_bool(Self::PLUGIN_IMAGES_KEY, false),
             plugin_audiosearch: load_bool(Self::PLUGIN_AUDIOSEARCH_KEY, false),
+            plugin_deviantart: load_bool(Self::PLUGIN_DA_KEY, false),
             gif_recolor: load_bool(Self::GIF_RECOLOR_KEY, false),
             gif_speed: cc
                 .storage
@@ -4635,6 +4675,12 @@ impl Kaleidotron {
         }
         if let Some(v) = sec.get("ma_key") {
             app.ma_key = v.clone();
+        }
+        if let Some(v) = sec.get("da_client_id") {
+            app.da_client_id = v.clone();
+        }
+        if let Some(v) = sec.get("da_client_secret") {
+            app.da_client_secret = v.clone();
         }
         // BEFORE the first folder is opened, not after. Both of these change what that scan
         // produces, and doing them afterwards meant the launch listing ignored them:
@@ -4754,6 +4800,7 @@ impl Kaleidotron {
             e(W, "plugin_steam", self.plugin_steam, "Steam library → video search"),
             e(W, "plugin_images", self.plugin_images, "image search (Openverse)"),
             e(W, "plugin_audiosearch", self.plugin_audiosearch, "audio search (Openverse)"),
+            e(W, "plugin_deviantart", self.plugin_deviantart, "DeviantArt browse (needs a client_id/secret in secrets.json)"),
             // Audio
             e(AU, "audio_autoplay", self.audio_autoplay, "start playing as soon as a clip is opened"),
             e(AU, "audio_volume", self.audio_volume, "master playback volume, 0..1"),
@@ -5000,6 +5047,7 @@ impl Kaleidotron {
             ("plugin_steam", &mut self.plugin_steam),
             ("plugin_images", &mut self.plugin_images),
             ("plugin_audiosearch", &mut self.plugin_audiosearch),
+            ("plugin_deviantart", &mut self.plugin_deviantart),
         ] {
             if let Some(v) = st::get_bool(&m, key) {
                 *flag = v;
@@ -5221,6 +5269,11 @@ impl Kaleidotron {
         // Lospec Gallery (community art — browse → thumbnails → open a piece full-res in the viewer).
         if crate::lospec_gallery::is_remote(&dir) {
             self.open_gallery(dir);
+            return;
+        }
+        // DeviantArt (official OAuth2 API — browse public art → view full-res, link back).
+        if crate::deviantart::is_remote(&dir) {
+            self.open_da(dir);
             return;
         }
         // Poly Haven CC0 assets (3D models / textures / HDRIs) — browse → download → view.
@@ -6331,6 +6384,7 @@ impl Kaleidotron {
             .or_else(|| self.snd_files.get(path))
             .or_else(|| self.gf_files.get(path))
             .or_else(|| self.gallery_files.get(path))
+            .or_else(|| self.da_files.get(path))
             .or_else(|| self.web_files.get(path))
             .or_else(|| self.ma_files.get(path))
         {
@@ -6871,6 +6925,150 @@ impl Kaleidotron {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gallery_open_rx = None,
+        }
+    }
+
+    // --- DeviantArt (official OAuth2 API): browse public art → view full-res, link back. ---
+
+    /// A valid app token, minting a fresh one when the cached one is missing/expired (synchronous —
+    /// a quick call, only on expiry). `None` (+ a status) when there are no creds or the mint failed.
+    fn da_ensure_token(&mut self) -> Option<String> {
+        let now = unix_now();
+        if !self.da_token.is_empty() && now < self.da_token_expires - 60 {
+            return Some(self.da_token.clone());
+        }
+        match crate::deviantart::fetch_token(&self.da_client_id, &self.da_client_secret) {
+            Ok((tok, exp)) => {
+                self.da_token = tok.clone();
+                self.da_token_expires = now + exp;
+                Some(tok)
+            }
+            Err(e) => {
+                self.status = format!("DeviantArt: {e}");
+                None
+            }
+        }
+    }
+
+    /// The virtual browse path for the current facet + query.
+    fn da_browse_path(&self) -> PathBuf {
+        let facet = crate::deviantart::FACETS.get(self.da_facet).map_or("popular", |f| f.0);
+        crate::deviantart::browse_path(facet, &self.da_query)
+    }
+
+    fn open_da(&mut self, dir: PathBuf) {
+        match crate::deviantart::rel_parts(&dir).first().map(String::as_str) {
+            None => {
+                let p = self.da_browse_path();
+                self.start_da_browse(p);
+            }
+            Some(b) if b == crate::deviantart::BROWSE => self.start_da_browse(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    fn start_da_browse(&mut self, dir: PathBuf) {
+        let Some(token) = self.da_ensure_token() else {
+            self.show_folder(dir, Vec::new());
+            return;
+        };
+        let parts = crate::deviantart::rel_parts(&dir);
+        let facet = parts.get(1).cloned().unwrap_or_else(|| "popular".into());
+        let query = parts.get(2).filter(|q| *q != "-").cloned().unwrap_or_default();
+        let want = self.da_want;
+        self.show_folder(dir.clone(), Vec::new());
+        self.da_devs.clear();
+        if let Some(c) = self.da_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.da_rx = Some(rx);
+        self.da_cancel = Some(cancel.clone());
+        self.status = "Browsing DeviantArt…".into();
+        self.want_repaint = true;
+        std::thread::spawn(move || da_walk(token, facet, query, want, &dir, cancel, tx));
+    }
+
+    fn poll_da(&mut self) {
+        let Some(rx) = &self.da_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..64 {
+            match rx.try_recv() {
+                Ok(DaMsg::Hit(mut entry, d)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.da_devs.insert(entry.path.clone(), *d);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(DaMsg::Done(n)) => {
+                    self.status = format!("{n} deviation(s) — click one to view full size");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.da_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    fn start_da_open(&mut self, vpath: PathBuf) {
+        let Some(d) = self.da_devs.get(&vpath).cloned() else {
+            self.status = "Unknown deviation".into();
+            return;
+        };
+        if d.content_url.is_empty() {
+            self.open_url(&d.page_url); // no downloadable image (e.g. literature) → open the page
+            return;
+        }
+        if self.da_open_rx.is_some() {
+            self.status = "Already loading…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.da_open_rx = Some(rx);
+        self.status = format!("Loading: {}", elide(&d.title, 40));
+        let dir = self.da_dir.clone();
+        std::thread::spawn(move || {
+            let res = download_to_dir(&d.content_url, &d.filename(), &dir).map(|local| (vpath, local));
+            let _ = tx.send(res);
+        });
+    }
+
+    fn poll_da_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.da_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self
+                    .da_devs
+                    .get(&vpath)
+                    .map(|d| format!("{} — by {} · {}", d.title, d.artist, d.page_url));
+                self.da_files.insert(vpath.clone(), local);
+                self.da_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Load failed: {e}");
+                self.da_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.da_open_rx = None,
         }
     }
 
@@ -19867,6 +20065,10 @@ impl Kaleidotron {
             // A Lospec gallery piece not yet fetched → resolve its full image + view it.
             self.selected = idx;
             self.start_gallery_open(entry.path);
+        } else if self.da_devs.contains_key(&entry.path) && !self.da_files.contains_key(&entry.path) {
+            // A DeviantArt deviation not yet fetched → download its full-view image + view it.
+            self.selected = idx;
+            self.start_da_open(entry.path);
         } else if self.ph_assets.contains_key(&entry.path) && !self.ph_files.contains_key(&entry.path)
         {
             // A Poly Haven asset not yet downloaded → fetch it (a model pulls its whole bundle),
@@ -28762,6 +28964,9 @@ impl Kaleidotron {
                                 } else if let Some(gp) = self.gallery_pieces.get(path) {
                                     // Lospec gallery piece → fetch its CDN preview thumbnail.
                                     self.colo_thumbs.request(path, &gp.thumb_url, THUMB_PX, false);
+                                } else if let Some(d) = self.da_devs.get(path) {
+                                    // DeviantArt deviation → fetch its hosted thumbnail.
+                                    self.colo_thumbs.request(path, &d.thumb_url, THUMB_PX, false);
                                 } else if let Some(g) = self.steam_games.get(path) {
                                     // Steam game → fetch its CDN header image over HTTP.
                                     self.colo_thumbs.request(
@@ -35427,6 +35632,8 @@ impl Kaleidotron {
             11
         } else if crate::lospec_gallery::is_remote(dir) {
             18
+        } else if crate::deviantart::is_remote(dir) {
+            19
         } else if crate::polyhaven::is_remote(dir) {
             12
         } else if crate::gfonts::is_remote(dir) {
@@ -35464,6 +35671,7 @@ impl Kaleidotron {
             9 => self.plugin_icons,
             10 => self.plugin_vectors,
             11 | 18 => self.plugin_lospec, // 11 = palettes, 18 = gallery (both under the Lospec plugin)
+            19 => self.plugin_deviantart,
             12 => self.plugin_ph,
             13 => self.plugin_gfonts,
             14 => self.plugin_audiosearch,
@@ -37171,6 +37379,58 @@ impl Kaleidotron {
                         if let Some(p) = self.favorites_buttons(ui, "\u{1F5BC}", crate::lospec_gallery::is_remote, false) {
                             nav = Some(p);
                         }
+                    } else if self.places_tab == 19 {
+                        // DeviantArt: a facet dropdown (Popular / Newest / Tag / Topic) + a query box.
+                        use crate::deviantart as da;
+                        if self.da_client_id.trim().is_empty() || self.da_client_secret.trim().is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 120, 80),
+                                "Set a DeviantArt client_id + client_secret in Preferences → Plugins.",
+                            );
+                            if ui.button("Open Preferences").clicked() {
+                                self.show_prefs = true;
+                                self.prefs_section = 4;
+                            }
+                        }
+                        let mut da_go = false;
+                        let needs_q = matches!(self.da_facet, 2 | 3); // Tag / Topic need a query
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("da_facet")
+                                .selected_text(da::FACETS.get(self.da_facet).map_or("Popular", |f| f.1))
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, label)) in da::FACETS.iter().enumerate() {
+                                        ui.selectable_value(&mut self.da_facet, i, *label);
+                                    }
+                                });
+                            if needs_q {
+                                let te = ui.add(
+                                    egui::TextEdit::singleline(&mut self.da_query)
+                                        .hint_text(if self.da_facet == 3 { "topic…" } else { "tag…" })
+                                        .desired_width(110.0),
+                                );
+                                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    self.da_want = 48;
+                                    da_go = true;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button(format!("{} Browse", icons::SEARCH)).clicked() {
+                                self.da_want = 48;
+                                da_go = true;
+                            }
+                            if !self.da_devs.is_empty() && ui.button("Load more").clicked() {
+                                self.da_want = (self.da_want + 48).min(240);
+                                da_go = true;
+                            }
+                        });
+                        ui.weak("Official DeviantArt API — click a piece for a full-size view; each links back.");
+                        if da_go {
+                            nav = Some(self.da_browse_path());
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "\u{1F3A8}", crate::deviantart::is_remote, false) {
+                            nav = Some(p);
+                        }
                     } else if self.places_tab == 12 {
                         // Poly Haven: one search box per family (models / textures / HDRIs). The
                         // catalogue is a single cached request, so filtering is local + instant.
@@ -38542,6 +38802,8 @@ impl eframe::App for Kaleidotron {
         self.poll_lospec_open();
         self.poll_gallery();
         self.poll_gallery_open(&ctx);
+        self.poll_da();
+        self.poll_da_open(&ctx);
         self.poll_lospec_author();
         self.poll_ph();
         self.poll_ph_open(&ctx);
@@ -39483,6 +39745,7 @@ impl eframe::App for Kaleidotron {
                                     (&mut self.plugin_steam, "Steam", "Your installed Steam games → video search"),
                                     (&mut self.plugin_images, "Image Search", "Creative-Commons images (Openverse)"),
                                     (&mut self.plugin_audiosearch, "Audio Search", "Creative-Commons audio (Openverse)"),
+                                    (&mut self.plugin_deviantart, "DeviantArt", "Browse DeviantArt (set a client_id/secret in Preferences → Plugins)"),
                                     (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
                                     (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
                                     (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
@@ -39643,6 +39906,29 @@ impl eframe::App for Kaleidotron {
                                         "Stored locally only. Enables the full owned-games library.",
                                     );
                                 }
+
+                                // DeviantArt app credentials → the DeviantArt browse source. Register
+                                // an app at deviantart.com/developers (client type: Confidential) for
+                                // a client_id + client_secret; stored in secrets.json, out of sync.
+                                ui.add_space(8.0);
+                                ui.label("DeviantArt app (client-credentials)");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.da_client_id)
+                                            .hint_text("client_id")
+                                            .desired_width(150.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.da_client_secret)
+                                            .password(true)
+                                            .hint_text("client_secret")
+                                            .desired_width(170.0),
+                                    );
+                                });
+                                if ui.button("Register an app…").clicked() {
+                                    self.open_url("https://www.deviantart.com/developers/");
+                                }
+                                ui.weak("Stored locally only. Enables the DeviantArt browse source.");
 
                                 // DOSBox path → run DOS .com/.exe programs (click or right-click
                                 // "Run in DOSBox"). Off until a binary is set. A paste-able text
@@ -40437,6 +40723,8 @@ impl eframe::App for Kaleidotron {
             &[
                 ("steam_api_key", &self.steam_api_key, "Steam Web API key — steamcommunity.com/dev/apikey"),
                 ("ma_key", &self.ma_key, "ModArchive API key (optional; browsing works without one)"),
+                ("da_client_id", &self.da_client_id, "DeviantArt app client_id — deviantart.com/developers"),
+                ("da_client_secret", &self.da_client_secret, "DeviantArt app client_secret (keep private)"),
             ],
         ) {
             eprintln!("secrets.json: {e}");
@@ -40454,6 +40742,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_STEAM_KEY, &self.plugin_steam);
         eframe::set_value(storage, Self::PLUGIN_IMAGES_KEY, &self.plugin_images);
         eframe::set_value(storage, Self::PLUGIN_AUDIOSEARCH_KEY, &self.plugin_audiosearch);
+        eframe::set_value(storage, Self::PLUGIN_DA_KEY, &self.plugin_deviantart);
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
         eframe::set_value(storage, Self::RAIL_EXPANDED_KEY, &self.rail_expanded);
@@ -47293,6 +47582,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::httpfs::is_remote(p)
         || crate::modarchive::is_remote(p)
         || crate::lospec_gallery::is_remote(p)
+        || crate::deviantart::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -47545,6 +47835,58 @@ fn gallery_walk(
         }
     }
     let _ = tx.send(GalleryMsg::Done(n));
+}
+
+/// Worker: browse DeviantArt, paging by `offset`/`next_offset` until `want`. Sends the token as a
+/// Bearer header (via the cache helper); the virtual path nests the artist so pieces don't collide.
+fn da_walk(
+    token: String,
+    facet: String,
+    query: String,
+    want: usize,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<DaMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut offset = 0usize;
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let url = crate::deviantart::browse_url(&facet, &query, offset, 24);
+        let Ok(body) = crate::cache::get_bytes_bearer(&url, &token, Some(3600)) else {
+            break;
+        };
+        let Ok(page) = crate::deviantart::parse(&body) else {
+            break;
+        };
+        if page.items.is_empty() {
+            break;
+        }
+        for d in page.items {
+            if n >= want {
+                break;
+            }
+            // Nest by artist + short id so same-title pieces don't collide.
+            let short = d.id.split('-').next().unwrap_or("x").to_string();
+            let path = root.join(&d.artist).join(format!("{short}-{}", d.filename()));
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            n += 1;
+            if tx.send(DaMsg::Hit(virtual_entry(path), Box::new(d))).is_err() {
+                return;
+            }
+        }
+        if n >= want || !page.has_more || page.next_offset <= offset {
+            break;
+        }
+        offset = page.next_offset;
+    }
+    let _ = tx.send(DaMsg::Done(n));
 }
 
 /// A bare virtual result entry (no on-disk file behind it yet) — the shape every search worker
