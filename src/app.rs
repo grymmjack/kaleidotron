@@ -33022,24 +33022,28 @@ impl Kaleidotron {
         }
     }
 
-    /// Run a DOS executable (`.com`/`.exe`/`.bat`) in DOSBox. DOSBox-Staging auto-mounts the
-    /// program's containing directory as `C:` and runs it when the path is passed as an argument;
-    /// `-exit` quits DOSBox when the program does. Spawned detached (no wait) so the UI stays live.
-    /// `resolve_local` handles a file inside an archive / 16colo pack (its real temp copy).
+    /// Run a DOS executable (`.com`/`.exe`) in DOSBox. Passing the program path makes DOSBox-Staging
+    /// mount its containing directory as `C:`, run it, and quit when it exits — so no `-exit` needed.
+    /// **`--noautoexec` is the key:** it skips the user's `[autoexec]` (which commonly mounts drives
+    /// and launches a menu program that would sit there interactively and never let our program run —
+    /// exactly the "nothing happens" symptom). Spawned detached so the UI stays live; `resolve_local`
+    /// handles a file inside an archive / 16colo pack (its real temp copy).
     fn run_in_dosbox(&mut self, path: &Path) {
         let Some(dosbox) = self.dosbox_path.clone() else {
-            self.status = "Set the DOSBox path in Preferences → Paths first".into();
+            self.status =
+                "Set the DOSBox binary in Preferences → Format plugins → DOSBox first".into();
             return;
         };
         if !dosbox.exists() {
-            self.status = format!("DOSBox not found at {}", dosbox.display());
+            self.status = format!("DOSBox binary not found at {}", dosbox.display());
             return;
         }
         let real = self.resolve_local(path);
         // Run from the program's own folder so relative data paths resolve as they would on C:.
         let cwd = real.parent().map(|p| p.to_path_buf());
         let mut cmd = std::process::Command::new(&dosbox);
-        cmd.arg(&real).arg("-exit");
+        // `--noautoexec` before the path: skip the user's menu autoexec, then mount+run our program.
+        cmd.arg("--noautoexec").arg(&real);
         if let Some(dir) = &cwd {
             cmd.current_dir(dir);
         }
@@ -38757,31 +38761,60 @@ impl eframe::App for Kaleidotron {
                                     );
                                 }
 
-                                // DOSBox path → run DOS .com/.exe/.bat programs (double-click or
-                                // right-click "Run in DOSBox"). Off until a binary is set.
+                                // DOSBox path → run DOS .com/.exe programs (click or right-click
+                                // "Run in DOSBox"). Off until a binary is set. A paste-able text
+                                // field is the reliable path in — the rfd file dialog can silently
+                                // fail on some Wayland/KDE setups, which is why this looked "broken".
                                 ui.add_space(8.0);
                                 ui.label("DOSBox");
-                                let cur = self
-                                    .dosbox_path
-                                    .as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| "Not set — .com/.exe/.bat won't run".into());
-                                ui.weak(format!("Binary: {cur}"));
                                 ui.horizontal(|ui| {
-                                    if ui.button("Choose…").clicked() {
+                                    // Rebuild the string from the source of truth each frame and
+                                    // write back on edit (egui keeps the cursor state by widget id).
+                                    let mut s = self
+                                        .dosbox_path
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default();
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut s)
+                                            .hint_text("/path/to/dosbox")
+                                            .desired_width(320.0),
+                                    );
+                                    if resp.changed() {
+                                        let t = s.trim();
+                                        self.dosbox_path =
+                                            (!t.is_empty()).then(|| PathBuf::from(t));
+                                        prefs_refresh = true; // re-scan so .com/.exe tiles appear
+                                    }
+                                    if ui.button("Browse…").clicked() {
                                         if let Some(f) = rfd::FileDialog::new().pick_file() {
                                             self.dosbox_path = Some(f);
-                                            prefs_refresh = true; // re-scan so .com/.exe tiles appear
+                                            prefs_refresh = true;
                                         }
                                     }
                                     if self.dosbox_path.is_some() && ui.button("Clear").clicked() {
                                         self.dosbox_path = None;
-                                        prefs_refresh = true; // re-scan so they drop from the listing
+                                        prefs_refresh = true;
                                     }
                                 });
+                                // Live status: found / missing / unset, so a wrong path is obvious.
+                                match &self.dosbox_path {
+                                    Some(p) if p.exists() => {
+                                        ui.weak(format!("\u{2713} Found: {}", p.display()));
+                                    }
+                                    Some(p) => {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 120, 80),
+                                            format!("\u{2717} Not found at {}", p.display()),
+                                        );
+                                    }
+                                    None => {
+                                        ui.weak("Not set — .com/.exe won't run.");
+                                    }
+                                }
                                 ui.weak(
-                                    "Point at the DOSBox / DOSBox-Staging binary. DOS programs then \
-                                     run in DOSBox (its folder is mounted as C:).",
+                                    "Paste or browse to the DOSBox / DOSBox-Staging binary. DOS \
+                                     programs then run in DOSBox (their folder is mounted as C:).",
                                 );
 
                                 // ModArchive API key — OPTIONAL. Browsing already works without
