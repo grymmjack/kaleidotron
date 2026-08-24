@@ -983,7 +983,7 @@ impl RailSection {
     /// button per source you actually enabled, so the rail stays short.
     fn source_buttons() -> &'static [(u8, &'static str, &'static str, &'static str)] {
         &[
-            (1, icons::BOLT, "16colo", "16colo.rs — ANSI art archive"),
+            (1, icons::BOLT, "16colo.rs", "16colo.rs — ANSI art archive"),
             (5, icons::PLAY, "YouTube", "YouTube"),
             (8, icons::SEARCH, "Images", "Image search"),
             (16, "\u{1F39E}", "GIFs", "Animated GIF search"),
@@ -1003,7 +1003,7 @@ impl RailSection {
         match self {
             RailSection::Files => &[(0, "Local")],
             RailSection::Sources => &[
-                (1, "16colors"),
+                (1, "16colo.rs"),
                 (5, "YouTube"),
                 (8, "Images"),
                 (16, "GIFs"),
@@ -2330,6 +2330,13 @@ pub struct Kaleidotron {
     plugin_ph: bool,
     plugin_gfonts: bool,
     plugin_ma: bool,
+    // Sources that used to be always-on; now gated like every other web source (Preferences →
+    // Sources), so a clean profile shows only what you switched on.
+    plugin_16c: bool,        // 16colo.rs ANSI/ASCII art archive
+    plugin_youtube: bool,    // YouTube search + playback
+    plugin_steam: bool,      // Steam library → video search
+    plugin_images: bool,     // Openverse image search
+    plugin_audiosearch: bool, // Openverse audio search
     gif_recolor: bool, // run the Recolor/PixelFX stack on animated GIF frames
     gif_speed: f32,    // GIF playback rate (0.25×–4×), like the video player's Speed
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
@@ -2477,6 +2484,11 @@ impl Kaleidotron {
     const PLUGIN_PH_KEY: &'static str = "plugin_polyhaven";
     const PLUGIN_GFONTS_KEY: &'static str = "plugin_gfonts";
     const PLUGIN_MA_KEY: &'static str = "plugin_modarchive";
+    const PLUGIN_16C_KEY: &'static str = "plugin_16colo";
+    const PLUGIN_YOUTUBE_KEY: &'static str = "plugin_youtube";
+    const PLUGIN_STEAM_KEY: &'static str = "plugin_steam";
+    const PLUGIN_IMAGES_KEY: &'static str = "plugin_images";
+    const PLUGIN_AUDIOSEARCH_KEY: &'static str = "plugin_audiosearch";
     const GIF_RECOLOR_KEY: &'static str = "gif_recolor";
     const GIF_SPEED_KEY: &'static str = "gif_speed";
     /// Audio preview: start on select + loop until stopped.
@@ -4479,6 +4491,11 @@ impl Kaleidotron {
             plugin_ph: load_bool(Self::PLUGIN_PH_KEY, false),
             plugin_gfonts: load_bool(Self::PLUGIN_GFONTS_KEY, false),
             plugin_ma: load_bool(Self::PLUGIN_MA_KEY, false),
+            plugin_16c: load_bool(Self::PLUGIN_16C_KEY, false),
+            plugin_youtube: load_bool(Self::PLUGIN_YOUTUBE_KEY, false),
+            plugin_steam: load_bool(Self::PLUGIN_STEAM_KEY, false),
+            plugin_images: load_bool(Self::PLUGIN_IMAGES_KEY, false),
+            plugin_audiosearch: load_bool(Self::PLUGIN_AUDIOSEARCH_KEY, false),
             gif_recolor: load_bool(Self::GIF_RECOLOR_KEY, false),
             gif_speed: cc
                 .storage
@@ -4673,6 +4690,11 @@ impl Kaleidotron {
             e(W, "plugin_ph", self.plugin_ph, "Poly Haven CC0 models / textures / HDRIs"),
             e(W, "plugin_gfonts", self.plugin_gfonts, "Google Fonts browser"),
             e(W, "plugin_ma", self.plugin_ma, "The Mod Archive (tracker modules)"),
+            e(W, "plugin_16colo", self.plugin_16c, "16colo.rs ANSI art archive"),
+            e(W, "plugin_youtube", self.plugin_youtube, "YouTube browser (needs yt-dlp)"),
+            e(W, "plugin_steam", self.plugin_steam, "Steam library → video search"),
+            e(W, "plugin_images", self.plugin_images, "image search (Openverse)"),
+            e(W, "plugin_audiosearch", self.plugin_audiosearch, "audio search (Openverse)"),
             // Audio
             e(AU, "audio_autoplay", self.audio_autoplay, "start playing as soon as a clip is opened"),
             e(AU, "audio_volume", self.audio_volume, "master playback volume, 0..1"),
@@ -4905,6 +4927,11 @@ impl Kaleidotron {
             ("plugin_ph", &mut self.plugin_ph),
             ("plugin_gfonts", &mut self.plugin_gfonts),
             ("plugin_ma", &mut self.plugin_ma),
+            ("plugin_16colo", &mut self.plugin_16c),
+            ("plugin_youtube", &mut self.plugin_youtube),
+            ("plugin_steam", &mut self.plugin_steam),
+            ("plugin_images", &mut self.plugin_images),
+            ("plugin_audiosearch", &mut self.plugin_audiosearch),
         ] {
             if let Some(v) = st::get_bool(&m, key) {
                 *flag = v;
@@ -34990,13 +35017,18 @@ impl Kaleidotron {
 
     fn places_tab_enabled(&self, idx: u8) -> bool {
         match idx {
+            1 => self.plugin_16c,
             2 | 3 => self.plugin_audio,
+            5 => self.plugin_youtube,
+            6 => self.plugin_steam,
             7 => self.plugin_ai,
+            8 => self.plugin_images,
             9 => self.plugin_icons,
             10 => self.plugin_vectors,
             11 => self.plugin_lospec,
             12 => self.plugin_ph,
             13 => self.plugin_gfonts,
+            14 => self.plugin_audiosearch,
             15 => self.plugin_ma,
             16 => self.plugin_gifs,
             17 => self.plugin_web,
@@ -36136,17 +36168,7 @@ impl Kaleidotron {
                     // A disabled source's tab button is gone, but `places_tab` may still point at
                     // it (it was selected when the user unchecked it) — that would render a blank
                     // panel with no way back, so fall back to Local.
-                    if !match self.places_tab {
-                        9 => self.plugin_icons,
-                        10 => self.plugin_vectors,
-                        11 => self.plugin_lospec,
-                        12 => self.plugin_ph,
-                        13 => self.plugin_gfonts,
-                        15 => self.plugin_ma,
-                        16 => self.plugin_gifs,
-                        17 => self.plugin_web,
-                        _ => true,
-                    } {
+                    if !self.places_tab_enabled(self.places_tab) {
                         self.places_tab = 0;
                     }
                     if self.places_tab == 0 {
@@ -38864,6 +38886,11 @@ impl eframe::App for Kaleidotron {
                                 ui.label("Web sources");
                                 ui.weak("Off by default — switch on the sources you browse.");
                                 for (on, label, hover) in [
+                                    (&mut self.plugin_16c, "16colo.rs", "The 16colo.rs ANSI/ASCII art archive"),
+                                    (&mut self.plugin_youtube, "YouTube", "Search + play YouTube videos (needs yt-dlp)"),
+                                    (&mut self.plugin_steam, "Steam", "Your installed Steam games → video search"),
+                                    (&mut self.plugin_images, "Image Search", "Creative-Commons images (Openverse)"),
+                                    (&mut self.plugin_audiosearch, "Audio Search", "Creative-Commons audio (Openverse)"),
                                     (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
                                     (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
                                     (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
@@ -39778,6 +39805,11 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_PH_KEY, &self.plugin_ph);
         eframe::set_value(storage, Self::PLUGIN_GFONTS_KEY, &self.plugin_gfonts);
         eframe::set_value(storage, Self::PLUGIN_MA_KEY, &self.plugin_ma);
+        eframe::set_value(storage, Self::PLUGIN_16C_KEY, &self.plugin_16c);
+        eframe::set_value(storage, Self::PLUGIN_YOUTUBE_KEY, &self.plugin_youtube);
+        eframe::set_value(storage, Self::PLUGIN_STEAM_KEY, &self.plugin_steam);
+        eframe::set_value(storage, Self::PLUGIN_IMAGES_KEY, &self.plugin_images);
+        eframe::set_value(storage, Self::PLUGIN_AUDIOSEARCH_KEY, &self.plugin_audiosearch);
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
         eframe::set_value(storage, Self::RAIL_EXPANDED_KEY, &self.rail_expanded);
