@@ -2368,6 +2368,13 @@ pub struct Kaleidotron {
     // executables (`.com`/`.exe`/`.bat`) list in the grid and run in DOSBox on double-click /
     // right-click "Run in DOSBox". None = the feature is off (they aren't listed as runnable).
     dosbox_path: Option<PathBuf>,
+    // Keep the DOSBox window open after the program exits (run it, then `pause` for a keypress) so
+    // a program's outro screen / final ANSI is readable instead of vanishing when DOSBox quits.
+    // Persisted; default ON (this browser is for looking at scene art, outros included).
+    dosbox_keep_open: bool,
+    // Emulated CPU/speed preset: an index into `DOSBOX_MACHINES`. 0 = Auto (no override). Persisted.
+    // Lets a program run at a period-accurate speed (e.g. a 486 DX2/66) instead of DOSBox's default.
+    dosbox_machine: usize,
     yt_max_height: u32, // YouTube download resolution cap (0 = best); persisted, default 1080
     yt_open_folder_after: bool, // reveal the file in the OS file manager once a download finishes
     // Bulk 16colo.rs download (a whole artist / group / search / pack → a local folder,
@@ -2439,6 +2446,8 @@ impl Kaleidotron {
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
     const DOSBOX_PATH_KEY: &'static str = "dosbox_path";
+    const DOSBOX_KEEP_OPEN_KEY: &'static str = "dosbox_keep_open";
+    const DOSBOX_MACHINE_KEY: &'static str = "dosbox_machine";
     const YT_QUALITY_KEY: &'static str = "yt_max_height";
     const YT_OPEN_FOLDER_KEY: &'static str = "yt_open_folder_after";
     const YT_COOKIES_KEY: &'static str = "yt_cookies_browser";
@@ -2742,6 +2751,15 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::DOSBOX_PATH_KEY))
             .flatten();
+        let dosbox_keep_open = cc
+            .storage
+            .and_then(|s| eframe::get_value::<bool>(s, Self::DOSBOX_KEEP_OPEN_KEY))
+            .unwrap_or(true);
+        let dosbox_machine = cc
+            .storage
+            .and_then(|s| eframe::get_value::<usize>(s, Self::DOSBOX_MACHINE_KEY))
+            .filter(|&i| i < DOSBOX_MACHINES.len())
+            .unwrap_or(0);
         let yt_max_height = cc
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::YT_QUALITY_KEY))
@@ -4479,6 +4497,8 @@ impl Kaleidotron {
             steam_names: HashMap::new(),
             yt_download_dir,
             dosbox_path,
+            dosbox_keep_open,
+            dosbox_machine,
             yt_max_height,
             yt_open_folder_after,
             bulk_dl: None,
@@ -4645,6 +4665,8 @@ impl Kaleidotron {
             e(PA, "palette_dir", self.palette_dir.clone(), "extra folder scanned for .gpl palettes"),
             e(PA, "yt_download_dir", self.yt_download_dir.clone(), "where YouTube downloads land (null = default)"),
             e(PA, "dosbox_path", self.dosbox_path.clone(), "path to the DOSBox binary (null = off; enables Run in DOSBox for .com/.exe/.bat)"),
+            e(PA, "dosbox_keep_open", self.dosbox_keep_open, "keep the DOSBox window open after a program exits (press a key), so outro screens are readable"),
+            e(PA, "dosbox_machine", self.dosbox_machine as u64, "emulated CPU preset index (0=Auto, 4=486DX2/66 — see the Preferences dropdown)"),
             e(PA, "yt_max_height", self.yt_max_height, "YouTube download resolution cap, e.g. 720"),
             e(PA, "git_enabled", self.git_enabled, "show git status badges in local repos"),
             e(PA, "tasks_enabled", self.tasks_enabled, "read .vscode/tasks.json and offer its tasks"),
@@ -4821,6 +4843,15 @@ impl Kaleidotron {
         }
         if let Some(v) = m.get("dosbox_path") {
             self.dosbox_path = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+        }
+        if let Some(v) = st::get_bool(&m, "dosbox_keep_open") {
+            self.dosbox_keep_open = v;
+        }
+        if let Some(v) = st::get_u64(&m, "dosbox_machine") {
+            let i = v as usize;
+            if i < DOSBOX_MACHINES.len() {
+                self.dosbox_machine = i;
+            }
         }
         if let Some(v) = st::get_string(&m, "palette_dir") {
             if !v.trim().is_empty() {
@@ -19420,7 +19451,9 @@ impl Kaleidotron {
         }
     }
 
-    /// In the single view, step to the previous/next *image* entry, skipping folders.
+    /// In the single view, step to the previous/next *viewable* entry, skipping folders and DOS
+    /// executables. A `.com`/`.exe` must only ever run on an explicit click — never from prev/next
+    /// (or the slideshow, which routes through here), so browsing a pack of art never spawns DOSBox.
     fn step_image(&mut self, ctx: &egui::Context, forward: bool) {
         let n = self.entries.len();
         let mut i = self.selected as isize;
@@ -19430,7 +19463,7 @@ impl Kaleidotron {
                 return;
             }
             let e = &self.entries[i as usize];
-            if !e.is_dir && !e.is_archive {
+            if !e.is_dir && !e.is_archive && !is_dos_executable(&e.path) {
                 self.activate(ctx, i as usize);
                 return;
             }
@@ -19447,7 +19480,8 @@ impl Kaleidotron {
             let mut imgs: Vec<PathBuf> = self
                 .entries
                 .iter()
-                .filter(|e| !e.is_dir && !e.is_archive)
+                // DOS executables are never part of a shuffle/slideshow — only a manual launch.
+                .filter(|e| !e.is_dir && !e.is_archive && !is_dos_executable(&e.path))
                 .map(|e| e.path.clone())
                 .collect();
             if imgs.len() <= 1 {
@@ -33050,6 +33084,7 @@ impl Kaleidotron {
             return;
         }
         let real = self.resolve_local(path);
+        let keep = self.dosbox_keep_open;
         // If the file lives inside the current mount (a 16colo pack / archive), mount the pack ROOT
         // as C: so all of its contents are reachable, then cd into the program's own subdir.
         let mount_root = self
@@ -33057,28 +33092,57 @@ impl Kaleidotron {
             .as_ref()
             .map(|m| m.temp_root.clone())
             .filter(|root| real.starts_with(root));
+        // Quote a DOS path/name only when it has a space (LFN) — quoting a bare 8.3 command name can
+        // make COMMAND.COM fail to find it, and DOS names almost never contain spaces.
+        let q = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };
         let mut cmd = std::process::Command::new(&dosbox);
         cmd.arg("--noautoexec");
-        if let Some(root) = &mount_root {
-            let rel = real.strip_prefix(root).unwrap_or(&real);
-            // DOS uses backslash paths; a leading `\` makes the cd absolute from C: root. Quote a
-            // path/name only when it has a space (LFN) — quoting a bare 8.3 command name can make
-            // COMMAND.COM fail to find it, and DOS names almost never contain spaces.
-            let subdir = rel
-                .parent()
-                .map(|p| p.to_string_lossy().replace('/', "\\"))
-                .filter(|s| !s.is_empty());
-            let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Emulated-machine preset (CPU type + fixed cycles) so speed-sensitive DOS programs run at a
+        // period-accurate rate. Index 0 (Auto) adds nothing.
+        if let Some((_, cputype, cycles)) = DOSBOX_MACHINES.get(self.dosbox_machine) {
+            if !cputype.is_empty() {
+                cmd.arg("--set").arg(format!("cputype={cputype}"));
+            }
+            if *cycles > 0 {
+                // Fix both the real- and protected-mode cycle budgets to the era's speed (the
+                // modern setting names; bare `cycles` is deprecated in DOSBox-Staging).
+                cmd.arg("--set").arg(format!("cpu_cycles={cycles}"));
+                cmd.arg("--set").arg(format!("cpu_cycles_protected={cycles}"));
+            }
+        }
+        // Either the pack-root explicit mount (dependencies reachable) or — for a plain local file
+        // with keep-open on — the parent-mount explicit form, since only the `-c` run form can be
+        // followed by `pause`. A plain local file with keep-open OFF uses the simplest path-passing
+        // form (DOSBox mounts the parent + resolves the runnable name itself).
+        let explicit_root = mount_root.clone().or_else(|| {
+            (keep).then(|| real.parent().map(|p| p.to_path_buf())).flatten()
+        });
+        if let Some(root) = &explicit_root {
+            // `cd` only makes sense relative to the mount root; for the local keep-open case the
+            // mount root IS the parent, so there's no subdir.
+            let subdir = mount_root.as_ref().and_then(|_| {
+                real.strip_prefix(root)
+                    .ok()
+                    .and_then(|rel| rel.parent())
+                    .map(|p| p.to_string_lossy().replace('/', "\\"))
+                    .filter(|s| !s.is_empty())
+            });
+            let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             cmd.arg("-c").arg(format!("mount c \"{}\"", root.display())).arg("-c").arg("c:");
             if let Some(sub) = subdir {
+                // The leading `\` must be INSIDE the quotes: `cd "\SUB DIR"`, not `cd \"SUB DIR"`.
                 let arg = if sub.contains(' ') { format!("cd \"\\{sub}\"") } else { format!("cd \\{sub}") };
                 cmd.arg("-c").arg(arg);
             }
-            let run = if name.contains(' ') { format!("\"{name}\"") } else { name };
-            cmd.arg("-c").arg(run).arg("--exit");
+            cmd.arg("-c").arg(q(&name));
+            // Keep-open: pause for a keypress so an outro screen stays readable, THEN exit.
+            if keep {
+                cmd.arg("-c").arg("pause");
+            }
+            cmd.arg("--exit");
             cmd.current_dir(root);
         } else {
-            // Plain local file: let DOSBox mount the parent + resolve the runnable name.
+            // Plain local file, auto-close: let DOSBox mount the parent + resolve the runnable name.
             cmd.arg(&real);
             if let Some(dir) = real.parent() {
                 cmd.current_dir(dir);
@@ -37743,7 +37807,11 @@ impl eframe::App for Kaleidotron {
                                                                // first art file. Both async ops idle ⇒ the listing has settled.
         if self.pending_autoplay && self.random_rx.is_none() && self.remote_rx.is_none() {
             self.pending_autoplay = false;
-            if let Some(idx) = self.entries.iter().position(|e| !e.is_dir && !e.is_archive) {
+            if let Some(idx) = self
+                .entries
+                .iter()
+                .position(|e| !e.is_dir && !e.is_archive && !is_dos_executable(&e.path))
+            {
                 self.activate(&ctx, idx);
             } else if self.shuffle {
                 self.start_random_pack(); // empty/failed pack → try the next one
@@ -38853,6 +38921,36 @@ impl eframe::App for Kaleidotron {
                                     "Paste or browse to the DOSBox / DOSBox-Staging binary. DOS \
                                      programs then run in DOSBox (their folder is mounted as C:).",
                                 );
+                                ui.checkbox(
+                                    &mut self.dosbox_keep_open,
+                                    "Keep window open after the program exits",
+                                )
+                                .on_hover_text(
+                                    "Pause for a keypress when the program quits, so an outro \
+                                     screen / final ANSI stays up instead of the window closing.",
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Machine");
+                                    egui::ComboBox::from_id_salt("dosbox_machine")
+                                        .selected_text(DOSBOX_MACHINES[self.dosbox_machine].0)
+                                        .show_ui(ui, |ui| {
+                                            for (i, (label, ..)) in
+                                                DOSBOX_MACHINES.iter().enumerate()
+                                            {
+                                                ui.selectable_value(
+                                                    &mut self.dosbox_machine,
+                                                    i,
+                                                    *label,
+                                                );
+                                            }
+                                        });
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Emulated CPU speed for Run in DOSBox. Auto runs as fast as \
+                                     possible; the era presets slow it to period-accurate cycles \
+                                     (so speed-sensitive DOS programs behave).",
+                                );
 
                                 // ModArchive API key — OPTIONAL. Browsing already works without
                                 // one (the public search page is parsed); a key just upgrades to
@@ -39483,6 +39581,8 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::DOSBOX_PATH_KEY, &self.dosbox_path);
+        eframe::set_value(storage, Self::DOSBOX_KEEP_OPEN_KEY, &self.dosbox_keep_open);
+        eframe::set_value(storage, Self::DOSBOX_MACHINE_KEY, &self.dosbox_machine);
         eframe::set_value(storage, Self::YT_QUALITY_KEY, &self.yt_max_height);
         eframe::set_value(
             storage,
@@ -49549,6 +49649,21 @@ fn read_file_tail(path: &Path, n: u64) -> Option<Vec<u8>> {
         Some(buf)
     }
 }
+
+/// Emulated-machine presets for Run in DOSBox: `(label, cputype, cycles)`. `cputype == ""` +
+/// `cycles == 0` means "no override" (DOSBox's own default). The cycle counts are the widely-used
+/// DOSBox approximations for each era's speed; `cputype` picks the instruction set / prefetch model
+/// (DOSBox has no sub-386 cputype, so XT/286 use `386_prefetch` and lean on the low cycle count for
+/// the slow feel). Index 0 is the persisted default.
+const DOSBOX_MACHINES: &[(&str, &str, u32)] = &[
+    ("Auto (fastest)", "", 0),
+    ("8088 XT (4.77 MHz)", "386", 315),
+    ("286 (12 MHz)", "386", 2750),
+    ("386DX (33 MHz)", "386", 6000),
+    ("486DX2/66", "486", 23000),
+    ("Pentium 90", "pentium", 52000),
+    ("Pentium MMX 200", "pentium_mmx", 120000),
+];
 
 /// DOS executables we can hand to DOSBox: `.com`/`.exe` (case-insensitive). `.bat`/`.cmd` are
 /// intentionally NOT here — they stay viewable/editable text (they're also in `CODE_EXTS`), and
