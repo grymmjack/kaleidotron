@@ -33241,6 +33241,9 @@ impl Kaleidotron {
         let q = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };
         let mut cmd = std::process::Command::new(&dosbox);
         cmd.arg("--noautoexec");
+        // Hide the "Welcome to DOSBox Staging …" banner that otherwise prints in the emulated screen
+        // before the program runs (INTRO/HELP/keymapper hints) — we're launching straight into art.
+        cmd.arg("--set").arg("startup_verbosity=quiet");
         // SVGA: force an S3 Trio (with VESA) video adapter so high-res viewers/demos that need modes
         // beyond plain VGA work. `machine` is a startup config setting (the video hardware is built
         // once at boot), so it's set just like `cputype`.
