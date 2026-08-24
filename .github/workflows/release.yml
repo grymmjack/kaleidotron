@@ -1,15 +1,13 @@
 name: Release
 
-# Build standalone binaries for Linux, Windows and macOS (a universal Intel+ARM binary).
+# Build standalone binaries for Linux, Windows and macOS (Apple Silicon).
 #
 # - Push a tag like `v0.1.0` → builds every target AND publishes a GitHub Release with the
 #   archives attached.
 # - Run manually (Actions → Release → Run workflow) → builds them and uploads the archives
 #   as downloadable workflow artifacts, but publishes nothing. Handy for a dry run.
 #
-# macOS is built as ONE universal binary (arm64 + x86_64 fused with `lipo`) on the arm64
-# runner, rather than a separate Intel job — the hosted Intel (macos-13) runners queue for
-# ages, and a universal binary runs on both Apple Silicon and Intel Macs anyway.
+# macOS is arm64 only (Apple Silicon) — Intel Macs are intentionally not targeted.
 #
 # Cross-platform is near-zero-config: TLS is pure-Rust (ureq → rustls/ring, no system
 # OpenSSL); file dialogs use rfd's XDG-portal backend (no GTK dep); the vendored libxmp
@@ -102,37 +100,30 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macos-universal
-    runs-on: macos-latest # Apple Silicon; we cross-build x86_64 here too
+    name: Build macos-arm64
+    runs-on: macos-latest # Apple Silicon
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-universal
+          key: aarch64-apple-darwin
 
-      # Apple's clang cross-compiles x86_64 from the arm64 host natively (incl. the vendored
-      # libxmp C code), so both slices build on one runner.
-      - name: Build both arches (release)
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Build (release)
+        run: cargo build --release --locked --target aarch64-apple-darwin
 
-      - name: Fuse into a universal binary + package
+      - name: Package
         shell: bash
         run: |
           version="${GITHUB_REF_NAME}"
           [ "${GITHUB_REF_TYPE}" = "tag" ] || version="dev"
-          stage="kaleidotron-${version}-macos-universal"
+          stage="kaleidotron-${version}-macos-arm64"
           mkdir -p "$stage"
-          lipo -create -output "$stage/kaleidotron" \
-            target/aarch64-apple-darwin/release/kaleidotron \
-            target/x86_64-apple-darwin/release/kaleidotron
-          lipo -info "$stage/kaleidotron"
+          cp target/aarch64-apple-darwin/release/kaleidotron "$stage/"
           cp README.md "$stage/" 2>/dev/null || true
           tar -czf "${stage}.tar.gz" "$stage"
           echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
@@ -140,7 +131,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-universal
+          name: macos-arm64
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
