@@ -16,6 +16,13 @@ pub const SEARCH: &str = "search";
 const API: &str = "https://lospec.com/palette-list/load";
 const DL: &str = "https://lospec.com/palette-list";
 const PER_PAGE: usize = 10; // the load endpoint's fixed page size
+const REFERER: &str = "https://lospec.com/palette-list";
+
+/// Cached GET through the browser UA + a lospec Referer — all Lospec requests masquerade as the
+/// site's own browser so they can't be singled out and blocked (the app author's call).
+fn get(url: &str) -> Result<Vec<u8>, String> {
+    crate::cache::get_bytes_ua(url, crate::cache::BROWSER_UA, REFERER, Some(86_400))
+}
 
 pub fn is_remote(path: &Path) -> bool {
     path.starts_with(ROOT)
@@ -162,7 +169,7 @@ pub fn search_by_tag(tag: &str, want: usize) -> Result<Vec<LospecPalette>, Strin
     let mut seen = std::collections::HashSet::new();
     // 1) `load?tag=` — inline colours, paged, no per-palette fetch. Complete for common tags.
     for page in 1..=want.div_ceil(PER_PAGE) {
-        let Ok(body) = crate::cache::get_bytes(&browse_url(tag, page), Some(86_400)) else {
+        let Ok(body) = get(&browse_url(tag, page)) else {
             break;
         };
         let batch = parse(&body);
@@ -181,7 +188,7 @@ pub fn search_by_tag(tag: &str, want: usize) -> Result<Vec<LospecPalette>, Strin
     // 2) `/palette-list/tag/<tag>` page — the complete index; union in anything (1) missed, fetching
     //    each palette's `.json` for its colours.
     if out.len() < want {
-        if let Ok(body) = crate::cache::get_bytes(&format!("{DL}/tag/{}", enc(tag)), Some(86_400)) {
+        if let Ok(body) = get(&format!("{DL}/tag/{}", enc(tag))) {
             for slug in scrape_tag_slugs(&String::from_utf8_lossy(&body)) {
                 if out.len() >= want {
                     break;
@@ -216,7 +223,7 @@ fn scrape_tag_slugs(html: &str) -> Vec<String> {
 
 /// Fetch one palette's `.json` (`name` + `colors`; the tag page carries no inline colours).
 fn fetch_palette(slug: &str) -> Result<LospecPalette, String> {
-    let body = crate::cache::get_bytes(&format!("{DL}/{slug}.json"), Some(86_400))?;
+    let body = get(&format!("{DL}/{slug}.json"))?;
     let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     let colors: Vec<[u8; 3]> = v["colors"]
         .as_array()
@@ -247,7 +254,7 @@ fn browse_all(want: usize) -> Result<Vec<LospecPalette>, String> {
     for page in 1..=pages {
         // A later page failing (Lospec 500s on some edge requests) must NOT discard the pages that
         // already succeeded — break with what we have instead of `?`-ing the whole browse away.
-        let body = match crate::cache::get_bytes(&browse_url("", page), Some(86_400)) {
+        let body = match get(&browse_url("", page)) {
             Ok(b) => b,
             Err(e) => {
                 if page == 1 {

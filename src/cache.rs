@@ -131,6 +131,103 @@ pub fn get_bytes(url: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// A recent Firefox/Linux User-Agent for the few endpoints that are browser-only AJAX and reject or
+/// throttle non-browser clients (Lospec's gallery paging POST). Used ONLY there — a request shaped
+/// exactly like the browser one the endpoint is built for — while the rest of the app keeps the
+/// honest, identifying [`USER_AGENT`].
+pub const BROWSER_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+
+/// Cached GET with an explicit User-Agent + Referer — for hosts that behave as browser-only and
+/// reject/limit the honest UA (all of Lospec). Same disk cache as [`get_bytes`] (the UA doesn't
+/// change the bytes for a URL), still gated by the netpolicy choke point.
+pub fn get_bytes_ua(url: &str, ua: &str, referer: &str, ttl: Option<i64>) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = read_blob(url, ttl) {
+        return Ok(bytes);
+    }
+    crate::netpolicy::before_request(url)?;
+    let mut req = ureq::get(url).set("User-Agent", ua);
+    if !referer.is_empty() {
+        req = req.set("Referer", referer);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            if code == 429 || code == 503 {
+                crate::netpolicy::note_throttled(url, r.header("Retry-After"));
+            }
+            return Err(format!("HTTP {code}"));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(FETCH_CAP)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    write_blob(url, &buf);
+    Ok(buf)
+}
+
+/// Cached POST of a `multipart/form-data` body, for endpoints that only page via POST (Lospec's
+/// gallery). Sends a browser UA + the given `referer` + a matching `Origin` so it looks like the
+/// site's own fetch. Cache key folds in the form fields, so each (filters, page) caches separately.
+pub fn post_form(
+    url: &str,
+    referer: &str,
+    fields: &[(&str, &str)],
+    ttl: Option<i64>,
+) -> Result<Vec<u8>, String> {
+    const BOUNDARY: &str = "----kaleidotronformboundary7MA4YWxkTrZu0gW";
+    // Cache key = url + the form fields (paging + filters cache independently).
+    let key = format!(
+        "POST {url}\n{}",
+        fields
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    );
+    if let Some(bytes) = read_blob(&key, ttl) {
+        return Ok(bytes);
+    }
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    crate::netpolicy::before_request(url)?;
+    let origin = crate::netpolicy::split_url(url).map(|(o, _)| o).unwrap_or_default();
+    let ct = format!("multipart/form-data; boundary={BOUNDARY}");
+    let resp = match ureq::post(url)
+        .set("User-Agent", BROWSER_UA)
+        .set("Accept", "*/*")
+        .set("Content-Type", &ct)
+        .set("Origin", &origin)
+        .set("Referer", referer)
+        .send_bytes(&body)
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            if code == 429 || code == 503 {
+                crate::netpolicy::note_throttled(url, r.header("Retry-After"));
+            }
+            return Err(format!("HTTP {code}"));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(FETCH_CAP)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    write_blob(&key, &buf);
+    Ok(buf)
+}
+
 /// Cached GET → a file path *named* `filename` (so the decoder's extension dispatch
 /// still works, and a pack zip keeps its `.zip`). Immutable — once fetched it's reused.
 /// Returns a path even when the cache is disabled (a temp file).

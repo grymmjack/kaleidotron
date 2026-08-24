@@ -2265,9 +2265,12 @@ pub struct Kaleidotron {
     gallery_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded full image
     gallery_dir: PathBuf,                     // <data>/lospec-gallery — downloaded pieces
     gallery_medium: usize,                    // index into lospec_gallery::MEDIUMS (sidebar filter)
+    gallery_category: String,                 // category slug (medium-dependent; "all" = none)
     gallery_sorting: usize,                   // index into SORTINGS
     gallery_time: usize,                      // index into TIMES
     gallery_tag: String,                      // optional tag filter (blank = none)
+    gallery_masterpiece: bool,                // "Monthly masterpieces only"
+    gallery_want: usize,                      // how many pieces to fetch (Load more bumps this)
     #[allow(clippy::type_complexity)]
     lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     // Poly Haven (CC0 3D models / textures / HDRIs). A model is a *bundle* (gltf manifest + .bin +
@@ -4458,9 +4461,12 @@ impl Kaleidotron {
             gallery_files: HashMap::new(),
             gallery_dir,
             gallery_medium: 0,
+            gallery_category: "all".to_string(),
             gallery_sorting: 0,
             gallery_time: 0,
             gallery_tag: String::new(),
+            gallery_masterpiece: false,
+            gallery_want: 128,
             lospec_detail: None,
             lospec_authors: HashMap::new(),
             lospec_author_rx: None,
@@ -6728,7 +6734,14 @@ impl Kaleidotron {
         let medium = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
         let sorting = g::SORTINGS.get(self.gallery_sorting).map_or("latest", |s| s.0);
         let time = g::TIMES.get(self.gallery_time).map_or("all", |t| t.0);
-        g::browse_path(medium, sorting, time, &self.gallery_tag)
+        g::browse_path(
+            medium,
+            &self.gallery_category,
+            sorting,
+            time,
+            &self.gallery_tag,
+            self.gallery_masterpiece,
+        )
     }
 
     fn open_gallery(&mut self, dir: PathBuf) {
@@ -6747,11 +6760,14 @@ impl Kaleidotron {
     /// Kick off a gallery browse on a worker; pieces stream in via `poll_gallery`.
     fn start_gallery_browse(&mut self, dir: PathBuf) {
         let parts = crate::lospec_gallery::rel_parts(&dir);
-        // parts = [browse, medium, sorting, time, tag]
+        // parts = [browse, medium, category, sorting, time, tag, masterpiece]
         let medium = parts.get(1).cloned().unwrap_or_else(|| "all".into());
-        let sorting = parts.get(2).cloned().unwrap_or_else(|| "latest".into());
-        let time = parts.get(3).cloned().unwrap_or_else(|| "all".into());
-        let tag = parts.get(4).filter(|t| *t != "-").cloned().unwrap_or_default();
+        let category = parts.get(2).cloned().unwrap_or_else(|| "all".into());
+        let sorting = parts.get(3).cloned().unwrap_or_else(|| "latest".into());
+        let time = parts.get(4).cloned().unwrap_or_else(|| "all".into());
+        let tag = parts.get(5).filter(|t| *t != "-").cloned().unwrap_or_default();
+        let masterpiece = parts.get(6).map(|m| m == "1").unwrap_or(false);
+        let want = self.gallery_want;
         self.show_folder(dir.clone(), Vec::new());
         self.gallery_pieces.clear();
         if let Some(c) = self.gallery_cancel.take() {
@@ -6763,7 +6779,9 @@ impl Kaleidotron {
         self.gallery_cancel = Some(cancel.clone());
         self.status = "Browsing Lospec gallery…".into();
         self.want_repaint = true;
-        std::thread::spawn(move || gallery_walk(medium, sorting, time, tag, &dir, cancel, tx));
+        std::thread::spawn(move || {
+            gallery_walk(medium, category, sorting, time, tag, masterpiece, want, &dir, cancel, tx)
+        });
     }
 
     fn poll_gallery(&mut self) {
@@ -37024,16 +37042,37 @@ impl Kaleidotron {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 18 {
-                        // Lospec Gallery: Medium / Sorting / Time dropdowns + a tag box → Browse.
+                        // Lospec Gallery: Medium / Category / Sorting / Time / tag / masterpiece → Browse.
                         use crate::lospec_gallery as g;
                         let mut gallery_go = false;
                         egui::ComboBox::from_id_salt("gal_medium")
                             .selected_text(g::MEDIUMS.get(self.gallery_medium).map_or("All", |m| m.1))
                             .show_ui(ui, |ui| {
                                 for (i, (_, label)) in g::MEDIUMS.iter().enumerate() {
-                                    ui.selectable_value(&mut self.gallery_medium, i, *label);
+                                    // Categories are per-medium — reset to All when the medium changes.
+                                    if ui.selectable_value(&mut self.gallery_medium, i, *label).clicked() {
+                                        self.gallery_category = "all".to_string();
+                                    }
                                 }
                             });
+                        // Category (depends on the selected medium; hidden for mediums with none).
+                        let medium_slug = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
+                        let cats = g::categories_for(medium_slug);
+                        if cats.len() > 1 {
+                            let cur = cats
+                                .iter()
+                                .find(|(s, _)| *s == self.gallery_category)
+                                .map_or("All", |(_, l)| *l);
+                            egui::ComboBox::from_id_salt("gal_cat")
+                                .selected_text(cur)
+                                .show_ui(ui, |ui| {
+                                    for (slug, label) in cats {
+                                        if ui.selectable_label(self.gallery_category == *slug, *label).clicked() {
+                                            self.gallery_category = slug.to_string();
+                                        }
+                                    }
+                                });
+                        }
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("gal_sort")
                                 .selected_text(g::SORTINGS.get(self.gallery_sorting).map_or("Latest", |s| s.1))
@@ -37056,7 +37095,18 @@ impl Kaleidotron {
                                     .hint_text("tag (optional)…")
                                     .desired_width(110.0),
                             );
+                            ui.checkbox(&mut self.gallery_masterpiece, "★ only")
+                                .on_hover_text("Masterpieces only");
+                        });
+                        ui.horizontal(|ui| {
                             if ui.button(format!("{} Browse", icons::SEARCH)).clicked() {
+                                self.gallery_want = 128;
+                                gallery_go = true;
+                            }
+                            if !self.gallery_pieces.is_empty()
+                                && ui.button("Load more").on_hover_text("Fetch the next pages").clicked()
+                            {
+                                self.gallery_want = (self.gallery_want + 128).min(640);
                                 gallery_go = true;
                             }
                         });
@@ -47404,17 +47454,22 @@ fn lospec_walk(
 
 /// Worker: browse the Lospec gallery, streaming one art piece per hit. The virtual path nests the
 /// artist as a folder so two pieces with the same slug (different artists) can't collide.
+#[allow(clippy::too_many_arguments)]
 fn gallery_walk(
     medium: String,
+    category: String,
     sorting: String,
     time: String,
     tag: String,
+    masterpiece: bool,
+    want: usize,
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<GalleryMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let pieces = crate::lospec_gallery::browse(&medium, &sorting, &time, &tag, 160).unwrap_or_default();
+    let pieces = crate::lospec_gallery::browse(&medium, &category, &sorting, &time, &tag, masterpiece, want)
+        .unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
     for p in pieces {

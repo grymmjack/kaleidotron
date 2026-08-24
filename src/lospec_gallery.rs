@@ -18,14 +18,44 @@ pub const ROOT: &str = "<lospec-gallery>";
 /// The single browse facet: `<lospec-gallery>/browse/<medium>/<sorting>/<time>/<tag>`.
 pub const BROWSE: &str = "browse";
 
-/// Lospec's own filter vocabularies (slug, label). `medium` "all" and `tag` empty mean "no filter".
+/// Lospec's own filter vocabularies (slug, label). Slugs are the site's URL PATH tokens
+/// (`gallery/medium:pixel-art/sorting:top/…`) — they are NOT query params (those are ignored).
+/// `all` / `latest` are the defaults and emit no path segment.
 pub const MEDIUMS: &[(&str, &str)] = &[
     ("all", "All"),
-    ("pixelart", "Pixel Art"),
-    ("voxelart", "Voxel Art"),
-    ("lowpoly", "Low-Poly"),
-    ("textmode", "Textmode"),
+    ("pixel-art", "Pixel Art"),
+    ("voxel-art", "Voxel Art"),
+    ("low-poly", "Low-Poly"),
+    ("textmode-art", "Textmode"),
 ];
+/// Categories are **per-medium** (the site's Category dropdown changes with Medium). `all` = none.
+const PIXEL_CATEGORIES: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("hand-pixelled", "Hand-pixelled"),
+    ("enhanced-pixel-art", "Enhanced"),
+    ("pixel-painting", "Pixel Painting"),
+    ("low-res-render", "Low-res Render"),
+    ("reduction", "Reduction"),
+    ("computer-generated", "Computer-generated"),
+];
+const TEXTMODE_CATEGORIES: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("ascii", "ASCII"),
+    ("petscii", "PETSCII"),
+    ("ansi", "ANSI"),
+    ("miscii", "MISCII"),
+    ("enhanced-textmode", "Enhanced"),
+];
+const NO_CATEGORIES: &[(&str, &str)] = &[("all", "All")];
+
+/// The category options for a given medium slug (empty-ish for mediums with none).
+pub fn categories_for(medium: &str) -> &'static [(&'static str, &'static str)] {
+    match medium {
+        "pixel-art" => PIXEL_CATEGORIES,
+        "textmode-art" => TEXTMODE_CATEGORIES,
+        _ => NO_CATEGORIES,
+    }
+}
 pub const SORTINGS: &[(&str, &str)] = &[("latest", "Latest"), ("top", "Top"), ("likes", "Likes")];
 pub const TIMES: &[(&str, &str)] = &[
     ("all", "All"),
@@ -35,7 +65,7 @@ pub const TIMES: &[(&str, &str)] = &[
     ("yearly", "Yearly"),
 ];
 
-const API: &str = "https://lospec.com/gallery/load";
+const GALLERY: &str = "https://lospec.com/gallery";
 /// Pieces per page in the gallery/load response.
 pub const PER_PAGE: usize = 32;
 
@@ -57,16 +87,31 @@ pub fn rel_parts(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The virtual browse path for a filter set. A blank `tag` becomes `-` so the path keeps a fixed
-/// arity (and stays a valid, pinnable identity that round-trips through `rel_parts`).
-pub fn browse_path(medium: &str, sorting: &str, time: &str, tag: &str) -> PathBuf {
+/// The virtual browse path for a filter set — fixed arity so it round-trips through `rel_parts` and
+/// stays a pinnable identity:
+/// `<lospec-gallery>/browse/<medium>/<category>/<sorting>/<time>/<tag|->/<masterpiece 0|1>`.
+pub fn browse_path(
+    medium: &str,
+    category: &str,
+    sorting: &str,
+    time: &str,
+    tag: &str,
+    masterpiece: bool,
+) -> PathBuf {
     let tag = if tag.trim().is_empty() { "-" } else { tag.trim() };
     Path::new(ROOT)
         .join(BROWSE)
-        .join(medium)
-        .join(sorting)
-        .join(time)
+        .join(dash(medium))
+        .join(dash(category))
+        .join(dash(sorting))
+        .join(dash(time))
         .join(tag)
+        .join(if masterpiece { "1" } else { "0" })
+}
+
+/// A blank filter value becomes `-` so no path segment is empty.
+fn dash(s: &str) -> &str {
+    if s.trim().is_empty() { "-" } else { s.trim() }
 }
 
 /// One gallery piece (a scraped thumbnail + its identity).
@@ -100,27 +145,18 @@ impl GalleryPiece {
     }
 }
 
-/// Build the `gallery/load` URL for a filter set + page. `medium == "all"` and an empty `tag` are
-/// omitted (Lospec treats their absence as "no filter").
-pub fn browse_url(medium: &str, sorting: &str, time: &str, tag: &str, page: usize) -> String {
-    let mut u = format!("{API}?page={}", page.max(1));
-    if !medium.is_empty() && medium != "all" {
-        u.push_str(&format!("&medium={}", enc(medium)));
-    }
-    if !sorting.is_empty() {
-        u.push_str(&format!("&sorting={}", enc(sorting)));
-    }
-    if !time.is_empty() {
-        u.push_str(&format!("&time={}", enc(time)));
-    }
-    let tag = tag.trim();
-    if !tag.is_empty() && tag != "-" {
-        u.push_str(&format!("&tag={}", enc(tag)));
-    }
-    u
+/// The `Referer` we send with gallery requests — a plausible gallery URL, so Lospec's own AJAX
+/// endpoint sees a same-site request (per the app author's "masquerade as the browser" ask).
+const REFERER: &str = "https://lospec.com/gallery";
+
+/// Normalise a filter value for the POST form: a blank/`-` medium/category/time becomes `all`, a
+/// blank sorting becomes `latest` (the site's own defaults, sent explicitly in the form).
+fn norm<'a>(v: &'a str, default: &'a str) -> &'a str {
+    let v = v.trim();
+    if v.is_empty() || v == "-" { default } else { v }
 }
 
-/// Scrape a `gallery/load` HTML body into pieces. Each tile is
+/// Scrape a gallery HTML fragment into pieces. Each tile is
 /// `<img class="thumbnail" src="…/thumbnails/gallery/<artist>/<slug>-default.<ext>">`; artist + slug
 /// come from that path, and the piece's page URL is derived from them. Deduped by (artist, slug).
 pub fn parse(html: &str) -> Vec<GalleryPiece> {
@@ -150,37 +186,68 @@ pub fn parse(html: &str) -> Vec<GalleryPiece> {
     out
 }
 
-/// Browse the gallery for a filter set, up to `want` pieces (paged in [`PER_PAGE`]s; cached 1 day).
-/// A later page failing keeps the pages already collected (mirrors the palette browser).
+/// Browse the gallery for a filter set, up to `want` pieces.
+///
+/// **Paged via POST**, because Lospec's gallery only pages that way: `GET …/load?page=N` always
+/// returns page 1, but a `POST /gallery` with a `skip` offset returns the next batch. Each POST
+/// returns `{"success":true,"html":"<tiles…>"}`; the `html` is scraped by [`parse`]. Filters go in
+/// the form (`medium`/`category`/`sorting`/`time`/`tags`/`masterpiece`), not the URL. Deduped across
+/// pages; a page that adds nothing new stops the loop.
+#[allow(clippy::too_many_arguments)]
 pub fn browse(
     medium: &str,
+    category: &str,
     sorting: &str,
     time: &str,
     tag: &str,
+    masterpiece: bool,
     want: usize,
 ) -> Result<Vec<GalleryPiece>, String> {
-    let want = want.clamp(1, 320);
-    let pages = want.div_ceil(PER_PAGE);
+    let want = want.clamp(1, 640);
+    let batches = want.div_ceil(PER_PAGE);
+    let (medium, category) = (norm(medium, "all"), norm(category, "all"));
+    let (sorting, time) = (norm(sorting, "latest"), norm(time, "all"));
+    let tag = { let t = tag.trim(); if t == "-" { "" } else { t } };
+    let mp = if masterpiece { "true" } else { "" };
     let mut out: Vec<GalleryPiece> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut first_err: Option<String> = None;
-    for page in 1..=pages {
-        let url = browse_url(medium, sorting, time, tag, page);
-        let body = match crate::cache::get_bytes(&url, Some(86_400)) {
+    for batch in 0..batches {
+        let (page, skip) = ((batch + 1).to_string(), (batch * PER_PAGE).to_string());
+        let fields: &[(&str, &str)] = &[
+            ("page", &page),
+            ("skip", &skip),
+            ("medium", medium),
+            ("category", category),
+            ("sorting", sorting),
+            ("time", time),
+            ("artist", ""),
+            ("liked-by", ""),
+            ("tags", tag),
+            ("masterpiece", mp),
+        ];
+        let body = match crate::cache::post_form(GALLERY, REFERER, fields, Some(86_400)) {
             Ok(b) => b,
             Err(e) => {
-                if page == 1 {
+                if batch == 0 {
                     first_err = Some(e);
                 }
                 break;
             }
         };
-        let batch = parse(&String::from_utf8_lossy(&body));
-        if batch.is_empty() {
-            break;
+        let html = extract_html(&body);
+        let pieces = parse(&html);
+        if pieces.is_empty() {
+            break; // ran past the last batch
         }
-        out.extend(batch);
-        if out.len() >= want {
-            break;
+        let before = out.len();
+        for p in pieces {
+            if seen.insert((p.artist.clone(), p.slug.clone())) {
+                out.push(p);
+            }
+        }
+        if out.len() == before || out.len() >= want {
+            break; // nothing new (server clamped) or enough
         }
     }
     out.truncate(want);
@@ -190,12 +257,20 @@ pub fn browse(
     }
 }
 
+/// The `html` field out of a `{"success":true,"html":"…"}` gallery POST response (serde unescapes it).
+fn extract_html(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["html"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
 /// Fetch a piece's page and resolve its **full-resolution** image URL
 /// (`cdn.lospec.com/gallery/<slug>-<id>.<ext>` — NOT the `/thumbnails/…-default` preview). The
 /// gallery listing only exposes thumbnails, and the full URL carries a numeric id that isn't
 /// derivable from the artist/slug, so opening a piece resolves it from the page here.
 pub fn full_image_url(page_url: &str) -> Result<String, String> {
-    let body = crate::cache::get_bytes(page_url, Some(86_400))?;
+    let body = crate::cache::get_bytes_ua(page_url, crate::cache::BROWSER_UA, REFERER, Some(86_400))?;
     find_full_url(&String::from_utf8_lossy(&body))
         .ok_or_else(|| "no full-resolution image found on the piece page".to_string())
 }
@@ -270,34 +345,25 @@ fn prettify(slug: &str) -> String {
     out
 }
 
-/// Percent-encode a query value (unreserved chars pass through).
-fn enc(q: &str) -> String {
-    let mut out = String::with_capacity(q.len());
-    for b in q.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn browse_url_omits_defaults() {
-        assert_eq!(
-            browse_url("all", "latest", "all", "", 1),
-            "https://lospec.com/gallery/load?page=1&sorting=latest&time=all"
-        );
-        assert_eq!(
-            browse_url("textmode", "top", "all", "skull", 2),
-            "https://lospec.com/gallery/load?page=2&medium=textmode&sorting=top&time=all&tag=skull"
-        );
-        // A `-` placeholder tag is treated as empty.
-        assert!(!browse_url("all", "latest", "all", "-", 1).contains("tag="));
+    fn norm_defaults_filter_values() {
+        assert_eq!(norm("-", "all"), "all");
+        assert_eq!(norm("", "latest"), "latest");
+        assert_eq!(norm("pixel-art", "all"), "pixel-art");
+        assert_eq!(norm("  top ", "latest"), "top");
+    }
+
+    #[test]
+    fn extracts_html_from_post_json() {
+        let body = br#"{"success":true,"html":"<a class=\"gallery-thumbnail\"><img class=\"thumbnail\" src=\"https://cdn.lospec.com/thumbnails/gallery/wynat/lake-guardians-default.png\"></a>"}"#;
+        let pieces = parse(&extract_html(body));
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].slug, "lake-guardians");
+        assert_eq!(pieces[0].artist, "wynat");
     }
 
     #[test]
@@ -320,9 +386,9 @@ mod tests {
 
     #[test]
     fn rel_parts_and_browse_path_roundtrip() {
-        let p = browse_path("textmode", "top", "all", "");
+        let p = browse_path("textmode-art", "ansi", "top", "all", "", true);
         let parts = rel_parts(&p);
-        assert_eq!(parts, vec!["browse", "textmode", "top", "all", "-"]);
+        assert_eq!(parts, vec!["browse", "textmode-art", "ansi", "top", "all", "-", "1"]);
         assert!(is_remote(&p));
     }
 
