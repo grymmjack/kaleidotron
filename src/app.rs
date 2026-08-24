@@ -33022,12 +33022,23 @@ impl Kaleidotron {
         }
     }
 
-    /// Run a DOS executable (`.com`/`.exe`) in DOSBox. Passing the program path makes DOSBox-Staging
-    /// mount its containing directory as `C:`, run it, and quit when it exits — so no `-exit` needed.
+    /// Run a DOS executable (`.com`/`.exe`) in DOSBox.
+    ///
     /// **`--noautoexec` is the key:** it skips the user's `[autoexec]` (which commonly mounts drives
     /// and launches a menu program that would sit there interactively and never let our program run —
-    /// exactly the "nothing happens" symptom). Spawned detached so the UI stays live; `resolve_local`
-    /// handles a file inside an archive / 16colo pack (its real temp copy).
+    /// exactly the "nothing happens" symptom).
+    ///
+    /// What gets mounted as `C:` depends on where the file lives:
+    /// - **Inside a mounted archive / 16colo pack** — mount the *whole pack root* as `C:`, `cd` into
+    ///   the program's subdirectory, and run it by name. So a pack that bundles a viewer `.exe` next
+    ///   to its art (or in subfolders) has every sibling/parent dependency on `C:`, not just the one
+    ///   folder the program sits in.
+    /// - **A plain local file** — pass the program path and let DOSBox mount its parent as `C:` and
+    ///   resolve the runnable (8.3/long) name itself; most robust for an arbitrary on-disk program.
+    ///
+    /// A passed/`cd`-run DOS executable auto-quits DOSBox when it exits, so no `-exit` is needed.
+    /// Spawned detached so the UI stays live; `resolve_local` gives the real temp copy for a
+    /// virtual (archive / 16colo) path.
     fn run_in_dosbox(&mut self, path: &Path) {
         let Some(dosbox) = self.dosbox_path.clone() else {
             self.status =
@@ -33039,13 +33050,39 @@ impl Kaleidotron {
             return;
         }
         let real = self.resolve_local(path);
-        // Run from the program's own folder so relative data paths resolve as they would on C:.
-        let cwd = real.parent().map(|p| p.to_path_buf());
+        // If the file lives inside the current mount (a 16colo pack / archive), mount the pack ROOT
+        // as C: so all of its contents are reachable, then cd into the program's own subdir.
+        let mount_root = self
+            .archive_mount
+            .as_ref()
+            .map(|m| m.temp_root.clone())
+            .filter(|root| real.starts_with(root));
         let mut cmd = std::process::Command::new(&dosbox);
-        // `--noautoexec` before the path: skip the user's menu autoexec, then mount+run our program.
-        cmd.arg("--noautoexec").arg(&real);
-        if let Some(dir) = &cwd {
-            cmd.current_dir(dir);
+        cmd.arg("--noautoexec");
+        if let Some(root) = &mount_root {
+            let rel = real.strip_prefix(root).unwrap_or(&real);
+            // DOS uses backslash paths; a leading `\` makes the cd absolute from C: root. Quote a
+            // path/name only when it has a space (LFN) — quoting a bare 8.3 command name can make
+            // COMMAND.COM fail to find it, and DOS names almost never contain spaces.
+            let subdir = rel
+                .parent()
+                .map(|p| p.to_string_lossy().replace('/', "\\"))
+                .filter(|s| !s.is_empty());
+            let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            cmd.arg("-c").arg(format!("mount c \"{}\"", root.display())).arg("-c").arg("c:");
+            if let Some(sub) = subdir {
+                let arg = if sub.contains(' ') { format!("cd \"\\{sub}\"") } else { format!("cd \\{sub}") };
+                cmd.arg("-c").arg(arg);
+            }
+            let run = if name.contains(' ') { format!("\"{name}\"") } else { name };
+            cmd.arg("-c").arg(run).arg("--exit");
+            cmd.current_dir(root);
+        } else {
+            // Plain local file: let DOSBox mount the parent + resolve the runnable name.
+            cmd.arg(&real);
+            if let Some(dir) = real.parent() {
+                cmd.current_dir(dir);
+            }
         }
         match cmd.spawn() {
             Ok(_) => self.status = format!("Running {} in DOSBox", short_name(path)),
