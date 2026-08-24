@@ -2279,6 +2279,13 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     gf_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     gf_dir: PathBuf, // <data>/gfonts — downloaded families
+    // Grid-thumbnail support: a family's real `.ttf` URL isn't in the catalogue (it needs a css2
+    // lookup), so resolve it lazily per visible tile and cache it. The remote-thumb pool then
+    // fetches the .ttf and the registry renders its sample (via_registry, decode_as = the .ttf path).
+    gf_ttf_urls: HashMap<PathBuf, String>, // virtual path → resolved .ttf URL
+    gf_ttf_pending: std::collections::HashSet<PathBuf>, // url resolutions in flight (dedupe)
+    gf_ttf_rx: std::sync::mpsc::Receiver<(PathBuf, String)>,
+    gf_ttf_tx: std::sync::mpsc::Sender<(PathBuf, String)>,
     // The Mod Archive (~170k tracker modules). Downloads are keyless; SEARCH needs a free API key,
     // so `ma_key` (Preferences, local-only like the Steam key) upgrades to the richer XML API and
     // an empty key falls back to parsing the public search page.
@@ -3432,6 +3439,7 @@ impl Kaleidotron {
         let ph_dir = data_dir.join("polyhaven");
         let snd_dir = data_dir.join("audio");
         let gf_dir = data_dir.join("gfonts");
+        let (gf_ttf_tx, gf_ttf_rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
         let web_dir = data_dir.join("web");
         let ma_dir = data_dir.join("modules");
         let mut palette_files = all_palettes(&palette_dir);
@@ -4445,6 +4453,10 @@ impl Kaleidotron {
             gf_files: HashMap::new(),
             gf_open_rx: None,
             gf_dir,
+            gf_ttf_urls: HashMap::new(),
+            gf_ttf_pending: std::collections::HashSet::new(),
+            gf_ttf_rx,
+            gf_ttf_tx,
             web_url: String::new(),
             web_http: HashMap::new(),
             web_urls: HashMap::new(),
@@ -7285,6 +7297,34 @@ impl Kaleidotron {
         }
         if got || done {
             self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Kick off a background css2 lookup of a family's real `.ttf` URL (for its grid thumbnail),
+    /// deduped so a visible tile only resolves once. `poll_gf_ttf` drains the result.
+    fn request_gf_ttf_url(&mut self, path: &Path) {
+        if self.gf_ttf_urls.contains_key(path) || self.gf_ttf_pending.contains(path) {
+            return;
+        }
+        let Some(f) = self.gf_fonts.get(path).cloned() else {
+            return;
+        };
+        self.gf_ttf_pending.insert(path.to_path_buf());
+        let tx = self.gf_ttf_tx.clone();
+        let vpath = path.to_path_buf();
+        std::thread::spawn(move || {
+            if let Ok(url) = crate::gfonts::font_url(&f.family, &f.best_weight()) {
+                let _ = tx.send((vpath, url));
+            }
+        });
+    }
+
+    /// Drain resolved `.ttf` URLs each frame; a repaint then lets the grid request the thumbnail.
+    fn poll_gf_ttf(&mut self) {
+        while let Ok((path, url)) = self.gf_ttf_rx.try_recv() {
+            self.gf_ttf_pending.remove(&path);
+            self.gf_ttf_urls.insert(path, url);
             self.want_repaint = true;
         }
     }
@@ -28430,6 +28470,16 @@ impl Kaleidotron {
                                     } else {
                                         web_no_thumb = true;
                                     }
+                                } else if self.gf_fonts.contains_key(path)
+                                    && !self.gf_files.contains_key(path)
+                                {
+                                    // A Google Fonts family: resolve its .ttf URL (once, cached) then
+                                    // let the remote-thumb pool fetch the font + render its sample
+                                    // through the registry (decode_as = the .ttf path → FontDecoder).
+                                    match self.gf_ttf_urls.get(path).cloned() {
+                                        Some(u) => self.colo_thumbs.request(path, &u, THUMB_PX, true),
+                                        None => self.request_gf_ttf_url(path),
+                                    }
                                 } else {
                                     self.thumbs.request(path, THUMB_PX);
                                 }
@@ -38008,6 +38058,7 @@ impl eframe::App for Kaleidotron {
         self.poll_snd();
         self.poll_snd_open(&ctx);
         self.poll_gf();
+        self.poll_gf_ttf();
         self.poll_gf_open(&ctx);
         self.poll_web();
         self.poll_web_open(&ctx);
