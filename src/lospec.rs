@@ -94,12 +94,38 @@ fn enc(q: &str) -> String {
     out
 }
 
+/// Palette-list filters (the site's Filtering Options: colour-count + sorting).
+#[derive(Clone, Copy, Debug)]
+pub struct Filters<'a> {
+    /// `colorNumberFilterType`: `any` | `max` | `min` | `exact`.
+    pub color_filter: &'a str,
+    /// The `colorNumber` (ignored when `color_filter == "any"`).
+    pub color_n: u32,
+    /// `sortingType`: `default` | `alphabetical` | `downloads` | `newest`.
+    pub sorting: &'a str,
+}
+
+impl Default for Filters<'_> {
+    fn default() -> Self {
+        Filters { color_filter: "any", color_n: 16, sorting: "default" }
+    }
+}
+
 /// The browse/search request URL for `query` (a Lospec tag; empty = all), page `page` (1-based).
-fn browse_url(query: &str, page: usize) -> String {
-    format!(
-        "{API}?colorNumberFilterType=any&page={page}&tag={}&sortingType=default",
+fn browse_url(query: &str, page: usize, f: &Filters) -> String {
+    let cf = if matches!(f.color_filter, "max" | "min" | "exact") { f.color_filter } else { "any" };
+    let sort = match f.sorting {
+        "alphabetical" | "downloads" | "newest" => f.sorting,
+        _ => "default",
+    };
+    let mut u = format!(
+        "{API}?colorNumberFilterType={cf}&page={page}&tag={}&sortingType={sort}",
         enc(query.trim())
-    )
+    );
+    if cf != "any" {
+        u.push_str(&format!("&colorNumber={}", f.color_n.clamp(1, 256)));
+    }
+    u
 }
 
 /// Parse a `palette-list/load` body into palettes.
@@ -150,11 +176,11 @@ pub fn parse(bytes: &[u8]) -> Vec<LospecPalette> {
 /// authoritative `/palette-list/tag/<tag>` PAGE — `load?tag=ansi` silently returns nothing while
 /// `/tag/ansi` correctly lists `ansi32` etc. — then fetches each palette's `.json` for its colours
 /// (the tag page has none inline).
-pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
+pub fn search(query: &str, want: usize, f: &Filters) -> Result<Vec<LospecPalette>, String> {
     if query.trim().is_empty() {
-        browse_all(want)
+        browse_all(want, f)
     } else {
-        search_by_tag(query.trim(), want)
+        search_by_tag(query.trim(), want, f)
     }
 }
 
@@ -163,13 +189,13 @@ pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
 /// while the `/palette-list/tag/<tag>` page lists them all (incl. `ansi32`) but needs a `.json` per
 /// palette for colours. Query both, take load's inline-colour results first, then fill from the tag
 /// page whatever load didn't already have — so everything shows up, once.
-pub fn search_by_tag(tag: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
-    let want = want.clamp(1, 120);
+pub fn search_by_tag(tag: &str, want: usize, f: &Filters) -> Result<Vec<LospecPalette>, String> {
+    let want = want.clamp(1, 480);
     let mut out: Vec<LospecPalette> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // 1) `load?tag=` — inline colours, paged, no per-palette fetch. Complete for common tags.
     for page in 1..=want.div_ceil(PER_PAGE) {
-        let Ok(body) = get(&browse_url(tag, page)) else {
+        let Ok(body) = get(&browse_url(tag, page, f)) else {
             break;
         };
         let batch = parse(&body);
@@ -246,15 +272,15 @@ fn fetch_palette(slug: &str) -> Result<LospecPalette, String> {
 
 /// Browse the main palette list (blank query) via the JSON `load` endpoint, up to `want` (paged in
 /// 10s; cached 1 day; partial-tolerant).
-fn browse_all(want: usize) -> Result<Vec<LospecPalette>, String> {
-    let want = want.clamp(1, 120);
+fn browse_all(want: usize, f: &Filters) -> Result<Vec<LospecPalette>, String> {
+    let want = want.clamp(1, 480);
     let pages = want.div_ceil(PER_PAGE);
     let mut out = Vec::new();
     let mut first_err: Option<String> = None;
     for page in 1..=pages {
         // A later page failing (Lospec 500s on some edge requests) must NOT discard the pages that
         // already succeeded — break with what we have instead of `?`-ing the whole browse away.
-        let body = match get(&browse_url("", page)) {
+        let body = match get(&browse_url("", page, f)) {
             Ok(b) => b,
             Err(e) => {
                 if page == 1 {
@@ -351,8 +377,15 @@ mod tests {
 
     #[test]
     fn browse_url_encodes_tag() {
-        assert!(browse_url("dark fantasy", 2).contains("tag=dark%20fantasy"));
-        assert!(browse_url("", 1).contains("page=1"));
+        let f = Filters::default();
+        assert!(browse_url("dark fantasy", 2, &f).contains("tag=dark%20fantasy"));
+        assert!(browse_url("", 1, &f).contains("page=1"));
+        // Colour-count filter appends colorNumber only when not "any"; sorting is passed through.
+        let g = Filters { color_filter: "max", color_n: 8, sorting: "downloads" };
+        let u = browse_url("", 1, &g);
+        assert!(u.contains("colorNumberFilterType=max") && u.contains("colorNumber=8"));
+        assert!(u.contains("sortingType=downloads"));
+        assert!(!browse_url("", 1, &f).contains("colorNumber="));
     }
 }
 
@@ -362,7 +395,7 @@ mod live {
     #[test]
     #[ignore]
     fn live() {
-        match search("", 12) {
+        match search("", 12, &Filters::default()) {
             Ok(v) => {
                 eprintln!("got {} palettes", v.len());
                 for p in v.iter().take(4) {

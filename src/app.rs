@@ -2249,6 +2249,10 @@ pub struct Kaleidotron {
     // the API), clicking one downloads the `.gpl` into the palette library + selects it in Recolor.
     lospec_palettes: HashMap<PathBuf, crate::lospec::LospecPalette>,
     lospec_query: String,
+    lospec_sort: usize,    // 0=Default 1=A-Z 2=Downloads 3=Newest (Filtering Options → Sorting)
+    lospec_cfilter: usize, // 0=Any 1=Max 2=Min 3=Exact (Number of colors)
+    lospec_cn: u32,        // the colour count for Max/Min/Exact
+    lospec_want: usize,    // how many palettes to fetch (Load more bumps it)
     lospec_rx: Option<std::sync::mpsc::Receiver<LospecMsg>>,
     lospec_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[allow(clippy::type_complexity)]
@@ -4450,6 +4454,10 @@ impl Kaleidotron {
             asset_search_cache: None,
             lospec_palettes: HashMap::new(),
             lospec_query: String::new(),
+            lospec_sort: 0,
+            lospec_cfilter: 0,
+            lospec_cn: 16,
+            lospec_want: 120,
             lospec_rx: None,
             lospec_cancel: None,
             lospec_open_rx: None,
@@ -6897,7 +6905,12 @@ impl Kaleidotron {
         self.lospec_cancel = Some(cancel.clone());
         self.status = "Browsing Lospec palettes…".into();
         self.want_repaint = true;
-        std::thread::spawn(move || lospec_walk(query, &dir, cancel, tx));
+        const SORTS: [&str; 4] = ["default", "alphabetical", "downloads", "newest"];
+        const CFILTERS: [&str; 4] = ["any", "max", "min", "exact"];
+        let sorting = SORTS[self.lospec_sort.min(3)].to_string();
+        let cfilter = CFILTERS[self.lospec_cfilter.min(3)].to_string();
+        let (cn, want) = (self.lospec_cn, self.lospec_want);
+        std::thread::spawn(move || lospec_walk(query, sorting, cfilter, cn, want, &dir, cancel, tx));
     }
 
     /// Drain the Lospec worker each frame: generate a swatch thumbnail for each palette (colours are
@@ -36978,11 +36991,51 @@ impl Kaleidotron {
                             let go = ui.button(format!("{} Browse", icons::SEARCH)).clicked()
                                 || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                             if go {
+                                self.lospec_want = 120;
                                 let q = self.lospec_query.trim().to_string();
                                 nav = Some(Path::new(crate::lospec::ROOT).join(crate::lospec::SEARCH).join(q));
                             }
                         });
-                        ui.weak("Filters by Lospec TAG (e.g. gameboy · retro · fantasy) — not name/author.");
+                        // Filtering Options: Sorting + Number of colors (the site's palette filters).
+                        let mut pal_go = false;
+                        ui.horizontal(|ui| {
+                            const SORTS: [&str; 4] = ["Default", "A-Z", "Downloads", "Newest"];
+                            egui::ComboBox::from_id_salt("pal_sort")
+                                .selected_text(SORTS[self.lospec_sort.min(3)])
+                                .show_ui(ui, |ui| {
+                                    for (i, s) in SORTS.iter().enumerate() {
+                                        ui.selectable_value(&mut self.lospec_sort, i, *s);
+                                    }
+                                });
+                            const CF: [&str; 4] = ["Any #", "Max", "Min", "Exact"];
+                            egui::ComboBox::from_id_salt("pal_cf")
+                                .selected_text(CF[self.lospec_cfilter.min(3)])
+                                .show_ui(ui, |ui| {
+                                    for (i, s) in CF.iter().enumerate() {
+                                        ui.selectable_value(&mut self.lospec_cfilter, i, *s);
+                                    }
+                                });
+                            if self.lospec_cfilter != 0 {
+                                ui.add(egui::DragValue::new(&mut self.lospec_cn).range(1..=256));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply").on_hover_text("Re-browse with these filters").clicked() {
+                                self.lospec_want = 120;
+                                pal_go = true;
+                            }
+                            if !self.lospec_palettes.is_empty()
+                                && ui.button("Load more").clicked()
+                            {
+                                self.lospec_want = (self.lospec_want + 120).min(120 * 4);
+                                pal_go = true;
+                            }
+                        });
+                        if pal_go {
+                            let q = self.lospec_query.trim().to_string();
+                            nav = Some(Path::new(crate::lospec::ROOT).join(crate::lospec::SEARCH).join(q));
+                        }
+                        ui.weak("Tag filter (gameboy · retro · fantasy) — not name/author. Sorting + colour-count above.");
                         ui.weak("Click a palette → added to your library + Recolor.");
                         // Tag cloud: the tags on the palettes currently shown, most-common first,
                         // each a one-click filter. Lospec has no tags endpoint, so it's built from
@@ -47417,14 +47470,20 @@ fn asset_walk(
 }
 
 /// Worker: browse/search Lospec, streaming one palette per hit.
+#[allow(clippy::too_many_arguments)]
 fn lospec_walk(
     query: String,
+    sorting: String,
+    color_filter: String,
+    color_n: u32,
+    want: usize,
     root: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<LospecMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let palettes = crate::lospec::search(&query, 120).unwrap_or_default();
+    let f = crate::lospec::Filters { color_filter: &color_filter, color_n, sorting: &sorting };
+    let palettes = crate::lospec::search(&query, want, &f).unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
     for p in palettes {
