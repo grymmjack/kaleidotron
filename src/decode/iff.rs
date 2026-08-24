@@ -1,4 +1,5 @@
-//! IFF ILBM (`.iff`/`.ilbm`/`.lbm`) — the Amiga's interleaved bitmap format.
+//! IFF ILBM/PBM (`.iff`/`.ilbm`/`.lbm`) — the Amiga's interleaved bitmap format **and** PC Deluxe
+//! Paint's chunky `PBM ` variant (what a DOS `.LBM` almost always is).
 //!
 //! An IFF file is chunks inside a `FORM`: `BMHD` (dimensions, plane count, compression), `CMAP`
 //! (the palette), `CAMG` (Amiga display flags — HAM / EHB), and `BODY` (the pixels). ILBM stores
@@ -42,8 +43,15 @@ struct Bmhd {
 /// Decode an ILBM to an indexed (or, for HAM, true-colour) `PixImage`.
 pub fn decode(bytes: &[u8]) -> Result<PixImage, DecodeError> {
     let bad = |m: &str| DecodeError::Malformed(m.to_string());
-    if bytes.len() < 12 || &bytes[0..4] != b"FORM" || &bytes[8..12] != b"ILBM" {
-        return Err(bad("not a FORM ILBM"));
+    // ILBM = Amiga planar; PBM (note the trailing space) = PC Deluxe Paint's CHUNKY variant, which
+    // is what a DOS `.LBM` almost always is. Both share the same chunk layout (BMHD/CMAP/CAMG/BODY);
+    // only the BODY encoding differs (interleaved bitplanes vs one byte per pixel).
+    if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
+        return Err(bad("not a FORM"));
+    }
+    let is_pbm = &bytes[8..12] == b"PBM ";
+    if &bytes[8..12] != b"ILBM" && !is_pbm {
+        return Err(bad("not a FORM ILBM/PBM"));
     }
 
     let mut bmhd: Option<Bmhd> = None;
@@ -96,28 +104,44 @@ pub fn decode(bytes: &[u8]) -> Result<PixImage, DecodeError> {
         return Err(bad("implausible ILBM dimensions"));
     }
 
-    // Unpack the BODY into an index-per-pixel buffer. Rows are byte-padded: a plane row is
-    // ceil(w/8) bytes, and there is one such row per plane per scanline (plus a mask row if
-    // masking == 1), all interleaved.
-    let row_bytes = w.div_ceil(8);
-    let mask_rows = usize::from(bmhd.masking == 1);
-    let stride = (bmhd.planes as usize + mask_rows) * row_bytes;
-
-    let unpacked: Vec<u8> = match bmhd.compression {
-        0 => body.to_vec(),
-        1 => byterun1(body, stride * h),
-        c => return Err(bad(&format!("unsupported compression {c}"))),
-    };
-
     let mut indices = vec![0u16; w * h];
-    for y in 0..h {
-        let row = &unpacked[(y * stride).min(unpacked.len())..];
-        for p in 0..bmhd.planes as usize {
-            let plane = &row[(p * row_bytes)..];
+    if is_pbm {
+        // PBM: chunky — one byte per pixel is the palette index directly. Rows are padded to an
+        // even byte width (the IFF alignment rule), and ByteRun1 compresses that chunky stream.
+        let row_stride = w + (w & 1);
+        let unpacked: Vec<u8> = match bmhd.compression {
+            0 => body.to_vec(),
+            1 => byterun1(body, row_stride * h),
+            c => return Err(bad(&format!("unsupported compression {c}"))),
+        };
+        for y in 0..h {
             for x in 0..w {
-                let byte = plane.get(x >> 3).copied().unwrap_or(0);
-                if byte & (0x80 >> (x & 7)) != 0 {
-                    indices[y * w + x] |= 1 << p;
+                indices[y * w + x] = unpacked.get(y * row_stride + x).copied().unwrap_or(0) as u16;
+            }
+        }
+    } else {
+        // ILBM: unpack the BODY into an index-per-pixel buffer. Rows are byte-padded: a plane row is
+        // ceil(w/8) bytes, and there is one such row per plane per scanline (plus a mask row if
+        // masking == 1), all interleaved.
+        let row_bytes = w.div_ceil(8);
+        let mask_rows = usize::from(bmhd.masking == 1);
+        let stride = (bmhd.planes as usize + mask_rows) * row_bytes;
+
+        let unpacked: Vec<u8> = match bmhd.compression {
+            0 => body.to_vec(),
+            1 => byterun1(body, stride * h),
+            c => return Err(bad(&format!("unsupported compression {c}"))),
+        };
+
+        for y in 0..h {
+            let row = &unpacked[(y * stride).min(unpacked.len())..];
+            for p in 0..bmhd.planes as usize {
+                let plane = &row[(p * row_bytes)..];
+                for x in 0..w {
+                    let byte = plane.get(x >> 3).copied().unwrap_or(0);
+                    if byte & (0x80 >> (x & 7)) != 0 {
+                        indices[y * w + x] |= 1 << p;
+                    }
                 }
             }
         }
@@ -235,7 +259,9 @@ impl Decoder for IlbmDecoder {
         &["iff", "ilbm", "lbm"]
     }
     fn sniff(&self, header: &[u8]) -> bool {
-        header.len() >= 12 && &header[0..4] == b"FORM" && &header[8..12] == b"ILBM"
+        header.len() >= 12
+            && &header[0..4] == b"FORM"
+            && matches!(&header[8..12], b"ILBM" | b"PBM ")
     }
     fn decode(&self, bytes: &[u8]) -> Result<PixImage, DecodeError> {
         decode(bytes)
@@ -301,6 +327,32 @@ mod tests {
         let idx = img.indexed.as_ref().expect("palette-preserving");
         assert_eq!(&idx.indices[..4], &[1, 2, 3, 0]);
         assert_eq!(idx.palette[1], [255, 0, 0, 255], "CMAP colour 1 is red");
+    }
+
+    /// A PC Deluxe Paint `.LBM` is `FORM…PBM ` (chunky: one byte per pixel), not planar ILBM.
+    /// Odd width exercises the even-byte row padding. Decodes to the byte indices + keeps the CMAP.
+    #[test]
+    fn decodes_pbm_chunky_dos_deluxe_paint() {
+        let mut cmap_data = Vec::new();
+        for i in 0..8u8 {
+            cmap_data.extend_from_slice(&[i * 10, 0, 0]);
+        }
+        // w=3 (odd → row padded to 4 bytes); the 4th byte per row is padding.
+        let body = chunk(b"BODY", &[1, 2, 3, 0]);
+        let mut inner = b"PBM ".to_vec();
+        inner.extend_from_slice(&bmhd(3, 1, 8, 0, 0));
+        inner.extend_from_slice(&chunk(b"CMAP", &cmap_data));
+        inner.extend_from_slice(&body);
+        let mut iff = b"FORM".to_vec();
+        iff.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        iff.extend_from_slice(&inner);
+
+        assert!(IlbmDecoder.sniff(&iff), "PBM must sniff");
+        let img = decode(&iff).expect("PBM decodes");
+        assert_eq!((img.width, img.height), (3, 1));
+        let idx = img.indexed.as_ref().expect("palette-preserving");
+        assert_eq!(idx.indices, vec![1, 2, 3], "chunky byte-per-pixel indices");
+        assert_eq!(idx.palette[3], [30, 0, 0, 255], "CMAP colour 3");
     }
 
     /// ByteRun1: a literal run and a replicate run reconstruct the same bytes the uncompressed
