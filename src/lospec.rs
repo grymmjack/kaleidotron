@@ -141,8 +141,19 @@ pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
     let want = want.clamp(1, 120);
     let pages = want.div_ceil(PER_PAGE);
     let mut out = Vec::new();
+    let mut first_err: Option<String> = None;
     for page in 1..=pages {
-        let body = crate::cache::get_bytes(&browse_url(query, page), Some(86_400))?;
+        // A later page failing (Lospec 500s on some edge requests) must NOT discard the pages that
+        // already succeeded — break with what we have instead of `?`-ing the whole browse away.
+        let body = match crate::cache::get_bytes(&browse_url(query, page), Some(86_400)) {
+            Ok(b) => b,
+            Err(e) => {
+                if page == 1 {
+                    first_err = Some(e);
+                }
+                break;
+            }
+        };
         let batch = parse(&body);
         if batch.is_empty() {
             break;
@@ -153,7 +164,12 @@ pub fn search(query: &str, want: usize) -> Result<Vec<LospecPalette>, String> {
         }
     }
     out.truncate(want);
-    Ok(out)
+    // Only surface an error when we got nothing AND the very first page failed — otherwise a
+    // partial page-2+ failure just yields fewer results, not a broken source.
+    match first_err {
+        Some(e) if out.is_empty() => Err(e),
+        _ => Ok(out),
+    }
 }
 
 /// Render a palette's colours as a swatch-grid RGBA image (`size`×`size`), for the grid thumbnail.

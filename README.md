@@ -251,9 +251,9 @@ big ones in prose; this is the exhaustive index.)
 
 **Web sources** (each a keyless plugin) — Poly Haven, Google Fonts, Lospec, The Mod Archive, Openverse, Iconify, Wikimedia, an **HTTP browser** (any URL → a browsable tree with wildcard batch download), plus **YouTube** (yt-dlp) and your local **Steam** library; robots.txt-respecting with a 2 GiB LRU cache (backup/restore)
 
-**Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; persisted window geometry
+**Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; **export / import your whole setup** to one JSON file (API keys excluded by default); persisted window geometry
 
-**Command line** — headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind)
+**Command line** — headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
 
 ---
 
@@ -1113,21 +1113,29 @@ button to open it.
 copied aside rather than replaced — losing hand-written settings to a half-written file
 is not an acceptable failure mode.
 
+**Export / import your whole setup** (Preferences → **Advanced → Backup & sync setup**):
+one button writes every setting *plus* your keybindings to a single portable JSON file, and
+another imports it — applied live, no restart. **API keys are excluded by default**; an
+opt-in checkbox includes them, guarded by a plain-text warning (anyone the file reaches — a
+share, a cloud/dotfile/backup copy — can read them). The bundle is plain JSON, and `.ron` /
+`.json` open right in the built-in text viewer (syntax-highlighted) for inspection.
+
 ![preferences](docs/screenshots/preferences.png)
 
 ---
 
 ## Web sources
 
-Each is a **plugin, off by default** (Preferences → Format plugins / Web sources), and
-each appears as a browsable place in the rail. All are **keyless** except where noted —
-no account, no API token.
+**Every** source — including **16colo.rs**, **YouTube** and **Steam** — is an
+**off-by-default toggle** in **Preferences → Sources**; switch on the ones you browse and
+each appears as a button in the rail. All are **keyless** except where noted — no account,
+no API token.
 
 | source | what you get |
 |---|---|
 | **[16colo.rs](https://16colo.rs)** | the ANSI archive as a virtual folder — years, packs, groups, artists, search; bulk-download an artist or pack for offline use |
 | **[Poly Haven](https://polyhaven.com)** | CC0 3D models, textures and HDRIs. Models arrive as bundles (glTF + `.bin` + textures) and are materialised so they just open |
-| **[Google Fonts](https://fonts.google.com)** | browse and preview the whole library |
+| **[Google Fonts](https://fonts.google.com)** | browse the whole library — each tile renders a live sample of the actual font; open one to download the `.ttf` into the font viewer |
 | **[Lospec](https://lospec.com)** | palette browser, with a detail view — author, colours, downloads |
 | **[The Mod Archive](https://modarchive.org)** | tracker modules, playable in place |
 | **[Openverse](https://openverse.org)** | CC-licensed images, audio and animated GIFs |
@@ -1232,6 +1240,14 @@ OPTIONS:
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
     -h, --help                    Print this help
+
+PROFILE OPTIONS (test a build from a clean slate; settings live in the data dir):
+        --data-dir <DIR>          Use DIR for ALL settings / cache / ratings instead of
+                                  the default (~/.local/share/kaleidotron). Non-destructive
+                                  and repeatable — point it at an empty dir for a fresh run.
+        --reset                   Back the current profile up to '<data-dir>.bak' (once — your
+                                  real settings are never clobbered) and start FRESH.
+        --restore                 Move '<data-dir>.bak' back over the current profile, then exit.
 
 RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files):
     -r, --render <PATH>...        One or more input files and/or folders. A folder
