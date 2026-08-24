@@ -302,6 +302,12 @@ enum LospecMsg {
     Done(usize),
 }
 
+/// Messages from a Lospec **gallery** browse worker (`gallery_walk`): one art piece per hit + count.
+enum GalleryMsg {
+    Hit(Entry, Box<crate::lospec_gallery::GalleryPiece>),
+    Done(usize),
+}
+
 /// Messages from a Poly Haven browse worker (`ph_walk`): one CC0 asset per hit, then the count.
 enum PhMsg {
     Hit(Entry, Box<crate::polyhaven::PhAsset>),
@@ -996,6 +1002,7 @@ impl RailSection {
             (14, "\u{1F50A}", "Audio", "Free audio search"),
             (15, icons::MUSIC, "Modules", "The Mod Archive — tracker modules"),
             (6, "\u{1F3AE}", "Steam", "Steam library"),
+            (18, "\u{1F5BC}", "Gallery", "Lospec Gallery — pixel / voxel / textmode art"),
         ]
     }
 
@@ -1016,6 +1023,7 @@ impl RailSection {
                 (14, "Audio"),
                 (15, "Modules"),
                 (6, "Steam"),
+                (18, "Gallery"),
             ],
             RailSection::Audio => &[(2, "Kits"), (3, "Samples")],
             RailSection::Fx => &[(4, "PixelFX")],
@@ -2248,6 +2256,18 @@ pub struct Kaleidotron {
     lospec_dir: PathBuf, // where downloaded Lospec `.gpl`s are kept (scanned into the palette library)
     lospec_detail: Option<PathBuf>, // when set, the central panel shows this palette's detail view
     lospec_authors: HashMap<PathBuf, String>, // palette path → author (fetched lazily from the .json)
+    // Lospec Gallery (community art) — a browse source alongside the palette browser.
+    gallery_pieces: HashMap<PathBuf, crate::lospec_gallery::GalleryPiece>,
+    gallery_rx: Option<std::sync::mpsc::Receiver<GalleryMsg>>,
+    gallery_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[allow(clippy::type_complexity)]
+    gallery_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
+    gallery_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded full image
+    gallery_dir: PathBuf,                     // <data>/lospec-gallery — downloaded pieces
+    gallery_medium: usize,                    // index into lospec_gallery::MEDIUMS (sidebar filter)
+    gallery_sorting: usize,                   // index into SORTINGS
+    gallery_time: usize,                      // index into TIMES
+    gallery_tag: String,                      // optional tag filter (blank = none)
     #[allow(clippy::type_complexity)]
     lospec_author_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     // Poly Haven (CC0 3D models / textures / HDRIs). A model is a *bundle* (gltf manifest + .bin +
@@ -3434,6 +3454,7 @@ impl Kaleidotron {
         // Downloaded Lospec palettes live under the data dir and are folded into the library, so a
         // palette you grabbed last session is still in the Recolor list this session.
         let lospec_dir = data_dir.join("lospec");
+        let gallery_dir = data_dir.join("lospec-gallery");
         // Downloaded Poly Haven bundles / audio clips / Google Fonts. These are real files the user
         // keeps (a 3D model bundle or a font is not throwaway cache), so they live beside the
         // palettes under the data dir rather than in the 2 GiB HTTP blob cache.
@@ -4430,6 +4451,16 @@ impl Kaleidotron {
             lospec_cancel: None,
             lospec_open_rx: None,
             lospec_dir,
+            gallery_pieces: HashMap::new(),
+            gallery_rx: None,
+            gallery_cancel: None,
+            gallery_open_rx: None,
+            gallery_files: HashMap::new(),
+            gallery_dir,
+            gallery_medium: 0,
+            gallery_sorting: 0,
+            gallery_time: 0,
+            gallery_tag: String::new(),
             lospec_detail: None,
             lospec_authors: HashMap::new(),
             lospec_author_rx: None,
@@ -5171,6 +5202,11 @@ impl Kaleidotron {
         // Lospec palette browser (query → swatch tiles → click downloads the .gpl + applies it).
         if crate::lospec::is_remote(&dir) {
             self.open_lospec(dir);
+            return;
+        }
+        // Lospec Gallery (community art — browse → thumbnails → open a piece full-res in the viewer).
+        if crate::lospec_gallery::is_remote(&dir) {
+            self.open_gallery(dir);
             return;
         }
         // Poly Haven CC0 assets (3D models / textures / HDRIs) — browse → download → view.
@@ -6280,6 +6316,7 @@ impl Kaleidotron {
             .or_else(|| self.ph_files.get(path))
             .or_else(|| self.snd_files.get(path))
             .or_else(|| self.gf_files.get(path))
+            .or_else(|| self.gallery_files.get(path))
             .or_else(|| self.web_files.get(path))
             .or_else(|| self.ma_files.get(path))
         {
@@ -6680,6 +6717,134 @@ impl Kaleidotron {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.asset_open_rx = None,
+        }
+    }
+
+    // --- Lospec Gallery (community art): browse thumbnails, open a piece full-res in the viewer. ---
+
+    /// The virtual browse path for the current sidebar filter selection.
+    fn gallery_browse_path(&self) -> PathBuf {
+        use crate::lospec_gallery as g;
+        let medium = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
+        let sorting = g::SORTINGS.get(self.gallery_sorting).map_or("latest", |s| s.0);
+        let time = g::TIMES.get(self.gallery_time).map_or("all", |t| t.0);
+        g::browse_path(medium, sorting, time, &self.gallery_tag)
+    }
+
+    fn open_gallery(&mut self, dir: PathBuf) {
+        let parts = crate::lospec_gallery::rel_parts(&dir);
+        match parts.first().map(String::as_str) {
+            None => {
+                // Bare root → browse with the current sidebar filters.
+                let path = self.gallery_browse_path();
+                self.start_gallery_browse(path);
+            }
+            Some(b) if b == crate::lospec_gallery::BROWSE => self.start_gallery_browse(dir),
+            _ => self.show_folder(dir, Vec::new()),
+        }
+    }
+
+    /// Kick off a gallery browse on a worker; pieces stream in via `poll_gallery`.
+    fn start_gallery_browse(&mut self, dir: PathBuf) {
+        let parts = crate::lospec_gallery::rel_parts(&dir);
+        // parts = [browse, medium, sorting, time, tag]
+        let medium = parts.get(1).cloned().unwrap_or_else(|| "all".into());
+        let sorting = parts.get(2).cloned().unwrap_or_else(|| "latest".into());
+        let time = parts.get(3).cloned().unwrap_or_else(|| "all".into());
+        let tag = parts.get(4).filter(|t| *t != "-").cloned().unwrap_or_default();
+        self.show_folder(dir.clone(), Vec::new());
+        self.gallery_pieces.clear();
+        if let Some(c) = self.gallery_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gallery_rx = Some(rx);
+        self.gallery_cancel = Some(cancel.clone());
+        self.status = "Browsing Lospec gallery…".into();
+        self.want_repaint = true;
+        std::thread::spawn(move || gallery_walk(medium, sorting, time, tag, &dir, cancel, tx));
+    }
+
+    fn poll_gallery(&mut self) {
+        let Some(rx) = &self.gallery_rx else { return };
+        let (mut got, mut done) = (false, false);
+        for _ in 0..128 {
+            match rx.try_recv() {
+                Ok(GalleryMsg::Hit(mut entry, p)) => {
+                    entry.rating = self.read_rating(&entry.path);
+                    self.gallery_pieces.insert(entry.path.clone(), *p);
+                    self.all_entries.push(entry);
+                    got = true;
+                }
+                Ok(GalleryMsg::Done(n)) => {
+                    self.status = format!("{n} gallery piece(s) — click one to view full size");
+                    done = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.want_repaint = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if done {
+            self.gallery_rx = None;
+        }
+        if got || done {
+            self.rebuild_view();
+            self.want_repaint = true;
+        }
+    }
+
+    /// Open a gallery piece: resolve its full-resolution image URL from the piece page, download it,
+    /// then view it. (The listing only exposes thumbnails; the full image lives on the page.)
+    fn start_gallery_open(&mut self, vpath: PathBuf) {
+        let Some(p) = self.gallery_pieces.get(&vpath).cloned() else {
+            self.status = "Unknown piece".into();
+            return;
+        };
+        if self.gallery_open_rx.is_some() {
+            self.status = "Already loading…".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gallery_open_rx = Some(rx);
+        self.status = format!("Loading: {}", elide(&p.title, 40));
+        let dir = self.gallery_dir.clone();
+        std::thread::spawn(move || {
+            let res = crate::lospec_gallery::full_image_url(&p.page_url)
+                .and_then(|url| download_to_dir(&url, &p.filename(), &dir))
+                .map(|local| (vpath, local));
+            let _ = tx.send(res);
+        });
+    }
+
+    fn poll_gallery_open(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.gallery_open_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((vpath, local))) => {
+                let credit = self
+                    .gallery_pieces
+                    .get(&vpath)
+                    .map(|p| format!("{} — by {} · {}", p.title, p.artist, p.page_url));
+                self.gallery_files.insert(vpath.clone(), local);
+                self.gallery_open_rx = None;
+                self.load_full(ctx, vpath);
+                if let Some(c) = credit {
+                    self.status = c;
+                }
+            }
+            Ok(Err(e)) => {
+                self.status = format!("Load failed: {e}");
+                self.gallery_open_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.want_repaint = true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gallery_open_rx = None,
         }
     }
 
@@ -19665,6 +19830,12 @@ impl Kaleidotron {
             // A Lospec palette → open its detail view (author / colours / example art / download).
             self.selected = idx;
             self.open_lospec_detail(entry.path);
+        } else if self.gallery_pieces.contains_key(&entry.path)
+            && !self.gallery_files.contains_key(&entry.path)
+        {
+            // A Lospec gallery piece not yet fetched → resolve its full image + view it.
+            self.selected = idx;
+            self.start_gallery_open(entry.path);
         } else if self.ph_assets.contains_key(&entry.path) && !self.ph_files.contains_key(&entry.path)
         {
             // A Poly Haven asset not yet downloaded → fetch it (a model pulls its whole bundle),
@@ -28557,6 +28728,9 @@ impl Kaleidotron {
                                 } else if let Some(r) = self.img_results.get(path) {
                                     // Openverse result → fetch its hosted thumbnail over HTTP.
                                     self.colo_thumbs.request(path, &r.thumb_url, THUMB_PX, false);
+                                } else if let Some(gp) = self.gallery_pieces.get(path) {
+                                    // Lospec gallery piece → fetch its CDN preview thumbnail.
+                                    self.colo_thumbs.request(path, &gp.thumb_url, THUMB_PX, false);
                                 } else if let Some(g) = self.steam_games.get(path) {
                                     // Steam game → fetch its CDN header image over HTTP.
                                     self.colo_thumbs.request(
@@ -35256,7 +35430,7 @@ impl Kaleidotron {
             8 => self.plugin_images,
             9 => self.plugin_icons,
             10 => self.plugin_vectors,
-            11 => self.plugin_lospec,
+            11 | 18 => self.plugin_lospec, // 11 = palettes, 18 = gallery (both under the Lospec plugin)
             12 => self.plugin_ph,
             13 => self.plugin_gfonts,
             14 => self.plugin_audiosearch,
@@ -36816,6 +36990,51 @@ impl Kaleidotron {
                         if let Some(p) = self.favorites_buttons(ui, "🎨", crate::lospec::is_remote, false) {
                             nav = Some(p);
                         }
+                    } else if self.places_tab == 18 {
+                        // Lospec Gallery: Medium / Sorting / Time dropdowns + a tag box → Browse.
+                        use crate::lospec_gallery as g;
+                        let mut gallery_go = false;
+                        egui::ComboBox::from_id_salt("gal_medium")
+                            .selected_text(g::MEDIUMS.get(self.gallery_medium).map_or("All", |m| m.1))
+                            .show_ui(ui, |ui| {
+                                for (i, (_, label)) in g::MEDIUMS.iter().enumerate() {
+                                    ui.selectable_value(&mut self.gallery_medium, i, *label);
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("gal_sort")
+                                .selected_text(g::SORTINGS.get(self.gallery_sorting).map_or("Latest", |s| s.1))
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, label)) in g::SORTINGS.iter().enumerate() {
+                                        ui.selectable_value(&mut self.gallery_sorting, i, *label);
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt("gal_time")
+                                .selected_text(g::TIMES.get(self.gallery_time).map_or("All", |t| t.1))
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, label)) in g::TIMES.iter().enumerate() {
+                                        ui.selectable_value(&mut self.gallery_time, i, *label);
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.gallery_tag)
+                                    .hint_text("tag (optional)…")
+                                    .desired_width(110.0),
+                            );
+                            if ui.button(format!("{} Browse", icons::SEARCH)).clicked() {
+                                gallery_go = true;
+                            }
+                        });
+                        ui.weak("Community pixel / voxel / textmode art — click a piece for a full-size view.");
+                        ui.weak("Loads from Lospec's CDN; each piece links back to Lospec.");
+                        if gallery_go {
+                            nav = Some(self.gallery_browse_path());
+                        }
+                        if let Some(p) = self.favorites_buttons(ui, "\u{1F5BC}", crate::lospec_gallery::is_remote, false) {
+                            nav = Some(p);
+                        }
                     } else if self.places_tab == 12 {
                         // Poly Haven: one search box per family (models / textures / HDRIs). The
                         // catalogue is a single cached request, so filtering is local + instant.
@@ -38185,6 +38404,8 @@ impl eframe::App for Kaleidotron {
         self.poll_asset_open(&ctx);
         self.poll_lospec(&ctx);
         self.poll_lospec_open();
+        self.poll_gallery();
+        self.poll_gallery_open(&ctx);
         self.poll_lospec_author();
         self.poll_ph();
         self.poll_ph_open(&ctx);
@@ -46935,6 +47156,7 @@ fn any_remote(p: &Path) -> bool {
         || crate::gfonts::is_remote(p)
         || crate::httpfs::is_remote(p)
         || crate::modarchive::is_remote(p)
+        || crate::lospec_gallery::is_remote(p)
 }
 
 /// Extract the YouTube id from a virtual filename `Title [id].mp4` → `id`. `None` if absent.
@@ -47145,6 +47367,37 @@ fn lospec_walk(
         }
     }
     let _ = tx.send(LospecMsg::Done(n));
+}
+
+/// Worker: browse the Lospec gallery, streaming one art piece per hit. The virtual path nests the
+/// artist as a folder so two pieces with the same slug (different artists) can't collide.
+fn gallery_walk(
+    medium: String,
+    sorting: String,
+    time: String,
+    tag: String,
+    root: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<GalleryMsg>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let pieces = crate::lospec_gallery::browse(&medium, &sorting, &time, &tag, 160).unwrap_or_default();
+    let mut n = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for p in pieces {
+        if cancel.load(Relaxed) {
+            return;
+        }
+        let path = root.join(&p.artist).join(p.filename());
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        n += 1;
+        if tx.send(GalleryMsg::Hit(virtual_entry(path), Box::new(p))).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(GalleryMsg::Done(n));
 }
 
 /// A bare virtual result entry (no on-disk file behind it yet) — the shape every search worker
