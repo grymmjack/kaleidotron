@@ -85,9 +85,9 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
 
 ## Highlights
 
-- **30+ image & scene-art formats**, including palette-preserving PCX, Aseprite,
-  PSD, GIMP XCF, SVG, and the full demoscene/textmode set (ANSI, XBin, PETSCII,
-  RIPscript, and more).
+- **40+ image & scene-art formats**, including palette-preserving PCX, IFF/ILBM,
+  BSAVE, Aseprite, PSD, GIMP XCF, SVG, and the full demoscene/textmode set (ANSI, XBin,
+  PETSCII, RIPscript, and more).
 - **Pixel-perfect zoom** — nearest-neighbor textures, snapped to whole device
   pixels so dithering never warps, even on fractionally-scaled (HiDPI) displays.
 - **Virtualized thumbnail grid** — *or a sortable table view* — that scrolls smoothly
@@ -143,6 +143,11 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   color, authentic IBM VGA & C64 fonts, baud-rate ANSImation/RIP playback, CRT scanlines,
   phosphor glow, 9-dot VGA cells, slideshow, an immersive fullscreen mode, and a
   random-pack screensaver.
+- **Old-school DOS formats, first-class**: palette-preserving IFF/ILBM (incl. Deluxe Paint
+  PBM, HAM & EHB) and BSAVE CGA / mode-13h screen dumps, plus **content-sniffing** so a
+  group's oddball extension (`.hpe`/`.ad`/`.mir`/…) still renders as scene art. And you can
+  **run `.com`/`.exe`/`.bat` DOS programs in DOSBox** — period-accurate machine presets,
+  pack folder auto-mounted as `C:`.
 
 ---
 
@@ -156,8 +161,8 @@ down to the extensions a decoder claims.
 
 | Category | Formats | Notes |
 |---|---|---|
-| **Raster** | PNG, GIF, BMP, JPEG, WebP, TGA, TIFF, PNM/PBM/PGM/PPM, QOI, **ICO** | Via the `image` crate |
-| **Palette-preserving** | **PCX** | Original indices + palette kept, not flattened |
+| **Raster** | PNG, GIF, BMP, JPEG, WebP, TGA, TIFF, PNM/PBM/PGM/PPM, QOI, **ICO**, **HDR**, **DDS**, **OpenEXR**, **farbfeld** | Via the `image` crate |
+| **Palette-preserving** | **PCX**, **IFF / ILBM** (`.iff` / `.ilbm` / `.lbm`, incl. Deluxe Paint **PBM** chunky, HAM & EHB), **BSAVE** (`.bsv` / `.bsave` — DOS CGA / mode-13h screen dumps) | Original indices + palette kept, not flattened |
 | **Layered / editor** | **Aseprite** (`.aseprite` / `.ase`), **Photoshop PSD**, **GIMP XCF** | Composited / flattened |
 | **Animation** | Animated **GIF** | Plays in the viewer; hover-to-play in the grid |
 | **Misc** | **.draw** (DRAW project) | PNG preview |
@@ -173,16 +178,17 @@ down to the extensions a decoder claims.
 
 | Category | Formats | Notes |
 |---|---|---|
-| **ANSI / ASCII art** | `.ans` `.asc` `.nfo` `.diz` `.ice` `.cia` | CP437 + ANSI SGR/cursor, iCE colors, 24-bit, SAUCE-driven cells, baud ANSImation |
+| **ANSI / ASCII art** | `.ans` `.asc` `.nfo` `.diz` `.ice` `.cia` `.ace` `.hyp` + scene readme/doc exts (`.doc` `.dox` `.me` `.1st` `.now` `.msg` `.cap` `.inf` `.grp` `.fyi`) | CP437 + ANSI SGR/cursor, iCE colors, 24-bit, SAUCE-driven cells, baud ANSImation |
 | **Binary scene art** | **XBin** (`.xb`/`.xbin`), **raw BIN** (`.bin`), **TundraDraw** (`.tnd`, 24-bit), **iCE Draw** (`.idf`), **Artworx** (`.adf`) | |
 | **Commodore** | **PETSCII** (`.seq`/`.pet`), **petmate** (`.petmate`) | Authentic C64 font + VIC-II palette |
+| **Any unrecognized extension** | group-specific oddities (`.hpe` `.ad` `.img` `.lgc` `.ltd` `.mir` `.qck` …) | **Content-sniffed** — a file with a SAUCE record, ANSI escapes or CP437 block glyphs renders as scene art even under an unknown extension. Right-click → **Open as text art** forces it on anything |
 
 ### 📄 Documents & code *(plugins)*
 
 | Category | Formats | Notes |
 |---|---|---|
 | **PDF** | `.pdf` | Real first-page tile + in-app 1-/2-page viewer (needs poppler) |
-| **Source code / text** | ~90 exts — `rs` `c`/`cpp`/`h` `py` `js`/`ts` `css` `html` `php` `lua` `asm` `gd` `bas` `json` `yaml` `xml` `md` `log` `sh` `rb` `go` `swift` `kt` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter + line numbers |
+| **Source code / text** | ~100 exts — `rs` `c`/`cpp`/`h` `py` `js`/`ts` `css` `html` `php` `lua` `asm` `gd` `bas` `pas` `json` `yaml` `xml` `md` `log` `sh` `rb` `go` `swift` `kt` `ipynb` … | CP437-rasterized with a hand-rolled syntax highlighter + line numbers |
 
 ### 🔊 Sound *(plugin)*
 
@@ -223,11 +229,23 @@ headless-Blender render (no Rust crate can parse modern `.blend` files).
 `.xmind` — rendered from the file's own theme, with markers, notes, images, boundaries,
 relationships and multiple sheets.
 
+### 🕹 DOS programs *(needs DOSBox)*
+
+`.com` `.exe` `.bat` `.cmd` — **run in DOSBox** on double-click or right-click **▶ Run in
+DOSBox** (a scene pack's `RUNME.BAT` viewer just launches). Point Preferences at your
+DOSBox / DOSBox-Staging binary; the program's folder — or the whole pack, when it lives
+inside a mounted archive / 16colo.rs pack — is mounted as `C:` so dependencies resolve.
+Options: **keep the window open** after exit (for outro ANSIs), an emulated-**machine**
+preset (XT → Pentium MMX, e.g. 486 DX2/66), and an **SVGA mode** toggle for high-res
+viewers/demos. The welcome banner and your own `autoexec` are suppressed so it drops
+straight into the art. DOS programs are **never** auto-launched by prev/next or the
+slideshow — only an explicit click runs them.
+
 ### 🗜 Archives & online
 
 | Category | Formats | Notes |
 |---|---|---|
-| **Archives (virtual folders)** | `.zip` `.7z` `.rar` `.lha`/`.lzh` `.tar`/`.tgz`/`.tbz` `.ace` `.arj` `.arc` `.zoo` `.ha` `.uc2` `.sqz` `.hyp` | Browsed read-only; contents extracted on demand |
+| **Archives (virtual folders)** | `.zip` `.7z` `.rar` `.lha`/`.lzh` `.tar`/`.tgz`/`.tbz` `.arj` `.arc` `.zoo` `.ha` `.uc2` `.sqz` | Browsed read-only; contents extracted on demand. **Every** member is listed (with best-effort type ID), not just decodable ones |
 | **Online archive** | **[16colo.rs](https://16colo.rs)** | The ANSI scene, mounted as a virtual disk (years / packs / artists / groups / search) |
 
 Scene-art formats are decoded with **SAUCE** metadata awareness (the standard
