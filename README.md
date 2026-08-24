@@ -1463,6 +1463,26 @@ Pinned to `eframe = "0.34"` / `image = "0.25"` (with `Cargo.lock` committed). eg
 renames symbols even between patch releases — if a build breaks on an egui symbol,
 it almost certainly just moved; check the egui CHANGELOG for that version.
 
+### CI & releases
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **`ci.yml`** — builds + runs the headless test suite on Linux for every push/PR (plus a
+  best-effort GUI-screenshot artifact).
+- **`release.yml`** — builds standalone binaries for **Linux x86-64**, **Windows x86-64**,
+  and **macOS** (Intel *and* Apple Silicon). Run it manually (Actions → *Release* → *Run
+  workflow*) to get the four archives as downloadable workflow artifacts, or **push a
+  version tag** to build them *and* publish a GitHub Release:
+
+  ```sh
+  git tag v0.1.0 && git push origin v0.1.0
+  ```
+
+  Each archive contains the binary + `README.md`; the Windows `.zip` also ships `pdfium.dll`
+  (keep it next to `kaleidotron.exe` — it's what renders PDFs in-process). The macOS builds
+  are **unsigned**, so first launch needs a right-click → *Open* (or `xattr -dr
+  com.apple.quarantine kaleidotron`) to get past Gatekeeper.
+
 > **Note on UI glyphs:** the bundled egui font lacks the Geometric Shapes block
 > (`▲`/`▼`/`●` render as tofu). Stick to the emoji arrows `⬅`/`➡`/`⬆`/`⬇`,
 > `⟲`/`⟳`, `…`/`×`/`›`/`★`/`📁`/`·`, or ASCII — or paint the glyph yourself.

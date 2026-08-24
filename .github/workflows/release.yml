@@ -1,0 +1,131 @@
+name: Release
+
+# Build standalone binaries for Linux, macOS (Intel + Apple Silicon) and Windows.
+#
+# - Push a tag like `v0.1.0` → builds all four targets AND publishes a GitHub Release
+#   with the archives attached.
+# - Run manually (Actions → Release → Run workflow) → builds all four and uploads them as
+#   downloadable workflow artifacts, but publishes nothing. Handy for a dry run.
+#
+# Cross-platform notes (why this needs almost no per-OS setup):
+# - TLS is pure-Rust (ureq → rustls/ring), so there's no system OpenSSL to install.
+# - File dialogs use rfd's XDG-portal backend (ashpd), so there's no GTK build dep.
+# - Only Linux needs apt packages (xcb/xkb for winit, ALSA for rodio/cpal/midir).
+# - The vendored libxmp compiles with the C toolchain each runner already ships.
+# - Windows renders PDFs via a bundled pdfium.dll; build.rs copies it next to the .exe,
+#   and the Windows package ships it alongside the binary.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+          - os: macos-latest # Apple Silicon runner
+            target: aarch64-apple-darwin
+            name: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux-only build deps (eframe/winit + ALSA). Same set the CI job uses.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # NOTE: on Windows this step must run in the default PowerShell, NOT bash —
+      # Git Bash's /usr/bin/link.exe shadows MSVC's linker and fails with LNK1181.
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || version="dev"
+          stage="kaleidotron-${version}-${{ matrix.name }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/kaleidotron" "$stage/"
+          cp README.md "$stage/" 2>/dev/null || true
+          tar -czf "${stage}.tar.gz" "$stage"
+          echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $stage = "kaleidotron-$version-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/kaleidotron.exe" "$stage/"
+          # pdfium.dll is required for in-app PDF rendering (build.rs stages it beside the exe).
+          Copy-Item "target/${{ matrix.target }}/release/pdfium.dll" "$stage/" -ErrorAction SilentlyContinue
+          Copy-Item README.md "$stage/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          "ASSET=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to create the release + upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -R artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
