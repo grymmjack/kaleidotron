@@ -164,8 +164,9 @@ pub fn parse(html: &str) -> Vec<GalleryPiece> {
     let mut seen = std::collections::HashSet::new();
     for chunk in html.split("class=\"thumbnail\"").skip(1) {
         // The `src="…"` sits right after the class on the <img>. Cap the search window so a
-        // malformed tag can't scan the rest of the document.
-        let window = &chunk[..chunk.len().min(600)];
+        // malformed tag can't scan the rest of the document — via `get()`, which returns None (→ the
+        // whole chunk) rather than PANICKING when byte 600 lands mid-multibyte-char (unicode titles).
+        let window = chunk.get(..600).unwrap_or(chunk);
         let Some(src) = extract_attr(window, "src") else {
             continue;
         };
@@ -355,6 +356,18 @@ mod tests {
         assert_eq!(norm("", "latest"), "latest");
         assert_eq!(norm("pixel-art", "all"), "pixel-art");
         assert_eq!(norm("  top ", "latest"), "top");
+    }
+
+    #[test]
+    fn parse_survives_multibyte_near_the_window_edge() {
+        // A unicode-heavy blob after the src crosses byte 600 — the old byte-slice panicked here.
+        let pad = "é".repeat(400);
+        let html = format!(
+            "<img class=\"thumbnail\" src=\"https://cdn.lospec.com/thumbnails/gallery/artist/slug-default.png\">{pad}"
+        );
+        let p = parse(&html);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].slug, "slug");
     }
 
     #[test]
