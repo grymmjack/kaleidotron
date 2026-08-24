@@ -57,10 +57,36 @@ fn main() -> Result<(), eframe::Error> {
         std::process::exit(app::run_render(&cli));
     }
 
-    // Carry a pixelview install's data over before eframe reads its storage.
-    migrate_from_pixelview();
+    // The effective profile directory: `--data-dir DIR` overrides the default location
+    // (~/.local/share/kaleidotron), so a build can be tested from a clean slate.
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .or_else(|| eframe::storage_dir("kaleidotron"));
 
-    let options = eframe::NativeOptions {
+    // `--restore`: move the backup back over the current profile, then exit (maintenance op).
+    if cli.restore {
+        match &data_dir {
+            Some(dir) => restore_profile(dir),
+            None => eprintln!("kaleidotron: --restore: could not resolve the data dir"),
+        }
+        return Ok(());
+    }
+    // `--reset`: back the current profile up once (never clobbering an existing backup) and
+    // start fresh. Restore later with `--restore`.
+    if cli.reset {
+        if let Some(dir) = &data_dir {
+            reset_profile(dir);
+        }
+    }
+
+    // Carry a pixelview install's data over before eframe reads its storage — but NOT when a
+    // custom/reset profile is in play, whose whole point is a clean slate.
+    if cli.data_dir.is_none() && !cli.reset {
+        migrate_from_pixelview();
+    }
+
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 420.0])
@@ -71,12 +97,83 @@ fn main() -> Result<(), eframe::Error> {
             .with_icon(app_icon()),
         ..Default::default()
     };
+    // Point eframe's own persistence (app.ron) at the custom dir too, so it agrees with the
+    // app's data_dir (which reads `cli.data_dir`). Default = eframe's own storage location.
+    if let Some(dir) = &cli.data_dir {
+        let _ = std::fs::create_dir_all(dir);
+        options.persistence_path = Some(dir.join("app.ron"));
+    }
 
     eframe::run_native(
         "kaleidotron",
         options,
         Box::new(move |cc| Ok(Box::new(app::Kaleidotron::new(cc, cli)))),
     )
+}
+
+/// Backup path for a profile dir: the same path with `.bak` appended (a sibling, so the
+/// cache/youtube symlinks inside move with it on a rename).
+fn profile_backup(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut s = dir.as_os_str().to_owned();
+    s.push(".bak");
+    std::path::PathBuf::from(s)
+}
+
+/// `--reset`: preserve the current profile as `<dir>.bak` — but only if no backup exists yet,
+/// so a *second* reset can never overwrite your real settings with throwaway test data — then
+/// start fresh. Removing the dir drops the `cache`/`youtube` symlinks, not their shared targets.
+fn reset_profile(dir: &std::path::Path) {
+    let bak = profile_backup(dir);
+    if !dir.exists() {
+        eprintln!(
+            "kaleidotron: --reset: {} doesn't exist yet — already a clean slate",
+            dir.display()
+        );
+        return;
+    }
+    if bak.exists() {
+        // Real settings are already safely backed up; just clear the (test) profile.
+        if std::fs::remove_dir_all(dir).is_ok() {
+            eprintln!(
+                "kaleidotron: --reset: cleared {} for a fresh run (backup at {} kept — restore with --restore)",
+                dir.display(),
+                bak.display()
+            );
+        } else {
+            eprintln!("kaleidotron: --reset: could not clear {}", dir.display());
+        }
+    } else if std::fs::rename(dir, &bak).is_ok() {
+        eprintln!(
+            "kaleidotron: --reset: backed up {} → {} — starting fresh (restore with --restore)",
+            dir.display(),
+            bak.display()
+        );
+    } else {
+        eprintln!(
+            "kaleidotron: --reset: could not back up {}; leaving it in place",
+            dir.display()
+        );
+    }
+}
+
+/// `--restore`: discard the current (test) profile and move `<dir>.bak` back into place.
+fn restore_profile(dir: &std::path::Path) {
+    let bak = profile_backup(dir);
+    if !bak.exists() {
+        eprintln!("kaleidotron: --restore: no backup at {}", bak.display());
+        return;
+    }
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(dir); // discard the throwaway test profile
+    }
+    match std::fs::rename(&bak, dir) {
+        Ok(()) => eprintln!(
+            "kaleidotron: --restore: restored {} from {}",
+            dir.display(),
+            bak.display()
+        ),
+        Err(e) => eprintln!("kaleidotron: --restore failed ({e})"),
+    }
 }
 
 /// Bring a previous `pixelview` install's data across, once, on first run under the new name.

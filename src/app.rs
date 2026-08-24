@@ -3115,7 +3115,13 @@ impl Kaleidotron {
         crate::decode::set_font_9px(font_9px);
         // Ratings sidecar lives alongside eframe's own storage (e.g.
         // ~/.local/share/kaleidotron/ratings.json); temp dir is a harmless fallback.
-        let data_dir = eframe::storage_dir("kaleidotron").unwrap_or_else(std::env::temp_dir);
+        // `--data-dir` overrides the location (for testing a build from a clean slate); it must
+        // match the `persistence_path` main.rs hands eframe so app.ron + our sidecars agree.
+        let data_dir = cli
+            .data_dir
+            .clone()
+            .or_else(|| eframe::storage_dir("kaleidotron"))
+            .unwrap_or_else(std::env::temp_dir);
         let ratings = crate::ratings::RatingStore::load(&data_dir);
         // View history lives alongside the ratings sidecar + eframe storage.
         let viewdb = crate::viewdb::ViewDb::open(&data_dir);
@@ -50362,6 +50368,10 @@ pub struct CliArgs {
     pub batch_cols: Option<usize>,        // --cols N: force the char grid width
     pub batch_rows: Option<usize>,        // --rows N: force the char grid height
     pub batch_cell: Option<(usize, usize)>, // --cell WxH: 8x8 | 8x16 | 9x16
+    // Profile / data-dir management (for testing a build from a clean slate).
+    pub data_dir: Option<PathBuf>, // --data-dir DIR: use DIR for all settings/cache instead of the default
+    pub reset: bool,               // --reset: back the current profile up (once) and start fresh
+    pub restore: bool,             // --restore: move the backup back over the current profile, then exit
 }
 
 const USAGE: &str = "\
@@ -50378,6 +50388,16 @@ OPTIONS:
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
     -h, --help                    Print this help
+
+PROFILE OPTIONS (test a build from a clean slate; settings live in the data dir):
+        --data-dir <DIR>          Use DIR for ALL settings / cache / ratings instead of
+                                  the default (~/.local/share/kaleidotron). Non-destructive
+                                  and repeatable — point it at an empty dir for a fresh run.
+        --reset                   Back the current profile up to '<data-dir>.bak' (only if no
+                                  backup exists yet — your real settings are never clobbered)
+                                  and start FRESH. Restore later with --restore.
+        --restore                 Move '<data-dir>.bak' back over the current profile, then
+                                  exit. Gets your real settings back after --reset testing.
 
 RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files):
     -r, --render <PATH>...        One or more input files and/or folders. A folder
@@ -50480,6 +50500,12 @@ impl CliArgs {
                     Some(wh) => out.batch_cell = Some(wh),
                     None => cli_fail("--cell requires WxH (8x8, 8x16, or 9x16)"),
                 },
+                "--data-dir" | "--profile" => match args.next() {
+                    Some(v) => out.data_dir = Some(PathBuf::from(v)),
+                    None => cli_fail("--data-dir requires a directory path"),
+                },
+                "--reset" => out.reset = true,
+                "--restore" => out.restore = true,
                 "--font-9px" => out.render_font_9px = true,
                 "--scale" => match args.next() {
                     Some(v) => match v.parse::<u32>() {
