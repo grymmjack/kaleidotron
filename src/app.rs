@@ -36966,6 +36966,37 @@ impl Kaleidotron {
                         });
                         ui.weak("Filters by Lospec TAG (e.g. gameboy · retro · fantasy) — not name/author.");
                         ui.weak("Click a palette → added to your library + Recolor.");
+                        // Tag cloud: the tags on the palettes currently shown, most-common first,
+                        // each a one-click filter. Lospec has no tags endpoint, so it's built from
+                        // the results — a way to discover neighbouring tags to drill into.
+                        if !self.lospec_palettes.is_empty() {
+                            let mut counts: HashMap<&str, usize> = HashMap::new();
+                            for p in self.lospec_palettes.values() {
+                                for t in &p.tags {
+                                    *counts.entry(t.as_str()).or_default() += 1;
+                                }
+                            }
+                            let mut tags: Vec<(String, usize)> =
+                                counts.into_iter().map(|(t, n)| (t.to_string(), n)).collect();
+                            tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                            tags.truncate(30);
+                            if !tags.is_empty() {
+                                ui.add_space(4.0);
+                                ui.weak("Tags in these results — click to filter:");
+                                ui.horizontal_wrapped(|ui| {
+                                    for (t, _n) in &tags {
+                                        if ui.small_button(t).clicked() {
+                                            self.lospec_query = t.clone();
+                                            nav = Some(
+                                                Path::new(crate::lospec::ROOT)
+                                                    .join(crate::lospec::SEARCH)
+                                                    .join(t),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         // Pin the current browse to Places.
                         let cur = self.folder.as_ref().filter(|f| {
                             crate::lospec::is_remote(f)
@@ -47343,7 +47374,7 @@ fn lospec_walk(
     tx: std::sync::mpsc::Sender<LospecMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let palettes = crate::lospec::search(&query, 60).unwrap_or_default();
+    let palettes = crate::lospec::search(&query, 120).unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
     for p in palettes {
