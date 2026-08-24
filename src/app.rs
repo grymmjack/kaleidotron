@@ -28386,10 +28386,13 @@ impl Kaleidotron {
                                     crate::format_color::color32(ext),
                                 );
                             }
-                        } else if !self.is_renderable(path) {
+                        } else if !self.is_renderable(path) && !self.thumb_tex.contains_key(path) {
                             // A file we can't decode (surfaced by a mount's "show everything"
                             // listing): a document glyph + a best-effort type id, no thumbnail
                             // request (which would spin forever on an undecodable file).
+                            // BUT skip this when we already built a synthetic thumbnail for it (a
+                            // Lospec palette's `.gpl` isn't "renderable", yet poll_lospec put a
+                            // swatch grid in thumb_tex — fall through so that renders instead).
                             let label = self
                                 .file_id_cache
                                 .entry(path.clone())
@@ -36785,7 +36788,8 @@ impl Kaleidotron {
                                 nav = Some(Path::new(crate::lospec::ROOT).join(crate::lospec::SEARCH).join(q));
                             }
                         });
-                        ui.weak("Lospec · click a palette → added to your library + Recolor");
+                        ui.weak("Filters by Lospec TAG (e.g. gameboy · retro · fantasy) — not name/author.");
+                        ui.weak("Click a palette → added to your library + Recolor.");
                         // Pin the current browse to Places.
                         let cur = self.folder.as_ref().filter(|f| {
                             crate::lospec::is_remote(f)
