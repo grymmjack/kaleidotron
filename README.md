@@ -7,6 +7,40 @@ It started as an image viewer. It now also converts images to ANSI/PETSCII/ASCII
 renders 3D models, plays and trims video, edits samples and MIDI drum kits, browses
 a dozen web sources, and edits text — hence the name.
 
+## From Pixel Viewer to Kaleidotron
+
+*It started as **Pixel Viewer** — a fast pixel-art image viewer (a decoder registry, a
+thumbnail grid, and a nearest-neighbor zoom view). Here's everything that grew on the way
+to the new name:*
+
+- **Format coverage exploded** — from a handful of raster types to **40+ formats**:
+  palette-preserving PCX / IFF-ILBM / BSAVE, Aseprite, PSD, GIMP XCF, SVG, and the whole
+  textmode/scene family (ANSI, XBin, TundraDraw, iCE Draw, Artworx, PETSCII, petmate, RIPscript)
+- **It converts, not just views** — a full **image → ANSI / ASCII / Unicode / PETSCII /
+  ATASCII / Apple ][ / REXPaint** art pipeline, exportable back to `.ans` / `.xb` / `.petmate` / …
+- **A non-destructive Recolor stack** — reorderable adjustments, dithering
+  (Bayer / custom / Floyd–Steinberg / Atkinson), palette remap + reduce-to-N, pixel-art
+  upscalers (xBR / HQx / Scale2x / 2xSaI), CRT post-FX — saved as reusable **PixelFX presets**
+  (83 bundled)
+- **Grew a sampler + DAW corner** — waveform editor, a **16-pad Battery-style sampler** with
+  ADSR/MSEG envelopes, LFOs, filters, MIDI-learn, hardware MIDI in, kit save/load, native SFZ
+  export; plays trackers (MOD/XM/S3M/IT/…), MIDI (SoundFont), and RAD (OPL3 FM)
+- **Plays & edits video** — ffmpeg-backed player with A/V sync, hover-scrub thumbnails,
+  **lossless trim & join**, and YouTube-compatible `.md` chapter markers
+- **Renders 3D** — obj/stl/ply/gltf/glb/dae via a CPU rasterizer, interactive orbit + FPS
+  free-fly viewer, PNG export
+- **Reads code, PDFs, mind maps** — ~90 syntax-highlighted languages (VS Code theme import),
+  real PDF page renders, `.xmind` with the file's own theme
+- **Twelve web sources** — 16colo.rs, Poly Haven, Google Fonts, Lospec (palettes + gallery),
+  The Mod Archive, Openverse, Iconify, Wikimedia, a URL "HTTP browser," YouTube, Steam, and DeviantArt
+- **Became a real browser** — VS Code-shaped UI (activity rail, command palette, quick open),
+  recursive advanced search with saved filters, Grid/Table views, favorites, star ratings
+  (Gwenview-compatible), view history, git status, side-by-side image compare with layered-PSD export
+- **Authentic scene tooling** — SAUCE-aware rendering, true 24-bit ANSI, 9-dot VGA cells,
+  baud-rate "watch it draw" ANSImation/RIP playback, CRT phosphor/scanlines, a random-pack
+  screensaver, and **run DOS programs in DOSBox**
+- **Cross-platform** — Linux/macOS/Windows, headless `--render` batch conversion, and it still
+  opens instantly and zooms pixel-perfect like the original viewer did
 
 > I wrote this to accompany my https://github.com/grymmjack/pixelmon so I could easily see my generated AI art and rate it fast.
 > Needless to say, things got a little...
