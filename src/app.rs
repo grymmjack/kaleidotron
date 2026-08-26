@@ -39703,9 +39703,17 @@ impl eframe::App for Kaleidotron {
                 self.import_setup(&ctx);
             }
             // ── Theme editor actions ─────────────────────────────────────────────
+            if let Some(b) = out.theme_base {
+                // A Default base (Dark/Light) — clear the named theme + draft; the live preview
+                // block below applies the base every frame while the section is open.
+                self.theme = b;
+                self.theme_name.clear();
+                self.theme_draft = None;
+                out.theme_apply = true;
+            }
             if let Some(name) = out.theme_select {
                 self.theme_name = name.clone();
-                // Load the chosen theme into the draft for live editing (Built-in ⇒ no draft).
+                // Load the chosen theme into the draft for live editing (Default ⇒ no draft).
                 self.theme_draft = self
                     .themes
                     .iter()
@@ -39722,7 +39730,10 @@ impl eframe::App for Kaleidotron {
                 });
             }
             if out.theme_dup {
-                if let Some(mut d) = self
+                // Duplicate the draft, else the active saved theme, else — when a Default is
+                // selected — MATERIALISE the base into a full 16-colour theme so "duplicate the
+                // default" gives a complete editable starting point.
+                let dup = self
                     .theme_draft
                     .clone()
                     .or_else(|| {
@@ -39731,10 +39742,12 @@ impl eframe::App for Kaleidotron {
                             .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
                             .cloned()
                     })
-                {
-                    d.name = format!("{} copy", d.name.trim());
-                    self.theme_draft = Some(d);
-                }
+                    .map(|mut d| {
+                        d.name = format!("{} copy", d.name.trim());
+                        d
+                    })
+                    .unwrap_or_else(|| theme_from_base(self.theme == 1));
+                self.theme_draft = Some(dup);
             }
             if out.theme_save {
                 if let Some(d) = self.theme_draft.clone() {
@@ -39805,19 +39818,35 @@ impl eframe::App for Kaleidotron {
                 out.theme_apply = true;
             }
             // Live preview: `apply_theme` only runs on explicit changes, so while the Theme editor
-            // is open with a draft, push its visuals every frame (cheap — no syntax re-sync) and
-            // keep repainting so dragging a colour updates the whole app immediately.
+            // is open, push the EFFECTIVE theme's visuals every frame (cheap — no syntax re-sync)
+            // and keep repainting so selecting a theme or dragging a colour updates the whole app
+            // immediately. Covers the draft, a saved theme, AND a Default base — the last case is
+            // why selecting "Default Dark/Light" now resets correctly (before, a None draft was
+            // skipped here and `apply_theme` had already run before the select handler set its flag,
+            // so a Default selection didn't apply).
             if self.prefs_section == 8 {
-                if let Some(d) = self.theme_draft.as_ref() {
-                    let mut v = d.to_visuals();
-                    let a = d
-                        .accent
+                let teal = egui::Color32::from_rgb(78, 201, 208);
+                let acc = |t: &crate::theme::Theme| {
+                    t.accent
                         .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
-                        .unwrap_or(egui::Color32::from_rgb(78, 201, 208));
-                    stylize_visuals(&mut v, a);
-                    ctx.set_visuals(v);
-                    ctx.request_repaint();
-                }
+                        .unwrap_or(teal)
+                };
+                let (mut v, a) = if let Some(d) = self.theme_draft.as_ref() {
+                    (d.to_visuals(), acc(d))
+                } else if let Some(t) = self
+                    .themes
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
+                {
+                    (t.to_visuals(), acc(t))
+                } else if self.theme == 1 {
+                    (egui::Visuals::light(), teal)
+                } else {
+                    (egui::Visuals::dark(), teal)
+                };
+                stylize_visuals(&mut v, a);
+                ctx.set_visuals(v);
+                ctx.request_repaint();
             }
         }
 
@@ -40940,6 +40969,39 @@ fn stylize_visuals(v: &mut egui::Visuals, accent: egui::Color32) {
     // A muted, bg-toward-accent selection so highlights read the same on any base/theme.
     v.selection.bg_fill = blend_toward(v.window_fill, [accent.r(), accent.g(), accent.b()], 0.30);
     v.selection.stroke = egui::Stroke::new(1.0, accent);
+}
+
+/// Materialise egui's base dark/light `Visuals` into a full 16-colour [`crate::theme::Theme`] —
+/// for "Duplicate the default", so the user gets a complete editable starting point instead of an
+/// all-inherit blank.
+fn theme_from_base(light: bool) -> crate::theme::Theme {
+    let v = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    let c = |col: egui::Color32| [col.r(), col.g(), col.b(), col.a()];
+    crate::theme::Theme {
+        name: "Custom".to_string(),
+        dark: !light,
+        window_bg: Some(c(v.window_fill)),
+        panel_bg: Some(c(v.panel_fill)),
+        faint_bg: Some(c(v.faint_bg_color)),
+        extreme_bg: Some(c(v.extreme_bg_color)),
+        text: Some(c(v.text_color())),
+        weak_text: Some(c(v.weak_text_color())),
+        strong_text: Some(c(v.strong_text_color())),
+        accent: Some([78, 201, 208, 255]),
+        accent_text: Some(c(v.selection.stroke.color)),
+        hover_bg: Some(c(v.widgets.hovered.bg_fill)),
+        active_bg: Some(c(v.widgets.active.bg_fill)),
+        widget_bg: Some(c(v.widgets.inactive.bg_fill)),
+        border: Some(c(v.widgets.noninteractive.bg_stroke.color)),
+        hyperlink: Some(c(v.hyperlink_color)),
+        warn: Some(c(v.warn_fg_color)),
+        error: Some(c(v.error_fg_color)),
+        tokens: Default::default(),
+    }
 }
 
 /// A raised card surface for the current theme: a step off the panel fill (lighter on dark,
@@ -54356,6 +54418,7 @@ struct PrefsOut {
     theme_apply: bool,                        // theme picked → re-install Visuals
     open_config: Option<PathBuf>,             // Config-files tab → open this path
     // ── Theme editor (Theme section) ──
+    theme_base: Option<u8>,       // select a Default base: Some(0)=dark, Some(1)=light
     theme_select: Option<String>, // switch the active theme to this name ("" = Built-in)
     theme_new: bool,              // create a fresh blank theme
     theme_dup: bool,              // duplicate the active theme into an editable copy
@@ -55353,12 +55416,20 @@ impl Kaleidotron {
                     // LEFT — the theme library + create/import.
                     pref_card(&mut c[0], "Themes", accent, |ui| {
                         let active = self.theme_name.trim().to_string();
+                        let is_default = active.is_empty();
                         if ui
-                            .selectable_label(active.is_empty(), "Built-in (dark / light)")
+                            .selectable_label(is_default && self.theme == 0, "Default Dark")
                             .clicked()
                         {
-                            out.theme_select = Some(String::new());
+                            out.theme_base = Some(0);
                         }
+                        if ui
+                            .selectable_label(is_default && self.theme == 1, "Default Light")
+                            .clicked()
+                        {
+                            out.theme_base = Some(1);
+                        }
+                        ui.add_space(2.0);
                         for t in &self.themes {
                             let sel = t.name.eq_ignore_ascii_case(&active);
                             let label = format!("{}{}", t.name, if t.dark { "" } else { "  · light" });
@@ -55545,6 +55616,39 @@ mod gui_tests {
             img.save(format!("{dir}/main_menu.png")).unwrap();
             eprintln!("wrote {dir}/main_menu.png");
         }
+    }
+
+    #[test]
+    fn selecting_a_default_base_resets_the_theme() {
+        // The bug: `apply_theme` runs before the select handler sets its flag, and the live
+        // preview skipped a None draft — so clicking "Default Dark/Light" after a saved theme
+        // (i.e. going UP the list to the top) never reset the visuals. The live preview now
+        // applies the effective theme (draft → named → base) every frame, so a Default resets.
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1200.0, 900.0))
+            .build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+        h.state_mut().show_prefs = true;
+        h.state_mut().prefs_section = 8;
+        h.run_steps(3);
+        let fill = |h: &Harness<'_, Kaleidotron>| h.ctx.style().visuals.window_fill;
+        // A saved theme (bundled on first run) changes the window fill.
+        h.get_by_label("Midnight").click();
+        h.run_steps(3);
+        let mid = fill(&h);
+        // Going UP to "Default Dark" must reset away from Midnight (the bug: it didn't).
+        h.get_by_label("Default Dark").click();
+        h.run_steps(3);
+        let dark = fill(&h);
+        assert_ne!(mid, dark, "selecting Default Dark must reset off the saved theme");
+        // "Default Light" is a distinct base and is brighter than Default Dark.
+        h.get_by_label("Default Light").click();
+        h.run_steps(3);
+        let light = fill(&h);
+        let sum = |c: egui::Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(
+            sum(light) > sum(dark),
+            "Default Light ({light:?}) should be brighter than Default Dark ({dark:?})"
+        );
     }
 
     #[test]
