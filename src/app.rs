@@ -34365,25 +34365,47 @@ impl Kaleidotron {
             return;
         }
         let mut open = true;
+        let screen = ctx.content_rect();
+        let size = egui::vec2(
+            800.0_f32.min(screen.width() - 40.0),
+            600.0_f32.min(screen.height() - 40.0),
+        );
         egui::Window::new("Associations")
             .open(&mut open)
             .collapsible(false)
-            .default_width(580.0)
+            .resizable(true)
+            .default_size(size)
+            // Inherit the themed window fill + global rounded corners; pad the content ourselves.
+            .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(0)))
             .show(ctx, |ui| {
-                // Tabs: file "Open in…" programs vs "Open folder in…" folder actions. The two
-                // share one editor (`openers_editor`) — folders just hide the Extensions field.
+              egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(20, 16))
+                .show(ui, |ui| {
+                // Header: a title + segmented tabs. Files = "Open in…" programs; Folders =
+                // "Open folder in…" actions. Both share one editor (folders hide Extensions).
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.assoc_tab == 0, "Files").clicked() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("File associations").size(19.0).strong(),
+                        )
+                        .selectable(false),
+                    );
+                    ui.add_space(16.0);
+                    ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
+                    if ui
+                        .add(egui::Button::selectable(self.assoc_tab == 0, "Files"))
+                        .clicked()
+                    {
                         self.assoc_tab = 0;
                     }
                     if ui
-                        .selectable_label(self.assoc_tab == 1, "Folders")
+                        .add(egui::Button::selectable(self.assoc_tab == 1, "Folders"))
                         .clicked()
                     {
                         self.assoc_tab = 1;
                     }
                 });
-                ui.separator();
+                ui.add_space(10.0);
                 if self.assoc_tab == 1 {
                     openers_editor(
                         ui,
@@ -34416,6 +34438,7 @@ impl Kaleidotron {
                         "assoc_files",
                     );
                 }
+              });
             });
         self.show_associations = open;
     }
@@ -49158,17 +49181,19 @@ fn openers_editor(
         })
         .collect();
 
-    ui.label(intro);
-    ui.add_space(6.0);
+    let accent = ui.visuals().hyperlink_color;
+    ui.add_space(2.0);
+    ui.weak(intro);
+    ui.add_space(10.0);
     let mut add_blank = false;
     let mut add_preset: Option<Opener> = None;
     let mut remove: Option<usize> = None;
     ui.horizontal(|ui| {
-        if ui.button("➕ Add").clicked() {
+        if ui.button("\u{2795}  Add").clicked() {
             add_blank = true;
         }
         if !presets.is_empty() {
-            ui.menu_button("Add preset", |ui| {
+            ui.menu_button("Add preset  \u{25be}", |ui| {
                 for p in presets {
                     if ui.button(&p.name).clicked() {
                         add_preset = Some(p.clone());
@@ -49188,123 +49213,144 @@ fn openers_editor(
         openers.push(p);
         *selected = openers.len() - 1;
     }
-    ui.separator();
+    ui.add_space(10.0);
     if openers.is_empty() {
-        ui.weak(empty_hint);
+        pref_card(ui, "Nothing here yet", accent, |ui| {
+            ui.weak(empty_hint);
+        });
         return;
     }
 
     let mut select: Option<usize> = None;
     ui.columns(2, |cols| {
-        // Left: the program list.
-        egui::ScrollArea::vertical()
-            .id_salt(format!("{id_salt}_list"))
-            .max_height(320.0)
-            .show(&mut cols[0], |ui| {
-                for (i, (name, icon)) in list.iter().enumerate() {
-                    let sel = i == *selected;
-                    let resp = match icon {
-                        Some(id) => {
-                            let img = egui::Image::new(egui::load::SizedTexture::new(
-                                *id,
-                                egui::vec2(16.0, 16.0),
-                            ));
-                            ui.add(egui::Button::image_and_text(img, name).selected(sel))
+        // LEFT — the program list, in a card.
+        pref_card(
+            &mut cols[0],
+            if show_exts { "Programs" } else { "Folder actions" },
+            accent,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{id_salt}_list"))
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for (i, (name, icon)) in list.iter().enumerate() {
+                            let sel = i == *selected;
+                            let w = ui.available_width();
+                            let resp = match icon {
+                                Some(id) => {
+                                    let img = egui::Image::new(egui::load::SizedTexture::new(
+                                        *id,
+                                        egui::vec2(16.0, 16.0),
+                                    ));
+                                    ui.add_sized(
+                                        [w, 26.0],
+                                        egui::Button::image_and_text(img, name).selected(sel),
+                                    )
+                                }
+                                None => {
+                                    ui.add_sized([w, 26.0], egui::Button::selectable(sel, name))
+                                }
+                            };
+                            if resp.clicked() {
+                                select = Some(i);
+                            }
                         }
-                        None => ui.selectable_label(sel, name),
-                    };
-                    if resp.clicked() {
-                        select = Some(i);
-                    }
-                }
-            });
+                    });
+            },
+        );
 
-        // Right: edit the selected program's fields.
-        let rui = &mut cols[1];
+        // RIGHT — edit the selected program's fields, in a card.
         let sel = *selected;
         let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
         if let Some(o) = openers.get_mut(sel) {
-            egui::Grid::new(format!("{id_salt}_edit"))
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .show(rui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut o.name);
-                    ui.end_row();
-
-                    ui.label("Program");
-                    ui.horizontal(|ui| {
+            pref_card(&mut cols[1], "Details", accent, |ui| {
+                egui::Grid::new(format!("{id_salt}_edit"))
+                    .num_columns(2)
+                    .spacing([12.0, 9.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
                         ui.add(
-                            egui::TextEdit::singleline(&mut o.exec)
-                                .desired_width(200.0)
-                                .hint_text("gimp, /usr/bin/inkscape, code, …"),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Choose program")
-                                .pick_file()
-                            {
-                                o.exec = p.to_string_lossy().into_owned();
-                            }
-                        }
-                    });
-                    ui.end_row();
-
-                    if show_exts {
-                        ui.label("Extensions");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut o.exts)
-                                .desired_width(260.0)
-                                .hint_text("png, jpg, ans, xb …"),
+                            egui::TextEdit::singleline(&mut o.name).desired_width(f32::INFINITY),
                         );
                         ui.end_row();
-                    }
 
-                    ui.label("Arguments");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut o.args)
-                            .desired_width(260.0)
-                            .hint_text(args_hint),
-                    );
-                    ui.end_row();
-
-                    ui.label("Icon");
-                    ui.horizontal(|ui| {
-                        if let Some(id) = icon_id {
-                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                                id,
-                                egui::vec2(20.0, 20.0),
-                            )));
-                        }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut o.icon)
-                                .desired_width(170.0)
-                                .hint_text("optional image"),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .set_title("Choose an icon image")
-                                .pick_file()
-                            {
-                                o.icon = p.to_string_lossy().into_owned();
+                        ui.label("Program");
+                        ui.horizontal(|ui| {
+                            let bw = 78.0;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.exec)
+                                    .desired_width((ui.available_width() - bw).max(80.0))
+                                    .hint_text("gimp, /usr/bin/inkscape, code, \u{2026}"),
+                            );
+                            if ui.button("Browse\u{2026}").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_title("Choose program")
+                                    .pick_file()
+                                {
+                                    o.exec = p.to_string_lossy().into_owned();
+                                }
                             }
-                        }
-                    });
-                    ui.end_row();
+                        });
+                        ui.end_row();
 
-                    ui.label("Environment");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut o.env)
-                            .desired_width(260.0)
-                            .desired_rows(2)
-                            .hint_text("KEY=VALUE per line (optional)"),
-                    );
-                    ui.end_row();
-                });
-            rui.add_space(6.0);
-            if rui.button("🗑 Remove this entry").clicked() {
-                remove = Some(sel);
-            }
+                        if show_exts {
+                            ui.label("Extensions");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.exts)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("png, jpg, ans, xb \u{2026}"),
+                            );
+                            ui.end_row();
+                        }
+
+                        ui.label("Arguments");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut o.args)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(args_hint),
+                        );
+                        ui.end_row();
+
+                        ui.label("Icon");
+                        ui.horizontal(|ui| {
+                            if let Some(id) = icon_id {
+                                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                    id,
+                                    egui::vec2(20.0, 20.0),
+                                )));
+                            }
+                            let bw = 78.0;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.icon)
+                                    .desired_width((ui.available_width() - bw).max(60.0))
+                                    .hint_text("optional image"),
+                            );
+                            if ui.button("Browse\u{2026}").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .set_title("Choose an icon image")
+                                    .pick_file()
+                                {
+                                    o.icon = p.to_string_lossy().into_owned();
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Environment");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut o.env)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .hint_text("KEY=VALUE per line (optional)"),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(12.0);
+                if ui.button("\u{1F5D1}  Remove this entry").clicked() {
+                    remove = Some(sel);
+                }
+            });
         }
     });
     if let Some(i) = select {
@@ -55671,6 +55717,27 @@ mod gui_tests {
             eprintln!("wrote {dir}/hotkeys.png");
         }
         harness.state_mut().show_hotkeys = false;
+        // The Associations dialog (redesigned).
+        {
+            let st = harness.state_mut();
+            st.show_associations = true;
+            st.assoc_tab = 0;
+            if st.openers.is_empty() {
+                st.openers.push(Opener {
+                    name: "GIMP".to_string(),
+                    exec: "gimp".to_string(),
+                    exts: "png jpg jpeg xcf".to_string(),
+                    ..Default::default()
+                });
+            }
+            st.assoc_selected = 0;
+        }
+        harness.run_steps(3);
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/associations.png")).unwrap();
+            eprintln!("wrote {dir}/associations.png");
+        }
+        harness.state_mut().show_associations = false;
         // Last: open the View menu for a clean app-wide-look shot (checkbox toggles).
         harness.get_by_label("View").click();
         harness.run_steps(2);
