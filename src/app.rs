@@ -55505,13 +55505,6 @@ mod gui_tests {
             img.save(format!("{dir}/main.png")).unwrap();
             eprintln!("wrote {dir}/main.png");
         }
-        // Open the View menu so the dropdown's rounded corners + accent hover show.
-        harness.get_by_label("View").click();
-        harness.run_steps(2);
-        if let Ok(img) = harness.render() {
-            img.save(format!("{dir}/main_menu.png")).unwrap();
-            eprintln!("wrote {dir}/main_menu.png");
-        }
         harness.state_mut().show_prefs = true;
         // Seed a draft so the Theme section renders its editor populated.
         harness.state_mut().theme_draft = Some(crate::theme::Theme {
@@ -55543,6 +55536,14 @@ mod gui_tests {
                 }
                 Err(e) => eprintln!("render {nm} failed: {e}"),
             }
+        }
+        // Last: close the dialog and open the View menu for a clean app-wide-look shot.
+        harness.state_mut().show_prefs = false;
+        harness.get_by_label("View").click();
+        harness.run_steps(2);
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/main_menu.png")).unwrap();
+            eprintln!("wrote {dir}/main_menu.png");
         }
     }
 
