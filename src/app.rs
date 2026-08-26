@@ -36492,52 +36492,45 @@ impl Kaleidotron {
                     ui.close();
                 }
                 ui.separator();
-                if ui
-                    .selectable_label(self.table_view, "Table view")
-                    .on_hover_text("Show the current folder as a sortable table")
-                    .clicked()
-                {
+                // Toggles render as CHECKBOXES (a checkmark), not a full-width selectable bar that
+                // the app-wide accent turns into a big coloured highlight. The real toggle still
+                // goes through the MenuAction; the checkbox's bool is a throwaway mirror of state.
+                let check = |ui: &mut egui::Ui, on: bool, label: &str, hover: &str| {
+                    let mut v = on;
+                    let mut r = ui.checkbox(&mut v, label);
+                    if !hover.is_empty() {
+                        r = r.on_hover_text(hover);
+                    }
+                    r.clicked()
+                };
+                if check(ui, self.table_view, "Table view", "Show the current folder as a sortable table") {
                     action = Some(MenuAction::ToggleTable);
                     ui.close();
                 }
-                if ui
-                    .selectable_label(self.show_hidden, "Hidden files (.)")
-                    .on_hover_text("Show dotfiles / hidden entries in this folder")
-                    .clicked()
-                {
+                if check(ui, self.show_hidden, "Hidden files (.)", "Show dotfiles / hidden entries in this folder") {
                     action = Some(MenuAction::ToggleHidden);
                     ui.close();
                 }
-                if ui
-                    .selectable_label(self.fav_bar_colored_only, "Favorites bar: colored only")
-                    .on_hover_text(
-                        "Show only color-tagged favorites in the top bar (the rest stay in \
-                         the Places dock) — color-tag a favorite from its right-click menu",
-                    )
-                    .clicked()
-                {
+                if check(
+                    ui,
+                    self.fav_bar_colored_only,
+                    "Favorites bar: colored only",
+                    "Show only color-tagged favorites in the top bar (the rest stay in the Places \
+                     dock) — color-tag a favorite from its right-click menu",
+                ) {
                     action = Some(MenuAction::ToggleFavBarColored);
                     ui.close();
                 }
                 ui.separator();
-                if ui
-                    .selectable_label(self.show_explorer, "Explorer pane")
-                    .clicked()
-                {
+                if check(ui, self.show_explorer, "Explorer pane", "") {
                     action = Some(MenuAction::ToggleExplorer);
                     ui.close();
                 }
-                if ui
-                    .selectable_label(self.show_details, "Details pane")
-                    .clicked()
-                {
+                if check(ui, self.show_details, "Details pane", "") {
                     action = Some(MenuAction::ToggleDetails);
                     ui.close();
                 }
-                if ui
-                    .selectable_label(self.show_recolor, "Recolor pane")
-                    .clicked()
-                {
+                if check(ui, self.show_recolor, "Recolor pane", "") {
                     action = Some(MenuAction::ToggleRecolor);
                     ui.close();
                 }
@@ -39117,6 +39110,16 @@ impl eframe::App for Kaleidotron {
             }
         }
 
+        // Esc closes the Preferences dialog. Handled here — before the nav keys — and CONSUMED, so
+        // the same Esc doesn't also fire the Back-to-grid binding. Skipped while a rebind is in
+        // progress (there Esc cancels the rebind, handled just above).
+        if self.show_prefs
+            && self.rebinding.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.show_prefs = false;
+        }
+
         // Keyboard: ratings (1-5 / 0) + rebindable nav (defaults: Esc->grid,
         // Backspace->parent). Suppressed while typing into any text field (path /
         // search / rename) or capturing a rebind — else a typed digit rates an image.
@@ -39504,22 +39507,36 @@ impl eframe::App for Kaleidotron {
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
-                    egui::Grid::new("hotkeys_grid")
-                        .striped(true)
-                        .spacing([18.0, 6.0])
-                        .show(ui, |ui| {
-                            // Rebindable nav actions reflect the current keymap.
-                            for a in Action::ALL {
-                                ui.strong(self.key_for(a).symbol_or_name());
-                                ui.label(a.label());
-                                ui.end_row();
-                            }
-                            for (k, d) in HOTKEYS {
-                                ui.strong(*k);
-                                ui.label(*d);
-                                ui.end_row();
-                            }
-                        });
+                    // Collect all shortcuts (rebindable nav reflects the live keymap), then flow
+                    // them into 3 columns so the window is wide-and-short, not one very tall list.
+                    let mut rows: Vec<(String, String)> = Action::ALL
+                        .iter()
+                        .map(|&a| {
+                            (self.key_for(a).symbol_or_name().to_string(), a.label().to_string())
+                        })
+                        .collect();
+                    rows.extend(HOTKEYS.iter().map(|(k, d)| (k.to_string(), d.to_string())));
+                    let w = (ctx.content_rect().width() - 80.0).clamp(640.0, 1160.0);
+                    ui.set_width(w); // bound the width so `ui.columns` computes sane column widths
+                    let per = rows.len().div_ceil(3).max(1);
+                    ui.columns(3, |cols| {
+                        for (ci, chunk) in rows.chunks(per).enumerate() {
+                            let col_w = cols[ci].available_width();
+                            egui::Grid::new(("hotkeys_grid", ci))
+                                .striped(true)
+                                .spacing([10.0, 6.0])
+                                // Bound the description column so long lines WRAP inside the column
+                                // instead of overflowing into the next one's keys.
+                                .max_col_width(col_w * 0.66)
+                                .show(&mut cols[ci], |ui| {
+                                    for (k, d) in chunk {
+                                        ui.strong(k.as_str());
+                                        ui.add(egui::Label::new(d.as_str()).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    });
                 });
             self.show_hotkeys = open;
         }
@@ -55539,11 +55556,23 @@ impl Kaleidotron {
                                                 *cc = [rgb[0], rgb[1], rgb[2], 255];
                                             }
                                         } else {
-                                            ui.add_enabled(
-                                                false,
-                                                egui::Button::new("      "),
-                                            )
-                                            .on_hover_text("inherits the base");
+                                            // An empty swatch the EXACT size of the colour button
+                                            // (both are `interact_size`), so the label column is a
+                                            // straight line down whether a colour is set or inherited.
+                                            let size = ui.spacing().interact_size;
+                                            let (rect, resp) =
+                                                ui.allocate_exact_size(size, egui::Sense::hover());
+                                            ui.painter().rect(
+                                                rect,
+                                                egui::CornerRadius::same(2),
+                                                ui.visuals().extreme_bg_color,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                                ),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                            resp.on_hover_text("inherits the base");
                                         }
                                         ui.label(label);
                                     }
@@ -55633,8 +55662,16 @@ mod gui_tests {
                 Err(e) => eprintln!("render {nm} failed: {e}"),
             }
         }
-        // Last: close the dialog and open the View menu for a clean app-wide-look shot.
+        // The Keyboard-shortcuts window (3-column layout).
         harness.state_mut().show_prefs = false;
+        harness.state_mut().show_hotkeys = true;
+        harness.run_steps(3);
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/hotkeys.png")).unwrap();
+            eprintln!("wrote {dir}/hotkeys.png");
+        }
+        harness.state_mut().show_hotkeys = false;
+        // Last: open the View menu for a clean app-wide-look shot (checkbox toggles).
         harness.get_by_label("View").click();
         harness.run_steps(2);
         if let Ok(img) = harness.render() {
@@ -55674,6 +55711,18 @@ mod gui_tests {
             sum(light) > sum(dark),
             "Default Light ({light:?}) should be brighter than Default Dark ({dark:?})"
         );
+    }
+
+    #[test]
+    fn esc_closes_preferences() {
+        let mut h =
+            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+        h.state_mut().show_prefs = true;
+        h.run();
+        assert!(h.state().show_prefs);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(!h.state().show_prefs, "Esc should close the Preferences dialog");
     }
 
     #[test]
