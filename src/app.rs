@@ -39564,7 +39564,7 @@ impl eframe::App for Kaleidotron {
                         ("Audio & Colors", "SoundFont, keys & accent colors", "♪"),
                         ("Advanced", "backup, git, tasks & caches", "⚙"),
                         ("Config files", "hand-editable JSON on disk", "≡"),
-                        ("Theme", "colors, presets, import & export", "◐"),
+                        ("Theme", "colors, presets, import & export", "✎"),
                     ];
                     let sec = self.prefs_section;
                     ui.horizontal_top(|ui| {
