@@ -39511,55 +39511,87 @@ impl eframe::App for Kaleidotron {
             let mut open = true;
             let mut out = PrefsOut::default();
             let screen = ctx.content_rect();
+            // FIXED size, centered — deliberately NOT auto-sizing/resizable. An auto-sizing window
+            // grows to fit its widest unwrapped label, which (a) made a long line balloon the whole
+            // dialog and collapse `ui.columns` into an overlapping strip, and (b) let a user-widened
+            // window sprawl the two columns to opposite edges. A fixed size fits every section (the
+            // inner ScrollArea is the safety net for short displays) and never opens too small.
+            let pref_size = egui::vec2(
+                1080.0_f32.min(screen.width() - 40.0),
+                800.0_f32.min(screen.height() - 40.0),
+            );
+            let accent = egui::Color32::from_rgb(78, 201, 208); // scene-art teal
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(true)
-                // A fixed, fit-everything default so the dialog never opens too small for its
-                // controls (the old single-column layout forced a resize on almost every open).
-                // Centered on screen; the inner ScrollArea is a safety net for short displays.
-                .default_size([1000.0, 640.0])
-                .default_pos(screen.center())
-                .pivot(egui::Align2::CENTER_CENTER)
-                .min_width(620.0)
-                .max_height((screen.height() - 40.0).max(360.0))
+                .resizable(false)
+                .fixed_size(pref_size)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 // No window inner margin: the rail runs to the left edge, the content pads itself.
-                .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(0)))
+                .frame(
+                    egui::Frame::window(&ctx.global_style())
+                        .inner_margin(egui::Margin::same(0))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .fill(egui::Color32::from_rgb(20, 23, 28)),
+                )
                 .show(&ctx, |ui| {
+                    // Dialog-local styling (rounded widgets + teal accent) — doesn't touch the app.
+                    {
+                        let s = ui.style_mut();
+                        let r = egui::CornerRadius::same(6);
+                        s.visuals.widgets.noninteractive.corner_radius = r;
+                        s.visuals.widgets.inactive.corner_radius = r;
+                        s.visuals.widgets.hovered.corner_radius = r;
+                        s.visuals.widgets.active.corner_radius = r;
+                        s.visuals.widgets.open.corner_radius = r;
+                        s.visuals.selection.bg_fill = egui::Color32::from_rgb(40, 60, 76);
+                        s.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+                        s.visuals.hyperlink_color = accent;
+                        s.spacing.button_padding = egui::vec2(9.0, 5.0);
+                    }
                     // GIMP/VS Code-style vertical section rail + a two-column card content area.
                     // Section names double as the rail buttons' accessibility labels, so they stay
                     // exactly the section name (icons/padding baked into the label break the GUI
                     // test that clicks a tab by name).
-                    const PREF_SECTIONS: [&str; 8] = [
-                        "Appearance",
-                        "Viewer",
-                        "Keyboard",
-                        "Sources",
-                        "Plugins",
-                        "Audio & Colors",
-                        "Advanced",
-                        "Config files",
+                    const PREF_SECTIONS: [(&str, &str); 8] = [
+                        ("Appearance", "theme, code viewer, grid & captions"),
+                        ("Viewer", "zoom, info OSD, transparency"),
+                        ("Keyboard", "rebindable shortcuts, by scope"),
+                        ("Sources", "web places to browse"),
+                        ("Plugins", "format decoders & their credentials"),
+                        ("Audio & Colors", "SoundFont, keys & accent colors"),
+                        ("Advanced", "backup, git, tasks & caches"),
+                        ("Config files", "hand-editable JSON on disk"),
                     ];
                     let sec = self.prefs_section;
                     ui.horizontal_top(|ui| {
                         // ── section rail ────────────────────────────────────────────
-                        let rail_w = 168.0;
-                        let rail_fill = ui.visuals().extreme_bg_color;
+                        let rail_w = 178.0;
                         egui::Frame::NONE
-                            .fill(rail_fill)
-                            .inner_margin(egui::Margin::symmetric(8, 10))
+                            .fill(egui::Color32::from_rgb(15, 17, 21))
+                            .inner_margin(egui::Margin::symmetric(10, 14))
                             .show(ui, |ui| {
                                 ui.set_min_width(rail_w);
                                 ui.set_max_width(rail_w);
                                 ui.set_min_height(ui.available_height().max(1.0));
                                 ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("SETTINGS")
+                                                .color(ui.visuals().weak_text_color())
+                                                .size(10.5)
+                                                .strong(),
+                                        )
+                                        .selectable(false),
+                                    );
+                                    ui.add_space(9.0);
                                     ui.spacing_mut().item_spacing.y = 3.0;
-                                    ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
-                                    for (i, name) in PREF_SECTIONS.iter().enumerate() {
+                                    ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
+                                    for (i, (name, _)) in PREF_SECTIONS.iter().enumerate() {
                                         let i = i as u8;
                                         if ui
                                             .add_sized(
-                                                [rail_w - 6.0, 30.0],
+                                                [rail_w - 8.0, 32.0],
                                                 egui::Button::selectable(sec == i, *name),
                                             )
                                             .clicked()
@@ -39572,19 +39604,48 @@ impl eframe::App for Kaleidotron {
                         // ── content ─────────────────────────────────────────────────
                         let avail_h = ui.available_height();
                         egui::Frame::NONE
-                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .inner_margin(egui::Margin::symmetric(22, 16))
                             .show(ui, |ui| {
+                              // The content Frame sits inside `ui.horizontal_top` (rail | content),
+                              // so its inner Ui INHERITS a left-to-right layout — which laid the
+                              // header and every section's widgets out sideways and shoved
+                              // `ui.columns` off to the right. Force top-down here; that's the one
+                              // fix behind all the "columns collapsed / sprawled" symptoms.
+                              ui.vertical(|ui| {
+                                // Section header (big title + subtitle), above the scroll area.
+                                let (title, subtitle) = PREF_SECTIONS[sec as usize];
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(title).size(21.0).strong(),
+                                        )
+                                        .selectable(false),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(subtitle)
+                                                .color(ui.visuals().weak_text_color())
+                                                .size(13.0),
+                                        )
+                                        .selectable(false),
+                                    );
+                                });
+                                ui.add_space(14.0);
                                 egui::ScrollArea::vertical()
                                     .auto_shrink([false, false])
-                                    .max_height(avail_h)
+                                    .max_height((avail_h - 46.0).max(120.0))
                                     .show(ui, |ui| {
-                                        // Cap the content to a comfortable width so a wide window
-                                        // doesn't fling the two columns to opposite edges — a
-                                        // settings pane is read, not stretched. Left-aligned next
-                                        // to the rail; the slack sits to the right.
-                                        ui.set_max_width(ui.available_width().min(940.0));
+                                        // HARD-bound the content width. Without this, an
+                                        // auto_shrink=false ScrollArea reports an unbounded
+                                        // available width, so long labels never wrap — which
+                                        // balloons the window AND collapses `ui.columns` into an
+                                        // overlapping strip. A fixed width makes labels wrap and
+                                        // every column compute a sane width.
+                                        ui.set_width(ui.available_width().min(864.0));
                                         self.render_prefs_sections(ui, &ctx, &mut out);
                                     });
+                              });
                             });
                     });
                 });
@@ -54147,9 +54208,11 @@ struct PrefsOut {
 /// filling its column. The body writes into the inner `ui`. Cards flow across the
 /// section's `ui.columns(..)` so a section spreads sideways instead of stacking tall.
 fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .fill(ui.visuals().faint_bg_color)
-        .inner_margin(egui::Margin::symmetric(11, 10))
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(30, 34, 40))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(14, 13))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(
@@ -54157,14 +54220,14 @@ fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl Fn
                     egui::RichText::new(title.to_uppercase())
                         .color(accent)
                         .strong()
-                        .size(11.0),
+                        .size(11.5),
                 )
                 .selectable(false),
             );
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             add(ui);
         });
-    ui.add_space(9.0);
+    ui.add_space(12.0);
 }
 
 impl Kaleidotron {
@@ -54174,7 +54237,7 @@ impl Kaleidotron {
     fn render_prefs_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out: &mut PrefsOut) {
         // A cyan accent for the card titles — the scene-art cyan, darkened for light themes.
         let accent = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(86, 197, 204)
+            egui::Color32::from_rgb(78, 201, 208)
         } else {
             egui::Color32::from_rgb(20, 118, 128)
         };
@@ -55030,52 +55093,58 @@ impl Kaleidotron {
 
             // ── Config files ───────────────────────────────────────────────────────
             7 => {
-                pref_card(ui, "Configuration files", accent, |ui| {
-                    ui.weak(
-                        "Plain text, hand-editable, and safe to keep in a dotfile manager — except \
-                         secrets.json. Changes apply on the next launch.",
-                    );
-                    ui.add_space(8.0);
-                    let themes_dir = self.themes_dir.clone();
-                    let entries: [(&str, PathBuf, &str); 4] = [
-                        (
-                            "settings.json",
-                            self.settings_file.clone(),
-                            "Everything in this dialog, grouped by section. Delete a line to restore \
-                             its default; delete the file to reset all.",
-                        ),
-                        (
-                            "keybindings.json",
-                            self.keybindings_file.clone(),
-                            "Key bindings, one per action. Actions are named, so reordering them \
-                             can't rebind your keys.",
-                        ),
-                        (
-                            "themes/",
-                            themes_dir.clone(),
-                            "UI + syntax themes. Drop a VS Code theme .json in here and it's \
-                             imported directly.",
-                        ),
-                        (
-                            "secrets.json",
-                            self.secrets_file.clone(),
-                            "API keys, owner-readable only. Keep this one OUT of dotfile sync — it's \
-                             why they live apart from settings.",
-                        ),
-                    ];
-                    ui.columns(2, |c| {
-                        for (i, (name, path, blurb)) in entries.into_iter().enumerate() {
-                            let col = i % 2;
-                            let exists = path.exists();
-                            let when = std::fs::metadata(&path)
-                                .and_then(|m| m.modified())
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| date_ymd_unix(d.as_secs() as i64));
-                            egui::Frame::group(c[col].style()).show(&mut c[col], |ui| {
+                // NB: `ui.columns` is called directly on the content ui here (like every other
+                // section), NOT inside a `pref_card`. Wrapping it in a card's width-fixed Frame
+                // miscomputes the column geometry (the columns collapsed into an overlapping
+                // strip). Each file is its own bordered card in a column instead.
+                let themes_dir = self.themes_dir.clone();
+                let entries: [(&str, PathBuf, &str); 4] = [
+                    (
+                        "settings.json",
+                        self.settings_file.clone(),
+                        "Everything in this dialog, grouped by section. Delete a line to restore its \
+                         default; delete the file to reset all.",
+                    ),
+                    (
+                        "keybindings.json",
+                        self.keybindings_file.clone(),
+                        "Key bindings, one per action. Actions are named, so reordering them can't \
+                         rebind your keys.",
+                    ),
+                    (
+                        "themes/",
+                        themes_dir.clone(),
+                        "UI + syntax themes. Drop a VS Code theme .json in here and it's imported \
+                         directly.",
+                    ),
+                    (
+                        "secrets.json",
+                        self.secrets_file.clone(),
+                        "API keys, owner-readable only. Keep this one OUT of dotfile sync — it's why \
+                         they live apart from settings.",
+                    ),
+                ];
+                // Everything lives INSIDE `ui.columns` — nothing before or after it. `ui.columns`
+                // leaves the cursor at its top-right, so a widget after it renders to the right and
+                // blows the width; a widget before it shoves the columns right. Keeping it the sole
+                // top-level call (the note + button ride in the left column) is what every working
+                // section does.
+                ui.columns(2, |c| {
+                    for (i, (name, path, blurb)) in entries.into_iter().enumerate() {
+                        let col = i % 2;
+                        let exists = path.exists();
+                        let when = std::fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| date_ymd_unix(d.as_secs() as i64));
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(30, 34, 40))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(14, 13))
+                            .show(&mut c[col], |ui| {
                                 ui.set_min_width(ui.available_width());
-                                // Name + Open on one row; the timestamp gets its OWN line so a
-                                // narrow column can't overlap the name onto the date (the bug).
                                 ui.horizontal(|ui| {
                                     ui.strong(name);
                                     ui.with_layout(
@@ -55102,11 +55171,16 @@ impl Kaleidotron {
                                 }
                                 ui.weak(blurb);
                             });
-                            c[col].add_space(6.0);
-                        }
-                    });
-                    ui.add_space(6.0);
-                    if ui.button("📁 Open config folder").clicked() {
+                        c[col].add_space(8.0);
+                    }
+                    // Footnote + "open folder" ride in the left column so nothing sits after columns.
+                    c[0].add_space(2.0);
+                    c[0].weak(
+                        "Plain text, hand-editable, safe in a dotfile manager — except secrets.json. \
+                         Changes apply on the next launch.",
+                    );
+                    c[0].add_space(6.0);
+                    if c[0].button("📁 Open config folder").clicked() {
                         out.open_config = self.settings_file.parent().map(|d| d.to_path_buf());
                     }
                 });
@@ -55123,6 +55197,43 @@ mod gui_tests {
     use super::*;
     use egui_kittest::kittest::Queryable; // brings get_by_label onto Harness
     use egui_kittest::Harness;
+
+    // Dev-only: render every Preferences section to a PNG so layout/styling can be eyeballed
+    // headlessly (lavapipe software Vulkan, no display). Run with:
+    //   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json WGPU_BACKEND=vulkan \
+    //   PV_SHOT_DIR=/tmp/pv_shots cargo test --features gui-screenshots shoot_prefs -- --nocapture
+    #[cfg(feature = "gui-screenshots")]
+    #[test]
+    fn shoot_prefs_sections() {
+        let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::Vec2::new(1500.0, 980.0))
+            .wgpu()
+            .build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+        harness.state_mut().show_prefs = true;
+        let names = [
+            "0_appearance",
+            "1_viewer",
+            "2_keyboard",
+            "3_sources",
+            "4_plugins",
+            "5_audio",
+            "6_advanced",
+            "7_config",
+        ];
+        for (i, nm) in names.iter().enumerate() {
+            harness.state_mut().prefs_section = i as u8;
+            harness.run_steps(5);
+            match harness.render() {
+                Ok(img) => {
+                    img.save(format!("{dir}/{nm}.png")).unwrap();
+                    eprintln!("wrote {dir}/{nm}.png ({}x{})", img.width(), img.height());
+                }
+                Err(e) => eprintln!("render {nm} failed: {e}"),
+            }
+        }
+    }
 
     #[test]
     fn empty_state_renders_without_panic() {
