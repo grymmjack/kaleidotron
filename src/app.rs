@@ -8027,6 +8027,7 @@ impl Kaleidotron {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 let here = self
                     .folder
@@ -8122,6 +8123,7 @@ impl Kaleidotron {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 let te = ui.add(
                     egui::TextEdit::singleline(&mut self.sel_mask)
@@ -24476,6 +24478,7 @@ impl Kaleidotron {
             .collapsible(false)
             .resizable(true)
             .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 egui::Grid::new("ai_gen_grid")
                     .num_columns(2)
@@ -39547,6 +39550,7 @@ impl eframe::App for Kaleidotron {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(&ctx, |ui| {
                     // Grouped into titled cards by use-case (like the Preferences sections).
                     // Rebindable actions show their LIVE key from the keymap; the rest are the
@@ -40016,6 +40020,7 @@ impl eframe::App for Kaleidotron {
                 .collapsible(false)
                 .resizable(true)
                 .default_size([420.0, 200.0])
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(&ctx, |ui| {
                     ui.label("Shown on every font thumbnail (TTF · OTF · FON · TDF) when enabled.");
                     ui.label("One line per row; TDF tiles fall back to the font's own name when blank.");
