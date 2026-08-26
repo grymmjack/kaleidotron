@@ -34367,8 +34367,8 @@ impl Kaleidotron {
         let mut open = true;
         let screen = ctx.content_rect();
         let size = egui::vec2(
-            800.0_f32.min(screen.width() - 40.0),
-            600.0_f32.min(screen.height() - 40.0),
+            920.0_f32.min(screen.width() - 40.0),
+            560.0_f32.min(screen.height() - 40.0),
         );
         egui::Window::new("Associations")
             .open(&mut open)
@@ -39133,14 +39133,28 @@ impl eframe::App for Kaleidotron {
             }
         }
 
-        // Esc closes the Preferences dialog. Handled here — before the nav keys — and CONSUMED, so
-        // the same Esc doesn't also fire the Back-to-grid binding. Skipped while a rebind is in
-        // progress (there Esc cancels the rebind, handled just above).
-        if self.show_prefs
-            && self.rebinding.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
-            self.show_prefs = false;
+        // Esc closes an open modal dialog (Preferences / Associations / Keyboard shortcuts /
+        // font-preview). Handled here — before the nav keys — and CONSUMED, so the same Esc doesn't
+        // also fire Back-to-grid. Skipped while a rebind is in progress (there Esc cancels it).
+        if self.rebinding.is_none() {
+            let dialog_open = self.show_prefs
+                || self.show_associations
+                || self.show_hotkeys
+                || self.show_font_preview_edit;
+            if dialog_open
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                // Close the topmost (priority order: last-opened kinds first).
+                if self.show_font_preview_edit {
+                    self.show_font_preview_edit = false;
+                } else if self.show_associations {
+                    self.show_associations = false;
+                } else if self.show_hotkeys {
+                    self.show_hotkeys = false;
+                } else {
+                    self.show_prefs = false;
+                }
+            }
         }
 
         // Keyboard: ratings (1-5 / 0) + rebindable nav (defaults: Esc->grid,
@@ -39530,34 +39544,105 @@ impl eframe::App for Kaleidotron {
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
-                    // Collect all shortcuts (rebindable nav reflects the live keymap), then flow
-                    // them into 3 columns so the window is wide-and-short, not one very tall list.
-                    let mut rows: Vec<(String, String)> = Action::ALL
-                        .iter()
-                        .map(|&a| {
-                            (self.key_for(a).symbol_or_name().to_string(), a.label().to_string())
-                        })
-                        .collect();
-                    rows.extend(HOTKEYS.iter().map(|(k, d)| (k.to_string(), d.to_string())));
-                    let w = (ctx.content_rect().width() - 80.0).clamp(640.0, 1160.0);
-                    ui.set_width(w); // bound the width so `ui.columns` computes sane column widths
-                    let per = rows.len().div_ceil(3).max(1);
+                    // Grouped into titled cards by use-case (like the Preferences sections).
+                    // Rebindable actions show their LIVE key from the keymap; the rest are the
+                    // fixed mouse / chord shortcuts. This window is the FULL reference — the
+                    // Preferences → Keyboard section lists only the (13) *rebindable* actions.
+                    let accent = ui.visuals().hyperlink_color;
+                    let k = |a: Action| self.key_for(a).symbol_or_name().to_string();
+                    let groups: [(&str, Vec<(String, &str)>); 6] = [
+                        (
+                            "Navigation",
+                            vec![
+                                (k(Action::PrevImage), "Previous image"),
+                                (k(Action::NextImage), "Next image"),
+                                (k(Action::BackToGrid), "Back to grid"),
+                                (k(Action::ParentDir), "Parent folder"),
+                                (k(Action::FirstItem), "First item (grid)"),
+                                (k(Action::LastItem), "Last item (grid)"),
+                                ("Mouse Back / Fwd".into(), "Folder history · prev / next image"),
+                            ],
+                        ),
+                        (
+                            "Grid & browser",
+                            vec![
+                                (k(Action::ToggleView), "Toggle grid / table view"),
+                                (k(Action::FilterFilenames), "Filter filenames"),
+                                (k(Action::ToggleHidden), "Show hidden files"),
+                                (k(Action::RandomPack), "Random 16colo.rs pack"),
+                                (k(Action::Refresh), "Refresh folder"),
+                                ("Shift + F5".into(), "Hard refresh — also clear caches"),
+                            ],
+                        ),
+                        (
+                            "Viewer",
+                            vec![
+                                (k(Action::FitToScreen), "Fit image to window"),
+                                (k(Action::Fullscreen), "Immersive fullscreen"),
+                                ("Home / End".into(), "Scroll to top / bottom"),
+                                ("PageUp / PageDown".into(), "Scroll 25 lines"),
+                                ("Arrow Up / Down".into(), "Scroll a long image"),
+                                ("Z + 1–9 / 0".into(), "Zoom 100 % – 1000 %"),
+                                ("T".into(), "Tile preview — fill window"),
+                                ("Drag".into(), "Pan the image"),
+                                ("Wheel".into(), "Prev / next image · grid scroll"),
+                                ("Ctrl + Wheel".into(), "Resize thumbs · zoom image"),
+                                ("Enter".into(), "Open in default app"),
+                                ("Ctrl + F".into(), "Advanced recursive search"),
+                            ],
+                        ),
+                        (
+                            "Rating & audio",
+                            vec![
+                                ("1 – 5".into(), "Set star rating"),
+                                ("0".into(), "Clear rating"),
+                                ("Space".into(), "Audio: play / pause"),
+                                ("Shift + Esc".into(), "PANIC — stop all audio + pads"),
+                            ],
+                        ),
+                        (
+                            "Files",
+                            vec![
+                                ("Ctrl + C / X / V".into(), "Copy / Cut / Paste"),
+                                ("Ctrl + N".into(), "New folder"),
+                                ("F2".into(), "Rename"),
+                                ("Delete".into(), "Move to trash"),
+                                ("Ctrl + Z".into(), "Undo last file operation"),
+                            ],
+                        ),
+                        (
+                            "Mouse & UI",
+                            vec![
+                                ("Click".into(), "Open image / enter folder · trigger a pad"),
+                                ("Ctrl + Click".into(), "Toggle selection"),
+                                ("Shift + Click".into(), "Range-select"),
+                                ("Right-click".into(), "File operations menu"),
+                                ("Ctrl + / Ctrl -".into(), "Zoom the whole UI"),
+                            ],
+                        ),
+                    ];
+                    let w = (ctx.content_rect().width() - 80.0).clamp(720.0, 1180.0);
+                    ui.set_width(w);
+                    // Assign the 6 groups to 3 columns for a balanced height (Viewer is the tallest).
+                    let layout: [&[usize]; 3] = [&[0, 4], &[1, 3, 5], &[2]];
                     ui.columns(3, |cols| {
-                        for (ci, chunk) in rows.chunks(per).enumerate() {
-                            let col_w = cols[ci].available_width();
-                            egui::Grid::new(("hotkeys_grid", ci))
-                                .striped(true)
-                                .spacing([10.0, 6.0])
-                                // Bound the description column so long lines WRAP inside the column
-                                // instead of overflowing into the next one's keys.
-                                .max_col_width(col_w * 0.66)
-                                .show(&mut cols[ci], |ui| {
-                                    for (k, d) in chunk {
-                                        ui.strong(k.as_str());
-                                        ui.add(egui::Label::new(d.as_str()).wrap());
-                                        ui.end_row();
-                                    }
+                        for (ci, gis) in layout.iter().enumerate() {
+                            for &gi in *gis {
+                                let (title, rows) = &groups[gi];
+                                pref_card(&mut cols[ci], title, accent, |ui| {
+                                    let cw = ui.available_width();
+                                    egui::Grid::new(("hk", gi))
+                                        .spacing([10.0, 5.0])
+                                        .max_col_width(cw * 0.60)
+                                        .show(ui, |ui| {
+                                            for (key, desc) in rows {
+                                                ui.strong(key.as_str());
+                                                ui.add(egui::Label::new(*desc).wrap());
+                                                ui.end_row();
+                                            }
+                                        });
                                 });
+                            }
                         }
                     });
                 });
@@ -49222,136 +49307,154 @@ fn openers_editor(
     }
 
     let mut select: Option<usize> = None;
-    ui.columns(2, |cols| {
-        // LEFT — the program list, in a card.
-        pref_card(
-            &mut cols[0],
-            if show_exts { "Programs" } else { "Folder actions" },
-            accent,
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt(format!("{id_salt}_list"))
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        for (i, (name, icon)) in list.iter().enumerate() {
-                            let sel = i == *selected;
-                            let w = ui.available_width();
-                            let resp = match icon {
-                                Some(id) => {
-                                    let img = egui::Image::new(egui::load::SizedTexture::new(
-                                        *id,
-                                        egui::vec2(16.0, 16.0),
-                                    ));
-                                    ui.add_sized(
-                                        [w, 26.0],
-                                        egui::Button::image_and_text(img, name).selected(sel),
-                                    )
+    // 30 / 70 split — the program list is narrow, the field editor gets the room (long program
+    // paths were being cut off in an even 50/50). Manual panes because `ui.columns` is equal-width.
+    let total = ui.available_width();
+    let gap = 14.0;
+    let left_w = ((total - gap) * 0.30).clamp(150.0, 340.0);
+    let right_w = (total - left_w - gap).max(260.0);
+    ui.horizontal_top(|ui| {
+        // LEFT — the program list (30%). `vertical` (not `scope`) so pref_card lays out
+        // top-down; a scope would inherit horizontal_top's left-to-right layout and put each
+        // card's title beside its content.
+        ui.vertical(|ui| {
+            ui.set_width(left_w);
+            {
+                pref_card(
+                    ui,
+                    if show_exts { "Programs" } else { "Folder actions" },
+                    accent,
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("{id_salt}_list"))
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                for (i, (name, icon)) in list.iter().enumerate() {
+                                    let sel = i == *selected;
+                                    let w = ui.available_width();
+                                    let resp = match icon {
+                                        Some(id) => {
+                                            let img = egui::Image::new(egui::load::SizedTexture::new(
+                                                *id,
+                                                egui::vec2(16.0, 16.0),
+                                            ));
+                                            ui.add_sized(
+                                                [w, 26.0],
+                                                egui::Button::image_and_text(img, name).selected(sel),
+                                            )
+                                        }
+                                        None => {
+                                            ui.add_sized([w, 26.0], egui::Button::selectable(sel, name))
+                                        }
+                                    };
+                                    if resp.clicked() {
+                                        select = Some(i);
+                                    }
                                 }
-                                None => {
-                                    ui.add_sized([w, 26.0], egui::Button::selectable(sel, name))
+                            });
+                    },
+                );
+            }
+        });
+        ui.add_space(gap);
+        // RIGHT — the field editor (70%).
+        ui.vertical(|ui| {
+            ui.set_width(right_w);
+            {
+                let sel = *selected;
+                let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
+                if let Some(o) = openers.get_mut(sel) {
+                    pref_card(ui, "Details", accent, |ui| {
+                        egui::Grid::new(format!("{id_salt}_edit"))
+                            .num_columns(2)
+                            .spacing([12.0, 9.0])
+                            .show(ui, |ui| {
+                                ui.label("Name");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut o.name).desired_width(f32::INFINITY),
+                                );
+                                ui.end_row();
+
+                                ui.label("Program");
+                                ui.horizontal(|ui| {
+                                    let bw = 78.0;
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut o.exec)
+                                            .desired_width((ui.available_width() - bw).max(80.0))
+                                            .hint_text("gimp, /usr/bin/inkscape, code, \u{2026}"),
+                                    );
+                                    if ui.button("Browse\u{2026}").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .set_title("Choose program")
+                                            .pick_file()
+                                        {
+                                            o.exec = p.to_string_lossy().into_owned();
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
+                                if show_exts {
+                                    ui.label("Extensions");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut o.exts)
+                                            .desired_width(f32::INFINITY)
+                                            .hint_text("png, jpg, ans, xb \u{2026}"),
+                                    );
+                                    ui.end_row();
                                 }
-                            };
-                            if resp.clicked() {
-                                select = Some(i);
-                            }
+
+                                ui.label("Arguments");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut o.args)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(args_hint),
+                                );
+                                ui.end_row();
+
+                                ui.label("Icon");
+                                ui.horizontal(|ui| {
+                                    if let Some(id) = icon_id {
+                                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                            id,
+                                            egui::vec2(20.0, 20.0),
+                                        )));
+                                    }
+                                    let bw = 78.0;
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut o.icon)
+                                            .desired_width((ui.available_width() - bw).max(60.0))
+                                            .hint_text("optional image"),
+                                    );
+                                    if ui.button("Browse\u{2026}").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new()
+                                            .set_title("Choose an icon image")
+                                            .pick_file()
+                                        {
+                                            o.icon = p.to_string_lossy().into_owned();
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Environment");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut o.env)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(2)
+                                        .hint_text("KEY=VALUE per line (optional)"),
+                                );
+                                ui.end_row();
+                            });
+                        ui.add_space(12.0);
+                        if ui.button("\u{1F5D1}  Remove this entry").clicked() {
+                            remove = Some(sel);
                         }
                     });
-            },
-        );
-
-        // RIGHT — edit the selected program's fields, in a card.
-        let sel = *selected;
-        let icon_id = list.get(sel).and_then(|(_, ic)| *ic);
-        if let Some(o) = openers.get_mut(sel) {
-            pref_card(&mut cols[1], "Details", accent, |ui| {
-                egui::Grid::new(format!("{id_salt}_edit"))
-                    .num_columns(2)
-                    .spacing([12.0, 9.0])
-                    .show(ui, |ui| {
-                        ui.label("Name");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut o.name).desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-
-                        ui.label("Program");
-                        ui.horizontal(|ui| {
-                            let bw = 78.0;
-                            ui.add(
-                                egui::TextEdit::singleline(&mut o.exec)
-                                    .desired_width((ui.available_width() - bw).max(80.0))
-                                    .hint_text("gimp, /usr/bin/inkscape, code, \u{2026}"),
-                            );
-                            if ui.button("Browse\u{2026}").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_title("Choose program")
-                                    .pick_file()
-                                {
-                                    o.exec = p.to_string_lossy().into_owned();
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        if show_exts {
-                            ui.label("Extensions");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut o.exts)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("png, jpg, ans, xb \u{2026}"),
-                            );
-                            ui.end_row();
-                        }
-
-                        ui.label("Arguments");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut o.args)
-                                .desired_width(f32::INFINITY)
-                                .hint_text(args_hint),
-                        );
-                        ui.end_row();
-
-                        ui.label("Icon");
-                        ui.horizontal(|ui| {
-                            if let Some(id) = icon_id {
-                                ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                                    id,
-                                    egui::vec2(20.0, 20.0),
-                                )));
-                            }
-                            let bw = 78.0;
-                            ui.add(
-                                egui::TextEdit::singleline(&mut o.icon)
-                                    .desired_width((ui.available_width() - bw).max(60.0))
-                                    .hint_text("optional image"),
-                            );
-                            if ui.button("Browse\u{2026}").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .set_title("Choose an icon image")
-                                    .pick_file()
-                                {
-                                    o.icon = p.to_string_lossy().into_owned();
-                                }
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Environment");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut o.env)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(2)
-                                .hint_text("KEY=VALUE per line (optional)"),
-                        );
-                        ui.end_row();
-                    });
-                ui.add_space(12.0);
-                if ui.button("\u{1F5D1}  Remove this entry").clicked() {
-                    remove = Some(sel);
                 }
-            });
-        }
+            }
+        });
     });
     if let Some(i) = select {
         *selected = i;
@@ -50904,48 +51007,6 @@ fn search_walk(
     }
     let _ = tx.send(SearchMsg::Done(count));
 }
-
-/// Keyboard shortcuts, shown in Help → Keyboard shortcuts.
-const HOTKEYS: &[(&str, &str)] = &[
-    ("Ctrl +  /  Ctrl -", "Zoom the whole UI"),
-    (
-        "Ctrl + Wheel / Pinch",
-        "Resize thumbnails (grid) · zoom image (viewer)",
-    ),
-    ("Wheel", "Viewer: previous / next image · Grid: scroll"),
-    (
-        "Mouse Back / Fwd",
-        "Grid: folder history · Viewer: prev / next image",
-    ),
-    ("Home / End", "Viewer: scroll to top / bottom"),
-    (
-        "PageUp / PageDown",
-        "Viewer: scroll 25 lines (a screen of scene art)",
-    ),
-    ("Arrow Up / Down", "Viewer: scroll a long image"),
-    ("Z + 1 – 9 / 0", "Viewer: zoom 100 % – 1000 %"),
-    ("Ctrl + F", "Advanced recursive search"),
-    ("Drag", "Pan the image"),
-    ("T", "Tile preview — fill window (viewer)"),
-    (
-        "Shift + F5",
-        "Hard refresh — also clear cached thumbnails / metadata",
-    ),
-    ("1 – 5", "Set star rating"),
-    ("0", "Clear rating"),
-    ("Space", "Audio: play / pause"),
-    ("Shift + Esc", "PANIC — stop ALL audio + sample-pad voices"),
-    ("Enter", "Viewer: open in default app"),
-    ("Click", "Open image / enter folder · trigger a sample pad"),
-    ("Ctrl + Click", "Toggle selection"),
-    ("Shift + Click", "Range-select"),
-    ("Right-click", "Grid: file operations menu"),
-    ("Ctrl + C / X / V", "Copy / Cut / Paste"),
-    ("Ctrl + N", "New folder"),
-    ("F2", "Rename"),
-    ("Delete", "Move to trash"),
-    ("Ctrl + Z", "Undo last file operation"),
-];
 
 /// Command-line options. These override persisted settings; add more flags here.
 #[derive(Default)]
@@ -55781,15 +55842,24 @@ mod gui_tests {
     }
 
     #[test]
-    fn esc_closes_preferences() {
+    fn esc_closes_dialogs() {
         let mut h =
             Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
-        h.state_mut().show_prefs = true;
-        h.run();
-        assert!(h.state().show_prefs);
-        h.key_press(egui::Key::Escape);
-        h.run();
-        assert!(!h.state().show_prefs, "Esc should close the Preferences dialog");
+        for open in [
+            |k: &mut Kaleidotron| k.show_prefs = true,
+            |k: &mut Kaleidotron| k.show_associations = true,
+            |k: &mut Kaleidotron| k.show_hotkeys = true,
+        ] {
+            open(h.state_mut());
+            h.run();
+            h.key_press(egui::Key::Escape);
+            h.run();
+            let s = h.state();
+            assert!(
+                !s.show_prefs && !s.show_associations && !s.show_hotkeys,
+                "Esc should close the open dialog"
+            );
+        }
     }
 
     #[test]
