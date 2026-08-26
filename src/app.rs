@@ -39578,7 +39578,11 @@ impl eframe::App for Kaleidotron {
                                     .auto_shrink([false, false])
                                     .max_height(avail_h)
                                     .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
+                                        // Cap the content to a comfortable width so a wide window
+                                        // doesn't fling the two columns to opposite edges — a
+                                        // settings pane is read, not stretched. Left-aligned next
+                                        // to the rail; the slack sits to the right.
+                                        ui.set_max_width(ui.available_width().min(940.0));
                                         self.render_prefs_sections(ui, &ctx, &mut out);
                                     });
                             });
@@ -54397,7 +54401,7 @@ impl Kaleidotron {
                             }
                         }
                     });
-                    pref_card(&mut c[0], "Viewer info OSD", accent, |ui| {
+                    pref_card(&mut c[1], "Viewer info OSD", accent, |ui| {
                         ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
                             .on_hover_text("A fading panel with the piece's details");
                         ui.add_enabled_ui(self.osd_enabled, |ui| {
@@ -54424,7 +54428,7 @@ impl Kaleidotron {
                             .on_hover_text("How long it stays before fading out");
                         });
                     });
-                    pref_card(&mut c[1], "Transparency", accent, |ui| {
+                    pref_card(&mut c[0], "Transparency", accent, |ui| {
                         ui.weak("What shows through an image's transparent pixels in the viewer.");
                         ui.horizontal_wrapped(|ui| {
                             ui.radio_value(&mut self.transp_solid, false, "Checkerboard");
@@ -54514,12 +54518,19 @@ impl Kaleidotron {
                         (&mut self.plugin_gfonts, "Google Fonts", "Browse + download Google Fonts"),
                         (&mut self.plugin_ma, "MOD Archive", "~170k tracker modules"),
                     ];
-                    ui.columns(2, |cc| {
-                        for (i, (on, label, hover)) in items.into_iter().enumerate() {
-                            let col = if i < 7 { 0 } else { 1 };
-                            cc[col].checkbox(on, label).on_hover_text(hover);
-                        }
-                    });
+                    // A tight 2-column grid (adjacent, not split across the full card width) so
+                    // the sources read as one list, not two groups flung to opposite edges.
+                    egui::Grid::new("web_sources_grid")
+                        .num_columns(2)
+                        .spacing([40.0, 5.0])
+                        .show(ui, |ui| {
+                            for (i, (on, label, hover)) in items.into_iter().enumerate() {
+                                ui.checkbox(on, label).on_hover_text(hover);
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
                 });
             }
 
@@ -55062,7 +55073,9 @@ impl Kaleidotron {
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| date_ymd_unix(d.as_secs() as i64));
                             egui::Frame::group(c[col].style()).show(&mut c[col], |ui| {
-                                ui.set_width(ui.available_width());
+                                ui.set_min_width(ui.available_width());
+                                // Name + Open on one row; the timestamp gets its OWN line so a
+                                // narrow column can't overlap the name onto the date (the bug).
                                 ui.horizontal(|ui| {
                                     ui.strong(name);
                                     ui.with_layout(
@@ -55075,18 +55088,18 @@ impl Kaleidotron {
                                             {
                                                 out.open_config = Some(path.clone());
                                             }
-                                            match (&when, exists) {
-                                                (Some(w), _) => {
-                                                    ui.weak(format!("updated {w}"));
-                                                }
-                                                (None, false) => {
-                                                    ui.weak("not created yet");
-                                                }
-                                                _ => {}
-                                            }
                                         },
                                     );
                                 });
+                                match (&when, exists) {
+                                    (Some(w), _) => {
+                                        ui.weak(format!("updated {w}"));
+                                    }
+                                    (None, false) => {
+                                        ui.weak("not created yet");
+                                    }
+                                    _ => {}
+                                }
                                 ui.weak(blurb);
                             });
                             c[col].add_space(6.0);
