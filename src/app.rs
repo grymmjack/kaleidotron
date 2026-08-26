@@ -39531,14 +39531,14 @@ impl eframe::App for Kaleidotron {
                 .frame(
                     egui::Frame::window(&ctx.global_style())
                         .inner_margin(egui::Margin::same(0))
-                        .corner_radius(egui::CornerRadius::same(12))
+                        .corner_radius(egui::CornerRadius::same(8))
                         .fill(egui::Color32::from_rgb(20, 23, 28)),
                 )
                 .show(&ctx, |ui| {
                     // Dialog-local styling (rounded widgets + teal accent) — doesn't touch the app.
                     {
                         let s = ui.style_mut();
-                        let r = egui::CornerRadius::same(6);
+                        let r = egui::CornerRadius::same(3);
                         s.visuals.widgets.noninteractive.corner_radius = r;
                         s.visuals.widgets.inactive.corner_radius = r;
                         s.visuals.widgets.hovered.corner_radius = r;
@@ -54211,7 +54211,7 @@ fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl Fn
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(30, 34, 40))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
-        .corner_radius(egui::CornerRadius::same(10))
+        .corner_radius(egui::CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(14, 13))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -55141,7 +55141,7 @@ impl Kaleidotron {
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgb(30, 34, 40))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
-                            .corner_radius(egui::CornerRadius::same(10))
+                            .corner_radius(egui::CornerRadius::same(5))
                             .inner_margin(egui::Margin::symmetric(14, 13))
                             .show(&mut c[col], |ui| {
                                 ui.set_min_width(ui.available_width());
