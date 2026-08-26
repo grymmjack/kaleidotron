@@ -1258,22 +1258,86 @@ enum SmartCriterion {
 /// clicks, and zoom stay fixed for now; this is the structure to grow.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Action {
+    // ── Navigation (viewer + browser) ──
     PrevImage,
     NextImage,
     BackToGrid,
     ParentDir,
+    // ── Grid / browser ──
     ToggleView,
+    FirstItem,
+    LastItem,
+    FilterFilenames,
+    ToggleHidden,
+    RandomPack,
+    // ── Viewer ──
+    FitToScreen,
+    // ── Global / window ──
+    Refresh,
+    Fullscreen,
+}
+
+/// The use-case grouping a rebindable [`Action`] belongs to — drives the grouped cards in
+/// Preferences → Keyboard. Purely cosmetic: dispatch is still guarded by mode at each site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionScope {
+    Navigation,
+    Grid,
+    Viewer,
+    Global,
+}
+
+impl ActionScope {
+    const ALL: [ActionScope; 4] = [
+        ActionScope::Navigation,
+        ActionScope::Grid,
+        ActionScope::Viewer,
+        ActionScope::Global,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            ActionScope::Navigation => "Navigation",
+            ActionScope::Grid => "Grid & browser",
+            ActionScope::Viewer => "Viewer",
+            ActionScope::Global => "Global",
+        }
+    }
 }
 
 impl Action {
-    // New actions are appended so persisted keymap indices (`to_u8`) stay valid.
-    const ALL: [Action; 5] = [
+    // New actions are APPENDED so persisted keymap indices (`to_u8`, legacy load) stay valid;
+    // `keybindings.json` keys off the stable `id()`, so order here is otherwise free.
+    const ALL: [Action; 13] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
         Action::ParentDir,
         Action::ToggleView,
+        Action::FirstItem,
+        Action::LastItem,
+        Action::FilterFilenames,
+        Action::ToggleHidden,
+        Action::RandomPack,
+        Action::FitToScreen,
+        Action::Refresh,
+        Action::Fullscreen,
     ];
+    /// Which use-case group this action belongs to (for the Preferences → Keyboard cards).
+    fn scope(self) -> ActionScope {
+        match self {
+            Action::PrevImage | Action::NextImage | Action::BackToGrid | Action::ParentDir => {
+                ActionScope::Navigation
+            }
+            Action::ToggleView
+            | Action::FirstItem
+            | Action::LastItem
+            | Action::FilterFilenames
+            | Action::ToggleHidden
+            | Action::RandomPack => ActionScope::Grid,
+            Action::FitToScreen => ActionScope::Viewer,
+            Action::Refresh | Action::Fullscreen => ActionScope::Global,
+        }
+    }
     /// Stable id used in `keybindings.json`. Unlike the old `to_u8` index this doesn't constrain
     /// the order of `ALL` — actions can be reordered or removed without rebinding someone's keys.
     fn id(self) -> &'static str {
@@ -1283,6 +1347,14 @@ impl Action {
             Action::BackToGrid => "back_to_grid",
             Action::ParentDir => "parent_dir",
             Action::ToggleView => "toggle_view",
+            Action::FirstItem => "first_item",
+            Action::LastItem => "last_item",
+            Action::FilterFilenames => "filter_filenames",
+            Action::ToggleHidden => "toggle_hidden",
+            Action::RandomPack => "random_pack",
+            Action::FitToScreen => "fit_to_screen",
+            Action::Refresh => "refresh",
+            Action::Fullscreen => "fullscreen",
         }
     }
     fn from_id(id: &str) -> Option<Action> {
@@ -1295,6 +1367,14 @@ impl Action {
             Action::BackToGrid => "Back to grid",
             Action::ParentDir => "Parent folder",
             Action::ToggleView => "Toggle grid / table view",
+            Action::FirstItem => "First item",
+            Action::LastItem => "Last item",
+            Action::FilterFilenames => "Filter filenames",
+            Action::ToggleHidden => "Show hidden files",
+            Action::RandomPack => "Random 16colo.rs pack",
+            Action::FitToScreen => "Fit image to window",
+            Action::Refresh => "Refresh folder",
+            Action::Fullscreen => "Immersive fullscreen",
         }
     }
     fn default_key(self) -> egui::Key {
@@ -1304,6 +1384,14 @@ impl Action {
             Action::BackToGrid => egui::Key::Escape,
             Action::ParentDir => egui::Key::Backspace,
             Action::ToggleView => egui::Key::T,
+            Action::FirstItem => egui::Key::Home,
+            Action::LastItem => egui::Key::End,
+            Action::FilterFilenames => egui::Key::Slash,
+            Action::ToggleHidden => egui::Key::Period,
+            Action::RandomPack => egui::Key::R,
+            Action::FitToScreen => egui::Key::F,
+            Action::Refresh => egui::Key::F5,
+            Action::Fullscreen => egui::Key::F11,
         }
     }
     fn to_u8(self) -> u8 {
@@ -30790,6 +30878,7 @@ impl Kaleidotron {
     fn ui_single(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let prev_key = self.key_for(Action::PrevImage);
         let next_key = self.key_for(Action::NextImage);
+        let fit_key = self.key_for(Action::FitToScreen);
         let typing = self.keyboard_captured(ctx);
         let (prev, next, fit, tile, edit) = if typing {
             (false, false, false, false, false)
@@ -30798,7 +30887,7 @@ impl Kaleidotron {
                 (
                     i.key_pressed(prev_key),
                     i.key_pressed(next_key),
-                    i.key_pressed(egui::Key::F),
+                    i.key_pressed(fit_key),
                     i.key_pressed(egui::Key::T),
                     i.key_pressed(egui::Key::Enter),
                 )
@@ -38612,7 +38701,8 @@ impl eframe::App for Kaleidotron {
                 ),
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+        let fullscreen_key = self.key_for(Action::Fullscreen);
+        if ctx.input(|i| i.key_pressed(fullscreen_key)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
@@ -38632,7 +38722,8 @@ impl eframe::App for Kaleidotron {
         // Shift+F5 — the heavier "hard refresh": additionally DROP the cached thumbnail /
         // metadata / SAUCE / montage for every item in this place so they re-decode from
         // disk (catches a file whose *contents* changed but whose path didn't).
-        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+        let refresh_key = self.key_for(Action::Refresh);
+        if !typing && ctx.input(|i| i.key_pressed(refresh_key)) {
             if ctx.input(|i| i.modifiers.shift) {
                 self.clear_current_view_cache();
             } else {
@@ -38642,7 +38733,8 @@ impl eframe::App for Kaleidotron {
         // `.` — toggle hidden (dotfile) entries in the grid/table, like a shell's
         // `ls -a` or Dolphin's Alt+.  A pure view filter, so it re-filters instantly
         // (no re-scan). Guarded by `!typing` so it can't fire while editing a field.
-        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+        let hidden_key = self.key_for(Action::ToggleHidden);
+        if !typing && ctx.input(|i| i.key_pressed(hidden_key)) {
             self.show_hidden = !self.show_hidden;
             self.rebuild_view();
         }
@@ -38847,10 +38939,11 @@ impl eframe::App for Kaleidotron {
         };
 
         // R — jump to a new random 16colo.rs pack (skip a dud). Not while typing/searching.
+        let random_key = self.key_for(Action::RandomPack);
         if !typing
             && self.search.is_none()
             && !self.show_search
-            && ctx.input(|i| i.key_pressed(egui::Key::R))
+            && ctx.input(|i| i.key_pressed(random_key))
         {
             self.start_random_pack();
         }
@@ -39110,12 +39203,9 @@ impl eframe::App for Kaleidotron {
 
         // Grid: Home/End jump+scroll to first/last; mouse back/forward = folder
         // history. Single view: mouse back/forward = previous/next image.
-        let (home, end) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Home),
-                i.key_pressed(egui::Key::End),
-            )
-        });
+        let first_key = self.key_for(Action::FirstItem);
+        let last_key = self.key_for(Action::LastItem);
+        let (home, end) = ctx.input(|i| (i.key_pressed(first_key), i.key_pressed(last_key)));
         let (mouse_back, mouse_fwd) = ctx.input(|i| {
             (
                 i.pointer.button_pressed(egui::PointerButton::Extra1),
@@ -39135,12 +39225,13 @@ impl eframe::App for Kaleidotron {
         // focused text field (a URL in the Web tab, a ModArchive/Poly Haven query, …) is stolen by
         // the filter instead of being typed. The explicit `path_edit`/`search` flags only cover
         // this file's own two fields, not egui's focus in general.
+        let filter_key = self.key_for(Action::FilterFilenames);
         if self.mode == Mode::Grid
             && self.path_edit.is_none()
             && self.rebinding.is_none()
             && self.search.is_none()
             && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(egui::Key::Slash))
+            && ctx.input(|i| i.key_pressed(filter_key))
         {
             self.search = Some(String::new());
             self.focus_search = true;
@@ -39418,1128 +39509,164 @@ impl eframe::App for Kaleidotron {
 
         if self.show_prefs {
             let mut open = true;
-            let mut prefs_refresh = false; // a plugin toggle → re-scan the folder after
-            let mut color_change: Option<(String, [u8; 3])> = None; // a format-color edit
-            let mut reset_colors = false; // "Reset" the format colors
-            let mut clear_blend_renders = false; // "Clear renders" → wipe the .blend render cache
-            let mut do_export_setup: Option<bool> = None; // Some(include_secrets) → export bundle
-            let mut do_import_setup = false; // "Import setup…" clicked
-            let mut font_preview_changed = false; // font-tile sample text edited → refresh tiles
-            let mut theme_apply = false; // theme picked → re-install Visuals after the closure
-            let mut open_config: Option<PathBuf> = None; // Config-files tab → open this path
+            let mut out = PrefsOut::default();
+            let screen = ctx.content_rect();
+            // FIXED size, centered — deliberately NOT auto-sizing/resizable. An auto-sizing window
+            // grows to fit its widest unwrapped label, which (a) made a long line balloon the whole
+            // dialog and collapse `ui.columns` into an overlapping strip, and (b) let a user-widened
+            // window sprawl the two columns to opposite edges. A fixed size fits every section (the
+            // inner ScrollArea is the safety net for short displays) and never opens too small.
+            let pref_size = egui::vec2(
+                1080.0_f32.min(screen.width() - 40.0),
+                800.0_f32.min(screen.height() - 40.0),
+            );
+            let accent = egui::Color32::from_rgb(78, 201, 208); // scene-art teal
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(true)
-                // Fixed width, height follows the selected tab (see the ScrollArea's
-                // `auto_shrink` below) so the dialog is never too small for its content — the
-                // sections are short enough now that scrolling should be the exception.
-                .default_width(760.0)
-                .max_height(ctx.content_rect().height() - 80.0)
-                // Real breathing room: content was running into the frame edge on every side.
+                .resizable(false)
+                .fixed_size(pref_size)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                // No window inner margin: the rail runs to the left edge, the content pads itself.
                 .frame(
                     egui::Frame::window(&ctx.global_style())
-                        .inner_margin(egui::Margin::symmetric(18, 14)),
+                        .inner_margin(egui::Margin::same(0))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .fill(egui::Color32::from_rgb(20, 23, 28)),
                 )
                 .show(&ctx, |ui| {
-                    // Responsive layout: the sections flow into two columns when the (resizable)
-                    // window is wide enough, collapsing to a single stacked column when narrow.
-                    // The scroll area fills the window, so a scrollbar appears exactly when the
-                    // content is taller than the current window — drag the window bigger to see
-                    // more at once, or drag it wider to spread the controls across two columns.
-                    // GIMP/Inkscape-style section list, mirroring settings.json's objects so the
-                    // file and the dialog stay in step. One column now: a single section is short
-                    // enough that the old two-column flow (a full-screen wall) isn't needed.
-                    //
-                    // Section boundaries can only sit at the top level of the block — several
-                    // groups (YouTube, the Steam key, the SoundFont, format colours) live inside
-                    // `if plugin_… {}` conditionals, so they ride along with the section that
-                    // encloses them, and the names reflect where things actually landed.
-                    const PREF_SECTIONS: [&str; 8] = [
-                        "Appearance",
-                        "Viewer",
-                        "Keyboard",
-                        "Sources",
-                        "Plugins",
-                        "Audio & Colors",
-                        "Advanced",
-                        "Config files",
+                    // Dialog-local styling (rounded widgets + teal accent) — doesn't touch the app.
+                    {
+                        let s = ui.style_mut();
+                        let r = egui::CornerRadius::same(3);
+                        s.visuals.widgets.noninteractive.corner_radius = r;
+                        s.visuals.widgets.inactive.corner_radius = r;
+                        s.visuals.widgets.hovered.corner_radius = r;
+                        s.visuals.widgets.active.corner_radius = r;
+                        s.visuals.widgets.open.corner_radius = r;
+                        s.visuals.selection.bg_fill = egui::Color32::from_rgb(40, 60, 76);
+                        s.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+                        s.visuals.hyperlink_color = accent;
+                        s.spacing.button_padding = egui::vec2(9.0, 5.0);
+                    }
+                    // GIMP/VS Code-style vertical section rail + a two-column card content area.
+                    // Section names double as the rail buttons' accessibility labels, so they stay
+                    // exactly the section name (icons/padding baked into the label break the GUI
+                    // test that clicks a tab by name).
+                    const PREF_SECTIONS: [(&str, &str); 8] = [
+                        ("Appearance", "theme, code viewer, grid & captions"),
+                        ("Viewer", "zoom, info OSD, transparency"),
+                        ("Keyboard", "rebindable shortcuts, by scope"),
+                        ("Sources", "web places to browse"),
+                        ("Plugins", "format decoders & their credentials"),
+                        ("Audio & Colors", "SoundFont, keys & accent colors"),
+                        ("Advanced", "backup, git, tasks & caches"),
+                        ("Config files", "hand-editable JSON on disk"),
                     ];
                     let sec = self.prefs_section;
-                    // Section selector: padded, evenly sized tabs so the row reads as a strip
-                    // rather than as run-together text.
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-                        for (i, name) in PREF_SECTIONS.iter().enumerate() {
-                            let i = i as u8;
-                            // Real padding via button_padding, NOT spaces baked into the label:
-                            // the label text is the accessibility name, so "  Keyboard  " makes
-                            // the tab unfindable by name (which broke a GUI test).
-                            if ui
-                                .add_sized([0.0, 26.0], egui::Button::selectable(sec == i, *name))
-                                .clicked()
-                            {
-                                self.prefs_section = i;
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-                    // Roomier controls inside the dialog than the app default — a settings pane is
-                    // read, not skimmed, and the old wall was hard to scan partly from density.
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-                    ui.spacing_mut().slider_width = 180.0;
-                    let ncols = 1;
-                    egui::ScrollArea::vertical()
-                        // Horizontal: fill. Vertical: shrink to content, which is what lets the
-                        // window height follow the tab instead of being a fixed box.
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.columns(ncols, |cols| {
-                                let ui = &mut cols[0];
-                                ui.add_space(2.0);
-                                // Keep full-width widgets (text fields, sliders) off the right
-                                // edge — they were running flush into the frame.
-                                ui.set_max_width(ui.available_width() - 10.0);
-                                let mut theme = self.theme;
-                                let mut gap = self.grid_gap;
-                                if sec == 0 {
-                                ui.label("Theme");
-                                // Named themes from <data>/themes/*.json. "Built-in" falls back to
-                                // egui's dark/light base, which the Dark/Light buttons below pick.
-                                let mut pick: Option<String> = None;
-                                egui::ComboBox::from_id_salt("theme_pick")
-                                    .selected_text(if self.theme_name.trim().is_empty() {
-                                        "Built-in".to_string()
-                                    } else {
-                                        self.theme_name.clone()
-                                    })
-                                    .width(200.0)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(self.theme_name.is_empty(), "Built-in")
-                                            .clicked()
-                                        {
-                                            pick = Some(String::new());
-                                        }
-                                        for t in &self.themes {
-                                            if ui
-                                                .selectable_label(
-                                                    self.theme_name == t.name,
-                                                    format!("{}{}", t.name, if t.dark { "" } else { "  (light)" }),
-                                                )
-                                                .clicked()
-                                            {
-                                                pick = Some(t.name.clone());
-                                            }
-                                        }
-                                    });
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("Reload themes").clicked() {
-                                        self.themes = crate::theme::load_all(&self.themes_dir);
-                                        pick = Some(self.theme_name.clone());
-                                    }
-                                    if ui.small_button("Open themes folder").clicked() {
-                                        let d = self.themes_dir.to_string_lossy().to_string();
-                                        self.open_url(&d);
-                                    }
-                                });
-                                ui.weak("Drop a VS Code theme .json in that folder — it's imported directly.");
-                                // A VS Code theme carries both halves (`colors` + `tokenColors`);
-                                // this picks which of them we honour.
-                                ui.horizontal(|ui| {
-                                    ui.label("Styles");
-                                    for (v, label, hover) in [
-                                        (0u8, "Everything", "App chrome and code syntax"),
-                                        (1, "Code only", "Syntax colours; app keeps the built-in look"),
-                                        (2, "App only", "Chrome; code keeps the built-in palette"),
-                                    ] {
-                                        if ui
-                                            .selectable_label(self.theme_scope == v, label)
-                                            .on_hover_text(hover)
-                                            .clicked()
-                                        {
-                                            self.theme_scope = v;
-                                            theme_apply = true;
-                                        }
-                                    }
-                                });
-                                if let Some(name) = pick {
-                                    self.theme_name = name;
-                                    theme_apply = true;
-                                }
-                                ui.add_space(6.0);
-                                ui.label("Code viewer");
-                                ui.horizontal(|ui| {
-                                    ui.label("Size");
+                    ui.horizontal_top(|ui| {
+                        // ── section rail ────────────────────────────────────────────
+                        let rail_w = 178.0;
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgb(15, 17, 21))
+                            .inner_margin(egui::Margin::symmetric(10, 14))
+                            .show(ui, |ui| {
+                                ui.set_min_width(rail_w);
+                                ui.set_max_width(rail_w);
+                                ui.set_min_height(ui.available_height().max(1.0));
+                                ui.vertical(|ui| {
                                     ui.add(
-                                        egui::Slider::new(&mut self.code_font_size, 6.0..=32.0)
-                                            .step_by(0.5)
-                                            .suffix(" pt"),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Font");
-                                    // Shown by file name, not full path: a font lives at a long
-                                    // path nobody reads, and the name is the part being chosen.
-                                    let cur = std::path::Path::new(self.code_font_path.trim())
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| "Built-in monospace".into());
-                                    if ui.button(cur).on_hover_text(if self.code_font_path.is_empty() {
-                                        "Pick a .ttf/.otf to read code in".to_string()
-                                    } else {
-                                        self.code_font_path.clone()
-                                    }).clicked() {
-                                        if let Some(p) = rfd::FileDialog::new()
-                                            .add_filter("Font", &["ttf", "otf", "ttc"])
-                                            .pick_file()
-                                        {
-                                            self.code_font_path = p.to_string_lossy().to_string();
-                                        }
-                                    }
-                                    if !self.code_font_path.is_empty() && ui.small_button("\u{d7}").on_hover_text("Back to the built-in monospace").clicked() {
-                                        self.code_font_path.clear();
-                                    }
-                                });
-                                ui.checkbox(&mut self.code_line_highlight, "Highlight the current line");
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(&mut theme, 0, "Dark");
-                                    ui.selectable_value(&mut theme, 1, "Light");
-                                });
-                                ui.add_space(8.0);
-                                ui.label("Grid spacing (horizontal)");
-                                let resp = ui.add(egui::Slider::new(&mut gap, 0.0..=40.0).suffix(" pt"));
-                                wheel_adjust(ui, &resp, &mut gap, 1.0, 0.0f32, 40.0f32);
-                                let mut gap_y = self.grid_gap_y;
-                                ui.label("Grid spacing (vertical)");
-                                let resp = ui.add(egui::Slider::new(&mut gap_y, 0.0..=80.0).suffix(" pt"));
-                                wheel_adjust(ui, &resp, &mut gap_y, 1.0, 0.0f32, 80.0f32);
-                                if theme != self.theme {
-                                    self.theme = theme;
-                                    ctx.set_visuals(if theme == 1 {
-                                        egui::Visuals::light()
-                                    } else {
-                                        egui::Visuals::dark()
-                                    });
-                                }
-                                self.grid_gap = gap;
-                                self.grid_gap_y = gap_y;
-                                ui.checkbox(&mut self.grid_tile_border, "Tile borders")
-                                    .on_hover_text(
-                                        "Draw a border around each grid tile so they read as \
-                                         separate cards instead of one continuous row.",
-                                    );
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 0 {
-                                ui.label("Font preview sample");
-                                let resp = ui.add(
-                                    egui::TextEdit::multiline(&mut self.font_preview_text)
-                                        .desired_rows(2)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text(crate::decode::font::DEFAULT_THUMB_SAMPLE),
-                                );
-                                // Re-render tiles only when editing settles (focus lost), not on
-                                // every keystroke (a font folder can hold hundreds of tiles).
-                                if resp.lost_focus() && resp.changed() {
-                                    font_preview_changed = true;
-                                }
-                                resp.on_hover_text(
-                                    "The text drawn on font (.ttf/.otf) grid tiles. One line per \
-                                     row; leave blank for the default. The Font viewer has its own \
-                                     live type-to-sample box.",
-                                );
-                                if ui.small_button("↺ Reset to default").clicked() {
-                                    self.font_preview_text =
-                                        crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
-                                    font_preview_changed = true;
-                                }
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 1 {
-                                ui.label("Window title bar");
-                                ui.checkbox(&mut self.title_show_path, "Show open path / file")
-                                    .on_hover_text(
-                                        "Append the open folder or file to the title bar. The GUI \
-                                         zoom % (Ctrl +/-) always shows in parens when it isn't 100%.",
-                                    );
-
-                                ui.add_space(10.0);
-                                // Text-mode/scene art renders at a tiny native 8×16 px per cell, so
-                                // it opens at this zoom instead of an unreadable 1:1. Measured in
-                                // *device* pixels per source pixel (N×) — the pixel-perfect unit the
-                                // viewer shows; applied to every ANSI/scene file as it loads.
-                                }
-                                if sec == 1 {
-                                ui.label("Text-mode (ANSI/scene) zoom");
-                                let mut tz = self.textmode_zoom.round() as i32;
-                                egui::ComboBox::from_id_salt("textmode_zoom")
-                                    .selected_text(format!("{tz}×"))
-                                    .show_ui(ui, |ui| {
-                                        for n in [1, 2, 3, 4, 5, 6, 8] {
-                                            ui.selectable_value(&mut tz, n, format!("{n}×"));
-                                        }
-                                    });
-                                if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
-                                    self.textmode_zoom = tz as f32;
-                                    // Reflect the change immediately on an already-open ANSI.
-                                    if self.viewing_textmode && !self.fit_mode {
-                                        self.zoom = self.textmode_zoom / ctx.pixels_per_point();
-                                    }
-                                }
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 0 {
-                                ui.label("Show under thumbnails");
-                                let mut fields = self.caption_fields;
-                                ui.horizontal_wrapped(|ui| {
-                                    for &(mask, label) in CAPTION_FIELDS {
-                                        let mut on = fields & mask != 0;
-                                        if ui.checkbox(&mut on, label).changed() {
-                                            if on {
-                                                fields |= mask;
-                                            } else {
-                                                fields &= !mask;
-                                            }
-                                        }
-                                    }
-                                });
-                                self.caption_fields = fields;
-
-                                ui.add_space(10.0);
-                                ui.checkbox(&mut self.table_grid, "Table dividing lines")
-                                    .on_hover_text(
-                                        "Draw subtle row + column divider lines in the table view \
-                                         (in addition to the zebra striping)",
-                                    );
-                                }
-                                if sec == 0 {
-                                ui.label("Table columns (file view)");
-                                let mut tcols = self.table_columns;
-                                ui.horizontal_wrapped(|ui| {
-                                    for &(mask, label) in TABLE_COLUMNS {
-                                        let mut on = tcols & mask != 0;
-                                        if ui.checkbox(&mut on, label).changed() {
-                                            if on {
-                                                tcols |= mask;
-                                            } else {
-                                                tcols &= !mask;
-                                            }
-                                        }
-                                    }
-                                });
-                                self.table_columns = tcols;
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 2 {
-                                ui.label("Hotkeys");
-                                let mut new_rebind: Option<Option<Action>> = None;
-                                egui::Grid::new("prefs_keys")
-                                    .num_columns(3)
-                                    .spacing([10.0, 4.0])
-                                    .show(ui, |ui| {
-                                        for a in Action::ALL {
-                                            ui.label(a.label());
-                                            let cur = self
-                                                .keymap
-                                                .get(&a)
-                                                .copied()
-                                                .unwrap_or_else(|| a.default_key());
-                                            ui.strong(cur.symbol_or_name());
-                                            let waiting = self.rebinding == Some(a);
-                                            let btn = if waiting {
-                                                "press a key… (Esc cancels)"
-                                            } else {
-                                                "Rebind"
-                                            };
-                                            if ui.button(btn).clicked() {
-                                                new_rebind = Some(if waiting { None } else { Some(a) });
-                                            }
-                                            ui.end_row();
-                                        }
-                                    });
-                                if let Some(r) = new_rebind {
-                                    self.rebinding = r;
-                                }
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 1 {
-                                ui.label("Viewer info OSD");
-                                ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
-                                    .on_hover_text("A fading panel with the piece's details");
-                                ui.add_enabled_ui(self.osd_enabled, |ui| {
-                                    ui.label("Position");
-                                    // A spatial 3×3 picker (center unused) — the button's place in the
-                                    // grid is where the OSD lands, so a corner is one click.
-                                    egui::Grid::new("osd_pos_grid")
-                                        .spacing([4.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.selectable_value(&mut self.osd_position, 0, "Top L");
-                                            ui.selectable_value(&mut self.osd_position, 1, "Top");
-                                            ui.selectable_value(&mut self.osd_position, 2, "Top R");
-                                            ui.end_row();
-                                            ui.selectable_value(&mut self.osd_position, 3, "Left");
-                                            ui.label(""); // center: unused
-                                            ui.selectable_value(&mut self.osd_position, 4, "Right");
-                                            ui.end_row();
-                                            ui.selectable_value(&mut self.osd_position, 5, "Bot L");
-                                            ui.selectable_value(&mut self.osd_position, 6, "Bot");
-                                            ui.selectable_value(&mut self.osd_position, 7, "Bot R");
-                                            ui.end_row();
-                                        });
-                                    ui.add(
-                                        egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
-                                            .suffix(" s")
-                                            .text("Hold"),
-                                    )
-                                    .on_hover_text("How long it stays before fading out");
-                                });
-
-                                ui.add_space(10.0);
-                                // ── right column (same column as the left when collapsed to 1) ──
-                                }
-                                if sec == 3 {
-                                ui.label("Web sources");
-                                ui.weak("Off by default — switch on the sources you browse.");
-                                for (on, label, hover) in [
-                                    (&mut self.plugin_16c, "16colo.rs", "The 16colo.rs ANSI/ASCII art archive"),
-                                    (&mut self.plugin_youtube, "YouTube", "Search + play YouTube videos (needs yt-dlp)"),
-                                    (&mut self.plugin_steam, "Steam", "Your installed Steam games → video search"),
-                                    (&mut self.plugin_images, "Image Search", "Creative-Commons images (Openverse)"),
-                                    (&mut self.plugin_audiosearch, "Audio Search", "Creative-Commons audio (Openverse)"),
-                                    (&mut self.plugin_deviantart, "DeviantArt", "Browse DeviantArt (set a client_id/secret in Preferences → Plugins)"),
-                                    (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
-                                    (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
-                                    (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
-                                    (&mut self.plugin_vectors, "Vector Search", "Vector art (Wikimedia Commons)"),
-                                    (&mut self.plugin_lospec, "Lospec", "Lospec palette browser + downloader"),
-                                    (&mut self.plugin_ph, "3D Search", "Poly Haven CC0 models, textures and HDRIs"),
-                                    (&mut self.plugin_gfonts, "Google Fonts", "Browse + download Google Fonts"),
-                                    (&mut self.plugin_ma, "MOD Archive", "~170k tracker modules"),
-                                ] {
-                                    ui.checkbox(on, label).on_hover_text(hover);
-                                }
-                                ui.add_space(10.0);
-                                }
-                                if sec == 4 {
-                                ui.label("Format plugins");
-                                ui.weak("Turn off a file type you don't want the viewer to handle.");
-                                let mut plug_changed = false;
-                                plug_changed |= ui
-                                    .checkbox(&mut self.plugin_code, "Source code / text")
-                                    .on_hover_text("Syntax-highlighted source & text files (.rs, .py, .md …)")
-                                    .changed();
-                                plug_changed |= ui
-                                    .checkbox(&mut self.plugin_pdf, "PDF")
-                                    .on_hover_text("PDF page thumbnail + page/title/author info")
-                                    .changed();
-                                plug_changed |= ui
-                                    .checkbox(&mut self.plugin_audio, "Audio")
-                                    .on_hover_text("Audio waveform + metadata + in-app preview")
-                                    .changed();
-                                plug_changed |= ui
-                                    .checkbox(&mut self.plugin_3d, "3D models")
-                                    .on_hover_text(
-                                        "OBJ / STL / PLY / glTF / GLB / DAE — a shaded thumbnail \
-                                         + an interactive 3D viewer (rotate / zoom / pan / WASD)",
-                                    )
-                                    .changed();
-                                plug_changed |= ui
-                                    .checkbox(&mut self.plugin_video, "Video")
-                                    .on_hover_text(
-                                        "MP4 / MKV / WEBM / MOV / … — a frame thumbnail + an \
-                                         in-app player (play / seek / speed / volume / PNG export). \
-                                         Needs ffmpeg on PATH.",
-                                    )
-                                    .changed();
-                                ui.checkbox(&mut self.plugin_ai, "AI generation")
-                                    .on_hover_text(
-                                        "Generate images/sound from a prompt via an external \
-                                         generator you configure (pixelmon / soundmon / ansimon). \
-                                         Adds the AI tab in Places + folder/pad 'Generate…' actions.",
-                                    );
-                                if plug_changed {
-                                    self.registry.set_plugin("code", self.plugin_code);
-                                    self.registry.set_plugin("pdf", self.plugin_pdf);
-                                    self.registry.set_plugin("audio", self.plugin_audio);
-                                    self.registry.set_plugin("3d", self.plugin_3d);
-                                    self.registry.set_plugin("video", self.plugin_video);
-                                    prefs_refresh = true; // re-scan so the listing adds/drops those types
-                                }
-
-                                // Where downloaded YouTube videos are stored (they get large —
-                                // point this at an external drive if you like). Separate from cache.
-                                if self.plugin_video {
-                                    ui.add_space(8.0);
-                                    ui.label("YouTube downloads");
-                                    let cur = self.yt_cache_dir();
-                                    ui.weak(format!("Saved to: {}", cur.display()));
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Change…").clicked() {
-                                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                                                self.yt_download_dir = Some(d);
-                                            }
-                                        }
-                                        if self.yt_download_dir.is_some()
-                                            && ui.button("Reset to default").clicked()
-                                        {
-                                            self.yt_download_dir = None;
-                                        }
-                                    });
-                                    // YouTube download quality (also on a per-video right-click).
-                                    ui.horizontal(|ui| {
-                                        ui.label("Quality");
-                                        let cur = match self.yt_max_height {
-                                            0 => "Best".to_string(),
-                                            h => format!("{h}p"),
-                                        };
-                                        egui::ComboBox::from_id_salt("yt_quality")
-                                            .selected_text(cur)
-                                            .show_ui(ui, |ui| {
-                                                for (lbl, h) in [
-                                                    ("480p", 480u32),
-                                                    ("720p", 720),
-                                                    ("1080p", 1080),
-                                                    ("1440p", 1440),
-                                                    ("4K", 2160),
-                                                    ("Best", 0),
-                                                ] {
-                                                    ui.selectable_value(
-                                                        &mut self.yt_max_height,
-                                                        h,
-                                                        lbl,
-                                                    );
-                                                }
-                                            });
-                                    });
-                                    // Cookies from a browser → clears YouTube's "confirm you're
-                                    // not a bot" gate (rate-limit) + reaches age-gated videos.
-                                    ui.horizontal(|ui| {
-                                        ui.label("Cookies");
-                                        let cur = if self.yt_cookies_browser.is_empty() {
-                                            "None (anonymous)".to_string()
-                                        } else {
-                                            self.yt_cookies_browser.clone()
-                                        };
-                                        egui::ComboBox::from_id_salt("yt_cookies")
-                                            .selected_text(cur)
-                                            .show_ui(ui, |ui| {
-                                                for b in [
-                                                    "", "firefox", "chrome", "chromium", "brave",
-                                                    "edge", "vivaldi", "opera",
-                                                ] {
-                                                    let lbl = if b.is_empty() {
-                                                        "None (anonymous)"
-                                                    } else {
-                                                        b
-                                                    };
-                                                    ui.selectable_value(
-                                                        &mut self.yt_cookies_browser,
-                                                        b.to_string(),
-                                                        lbl,
-                                                    );
-                                                }
-                                            });
-                                    });
-                                    ui.weak(
-                                        "Pick your browser if YouTube says \"confirm you're not a \
-                                         bot\" or a video is age-restricted (uses that browser's \
-                                         login cookies).",
-                                    );
-                                }
-
-                                // Steam Web API key → your full owned library (Installed / Not
-                                // installed / Never played). Free from steamcommunity.com/dev/apikey.
-                                if crate::steam::steam_root().is_some() {
-                                    ui.add_space(8.0);
-                                    ui.label("Steam Web API key");
-                                    ui.horizontal(|ui| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.steam_api_key)
-                                                .password(true)
-                                                .hint_text("32-hex key")
-                                                .desired_width(220.0),
-                                        );
-                                        if ui.button("Get key…").clicked() {
-                                            self.open_url("https://steamcommunity.com/dev/apikey");
-                                        }
-                                    });
-                                    ui.weak(
-                                        "Stored locally only. Enables the full owned-games library.",
-                                    );
-                                }
-
-                                // DeviantArt app credentials → the DeviantArt browse source. Register
-                                // an app at deviantart.com/developers (client type: Confidential) for
-                                // a client_id + client_secret; stored in secrets.json, out of sync.
-                                ui.add_space(8.0);
-                                ui.label("DeviantArt app (client-credentials)");
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.da_client_id)
-                                            .hint_text("client_id")
-                                            .desired_width(150.0),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.da_client_secret)
-                                            .password(true)
-                                            .hint_text("client_secret")
-                                            .desired_width(170.0),
-                                    );
-                                });
-                                if ui.button("Register an app…").clicked() {
-                                    self.open_url("https://www.deviantart.com/developers/");
-                                }
-                                ui.weak("Stored locally only. Enables the DeviantArt browse source.");
-
-                                // DOSBox path → run DOS .com/.exe programs (click or right-click
-                                // "Run in DOSBox"). Off until a binary is set. A paste-able text
-                                // field is the reliable path in — the rfd file dialog can silently
-                                // fail on some Wayland/KDE setups, which is why this looked "broken".
-                                ui.add_space(8.0);
-                                ui.label("DOSBox");
-                                ui.horizontal(|ui| {
-                                    // Rebuild the string from the source of truth each frame and
-                                    // write back on edit (egui keeps the cursor state by widget id).
-                                    let mut s = self
-                                        .dosbox_path
-                                        .as_ref()
-                                        .map(|p| p.display().to_string())
-                                        .unwrap_or_default();
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut s)
-                                            .hint_text("/path/to/dosbox")
-                                            .desired_width(320.0),
-                                    );
-                                    if resp.changed() {
-                                        let t = s.trim();
-                                        self.dosbox_path =
-                                            (!t.is_empty()).then(|| PathBuf::from(t));
-                                        prefs_refresh = true; // re-scan so .com/.exe tiles appear
-                                    }
-                                    if ui.button("Browse…").clicked() {
-                                        if let Some(f) = rfd::FileDialog::new().pick_file() {
-                                            self.dosbox_path = Some(f);
-                                            prefs_refresh = true;
-                                        }
-                                    }
-                                    if self.dosbox_path.is_some() && ui.button("Clear").clicked() {
-                                        self.dosbox_path = None;
-                                        prefs_refresh = true;
-                                    }
-                                });
-                                // Live status: found / missing / unset, so a wrong path is obvious.
-                                match &self.dosbox_path {
-                                    Some(p) if p.exists() => {
-                                        ui.weak(format!("\u{2713} Found: {}", p.display()));
-                                    }
-                                    Some(p) => {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(220, 120, 80),
-                                            format!("\u{2717} Not found at {}", p.display()),
-                                        );
-                                    }
-                                    None => {
-                                        ui.weak("Not set — .com/.exe/.bat won't run.");
-                                    }
-                                }
-                                ui.weak(
-                                    "Paste or browse to the DOSBox / DOSBox-Staging binary. DOS \
-                                     programs then run in DOSBox (their folder is mounted as C:).",
-                                );
-                                ui.checkbox(
-                                    &mut self.dosbox_keep_open,
-                                    "Keep window open after the program exits",
-                                )
-                                .on_hover_text(
-                                    "Pause for a keypress when the program quits, so an outro \
-                                     screen / final ANSI stays up instead of the window closing.",
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.label("Machine");
-                                    egui::ComboBox::from_id_salt("dosbox_machine")
-                                        .selected_text(DOSBOX_MACHINES[self.dosbox_machine].0)
-                                        .show_ui(ui, |ui| {
-                                            for (i, (label, ..)) in
-                                                DOSBOX_MACHINES.iter().enumerate()
-                                            {
-                                                ui.selectable_value(
-                                                    &mut self.dosbox_machine,
-                                                    i,
-                                                    *label,
-                                                );
-                                            }
-                                        });
-                                })
-                                .response
-                                .on_hover_text(
-                                    "Emulated CPU speed for Run in DOSBox. Auto runs as fast as \
-                                     possible; the era presets slow it to period-accurate cycles \
-                                     (so speed-sensitive DOS programs behave).",
-                                );
-                                ui.checkbox(&mut self.dosbox_svga, "SVGA mode")
-                                    .on_hover_text(
-                                        "Emulate an S3 Trio SVGA card with VESA support, for high-res \
-                                         viewers / demos that need modes beyond plain VGA. Off leaves \
-                                         DOSBox's own default video adapter.",
-                                    );
-
-                                // ModArchive API key — OPTIONAL. Browsing already works without
-                                // one (the public search page is parsed); a key just upgrades to
-                                // the XML API's richer metadata (artist / genre / size).
-                                ui.add_space(8.0);
-                                }
-                                if sec == 5 {
-                                ui.label("ModArchive API key (optional)");
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.ma_key)
-                                            .password(true)
-                                            .hint_text("leave blank — browsing works without it")
-                                            .desired_width(220.0),
-                                    );
-                                    if ui.button("Request…").clicked() {
-                                        self.open_url("https://modarchive.org/index.php?request=view_page&page=api_key");
-                                    }
-                                });
-                                ui.weak("Stored locally only. Adds artist / genre / size to results.");
-
-                                // MIDI needs a General MIDI SoundFont to synthesize .mid files into audio.
-                                if self.plugin_audio {
-                                    ui.add_space(8.0);
-                                    ui.label("MIDI SoundFont");
-                                    let auto = self.midi_soundfont();
-                                    let shown = match (&self.midi_sf, &auto) {
-                                        (Some(p), _) if p.is_file() => short_name(p),
-                                        (_, Some(p)) => format!("auto: {}", short_name(p)),
-                                        _ => "none found — .mid files won't play".to_string(),
-                                    };
-                                    ui.weak(format!("Synthesizes .mid files · {shown}"));
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Choose .sf2…").clicked() {
-                                            if let Some(p) = rfd::FileDialog::new()
-                                                .add_filter("SoundFont", &["sf2"])
-                                                .pick_file()
-                                            {
-                                                self.midi_sf = Some(p);
-                                                self.midi_sf_cache = None; // reload the new SF
-                                                self.audio_decode_cache.clear(); // re-render with it
-                                                self.status = "MIDI SoundFont set".into();
-                                            }
-                                        }
-                                        if self.midi_sf.is_some()
-                                            && ui
-                                                .button("Auto")
-                                                .on_hover_text("Auto-detect a system General MIDI SoundFont")
-                                                .clicked()
-                                        {
-                                            self.midi_sf = None;
-                                            self.midi_sf_cache = None;
-                                            self.audio_decode_cache.clear();
-                                        }
-                                    });
-                                }
-
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Format colors");
-                                    if ui
-                                        .small_button("Reset")
-                                        .on_hover_text("Restore the default per-format colors")
-                                        .clicked()
-                                    {
-                                        reset_colors = true;
-                                    }
-                                });
-                                ui.weak("Accent color for each format's tile / waveform / badge.");
-                                let mut changed_color: Option<(&str, [u8; 3])> = None;
-                                egui::Grid::new("format_colors_grid")
-                                    .spacing([14.0, 4.0])
-                                    .show(ui, |ui| {
-                                        for (i, (ext, label)) in
-                                            crate::format_color::EDITABLE.iter().enumerate()
-                                        {
-                                            let mut rgb = crate::format_color::color(ext);
-                                            if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                                changed_color = Some((ext, rgb));
-                                            }
-                                            ui.label(*label);
-                                            if i % 2 == 1 {
-                                                ui.end_row();
-                                            }
-                                        }
-                                    });
-                                if let Some((ext, rgb)) = changed_color {
-                                    color_change = Some((ext.to_string(), rgb));
-                                }
-
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut self.tile_bg_enabled, "Tile backgrounds");
-                                    if ui
-                                        .small_button("Reset")
-                                        .on_hover_text("Restore the default folder / archive / container tints")
-                                        .clicked()
-                                    {
-                                        let (df, da, dc) = Self::TILE_BG_DEFAULTS;
-                                        self.tile_bg_folder = df;
-                                        self.tile_bg_archive = da;
-                                        self.tile_bg_container = dc;
-                                    }
-                                });
-                                ui.weak("A subtle accent behind folder / archive / sample-bank tiles in the grid.");
-                                ui.add_enabled_ui(self.tile_bg_enabled, |ui| {
-                                    egui::Grid::new("tile_bg_grid").spacing([14.0, 4.0]).show(ui, |ui| {
-                                        ui.color_edit_button_srgb(&mut self.tile_bg_folder);
-                                        ui.label("Folders");
-                                        ui.end_row();
-                                        ui.color_edit_button_srgb(&mut self.tile_bg_archive);
-                                        ui.label("Archives (.zip/.lha/…)");
-                                        ui.end_row();
-                                        ui.color_edit_button_srgb(&mut self.tile_bg_container);
-                                        ui.label("Containers (.sf2/.sfz/.dls/.xi)");
-                                        ui.end_row();
-                                    });
-                                });
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 1 {
-                                ui.label("Transparency");
-                                ui.weak("What shows through an image's transparent pixels in the viewer.");
-                                // Checkerboard row: radio + size dropdown + two colour chips.
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(&mut self.transp_solid, false, "Checkerboard");
-                                    ui.add_enabled_ui(!self.transp_solid, |ui| {
-                                        ui.label("Size");
-                                        let size_label = ["Small", "Medium", "Large"]
-                                            [self.transp_checker_size.min(2) as usize];
-                                        egui::ComboBox::from_id_salt("transp_checker_size")
-                                            .selected_text(size_label)
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut self.transp_checker_size, 0, "Small");
-                                                ui.selectable_value(&mut self.transp_checker_size, 1, "Medium");
-                                                ui.selectable_value(&mut self.transp_checker_size, 2, "Large");
-                                            });
-                                        ui.label("Colors");
-                                        ui.color_edit_button_srgb(&mut self.transp_checker_a);
-                                        ui.color_edit_button_srgb(&mut self.transp_checker_b);
-                                    });
-                                });
-                                // Solid-colour row: radio + one colour chip.
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(&mut self.transp_solid, true, "Solid color");
-                                    ui.add_enabled_ui(self.transp_solid, |ui| {
-                                        ui.label("Color");
-                                        ui.color_edit_button_srgb(&mut self.transp_color);
-                                    });
-                                });
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 6 {
-                                ui.label("Backup & sync setup");
-                                ui.weak(
-                                    "Save your whole setup — every setting in this dialog plus your \
-                                     keybindings — to one portable JSON file, and import it on \
-                                     another machine.",
-                                );
-                                ui.checkbox(
-                                    &mut self.export_include_keys,
-                                    "Include API keys (Steam · ModArchive)",
-                                )
-                                .on_hover_text(
-                                    "Off by default. Your API keys are normally kept out of the \
-                                     exported file.",
-                                );
-                                if self.export_include_keys {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(220, 120, 80),
-                                        "⚠ The file will hold your API keys in PLAIN TEXT — anyone \
-                                         you send it to, or any cloud/dotfile/backup copy, can read \
-                                         them. Only include keys for a private local backup, never \
-                                         for something you'll share or commit.",
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button("Export setup…")
-                                        .on_hover_text("Write the bundle to a file you choose")
-                                        .clicked()
-                                    {
-                                        do_export_setup = Some(self.export_include_keys);
-                                    }
-                                    if ui
-                                        .button("Import setup…")
-                                        .on_hover_text(
-                                            "Load a bundle and apply it now. Overwrites your current \
-                                             settings; anything the file omits (e.g. keys) is left \
-                                             alone.",
+                                        egui::Label::new(
+                                            egui::RichText::new("SETTINGS")
+                                                .color(ui.visuals().weak_text_color())
+                                                .size(10.5)
+                                                .strong(),
                                         )
-                                        .clicked()
-                                    {
-                                        do_import_setup = true;
-                                    }
-                                });
-                                ui.weak("The bundle is plain JSON — open it in the viewer to inspect it.");
-
-                                ui.add_space(10.0);
-                                ui.label("Git status");
-                                if ui
-                                    .checkbox(
-                                        &mut self.git_enabled,
-                                        "Show git status in the browser",
-                                    )
-                                    .on_hover_text(
-                                        "Badge (grid) / column (table) / Details line / filename \
-                                         tint for files in a git repo: new, modified, ignored, \
-                                         conflict. Runs `git status` per folder. Turn off on a \
-                                         very large repo if navigation feels slow.",
-                                    )
-                                    .changed()
-                                {
-                                    self.start_git_status(); // recompute now (or clear) so it's immediate
-                                }
-                                ui.weak("Add a \"Git\" column via the table header's right-click menu.");
-
-                                ui.add_space(10.0);
-                                ui.label("Project tasks");
-                                if ui
-                                    .checkbox(
-                                        &mut self.tasks_enabled,
-                                        "Read .vscode/tasks.json",
-                                    )
-                                    .on_hover_text(
-                                        "Offer a project's own build/run/tool commands: a \"▶ Run\" \
-                                         menu in the code viewer and a \"Tasks\" submenu on any \
-                                         file's right-click menu. Found by walking up from the \
-                                         current folder for a .vscode/tasks.json.",
-                                    )
-                                    .changed()
-                                {
-                                    self.refresh_tasks(); // pick up (or drop) them immediately
-                                }
-                                if self.tasks_enabled {
-                                    ui.weak(format!(
-                                        "{} task(s) available here.",
-                                        self.tasks.len()
-                                    ));
-                                    ui.horizontal(|ui| {
+                                        .selectable(false),
+                                    );
+                                    ui.add_space(9.0);
+                                    ui.spacing_mut().item_spacing.y = 3.0;
+                                    ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
+                                    for (i, (name, _)) in PREF_SECTIONS.iter().enumerate() {
+                                        let i = i as u8;
                                         if ui
-                                            .small_button("Open global tasks folder")
-                                            .on_hover_text(
-                                                "Tasks defined here are offered in EVERY folder, on \
-                                                 top of a project's own .vscode/tasks.json",
+                                            .add_sized(
+                                                [rail_w - 8.0, 32.0],
+                                                egui::Button::selectable(sec == i, *name),
                                             )
                                             .clicked()
                                         {
-                                            let d = self.tasks_dir.to_string_lossy().to_string();
-                                            self.open_url(&d);
-                                        }
-                                        if ui.small_button("Reload").clicked() {
-                                            self.refresh_tasks();
-                                        }
-                                    });
-                                    ui.weak(format!("Global: {}", self.tasks_dir.join("tasks.json").display()));
-                                }
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 6 {
-                                ui.label("16colo.rs cache");
-                                let (bytes, count) = crate::cache::stats();
-                                ui.horizontal(|ui| {
-                                    ui.weak(format!(
-                                        "{} · {count} items",
-                                        human_size(bytes.max(0) as u64)
-                                    ));
-                                    if ui
-                                        .button("Clear cache")
-                                        .on_hover_text(
-                                            "Delete all cached 16colo.rs JSON, thumbnails, files and \
-                                             pack zips (they'll re-download on demand)",
-                                        )
-                                        .clicked()
-                                    {
-                                        crate::cache::clear();
-                                        self.status = "Cache cleared".into();
-                                    }
-                                });
-                                // Backup / restore, so "Clear cache" isn't a one-way door — snapshot
-                                // the whole cache to a folder (e.g. an external drive) and bring it back.
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button("Backup cache…")
-                                        .on_hover_text(
-                                            "Copy the whole 16colo.rs cache to a folder you pick \
-                                             (into a 'kaleidotron-cache' subfolder there)",
-                                        )
-                                        .clicked()
-                                    {
-                                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                            let dest = dir.join("kaleidotron-cache");
-                                            self.status = match crate::cache::backup_to(&dest) {
-                                                Ok((n, bytes)) => format!(
-                                                    "Backed up {n} files ({}) → {}",
-                                                    human_size(bytes),
-                                                    dest.display()
-                                                ),
-                                                Err(e) => format!("Backup failed: {e}"),
-                                            };
-                                        }
-                                    }
-                                    if ui
-                                        .button("Restore…")
-                                        .on_hover_text(
-                                            "Restore a backup: pick its 'kaleidotron-cache' folder. \
-                                             Merges into the current cache (doesn't wipe it first)",
-                                        )
-                                        .clicked()
-                                    {
-                                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                            self.status = match crate::cache::restore_from(&dir) {
-                                                Ok((rows, total)) => format!(
-                                                    "Restored {rows} entries — cache now {}",
-                                                    human_size(total.max(0) as u64)
-                                                ),
-                                                Err(e) => format!("Restore failed: {e}"),
-                                            };
+                                            self.prefs_section = i;
                                         }
                                     }
                                 });
-
-                                ui.add_space(10.0);
-                                }
-                                if sec == 6 {
-                                ui.label("3D render cache");
-                                let (bbytes, bcount) = crate::decode::mesh3d::blend_cache_stats();
-                                ui.horizontal(|ui| {
-                                    ui.weak(format!("{} · {bcount} renders", human_size(bbytes)));
-                                    if ui
-                                        .button("Clear renders")
-                                        .on_hover_text(
-                                            "Delete every cached .blend render (right-click → \
-                                             Render re-creates them on demand)",
-                                        )
-                                        .clicked()
-                                    {
-                                        clear_blend_renders = true;
-                                    }
-                                });
-                                }
-                                if sec == 7 {
-                                ui.label("Configuration files");
-                                ui.weak(
-                                    "Plain text, hand-editable, and safe to keep in a dotfile \
-                                     manager — except secrets.json. Changes apply on the next \
-                                     launch.",
-                                );
-                                ui.add_space(10.0);
-                                let themes_dir = self.themes_dir.clone();
-                                let entries: [(&str, PathBuf, &str); 4] = [
-                                    (
-                                        "settings.json",
-                                        self.settings_file.clone(),
-                                        "Everything in this dialog, grouped by section. Delete a \
-                                         line to restore its default; delete the file to reset all.",
-                                    ),
-                                    (
-                                        "keybindings.json",
-                                        self.keybindings_file.clone(),
-                                        "Key bindings, one per action. Actions are named, so \
-                                         reordering them can't rebind your keys.",
-                                    ),
-                                    (
-                                        "themes/",
-                                        themes_dir.clone(),
-                                        "UI + syntax themes. Drop a VS Code theme .json in here \
-                                         and it's imported directly.",
-                                    ),
-                                    (
-                                        "secrets.json",
-                                        self.secrets_file.clone(),
-                                        "API keys, owner-readable only. Keep this one OUT of \
-                                         dotfile sync — it's why they live apart from settings.",
-                                    ),
-                                ];
-                                for (name, path, blurb) in entries {
-                                    let exists = path.exists();
-                                    // Modified time, so it's obvious which file a change landed in.
-                                    let when = std::fs::metadata(&path)
-                                        .and_then(|m| m.modified())
-                                        .ok()
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| date_ymd_unix(d.as_secs() as i64));
-                                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                                        ui.set_width(ui.available_width() - 8.0);
-                                        ui.horizontal(|ui| {
-                                            ui.strong(name);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .add_enabled(
-                                                            exists,
-                                                            egui::Button::new("Open"),
-                                                        )
-                                                        .on_hover_text(path.to_string_lossy())
-                                                        .clicked()
-                                                    {
-                                                        open_config = Some(path.clone());
-                                                    }
-                                                    match (&when, exists) {
-                                                        (Some(w), _) => {
-                                                            ui.weak(format!("updated {w}"));
-                                                        }
-                                                        (None, false) => {
-                                                            ui.weak("not created yet");
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                },
-                                            );
-                                        });
-                                        ui.weak(blurb);
-                                    });
-                                    ui.add_space(6.0);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("📁 Open config folder").clicked() {
-                                    open_config =
-                                        self.settings_file.parent().map(|d| d.to_path_buf());
-                                }
-                                }
                             });
-                        });
+                        // ── content ─────────────────────────────────────────────────
+                        let avail_h = ui.available_height();
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(22, 16))
+                            .show(ui, |ui| {
+                              // The content Frame sits inside `ui.horizontal_top` (rail | content),
+                              // so its inner Ui INHERITS a left-to-right layout — which laid the
+                              // header and every section's widgets out sideways and shoved
+                              // `ui.columns` off to the right. Force top-down here; that's the one
+                              // fix behind all the "columns collapsed / sprawled" symptoms.
+                              ui.vertical(|ui| {
+                                // Section header (big title + subtitle), above the scroll area.
+                                let (title, subtitle) = PREF_SECTIONS[sec as usize];
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(title).size(21.0).strong(),
+                                        )
+                                        .selectable(false),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(subtitle)
+                                                .color(ui.visuals().weak_text_color())
+                                                .size(13.0),
+                                        )
+                                        .selectable(false),
+                                    );
+                                });
+                                ui.add_space(14.0);
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height((avail_h - 46.0).max(120.0))
+                                    .show(ui, |ui| {
+                                        // HARD-bound the content width. Without this, an
+                                        // auto_shrink=false ScrollArea reports an unbounded
+                                        // available width, so long labels never wrap — which
+                                        // balloons the window AND collapses `ui.columns` into an
+                                        // overlapping strip. A fixed width makes labels wrap and
+                                        // every column compute a sane width.
+                                        ui.set_width(ui.available_width().min(864.0));
+                                        self.render_prefs_sections(ui, &ctx, &mut out);
+                                    });
+                              });
+                            });
+                    });
                 });
-            if theme_apply {
+            // ── apply the section renderers' deferred results ───────────────────────
+            if out.theme_apply {
                 self.apply_theme(&ctx);
             }
-            if let Some(p) = open_config {
+            if let Some(p) = out.open_config {
                 self.open_url(&p.to_string_lossy());
             }
             self.show_prefs = open;
-            if prefs_refresh {
+            if out.refresh {
                 self.refresh();
             }
-            if reset_colors {
+            if out.reset_colors {
                 self.reset_format_colors();
             }
-            if let Some((ext, rgb)) = color_change {
+            if let Some((ext, rgb)) = out.color_change {
                 self.set_format_color(&ext, rgb);
             }
-            if clear_blend_renders {
+            if out.clear_blend_renders {
                 crate::decode::mesh3d::clear_blend_cache();
                 // Revert any `.blend` tiles in view to the placeholder (drop their cached texture).
                 let blends: Vec<PathBuf> = self
@@ -40556,15 +39683,15 @@ impl eframe::App for Kaleidotron {
                 }
                 self.status = "3D render cache cleared".into();
             }
-            if font_preview_changed {
+            if out.font_preview_changed {
                 // Editing the Preferences text implies "use it".
                 self.font_preview_on = true;
                 self.refresh_font_thumbs();
             }
-            if let Some(include_secrets) = do_export_setup {
+            if let Some(include_secrets) = out.export_setup {
                 self.export_setup(include_secrets);
             }
-            if do_import_setup {
+            if out.import_setup {
                 self.import_setup(&ctx);
             }
         }
@@ -51487,28 +50614,20 @@ const HOTKEYS: &[(&str, &str)] = &[
         "Mouse Back / Fwd",
         "Grid: folder history · Viewer: prev / next image",
     ),
-    (
-        "Home / End",
-        "Grid: first / last · Viewer: scroll to top / bottom",
-    ),
+    ("Home / End", "Viewer: scroll to top / bottom"),
     (
         "PageUp / PageDown",
         "Viewer: scroll 25 lines (a screen of scene art)",
     ),
     ("Arrow Up / Down", "Viewer: scroll a long image"),
     ("Z + 1 – 9 / 0", "Viewer: zoom 100 % – 1000 %"),
-    ("/", "Grid: filter by filename"),
     ("Ctrl + F", "Advanced recursive search"),
     ("Drag", "Pan the image"),
-    ("F", "Fit to window + auto-fit new images (viewer)"),
-    ("T", "Tile preview — fill window (viewer) · Grid ↔ Table"),
-    ("F11", "Immersive fullscreen (hide all bars)"),
-    ("F5", "Refresh — re-scan the current folder from disk"),
+    ("T", "Tile preview — fill window (viewer)"),
     (
         "Shift + F5",
         "Hard refresh — also clear cached thumbnails / metadata",
     ),
-    ("R", "Load a random 16colo.rs pack"),
     ("1 – 5", "Set star rating"),
     ("0", "Clear rating"),
     ("Space", "Audio: play / pause"),
@@ -55069,11 +54188,1052 @@ mod text_editor_tests {
     }
 }
 
+/// Deferred results of the Preferences dialog: an egui closure can't borrow `self`
+/// twice, so the section renderers stash their side effects here and `ui()` applies
+/// them after the window closes (mirrors the `MenuAction` deferral pattern).
+#[derive(Default)]
+struct PrefsOut {
+    refresh: bool,                            // a plugin/DOSBox toggle → re-scan the folder
+    color_change: Option<(String, [u8; 3])>, // a format-color edit
+    reset_colors: bool,                       // "Reset" the format colors
+    clear_blend_renders: bool,                // "Clear renders" → wipe the .blend render cache
+    export_setup: Option<bool>,               // Some(include_secrets) → export bundle
+    import_setup: bool,                       // "Import setup…" clicked
+    font_preview_changed: bool,               // font-tile sample text edited → refresh tiles
+    theme_apply: bool,                        // theme picked → re-install Visuals
+    open_config: Option<PathBuf>,             // Config-files tab → open this path
+}
+
+/// One titled Preferences card: a bordered group with a small uppercase accent heading,
+/// filling its column. The body writes into the inner `ui`. Cards flow across the
+/// section's `ui.columns(..)` so a section spreads sideways instead of stacking tall.
+fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(30, 34, 40))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(14, 13))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title.to_uppercase())
+                        .color(accent)
+                        .strong()
+                        .size(11.5),
+                )
+                .selectable(false),
+            );
+            ui.add_space(8.0);
+            add(ui);
+        });
+    ui.add_space(12.0);
+}
+
+impl Kaleidotron {
+    /// The body of the Preferences dialog — the selected section's controls, grouped into
+    /// titled cards laid out across two columns. Layout-only; every control, conditional
+    /// group and deferred action matches the old single-column version (results in `out`).
+    fn render_prefs_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out: &mut PrefsOut) {
+        // A cyan accent for the card titles — the scene-art cyan, darkened for light themes.
+        let accent = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(78, 201, 208)
+        } else {
+            egui::Color32::from_rgb(20, 118, 128)
+        };
+        // Roomier controls than the app default — a settings pane is read, not skimmed.
+        ui.spacing_mut().item_spacing.y = 7.0;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+        ui.spacing_mut().slider_width = 170.0;
+
+        match self.prefs_section {
+            // ── Appearance ─────────────────────────────────────────────────────────
+            0 => {
+                ui.columns(2, |c| {
+                    // LEFT
+                    pref_card(&mut c[0], "Theme", accent, |ui| {
+                        let mut pick: Option<String> = None;
+                        egui::ComboBox::from_id_salt("theme_pick")
+                            .selected_text(if self.theme_name.trim().is_empty() {
+                                "Built-in".to_string()
+                            } else {
+                                self.theme_name.clone()
+                            })
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(self.theme_name.is_empty(), "Built-in").clicked() {
+                                    pick = Some(String::new());
+                                }
+                                for t in &self.themes {
+                                    if ui
+                                        .selectable_label(
+                                            self.theme_name == t.name,
+                                            format!("{}{}", t.name, if t.dark { "" } else { "  (light)" }),
+                                        )
+                                        .clicked()
+                                    {
+                                        pick = Some(t.name.clone());
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Reload themes").clicked() {
+                                self.themes = crate::theme::load_all(&self.themes_dir);
+                                pick = Some(self.theme_name.clone());
+                            }
+                            if ui.small_button("Open themes folder").clicked() {
+                                let d = self.themes_dir.to_string_lossy().to_string();
+                                self.open_url(&d);
+                            }
+                        });
+                        ui.weak("Drop a VS Code theme .json in that folder — it's imported directly.");
+                        ui.horizontal(|ui| {
+                            ui.label("Styles");
+                            for (v, label, hover) in [
+                                (0u8, "Everything", "App chrome and code syntax"),
+                                (1, "Code only", "Syntax colours; app keeps the built-in look"),
+                                (2, "App only", "Chrome; code keeps the built-in palette"),
+                            ] {
+                                if ui
+                                    .selectable_label(self.theme_scope == v, label)
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    self.theme_scope = v;
+                                    out.theme_apply = true;
+                                }
+                            }
+                        });
+                        if let Some(name) = pick {
+                            self.theme_name = name;
+                            out.theme_apply = true;
+                        }
+                    });
+                    pref_card(&mut c[0], "Code viewer", accent, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Size");
+                            ui.add(
+                                egui::Slider::new(&mut self.code_font_size, 6.0..=32.0)
+                                    .step_by(0.5)
+                                    .suffix(" pt"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Font");
+                            let cur = std::path::Path::new(self.code_font_path.trim())
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Built-in monospace".into());
+                            if ui
+                                .button(cur)
+                                .on_hover_text(if self.code_font_path.is_empty() {
+                                    "Pick a .ttf/.otf to read code in".to_string()
+                                } else {
+                                    self.code_font_path.clone()
+                                })
+                                .clicked()
+                            {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Font", &["ttf", "otf", "ttc"])
+                                    .pick_file()
+                                {
+                                    self.code_font_path = p.to_string_lossy().to_string();
+                                }
+                            }
+                            if !self.code_font_path.is_empty()
+                                && ui.small_button("\u{d7}").on_hover_text("Back to the built-in monospace").clicked()
+                            {
+                                self.code_font_path.clear();
+                            }
+                        });
+                        ui.checkbox(&mut self.code_line_highlight, "Highlight the current line");
+                    });
+                    pref_card(&mut c[0], "Grid & tiles", accent, |ui| {
+                        let mut theme = self.theme;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut theme, 0, "Dark");
+                            ui.selectable_value(&mut theme, 1, "Light");
+                        });
+                        if theme != self.theme {
+                            self.theme = theme;
+                            ctx.set_visuals(if theme == 1 {
+                                egui::Visuals::light()
+                            } else {
+                                egui::Visuals::dark()
+                            });
+                        }
+                        ui.add_space(4.0);
+                        ui.label("Grid spacing (horizontal)");
+                        let mut gap = self.grid_gap;
+                        let resp = ui.add(egui::Slider::new(&mut gap, 0.0..=40.0).suffix(" pt"));
+                        wheel_adjust(ui, &resp, &mut gap, 1.0, 0.0f32, 40.0f32);
+                        self.grid_gap = gap;
+                        ui.label("Grid spacing (vertical)");
+                        let mut gap_y = self.grid_gap_y;
+                        let resp = ui.add(egui::Slider::new(&mut gap_y, 0.0..=80.0).suffix(" pt"));
+                        wheel_adjust(ui, &resp, &mut gap_y, 1.0, 0.0f32, 80.0f32);
+                        self.grid_gap_y = gap_y;
+                        ui.checkbox(&mut self.grid_tile_border, "Tile borders").on_hover_text(
+                            "Draw a border around each grid tile so they read as separate cards \
+                             instead of one continuous row.",
+                        );
+                    });
+                    // RIGHT
+                    pref_card(&mut c[1], "Thumbnail captions", accent, |ui| {
+                        ui.label("Font preview sample");
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut self.font_preview_text)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(crate::decode::font::DEFAULT_THUMB_SAMPLE),
+                        );
+                        if resp.lost_focus() && resp.changed() {
+                            out.font_preview_changed = true;
+                        }
+                        resp.on_hover_text(
+                            "The text drawn on font (.ttf/.otf) grid tiles. One line per row; \
+                             leave blank for the default. The Font viewer has its own live \
+                             type-to-sample box.",
+                        );
+                        if ui.small_button("↺ Reset to default").clicked() {
+                            self.font_preview_text = crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
+                            out.font_preview_changed = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.label("Show under thumbnails");
+                        let mut fields = self.caption_fields;
+                        ui.horizontal_wrapped(|ui| {
+                            for &(mask, label) in CAPTION_FIELDS {
+                                let mut on = fields & mask != 0;
+                                if ui.checkbox(&mut on, label).changed() {
+                                    if on {
+                                        fields |= mask;
+                                    } else {
+                                        fields &= !mask;
+                                    }
+                                }
+                            }
+                        });
+                        self.caption_fields = fields;
+                        ui.checkbox(&mut self.table_grid, "Table dividing lines").on_hover_text(
+                            "Draw subtle row + column divider lines in the table view (in addition \
+                             to the zebra striping)",
+                        );
+                    });
+                    pref_card(&mut c[1], "Table columns (file view)", accent, |ui| {
+                        let mut tcols = self.table_columns;
+                        ui.horizontal_wrapped(|ui| {
+                            for &(mask, label) in TABLE_COLUMNS {
+                                let mut on = tcols & mask != 0;
+                                if ui.checkbox(&mut on, label).changed() {
+                                    if on {
+                                        tcols |= mask;
+                                    } else {
+                                        tcols &= !mask;
+                                    }
+                                }
+                            }
+                        });
+                        self.table_columns = tcols;
+                    });
+                });
+            }
+
+            // ── Viewer ─────────────────────────────────────────────────────────────
+            1 => {
+                ui.columns(2, |c| {
+                    pref_card(&mut c[0], "Window title bar", accent, |ui| {
+                        ui.checkbox(&mut self.title_show_path, "Show open path / file").on_hover_text(
+                            "Append the open folder or file to the title bar. The GUI zoom % \
+                             (Ctrl +/-) always shows in parens when it isn't 100%.",
+                        );
+                    });
+                    pref_card(&mut c[0], "Text-mode (ANSI/scene) zoom", accent, |ui| {
+                        let mut tz = self.textmode_zoom.round() as i32;
+                        egui::ComboBox::from_id_salt("textmode_zoom")
+                            .selected_text(format!("{tz}×"))
+                            .show_ui(ui, |ui| {
+                                for n in [1, 2, 3, 4, 5, 6, 8] {
+                                    ui.selectable_value(&mut tz, n, format!("{n}×"));
+                                }
+                            });
+                        if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
+                            self.textmode_zoom = tz as f32;
+                            if self.viewing_textmode && !self.fit_mode {
+                                self.zoom = self.textmode_zoom / ctx.pixels_per_point();
+                            }
+                        }
+                    });
+                    pref_card(&mut c[1], "Viewer info OSD", accent, |ui| {
+                        ui.checkbox(&mut self.osd_enabled, "Show metadata overlay on open")
+                            .on_hover_text("A fading panel with the piece's details");
+                        ui.add_enabled_ui(self.osd_enabled, |ui| {
+                            ui.label("Position");
+                            egui::Grid::new("osd_pos_grid").spacing([4.0, 4.0]).show(ui, |ui| {
+                                ui.selectable_value(&mut self.osd_position, 0, "Top L");
+                                ui.selectable_value(&mut self.osd_position, 1, "Top");
+                                ui.selectable_value(&mut self.osd_position, 2, "Top R");
+                                ui.end_row();
+                                ui.selectable_value(&mut self.osd_position, 3, "Left");
+                                ui.label("");
+                                ui.selectable_value(&mut self.osd_position, 4, "Right");
+                                ui.end_row();
+                                ui.selectable_value(&mut self.osd_position, 5, "Bot L");
+                                ui.selectable_value(&mut self.osd_position, 6, "Bot");
+                                ui.selectable_value(&mut self.osd_position, 7, "Bot R");
+                                ui.end_row();
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
+                                    .suffix(" s")
+                                    .text("Hold"),
+                            )
+                            .on_hover_text("How long it stays before fading out");
+                        });
+                    });
+                    pref_card(&mut c[0], "Transparency", accent, |ui| {
+                        ui.weak("What shows through an image's transparent pixels in the viewer.");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.radio_value(&mut self.transp_solid, false, "Checkerboard");
+                            ui.add_enabled_ui(!self.transp_solid, |ui| {
+                                ui.label("Size");
+                                let size_label =
+                                    ["Small", "Medium", "Large"][self.transp_checker_size.min(2) as usize];
+                                egui::ComboBox::from_id_salt("transp_checker_size")
+                                    .selected_text(size_label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.transp_checker_size, 0, "Small");
+                                        ui.selectable_value(&mut self.transp_checker_size, 1, "Medium");
+                                        ui.selectable_value(&mut self.transp_checker_size, 2, "Large");
+                                    });
+                                ui.label("Colors");
+                                ui.color_edit_button_srgb(&mut self.transp_checker_a);
+                                ui.color_edit_button_srgb(&mut self.transp_checker_b);
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.radio_value(&mut self.transp_solid, true, "Solid color");
+                            ui.add_enabled_ui(self.transp_solid, |ui| {
+                                ui.label("Color");
+                                ui.color_edit_button_srgb(&mut self.transp_color);
+                            });
+                        });
+                    });
+                });
+            }
+
+            // ── Keyboard ───────────────────────────────────────────────────────────
+            2 => {
+                ui.columns(2, |c| {
+                    let mut new_rebind: Option<Option<Action>> = None;
+                    for (si, scope) in ActionScope::ALL.iter().enumerate() {
+                        let col = si % 2;
+                        pref_card(&mut c[col], scope.title(), accent, |ui| {
+                            egui::Grid::new(("prefs_keys", si))
+                                .num_columns(3)
+                                .spacing([10.0, 6.0])
+                                .show(ui, |ui| {
+                                    for a in Action::ALL.into_iter().filter(|a| a.scope() == *scope) {
+                                        ui.label(a.label());
+                                        let cur =
+                                            self.keymap.get(&a).copied().unwrap_or_else(|| a.default_key());
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let waiting = self.rebinding == Some(a);
+                                                let btn = if waiting { "press a key…" } else { "Rebind" };
+                                                if ui.button(btn).on_hover_text("Esc cancels").clicked() {
+                                                    new_rebind = Some(if waiting { None } else { Some(a) });
+                                                }
+                                                ui.add_space(6.0);
+                                                ui.strong(cur.symbol_or_name());
+                                            },
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                    if let Some(r) = new_rebind {
+                        self.rebinding = r;
+                    }
+                });
+            }
+
+            // ── Sources ────────────────────────────────────────────────────────────
+            3 => {
+                pref_card(ui, "Web sources", accent, |ui| {
+                    ui.weak("Off by default — switch on the sources you browse.");
+                    ui.add_space(4.0);
+                    let items: [(&mut bool, &str, &str); 14] = [
+                        (&mut self.plugin_16c, "16colo.rs", "The 16colo.rs ANSI/ASCII art archive"),
+                        (&mut self.plugin_youtube, "YouTube", "Search + play YouTube videos (needs yt-dlp)"),
+                        (&mut self.plugin_steam, "Steam", "Your installed Steam games → video search"),
+                        (&mut self.plugin_images, "Image Search", "Creative-Commons images (Openverse)"),
+                        (&mut self.plugin_audiosearch, "Audio Search", "Creative-Commons audio (Openverse)"),
+                        (&mut self.plugin_deviantart, "DeviantArt", "Browse DeviantArt (set a client_id/secret in Plugins)"),
+                        (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
+                        (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
+                        (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
+                        (&mut self.plugin_vectors, "Vector Search", "Vector art (Wikimedia Commons)"),
+                        (&mut self.plugin_lospec, "Lospec", "Lospec palette browser + downloader"),
+                        (&mut self.plugin_ph, "3D Search", "Poly Haven CC0 models, textures and HDRIs"),
+                        (&mut self.plugin_gfonts, "Google Fonts", "Browse + download Google Fonts"),
+                        (&mut self.plugin_ma, "MOD Archive", "~170k tracker modules"),
+                    ];
+                    // A tight 2-column grid (adjacent, not split across the full card width) so
+                    // the sources read as one list, not two groups flung to opposite edges.
+                    egui::Grid::new("web_sources_grid")
+                        .num_columns(2)
+                        .spacing([40.0, 5.0])
+                        .show(ui, |ui| {
+                            for (i, (on, label, hover)) in items.into_iter().enumerate() {
+                                ui.checkbox(on, label).on_hover_text(hover);
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+            }
+
+            // ── Plugins ────────────────────────────────────────────────────────────
+            4 => {
+                ui.columns(2, |c| {
+                    // LEFT: format plugins + DOSBox
+                    pref_card(&mut c[0], "Format plugins", accent, |ui| {
+                        ui.weak("Turn off a file type you don't want the viewer to handle.");
+                        let mut plug_changed = false;
+                        plug_changed |= ui
+                            .checkbox(&mut self.plugin_code, "Source code / text")
+                            .on_hover_text("Syntax-highlighted source & text files (.rs, .py, .md …)")
+                            .changed();
+                        plug_changed |= ui
+                            .checkbox(&mut self.plugin_pdf, "PDF")
+                            .on_hover_text("PDF page thumbnail + page/title/author info")
+                            .changed();
+                        plug_changed |= ui
+                            .checkbox(&mut self.plugin_audio, "Audio")
+                            .on_hover_text("Audio waveform + metadata + in-app preview")
+                            .changed();
+                        plug_changed |= ui
+                            .checkbox(&mut self.plugin_3d, "3D models")
+                            .on_hover_text(
+                                "OBJ / STL / PLY / glTF / GLB / DAE — a shaded thumbnail + an \
+                                 interactive 3D viewer (rotate / zoom / pan / WASD)",
+                            )
+                            .changed();
+                        plug_changed |= ui
+                            .checkbox(&mut self.plugin_video, "Video")
+                            .on_hover_text(
+                                "MP4 / MKV / WEBM / MOV / … — a frame thumbnail + an in-app player \
+                                 (play / seek / speed / volume / PNG export). Needs ffmpeg on PATH.",
+                            )
+                            .changed();
+                        ui.checkbox(&mut self.plugin_ai, "AI generation").on_hover_text(
+                            "Generate images/sound from a prompt via an external generator you \
+                             configure (pixelmon / soundmon / ansimon). Adds the AI tab in Places \
+                             + folder/pad 'Generate…' actions.",
+                        );
+                        if plug_changed {
+                            self.registry.set_plugin("code", self.plugin_code);
+                            self.registry.set_plugin("pdf", self.plugin_pdf);
+                            self.registry.set_plugin("audio", self.plugin_audio);
+                            self.registry.set_plugin("3d", self.plugin_3d);
+                            self.registry.set_plugin("video", self.plugin_video);
+                            out.refresh = true;
+                        }
+                    });
+                    pref_card(&mut c[0], "DOSBox", accent, |ui| {
+                        let mut s = self
+                            .dosbox_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut s)
+                                .hint_text("/path/to/dosbox")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if resp.changed() {
+                            let t = s.trim();
+                            self.dosbox_path = (!t.is_empty()).then(|| PathBuf::from(t));
+                            out.refresh = true;
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Browse…").clicked() {
+                                if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                    self.dosbox_path = Some(f);
+                                    out.refresh = true;
+                                }
+                            }
+                            if self.dosbox_path.is_some() && ui.button("Clear").clicked() {
+                                self.dosbox_path = None;
+                                out.refresh = true;
+                            }
+                        });
+                        match &self.dosbox_path {
+                            Some(p) if p.exists() => {
+                                ui.weak(format!("\u{2713} Found: {}", p.display()));
+                            }
+                            Some(p) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 80),
+                                    format!("\u{2717} Not found at {}", p.display()),
+                                );
+                            }
+                            None => {
+                                ui.weak("Not set — .com/.exe/.bat won't run.");
+                            }
+                        }
+                        ui.checkbox(&mut self.dosbox_keep_open, "Keep window open after the program exits")
+                            .on_hover_text(
+                                "Pause for a keypress when the program quits, so an outro screen / \
+                                 final ANSI stays up instead of the window closing.",
+                            );
+                        ui.horizontal(|ui| {
+                            ui.label("Machine");
+                            egui::ComboBox::from_id_salt("dosbox_machine")
+                                .selected_text(DOSBOX_MACHINES[self.dosbox_machine].0)
+                                .show_ui(ui, |ui| {
+                                    for (i, (label, ..)) in DOSBOX_MACHINES.iter().enumerate() {
+                                        ui.selectable_value(&mut self.dosbox_machine, i, *label);
+                                    }
+                                });
+                        })
+                        .response
+                        .on_hover_text(
+                            "Emulated CPU speed for Run in DOSBox. Auto runs as fast as possible; \
+                             the era presets slow it to period-accurate cycles.",
+                        );
+                        ui.checkbox(&mut self.dosbox_svga, "SVGA mode").on_hover_text(
+                            "Emulate an S3 Trio SVGA card with VESA support, for high-res viewers / \
+                             demos that need modes beyond plain VGA.",
+                        );
+                    });
+                    // RIGHT: YouTube (if video) · Steam (if installed) · DeviantArt
+                    if self.plugin_video {
+                        pref_card(&mut c[1], "YouTube downloads", accent, |ui| {
+                            let cur = self.yt_cache_dir();
+                            ui.weak(format!("Saved to: {}", cur.display()));
+                            ui.horizontal(|ui| {
+                                if ui.button("Change…").clicked() {
+                                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                        self.yt_download_dir = Some(d);
+                                    }
+                                }
+                                if self.yt_download_dir.is_some() && ui.button("Reset to default").clicked() {
+                                    self.yt_download_dir = None;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Quality");
+                                let cur = match self.yt_max_height {
+                                    0 => "Best".to_string(),
+                                    h => format!("{h}p"),
+                                };
+                                egui::ComboBox::from_id_salt("yt_quality")
+                                    .selected_text(cur)
+                                    .show_ui(ui, |ui| {
+                                        for (lbl, h) in [
+                                            ("480p", 480u32),
+                                            ("720p", 720),
+                                            ("1080p", 1080),
+                                            ("1440p", 1440),
+                                            ("4K", 2160),
+                                            ("Best", 0),
+                                        ] {
+                                            ui.selectable_value(&mut self.yt_max_height, h, lbl);
+                                        }
+                                    });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Cookies");
+                                let cur = if self.yt_cookies_browser.is_empty() {
+                                    "None (anonymous)".to_string()
+                                } else {
+                                    self.yt_cookies_browser.clone()
+                                };
+                                egui::ComboBox::from_id_salt("yt_cookies")
+                                    .selected_text(cur)
+                                    .show_ui(ui, |ui| {
+                                        for b in [
+                                            "", "firefox", "chrome", "chromium", "brave", "edge",
+                                            "vivaldi", "opera",
+                                        ] {
+                                            let lbl = if b.is_empty() { "None (anonymous)" } else { b };
+                                            ui.selectable_value(
+                                                &mut self.yt_cookies_browser,
+                                                b.to_string(),
+                                                lbl,
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.weak(
+                                "Pick your browser if YouTube says \"confirm you're not a bot\" or a \
+                                 video is age-restricted (uses that browser's login cookies).",
+                            );
+                        });
+                    }
+                    if crate::steam::steam_root().is_some() {
+                        pref_card(&mut c[1], "Steam Web API key", accent, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.steam_api_key)
+                                        .password(true)
+                                        .hint_text("32-hex key")
+                                        .desired_width(180.0),
+                                );
+                                if ui.button("Get key…").clicked() {
+                                    self.open_url("https://steamcommunity.com/dev/apikey");
+                                }
+                            });
+                            ui.weak("Stored locally only. Enables the full owned-games library.");
+                        });
+                    }
+                    pref_card(&mut c[1], "DeviantArt app (client-credentials)", accent, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.da_client_id)
+                                .hint_text("client_id")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.da_client_secret)
+                                .password(true)
+                                .hint_text("client_secret")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.button("Register an app…").clicked() {
+                            self.open_url("https://www.deviantart.com/developers/");
+                        }
+                        ui.weak("Stored locally only. Enables the DeviantArt browse source.");
+                    });
+                });
+            }
+
+            // ── Audio & Colors ─────────────────────────────────────────────────────
+            5 => {
+                ui.columns(2, |c| {
+                    pref_card(&mut c[0], "ModArchive API key (optional)", accent, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ma_key)
+                                    .password(true)
+                                    .hint_text("leave blank — browsing works without it")
+                                    .desired_width(180.0),
+                            );
+                            if ui.button("Request…").clicked() {
+                                self.open_url(
+                                    "https://modarchive.org/index.php?request=view_page&page=api_key",
+                                );
+                            }
+                        });
+                        ui.weak("Stored locally only. Adds artist / genre / size to results.");
+                    });
+                    if self.plugin_audio {
+                        pref_card(&mut c[0], "MIDI SoundFont", accent, |ui| {
+                            let auto = self.midi_soundfont();
+                            let shown = match (&self.midi_sf, &auto) {
+                                (Some(p), _) if p.is_file() => short_name(p),
+                                (_, Some(p)) => format!("auto: {}", short_name(p)),
+                                _ => "none found — .mid files won't play".to_string(),
+                            };
+                            ui.weak(format!("Synthesizes .mid files · {shown}"));
+                            ui.horizontal(|ui| {
+                                if ui.button("Choose .sf2…").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new()
+                                        .add_filter("SoundFont", &["sf2"])
+                                        .pick_file()
+                                    {
+                                        self.midi_sf = Some(p);
+                                        self.midi_sf_cache = None;
+                                        self.audio_decode_cache.clear();
+                                        self.status = "MIDI SoundFont set".into();
+                                    }
+                                }
+                                if self.midi_sf.is_some()
+                                    && ui
+                                        .button("Auto")
+                                        .on_hover_text("Auto-detect a system General MIDI SoundFont")
+                                        .clicked()
+                                {
+                                    self.midi_sf = None;
+                                    self.midi_sf_cache = None;
+                                    self.audio_decode_cache.clear();
+                                }
+                            });
+                        });
+                    }
+                    pref_card(&mut c[1], "Format colors", accent, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.weak("Accent color per format's tile / waveform / badge.");
+                            if ui
+                                .small_button("Reset")
+                                .on_hover_text("Restore the default per-format colors")
+                                .clicked()
+                            {
+                                out.reset_colors = true;
+                            }
+                        });
+                        let mut changed_color: Option<(&str, [u8; 3])> = None;
+                        egui::Grid::new("format_colors_grid").spacing([14.0, 4.0]).show(ui, |ui| {
+                            for (i, (ext, label)) in crate::format_color::EDITABLE.iter().enumerate() {
+                                let mut rgb = crate::format_color::color(ext);
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    changed_color = Some((ext, rgb));
+                                }
+                                ui.label(*label);
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                        if let Some((ext, rgb)) = changed_color {
+                            out.color_change = Some((ext.to_string(), rgb));
+                        }
+                    });
+                    pref_card(&mut c[1], "Tile backgrounds", accent, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.tile_bg_enabled, "Enable");
+                            if ui
+                                .small_button("Reset")
+                                .on_hover_text("Restore the default folder / archive / container tints")
+                                .clicked()
+                            {
+                                let (df, da, dc) = Self::TILE_BG_DEFAULTS;
+                                self.tile_bg_folder = df;
+                                self.tile_bg_archive = da;
+                                self.tile_bg_container = dc;
+                            }
+                        });
+                        ui.weak("A subtle accent behind folder / archive / sample-bank tiles in the grid.");
+                        ui.add_enabled_ui(self.tile_bg_enabled, |ui| {
+                            egui::Grid::new("tile_bg_grid").spacing([14.0, 4.0]).show(ui, |ui| {
+                                ui.color_edit_button_srgb(&mut self.tile_bg_folder);
+                                ui.label("Folders");
+                                ui.end_row();
+                                ui.color_edit_button_srgb(&mut self.tile_bg_archive);
+                                ui.label("Archives (.zip/.lha/…)");
+                                ui.end_row();
+                                ui.color_edit_button_srgb(&mut self.tile_bg_container);
+                                ui.label("Containers (.sf2/.sfz/.dls/.xi)");
+                                ui.end_row();
+                            });
+                        });
+                    });
+                });
+            }
+
+            // ── Advanced ───────────────────────────────────────────────────────────
+            6 => {
+                ui.columns(2, |c| {
+                    pref_card(&mut c[0], "Backup & sync setup", accent, |ui| {
+                        ui.weak(
+                            "Save your whole setup — every setting in this dialog plus your \
+                             keybindings — to one portable JSON file, and import it on another machine.",
+                        );
+                        ui.checkbox(&mut self.export_include_keys, "Include API keys (Steam · ModArchive)")
+                            .on_hover_text(
+                                "Off by default. Your API keys are normally kept out of the exported file.",
+                            );
+                        if self.export_include_keys {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 120, 80),
+                                "⚠ The file will hold your API keys in PLAIN TEXT — anyone you send \
+                                 it to, or any cloud/dotfile/backup copy, can read them. Only include \
+                                 keys for a private local backup, never for something you'll share or commit.",
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Export setup…")
+                                .on_hover_text("Write the bundle to a file you choose")
+                                .clicked()
+                            {
+                                out.export_setup = Some(self.export_include_keys);
+                            }
+                            if ui
+                                .button("Import setup…")
+                                .on_hover_text(
+                                    "Load a bundle and apply it now. Overwrites your current settings; \
+                                     anything the file omits (e.g. keys) is left alone.",
+                                )
+                                .clicked()
+                            {
+                                out.import_setup = true;
+                            }
+                        });
+                        ui.weak("The bundle is plain JSON — open it in the viewer to inspect it.");
+                    });
+                    pref_card(&mut c[0], "Git status", accent, |ui| {
+                        if ui
+                            .checkbox(&mut self.git_enabled, "Show git status in the browser")
+                            .on_hover_text(
+                                "Badge (grid) / column (table) / Details line / filename tint for \
+                                 files in a git repo: new, modified, ignored, conflict. Runs `git \
+                                 status` per folder. Turn off on a very large repo if navigation \
+                                 feels slow.",
+                            )
+                            .changed()
+                        {
+                            self.start_git_status();
+                        }
+                        ui.weak("Add a \"Git\" column via the table header's right-click menu.");
+                    });
+                    pref_card(&mut c[0], "Project tasks", accent, |ui| {
+                        if ui
+                            .checkbox(&mut self.tasks_enabled, "Read .vscode/tasks.json")
+                            .on_hover_text(
+                                "Offer a project's own build/run/tool commands: a \"▶ Run\" menu in \
+                                 the code viewer and a \"Tasks\" submenu on any file's right-click \
+                                 menu. Found by walking up from the current folder for a \
+                                 .vscode/tasks.json.",
+                            )
+                            .changed()
+                        {
+                            self.refresh_tasks();
+                        }
+                        if self.tasks_enabled {
+                            ui.weak(format!("{} task(s) available here.", self.tasks.len()));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button("Open global tasks folder")
+                                    .on_hover_text(
+                                        "Tasks defined here are offered in EVERY folder, on top of a \
+                                         project's own .vscode/tasks.json",
+                                    )
+                                    .clicked()
+                                {
+                                    let d = self.tasks_dir.to_string_lossy().to_string();
+                                    self.open_url(&d);
+                                }
+                                if ui.small_button("Reload").clicked() {
+                                    self.refresh_tasks();
+                                }
+                            });
+                            ui.weak(format!("Global: {}", self.tasks_dir.join("tasks.json").display()));
+                        }
+                    });
+                    pref_card(&mut c[1], "16colo.rs cache", accent, |ui| {
+                        let (bytes, count) = crate::cache::stats();
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("{} · {count} items", human_size(bytes.max(0) as u64)));
+                            if ui
+                                .button("Clear cache")
+                                .on_hover_text(
+                                    "Delete all cached 16colo.rs JSON, thumbnails, files and pack \
+                                     zips (they'll re-download on demand)",
+                                )
+                                .clicked()
+                            {
+                                crate::cache::clear();
+                                self.status = "Cache cleared".into();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Backup cache…")
+                                .on_hover_text(
+                                    "Copy the whole 16colo.rs cache to a folder you pick (into a \
+                                     'kaleidotron-cache' subfolder there)",
+                                )
+                                .clicked()
+                            {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    let dest = dir.join("kaleidotron-cache");
+                                    self.status = match crate::cache::backup_to(&dest) {
+                                        Ok((n, bytes)) => format!(
+                                            "Backed up {n} files ({}) → {}",
+                                            human_size(bytes),
+                                            dest.display()
+                                        ),
+                                        Err(e) => format!("Backup failed: {e}"),
+                                    };
+                                }
+                            }
+                            if ui
+                                .button("Restore…")
+                                .on_hover_text(
+                                    "Restore a backup: pick its 'kaleidotron-cache' folder. Merges \
+                                     into the current cache (doesn't wipe it first)",
+                                )
+                                .clicked()
+                            {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    self.status = match crate::cache::restore_from(&dir) {
+                                        Ok((rows, total)) => format!(
+                                            "Restored {rows} entries — cache now {}",
+                                            human_size(total.max(0) as u64)
+                                        ),
+                                        Err(e) => format!("Restore failed: {e}"),
+                                    };
+                                }
+                            }
+                        });
+                    });
+                    pref_card(&mut c[1], "3D render cache", accent, |ui| {
+                        let (bbytes, bcount) = crate::decode::mesh3d::blend_cache_stats();
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("{} · {bcount} renders", human_size(bbytes)));
+                            if ui
+                                .button("Clear renders")
+                                .on_hover_text(
+                                    "Delete every cached .blend render (right-click → Render \
+                                     re-creates them on demand)",
+                                )
+                                .clicked()
+                            {
+                                out.clear_blend_renders = true;
+                            }
+                        });
+                    });
+                });
+            }
+
+            // ── Config files ───────────────────────────────────────────────────────
+            7 => {
+                // NB: `ui.columns` is called directly on the content ui here (like every other
+                // section), NOT inside a `pref_card`. Wrapping it in a card's width-fixed Frame
+                // miscomputes the column geometry (the columns collapsed into an overlapping
+                // strip). Each file is its own bordered card in a column instead.
+                let themes_dir = self.themes_dir.clone();
+                let entries: [(&str, PathBuf, &str); 4] = [
+                    (
+                        "settings.json",
+                        self.settings_file.clone(),
+                        "Everything in this dialog, grouped by section. Delete a line to restore its \
+                         default; delete the file to reset all.",
+                    ),
+                    (
+                        "keybindings.json",
+                        self.keybindings_file.clone(),
+                        "Key bindings, one per action. Actions are named, so reordering them can't \
+                         rebind your keys.",
+                    ),
+                    (
+                        "themes/",
+                        themes_dir.clone(),
+                        "UI + syntax themes. Drop a VS Code theme .json in here and it's imported \
+                         directly.",
+                    ),
+                    (
+                        "secrets.json",
+                        self.secrets_file.clone(),
+                        "API keys, owner-readable only. Keep this one OUT of dotfile sync — it's why \
+                         they live apart from settings.",
+                    ),
+                ];
+                // Everything lives INSIDE `ui.columns` — nothing before or after it. `ui.columns`
+                // leaves the cursor at its top-right, so a widget after it renders to the right and
+                // blows the width; a widget before it shoves the columns right. Keeping it the sole
+                // top-level call (the note + button ride in the left column) is what every working
+                // section does.
+                ui.columns(2, |c| {
+                    for (i, (name, path, blurb)) in entries.into_iter().enumerate() {
+                        let col = i % 2;
+                        let exists = path.exists();
+                        let when = std::fs::metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| date_ymd_unix(d.as_secs() as i64));
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(30, 34, 40))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+                            .corner_radius(egui::CornerRadius::same(5))
+                            .inner_margin(egui::Margin::symmetric(14, 13))
+                            .show(&mut c[col], |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.strong(name);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(exists, egui::Button::new("Open"))
+                                                .on_hover_text(path.to_string_lossy())
+                                                .clicked()
+                                            {
+                                                out.open_config = Some(path.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                                match (&when, exists) {
+                                    (Some(w), _) => {
+                                        ui.weak(format!("updated {w}"));
+                                    }
+                                    (None, false) => {
+                                        ui.weak("not created yet");
+                                    }
+                                    _ => {}
+                                }
+                                ui.weak(blurb);
+                            });
+                        c[col].add_space(8.0);
+                    }
+                    // Footnote + "open folder" ride in the left column so nothing sits after columns.
+                    c[0].add_space(2.0);
+                    c[0].weak(
+                        "Plain text, hand-editable, safe in a dotfile manager — except secrets.json. \
+                         Changes apply on the next launch.",
+                    );
+                    c[0].add_space(6.0);
+                    if c[0].button("📁 Open config folder").clicked() {
+                        out.open_config = self.settings_file.parent().map(|d| d.to_path_buf());
+                    }
+                });
+            }
+
+            _ => {}
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod gui_tests {
     use super::*;
     use egui_kittest::kittest::Queryable; // brings get_by_label onto Harness
     use egui_kittest::Harness;
+
+    // Dev-only: render every Preferences section to a PNG so layout/styling can be eyeballed
+    // headlessly (lavapipe software Vulkan, no display). Run with:
+    //   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json WGPU_BACKEND=vulkan \
+    //   PV_SHOT_DIR=/tmp/pv_shots cargo test --features gui-screenshots shoot_prefs -- --nocapture
+    #[cfg(feature = "gui-screenshots")]
+    #[test]
+    fn shoot_prefs_sections() {
+        let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::Vec2::new(1500.0, 980.0))
+            .wgpu()
+            .build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+        harness.state_mut().show_prefs = true;
+        let names = [
+            "0_appearance",
+            "1_viewer",
+            "2_keyboard",
+            "3_sources",
+            "4_plugins",
+            "5_audio",
+            "6_advanced",
+            "7_config",
+        ];
+        for (i, nm) in names.iter().enumerate() {
+            harness.state_mut().prefs_section = i as u8;
+            harness.run_steps(5);
+            match harness.render() {
+                Ok(img) => {
+                    img.save(format!("{dir}/{nm}.png")).unwrap();
+                    eprintln!("wrote {dir}/{nm}.png ({}x{})", img.width(), img.height());
+                }
+                Err(e) => eprintln!("render {nm} failed: {e}"),
+            }
+        }
+    }
 
     #[test]
     fn empty_state_renders_without_panic() {
