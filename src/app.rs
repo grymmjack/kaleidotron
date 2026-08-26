@@ -39557,19 +39557,20 @@ impl eframe::App for Kaleidotron {
                     // globally in `apply_theme`, so this dialog inherits it like the rest of the app.
                     ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
                     // GIMP/VS Code-style vertical section rail + a two-column card content area.
-                    // Section names double as the rail buttons' accessibility labels, so they stay
-                    // exactly the section name (icons/padding baked into the label break the GUI
-                    // test that clicks a tab by name).
-                    const PREF_SECTIONS: [(&str, &str); 9] = [
-                        ("Appearance", "theme, code viewer, grid & captions"),
-                        ("Viewer", "zoom, info OSD, transparency"),
-                        ("Keyboard", "rebindable shortcuts, by scope"),
-                        ("Sources", "web places to browse"),
-                        ("Plugins", "format decoders & their credentials"),
-                        ("Audio & Colors", "SoundFont, keys & accent colors"),
-                        ("Advanced", "backup, git, tasks & caches"),
-                        ("Config files", "hand-editable JSON on disk"),
-                        ("Theme", "colors, presets, import & export"),
+                    // (name, subtitle, icon). Icons are monochrome symbol glyphs (DejaVu/Nerd
+                    // fallbacks), prefixed to the left-aligned rail label with a gap. The rail
+                    // labels now carry the icon, so the GUI test selects a section by index rather
+                    // than by clicking its (icon-prefixed) name.
+                    const PREF_SECTIONS: [(&str, &str, &str); 9] = [
+                        ("Appearance", "theme, code viewer, grid & captions", "◑"),
+                        ("Viewer", "zoom, info OSD, transparency", "▧"),
+                        ("Keyboard", "rebindable shortcuts, by scope", "⌨"),
+                        ("Sources", "web places to browse", "❖"),
+                        ("Plugins", "format decoders & their credentials", "▣"),
+                        ("Audio & Colors", "SoundFont, keys & accent colors", "♪"),
+                        ("Advanced", "backup, git, tasks & caches", "⚙"),
+                        ("Config files", "hand-editable JSON on disk", "≡"),
+                        ("Theme", "colors, presets, import & export", "◐"),
                     ];
                     let sec = self.prefs_section;
                     ui.horizontal_top(|ui| {
@@ -39595,12 +39596,17 @@ impl eframe::App for Kaleidotron {
                                     ui.add_space(9.0);
                                     ui.spacing_mut().item_spacing.y = 3.0;
                                     ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
-                                    for (i, (name, _)) in PREF_SECTIONS.iter().enumerate() {
+                                    for (i, (name, _, icon)) in PREF_SECTIONS.iter().enumerate() {
                                         let i = i as u8;
+                                        // Left-aligned (SelectableLabel left-justifies its text,
+                                        // unlike a centered Button) with a monochrome icon + gap.
                                         if ui
                                             .add_sized(
                                                 [rail_w - 8.0, 32.0],
-                                                egui::Button::selectable(sec == i, *name),
+                                                egui::SelectableLabel::new(
+                                                    sec == i,
+                                                    format!("{icon}   {name}"),
+                                                ),
                                             )
                                             .clicked()
                                         {
@@ -39621,7 +39627,7 @@ impl eframe::App for Kaleidotron {
                               // fix behind all the "columns collapsed / sprawled" symptoms.
                               ui.vertical(|ui| {
                                 // Section header (big title + subtitle), above the scroll area.
-                                let (title, subtitle) = PREF_SECTIONS[sec as usize];
+                                let (title, subtitle, _) = PREF_SECTIONS[sec as usize];
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::Label::new(
@@ -55759,8 +55765,9 @@ mod gui_tests {
         // Preferences opens on the Appearance section, so its controls are the visible ones.
         harness.get_by_label("Grid spacing (horizontal)");
         // Settings now live behind section tabs rather than all being shown at once, so the
-        // hotkeys are reachable only after selecting Keyboard — which is exactly what this asserts.
-        harness.get_by_label("Keyboard").click();
+        // hotkeys are reachable only after selecting Keyboard. The rail labels now carry an icon
+        // prefix, so select the section by index (index 2 = Keyboard) rather than clicking its name.
+        harness.state_mut().prefs_section = 2;
         harness.run();
         harness.get_by_label("Previous image");
     }
