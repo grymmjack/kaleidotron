@@ -34366,15 +34366,19 @@ impl Kaleidotron {
         }
         let mut open = true;
         let screen = ctx.content_rect();
+        // FIXED, centred size with a margin on every side — NOT resizable/auto-sizing. The editor's
+        // `desired_width(f32::INFINITY)` fields would otherwise make a resizable window grow to the
+        // screen edge (the "animated" expand), leaving it flush + cramped with the ✕ off-screen.
         let size = egui::vec2(
-            920.0_f32.min(screen.width() - 40.0),
-            560.0_f32.min(screen.height() - 40.0),
+            (screen.width() * 0.80).clamp(680.0, 1180.0),
+            (screen.height() * 0.80).clamp(420.0, 680.0),
         );
         egui::Window::new("Associations")
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
-            .default_size(size)
+            .resizable(false)
+            .fixed_size(size)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             // Inherit the themed window fill + global rounded corners; pad the content ourselves.
             .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(0)))
             .show(ctx, |ui| {
