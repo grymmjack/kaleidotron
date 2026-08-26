@@ -34891,20 +34891,35 @@ impl Kaleidotron {
     /// dark/light base, so deleting a theme file can't leave the UI unstyled.
     fn apply_theme(&mut self, ctx: &egui::Context) {
         self.sync_syntax_theme();
-        if let Some(t) = self
+        let mut v = if let Some(t) = self
             .themes
             .iter()
             .filter(|_| self.theme_chrome())
             .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
         {
-            ctx.set_visuals(t.to_visuals());
+            t.to_visuals()
+        } else if self.theme == 1 {
+            egui::Visuals::light()
         } else {
-            ctx.set_visuals(if self.theme == 1 {
-                egui::Visuals::light()
-            } else {
-                egui::Visuals::dark()
-            });
-        }
+            egui::Visuals::dark()
+        };
+        // App-wide "new look": rounded widgets/windows + a cohesive accent, layered on top of
+        // whatever base/theme visuals we resolved. This is the single chokepoint (runs every
+        // frame), so the whole app — menus, panels, dialogs, grid — inherits it, not just Prefs.
+        stylize_visuals(&mut v, self.accent_color());
+        ctx.set_visuals(v);
+    }
+
+    /// The active theme's accent colour (its `accent` field), else the default scene-art teal.
+    /// Drives card titles, links, and selection highlights across the app.
+    fn accent_color(&self) -> egui::Color32 {
+        self.themes
+            .iter()
+            .filter(|_| self.theme_chrome())
+            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
+            .and_then(|t| t.accent)
+            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+            .unwrap_or(egui::Color32::from_rgb(78, 201, 208))
     }
 
     /// Install the chosen code font if it isn't already, then hand back the `FontId` the code
@@ -39520,35 +39535,19 @@ impl eframe::App for Kaleidotron {
                 1080.0_f32.min(screen.width() - 40.0),
                 800.0_f32.min(screen.height() - 40.0),
             );
-            let accent = egui::Color32::from_rgb(78, 201, 208); // scene-art teal
             egui::Window::new("Preferences")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .fixed_size(pref_size)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                // Inherits the themed window fill + the global rounded corners (see `apply_theme`).
                 // No window inner margin: the rail runs to the left edge, the content pads itself.
-                .frame(
-                    egui::Frame::window(&ctx.global_style())
-                        .inner_margin(egui::Margin::same(0))
-                        .corner_radius(egui::CornerRadius::same(8))
-                        .fill(egui::Color32::from_rgb(20, 23, 28)),
-                )
+                .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(0)))
                 .show(&ctx, |ui| {
-                    // Dialog-local styling (rounded widgets + teal accent) — doesn't touch the app.
-                    {
-                        let s = ui.style_mut();
-                        let r = egui::CornerRadius::same(3);
-                        s.visuals.widgets.noninteractive.corner_radius = r;
-                        s.visuals.widgets.inactive.corner_radius = r;
-                        s.visuals.widgets.hovered.corner_radius = r;
-                        s.visuals.widgets.active.corner_radius = r;
-                        s.visuals.widgets.open.corner_radius = r;
-                        s.visuals.selection.bg_fill = egui::Color32::from_rgb(40, 60, 76);
-                        s.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
-                        s.visuals.hyperlink_color = accent;
-                        s.spacing.button_padding = egui::vec2(9.0, 5.0);
-                    }
+                    // Only a touch of extra button padding here; the rounded/accent look is applied
+                    // globally in `apply_theme`, so this dialog inherits it like the rest of the app.
+                    ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
                     // GIMP/VS Code-style vertical section rail + a two-column card content area.
                     // Section names double as the rail buttons' accessibility labels, so they stay
                     // exactly the section name (icons/padding baked into the label break the GUI
@@ -39568,7 +39567,7 @@ impl eframe::App for Kaleidotron {
                         // ── section rail ────────────────────────────────────────────
                         let rail_w = 178.0;
                         egui::Frame::NONE
-                            .fill(egui::Color32::from_rgb(15, 17, 21))
+                            .fill(blend_toward(ui.visuals().window_fill, [0, 0, 0], 0.35))
                             .inner_margin(egui::Margin::symmetric(10, 14))
                             .show(ui, |ui| {
                                 ui.set_min_width(rail_w);
@@ -40797,6 +40796,34 @@ fn blend_toward(base: egui::Color32, accent: [u8; 3], t: f32) -> egui::Color32 {
         mix(base.r(), accent[0]),
         mix(base.g(), accent[1]),
         mix(base.b(), accent[2]),
+    )
+}
+
+/// Layer the app-wide "new look" onto resolved `Visuals`: rounded widgets + windows, an
+/// accent-tinted selection highlight, and accent links. Applied in `apply_theme` so every
+/// surface inherits it. Colour comes from the theme (via `accent`); geometry is fixed.
+fn stylize_visuals(v: &mut egui::Visuals, accent: egui::Color32) {
+    let r = egui::CornerRadius::same(3);
+    v.widgets.noninteractive.corner_radius = r;
+    v.widgets.inactive.corner_radius = r;
+    v.widgets.hovered.corner_radius = r;
+    v.widgets.active.corner_radius = r;
+    v.widgets.open.corner_radius = r;
+    v.window_corner_radius = egui::CornerRadius::same(8);
+    v.hyperlink_color = accent;
+    // A muted, bg-toward-accent selection so highlights read the same on any base/theme.
+    v.selection.bg_fill = blend_toward(v.window_fill, [accent.r(), accent.g(), accent.b()], 0.30);
+    v.selection.stroke = egui::Stroke::new(1.0, accent);
+}
+
+/// A raised card surface for the current theme: a step off the panel fill (lighter on dark,
+/// darker on light) so grouped controls read as cards. Returns (fill, border).
+fn card_colors(v: &egui::Visuals) -> (egui::Color32, egui::Color32) {
+    let toward = if v.dark_mode { [255, 255, 255] } else { [0, 0, 0] };
+    let (fill_t, border_t) = if v.dark_mode { (0.05, 0.14) } else { (0.04, 0.16) };
+    (
+        blend_toward(v.panel_fill, toward, fill_t),
+        blend_toward(v.panel_fill, toward, border_t),
     )
 }
 
@@ -54208,9 +54235,10 @@ struct PrefsOut {
 /// filling its column. The body writes into the inner `ui`. Cards flow across the
 /// section's `ui.columns(..)` so a section spreads sideways instead of stacking tall.
 fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
+    let (fill, border) = card_colors(ui.visuals());
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(30, 34, 40))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, border))
         .corner_radius(egui::CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(14, 13))
         .show(ui, |ui| {
@@ -54236,11 +54264,8 @@ impl Kaleidotron {
     /// group and deferred action matches the old single-column version (results in `out`).
     fn render_prefs_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out: &mut PrefsOut) {
         // A cyan accent for the card titles — the scene-art cyan, darkened for light themes.
-        let accent = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(78, 201, 208)
-        } else {
-            egui::Color32::from_rgb(20, 118, 128)
-        };
+        // The active theme's accent (set app-wide as `hyperlink_color` in `apply_theme`).
+        let accent = ui.visuals().hyperlink_color;
         // Roomier controls than the app default — a settings pane is read, not skimmed.
         ui.spacing_mut().item_spacing.y = 7.0;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
@@ -55138,9 +55163,10 @@ impl Kaleidotron {
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| date_ymd_unix(d.as_secs() as i64));
+                        let (cfill, cborder) = card_colors(c[col].visuals());
                         egui::Frame::new()
-                            .fill(egui::Color32::from_rgb(30, 34, 40))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 62)))
+                            .fill(cfill)
+                            .stroke(egui::Stroke::new(1.0, cborder))
                             .corner_radius(egui::CornerRadius::same(5))
                             .inner_margin(egui::Margin::symmetric(14, 13))
                             .show(&mut c[col], |ui| {
@@ -55207,10 +55233,32 @@ mod gui_tests {
     fn shoot_prefs_sections() {
         let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
         std::fs::create_dir_all(&dir).unwrap();
+        let folder = std::env::current_dir().unwrap().join("assets/palettes");
         let mut harness = Harness::builder()
             .with_size(egui::Vec2::new(1500.0, 980.0))
             .wgpu()
-            .build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+            .build_eframe(|cc| {
+                Kaleidotron::new(
+                    cc,
+                    CliArgs {
+                        folder: Some(folder.clone()),
+                        ..CliArgs::default()
+                    },
+                )
+            });
+        // Main app with a folder open — eyeball the app-wide look (grid, sortbar, rail, menus).
+        harness.run_steps(8);
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/main.png")).unwrap();
+            eprintln!("wrote {dir}/main.png");
+        }
+        // Open the View menu so the dropdown's rounded corners + accent hover show.
+        harness.get_by_label("View").click();
+        harness.run_steps(2);
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/main_menu.png")).unwrap();
+            eprintln!("wrote {dir}/main_menu.png");
+        }
         harness.state_mut().show_prefs = true;
         let names = [
             "0_appearance",
