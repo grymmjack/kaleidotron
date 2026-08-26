@@ -180,7 +180,122 @@ impl Theme {
     }
 }
 
+/// The editable colours, in editor order: (display label, native-JSON key). Also the field set
+/// `to_json` serialises. Grouped loosely surfaces → text → accents for a sensible editor layout.
+pub const FIELDS: [(&str, &str); 16] = [
+    ("Window background", "window_bg"),
+    ("Panel background", "panel_bg"),
+    ("Faint background", "faint_bg"),
+    ("Input background", "extreme_bg"),
+    ("Widget background", "widget_bg"),
+    ("Hover background", "hover_bg"),
+    ("Active background", "active_bg"),
+    ("Border", "border"),
+    ("Text", "text"),
+    ("Weak text", "weak_text"),
+    ("Strong text", "strong_text"),
+    ("Accent", "accent"),
+    ("Accent text", "accent_text"),
+    ("Hyperlink", "hyperlink"),
+    ("Warning", "warn"),
+    ("Error", "error"),
+];
+
+/// `#rrggbb` (or `#rrggbbaa` when not fully opaque).
+pub fn to_hex(c: [u8; 4]) -> String {
+    if c[3] == 255 {
+        format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+    } else {
+        format!("#{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3])
+    }
+}
+
+/// A filesystem-safe slug for a theme name → its `<slug>.json` filename.
+pub fn slug(name: &str) -> String {
+    let s: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').replace("--", "-");
+    if s.is_empty() { "theme".to_string() } else { s }
+}
+
+/// Path a theme name saves to, under `dir`.
+pub fn path_for(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.json", slug(name)))
+}
+
+/// Write a theme to `<dir>/<slug>.json` (native JSON), returning the path written.
+pub fn save(dir: &Path, theme: &Theme) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = path_for(dir, &theme.name);
+    std::fs::write(&path, theme.to_json())?;
+    Ok(path)
+}
+
 impl Theme {
+    /// The colour field named by its native-JSON `key` (see [`FIELDS`]), by value.
+    pub fn field(&self, key: &str) -> Option<[u8; 4]> {
+        match key {
+            "window_bg" => self.window_bg,
+            "panel_bg" => self.panel_bg,
+            "faint_bg" => self.faint_bg,
+            "extreme_bg" => self.extreme_bg,
+            "text" => self.text,
+            "weak_text" => self.weak_text,
+            "strong_text" => self.strong_text,
+            "accent" => self.accent,
+            "accent_text" => self.accent_text,
+            "hover_bg" => self.hover_bg,
+            "active_bg" => self.active_bg,
+            "widget_bg" => self.widget_bg,
+            "border" => self.border,
+            "hyperlink" => self.hyperlink,
+            "warn" => self.warn,
+            "error" => self.error,
+            _ => None,
+        }
+    }
+
+    /// A mutable handle to the colour field named by `key`, for the editor's pickers.
+    pub fn field_mut(&mut self, key: &str) -> Option<&mut Option<[u8; 4]>> {
+        Some(match key {
+            "window_bg" => &mut self.window_bg,
+            "panel_bg" => &mut self.panel_bg,
+            "faint_bg" => &mut self.faint_bg,
+            "extreme_bg" => &mut self.extreme_bg,
+            "text" => &mut self.text,
+            "weak_text" => &mut self.weak_text,
+            "strong_text" => &mut self.strong_text,
+            "accent" => &mut self.accent,
+            "accent_text" => &mut self.accent_text,
+            "hover_bg" => &mut self.hover_bg,
+            "active_bg" => &mut self.active_bg,
+            "widget_bg" => &mut self.widget_bg,
+            "border" => &mut self.border,
+            "hyperlink" => &mut self.hyperlink,
+            "warn" => &mut self.warn,
+            "error" => &mut self.error,
+            _ => return None,
+        })
+    }
+
+    /// Serialise to our native theme JSON (`name`, `dark`, and every set colour as a hex string).
+    /// The inverse of [`from_json`]'s native branch; round-trips through `parse_hex`.
+    pub fn to_json(&self) -> String {
+        use serde_json::{Map, Value};
+        let mut m = Map::new();
+        m.insert("name".to_string(), Value::String(self.name.clone()));
+        m.insert("dark".to_string(), Value::Bool(self.dark));
+        for (_, key) in FIELDS {
+            if let Some(c) = self.field(key) {
+                m.insert(key.to_string(), Value::String(to_hex(c)));
+            }
+        }
+        serde_json::to_string_pretty(&Value::Object(m)).unwrap_or_default()
+    }
+
     /// The colour a theme gives a TextMate `scope`, following TextMate's **most-specific-wins**
     /// rule: a theme that only defines `comment` still colours `comment.line.double-slash`, so the
     /// lookup drops trailing segments until something matches.
@@ -342,6 +457,29 @@ pub fn builtin() -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_json_round_trips() {
+        let mut t = Theme {
+            name: "My Theme".to_string(),
+            dark: true,
+            ..Default::default()
+        };
+        *t.field_mut("accent").unwrap() = Some([78, 201, 208, 255]);
+        *t.field_mut("window_bg").unwrap() = Some([20, 23, 28, 255]);
+        *t.field_mut("error").unwrap() = Some([220, 90, 90, 128]); // non-opaque → #rrggbbaa
+        let back = Theme::from_json(&t.to_json(), "fallback").unwrap();
+        assert_eq!(back.name, "My Theme");
+        assert!(back.dark);
+        assert_eq!(back.accent, Some([78, 201, 208, 255]));
+        assert_eq!(back.window_bg, Some([20, 23, 28, 255]));
+        assert_eq!(back.error, Some([220, 90, 90, 128]));
+        // Unset fields stay None (fall back to the base), not black.
+        assert_eq!(back.panel_bg, None);
+        // slug is filesystem-safe.
+        assert_eq!(slug("My Theme!"), "my-theme");
+        assert_eq!(slug("  "), "theme");
+    }
 
     #[test]
     fn parses_hex_forms() {

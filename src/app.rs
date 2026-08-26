@@ -2450,6 +2450,9 @@ pub struct Kaleidotron {
     /// restrained chrome (or the reverse), so the two halves are independently switchable.
     theme_scope: u8,
     themes: Vec<crate::theme::Theme>,
+    /// The theme being edited in the Theme section (a working copy). While present and the Theme
+    /// section is open, it previews live (see `apply_theme`); Save writes it to `themes_dir`.
+    theme_draft: Option<crate::theme::Theme>,
     /// Point size of the code viewer's monospace text. Separate from the whole-UI zoom on purpose:
     /// reading code comfortably is a different setting from sizing the chrome, and changing one to
     /// fix the other is the frustration this avoids.
@@ -4657,6 +4660,7 @@ impl Kaleidotron {
             theme_name: String::new(),
             theme_scope: 0,
             themes,
+            theme_draft: None,
             code_font_size: 13.0,
             code_font_path: String::new(),
             code_font_loaded: None,
@@ -34891,22 +34895,38 @@ impl Kaleidotron {
     /// dark/light base, so deleting a theme file can't leave the UI unstyled.
     fn apply_theme(&mut self, ctx: &egui::Context) {
         self.sync_syntax_theme();
-        let mut v = if let Some(t) = self
+        // Live preview: while the Theme editor is open with a draft, show the draft everywhere.
+        let editing = self.show_prefs && self.prefs_section == 8 && self.theme_draft.is_some();
+        let (mut v, accent) = if let Some(d) = self.theme_draft.as_ref().filter(|_| editing) {
+            (
+                d.to_visuals(),
+                d.accent
+                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                    .unwrap_or(egui::Color32::from_rgb(78, 201, 208)),
+            )
+        } else if let Some(t) = self
             .themes
             .iter()
             .filter(|_| self.theme_chrome())
             .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
         {
-            t.to_visuals()
-        } else if self.theme == 1 {
-            egui::Visuals::light()
+            let a = t
+                .accent
+                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                .unwrap_or(egui::Color32::from_rgb(78, 201, 208));
+            (t.to_visuals(), a)
         } else {
-            egui::Visuals::dark()
+            let base = if self.theme == 1 {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            };
+            (base, egui::Color32::from_rgb(78, 201, 208))
         };
         // App-wide "new look": rounded widgets/windows + a cohesive accent, layered on top of
         // whatever base/theme visuals we resolved. This is the single chokepoint (runs every
         // frame), so the whole app — menus, panels, dialogs, grid — inherits it, not just Prefs.
-        stylize_visuals(&mut v, self.accent_color());
+        stylize_visuals(&mut v, accent);
         ctx.set_visuals(v);
     }
 
@@ -39552,7 +39572,7 @@ impl eframe::App for Kaleidotron {
                     // Section names double as the rail buttons' accessibility labels, so they stay
                     // exactly the section name (icons/padding baked into the label break the GUI
                     // test that clicks a tab by name).
-                    const PREF_SECTIONS: [(&str, &str); 8] = [
+                    const PREF_SECTIONS: [(&str, &str); 9] = [
                         ("Appearance", "theme, code viewer, grid & captions"),
                         ("Viewer", "zoom, info OSD, transparency"),
                         ("Keyboard", "rebindable shortcuts, by scope"),
@@ -39561,6 +39581,7 @@ impl eframe::App for Kaleidotron {
                         ("Audio & Colors", "SoundFont, keys & accent colors"),
                         ("Advanced", "backup, git, tasks & caches"),
                         ("Config files", "hand-editable JSON on disk"),
+                        ("Theme", "colors, presets, import & export"),
                     ];
                     let sec = self.prefs_section;
                     ui.horizontal_top(|ui| {
@@ -39692,6 +39713,123 @@ impl eframe::App for Kaleidotron {
             }
             if out.import_setup {
                 self.import_setup(&ctx);
+            }
+            // ── Theme editor actions ─────────────────────────────────────────────
+            if let Some(name) = out.theme_select {
+                self.theme_name = name.clone();
+                // Load the chosen theme into the draft for live editing (Built-in ⇒ no draft).
+                self.theme_draft = self
+                    .themes
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(name.trim()))
+                    .cloned();
+                out.theme_apply = true;
+            }
+            if out.theme_new {
+                self.theme_draft = Some(crate::theme::Theme {
+                    name: "New Theme".to_string(),
+                    dark: true,
+                    accent: Some([78, 201, 208, 255]),
+                    ..Default::default()
+                });
+            }
+            if out.theme_dup {
+                if let Some(mut d) = self
+                    .theme_draft
+                    .clone()
+                    .or_else(|| {
+                        self.themes
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
+                            .cloned()
+                    })
+                {
+                    d.name = format!("{} copy", d.name.trim());
+                    self.theme_draft = Some(d);
+                }
+            }
+            if out.theme_save {
+                if let Some(d) = self.theme_draft.clone() {
+                    match crate::theme::save(&self.themes_dir, &d) {
+                        Ok(p) => {
+                            self.themes = crate::theme::load_all(&self.themes_dir);
+                            self.theme_name = d.name.clone();
+                            self.status = format!("Saved theme → {}", short_name(&p));
+                            out.theme_apply = true;
+                        }
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    }
+                }
+            }
+            if let Some(name) = out.theme_delete {
+                let _ = std::fs::remove_file(crate::theme::path_for(&self.themes_dir, &name));
+                self.themes = crate::theme::load_all(&self.themes_dir);
+                if self.theme_name.eq_ignore_ascii_case(name.trim()) {
+                    self.theme_name.clear();
+                }
+                self.theme_draft = None;
+                self.status = format!("Deleted theme “{name}”");
+                out.theme_apply = true;
+            }
+            if out.theme_import {
+                if let Some(src) = rfd::FileDialog::new()
+                    .add_filter("Theme JSON", &["json"])
+                    .pick_file()
+                {
+                    let stem = src
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("theme")
+                        .to_string();
+                    match std::fs::read_to_string(&src)
+                        .ok()
+                        .and_then(|t| crate::theme::Theme::from_json(&t, &stem))
+                    {
+                        Some(t) => {
+                            let _ = crate::theme::save(&self.themes_dir, &t);
+                            self.themes = crate::theme::load_all(&self.themes_dir);
+                            self.theme_name = t.name.clone();
+                            self.theme_draft = Some(t);
+                            self.status = "Theme imported".into();
+                            out.theme_apply = true;
+                        }
+                        None => self.status = "Not a theme JSON (needs colors or native keys)".into(),
+                    }
+                }
+            }
+            if out.theme_export {
+                if let Some(d) = self.theme_draft.clone() {
+                    if let Some(dest) = rfd::FileDialog::new()
+                        .set_file_name(format!("{}.json", crate::theme::slug(&d.name)))
+                        .add_filter("Theme JSON", &["json"])
+                        .save_file()
+                    {
+                        self.status = match std::fs::write(&dest, d.to_json()) {
+                            Ok(()) => format!("Exported theme → {}", short_name(&dest)),
+                            Err(e) => format!("Export failed: {e}"),
+                        };
+                    }
+                }
+            }
+            if out.theme_reload {
+                self.themes = crate::theme::load_all(&self.themes_dir);
+                self.status = format!("{} themes loaded", self.themes.len());
+                out.theme_apply = true;
+            }
+            // Live preview: `apply_theme` only runs on explicit changes, so while the Theme editor
+            // is open with a draft, push its visuals every frame (cheap — no syntax re-sync) and
+            // keep repainting so dragging a colour updates the whole app immediately.
+            if self.prefs_section == 8 {
+                if let Some(d) = self.theme_draft.as_ref() {
+                    let mut v = d.to_visuals();
+                    let a = d
+                        .accent
+                        .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                        .unwrap_or(egui::Color32::from_rgb(78, 201, 208));
+                    stylize_visuals(&mut v, a);
+                    ctx.set_visuals(v);
+                    ctx.request_repaint();
+                }
             }
         }
 
@@ -54229,6 +54367,15 @@ struct PrefsOut {
     font_preview_changed: bool,               // font-tile sample text edited → refresh tiles
     theme_apply: bool,                        // theme picked → re-install Visuals
     open_config: Option<PathBuf>,             // Config-files tab → open this path
+    // ── Theme editor (Theme section) ──
+    theme_select: Option<String>, // switch the active theme to this name ("" = Built-in)
+    theme_new: bool,              // create a fresh blank theme
+    theme_dup: bool,              // duplicate the active theme into an editable copy
+    theme_save: bool,             // write the active theme to disk
+    theme_delete: Option<String>, // delete this theme (file + list)
+    theme_import: bool,           // import a .json theme from a file
+    theme_export: bool,           // export the active theme to a file
+    theme_reload: bool,           // re-scan the themes folder from disk
 }
 
 /// One titled Preferences card: a bordered group with a small uppercase accent heading,
@@ -55212,6 +55359,124 @@ impl Kaleidotron {
                 });
             }
 
+            // ── Theme (colors, presets, import/export) ───────────────────────────────
+            8 => {
+                ui.columns(2, |c| {
+                    // LEFT — the theme library + create/import.
+                    pref_card(&mut c[0], "Themes", accent, |ui| {
+                        let active = self.theme_name.trim().to_string();
+                        if ui
+                            .selectable_label(active.is_empty(), "Built-in (dark / light)")
+                            .clicked()
+                        {
+                            out.theme_select = Some(String::new());
+                        }
+                        for t in &self.themes {
+                            let sel = t.name.eq_ignore_ascii_case(&active);
+                            let label = format!("{}{}", t.name, if t.dark { "" } else { "  · light" });
+                            if ui.selectable_label(sel, label).clicked() {
+                                out.theme_select = Some(t.name.clone());
+                            }
+                        }
+                    });
+                    pref_card(&mut c[0], "Library", accent, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("New").clicked() {
+                                out.theme_new = true;
+                            }
+                            if ui.button("Duplicate").clicked() {
+                                out.theme_dup = true;
+                            }
+                            if ui.button("Import…").clicked() {
+                                out.theme_import = true;
+                            }
+                            if ui.button("Reload").clicked() {
+                                out.theme_reload = true;
+                            }
+                            if ui.button("Open folder").clicked() {
+                                out.open_config = Some(self.themes_dir.clone());
+                            }
+                        });
+                        ui.weak(
+                            "A VS Code theme .json dropped in the folder imports too. Deleting a \
+                             bundled theme re-seeds it next launch.",
+                        );
+                    });
+                    // RIGHT — the editor for the working copy (draft).
+                    if self.theme_draft.is_some() {
+                        pref_card(&mut c[1], "Theme", accent, |ui| {
+                            if let Some(d) = self.theme_draft.as_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Name");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut d.name)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Base");
+                                    ui.selectable_value(&mut d.dark, true, "Dark");
+                                    ui.selectable_value(&mut d.dark, false, "Light");
+                                });
+                            }
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Save").clicked() {
+                                    out.theme_save = true;
+                                }
+                                if ui.button("Export…").clicked() {
+                                    out.theme_export = true;
+                                }
+                                let nm = self
+                                    .theme_draft
+                                    .as_ref()
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_default();
+                                if ui.button("Delete").clicked() {
+                                    out.theme_delete = Some(nm);
+                                }
+                            });
+                        });
+                        pref_card(&mut c[1], "Colors", accent, |ui| {
+                            ui.weak("Uncheck a color to inherit it from the base theme.");
+                            ui.add_space(6.0);
+                            for (label, key) in crate::theme::FIELDS {
+                                ui.horizontal(|ui| {
+                                    if let Some(f) =
+                                        self.theme_draft.as_mut().and_then(|d| d.field_mut(key))
+                                    {
+                                        let mut on = f.is_some();
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            *f = on.then_some([136, 136, 136, 255]);
+                                        }
+                                        if let Some(cc) = f.as_mut() {
+                                            let mut rgb = [cc[0], cc[1], cc[2]];
+                                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                                *cc = [rgb[0], rgb[1], rgb[2], 255];
+                                            }
+                                        } else {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new("      "),
+                                            )
+                                            .on_hover_text("inherits the base");
+                                        }
+                                        ui.label(label);
+                                    }
+                                });
+                            }
+                        });
+                    } else {
+                        pref_card(&mut c[1], "Editor", accent, |ui| {
+                            ui.weak(
+                                "Pick a theme on the left to edit its colors live, or New to start \
+                                 one. Changes preview across the whole app while this section is open.",
+                            );
+                        });
+                    }
+                });
+            }
+
             _ => {}
         }
     }
@@ -55260,6 +55525,15 @@ mod gui_tests {
             eprintln!("wrote {dir}/main_menu.png");
         }
         harness.state_mut().show_prefs = true;
+        // Seed a draft so the Theme section renders its editor populated.
+        harness.state_mut().theme_draft = Some(crate::theme::Theme {
+            name: "My Theme".to_string(),
+            dark: true,
+            accent: Some([78, 201, 208, 255]),
+            window_bg: Some([20, 23, 28, 255]),
+            text: Some([220, 224, 230, 255]),
+            ..Default::default()
+        });
         let names = [
             "0_appearance",
             "1_viewer",
@@ -55269,6 +55543,7 @@ mod gui_tests {
             "5_audio",
             "6_advanced",
             "7_config",
+            "8_theme",
         ];
         for (i, nm) in names.iter().enumerate() {
             harness.state_mut().prefs_section = i as u8;
