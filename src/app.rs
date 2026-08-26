@@ -128,34 +128,24 @@ struct PanelLayout {
 /// Which font the Unicode "Ramp" converter rasterizes its glyphs from. `Pdv` (Perfect DOS VGA,
 /// bundled) is crisp CP437 but has no Braille/Geometric; `DejaVu` (bundled) trades crispness for
 /// that coverage; `File` is any TTF/OTF the user browses to.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 enum UniFont {
+    #[default]
     Pdv,
     DejaVu,
     File(PathBuf),
-}
-
-impl Default for UniFont {
-    fn default() -> Self {
-        UniFont::Pdv
-    }
 }
 
 /// Which font the ASCII converter renders + measures its coverage ramp from. `Cp437` (the built-in
 /// VGA ROM, 8×8 or 8×16 per the VGA50 toggle) is the default and keeps the authentic 9-dot cell;
 /// `Rex(i)` is a bundled REXPaint font (index into `rexfont`); `File` is any TTF/OTF, rasterized
 /// CP437-ordered so the pool codes still line up.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 enum AsciiFont {
+    #[default]
     Cp437,
     Rex(usize),
     File(PathBuf),
-}
-
-impl Default for AsciiFont {
-    fn default() -> Self {
-        AsciiFont::Cp437
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1426,6 +1416,10 @@ enum FileAction {
 /// row controls (reorder ▲▼, resets, sliders) never touch the scrollbar — reaching for the
 /// bar shouldn't land on a widget and change a value.
 const SCROLL_GUTTER: f32 = 16.0;
+
+/// Shared work queue for the `.diz`-thumbnail worker pool: a LIFO stack of (index, path, text)
+/// jobs behind a Condvar (mirrors the ThumbBuilder pattern).
+type DizQueue = Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)>;
 
 pub struct Kaleidotron {
     registry: Arc<Registry>,
@@ -3693,7 +3687,7 @@ impl Kaleidotron {
         // pack nearest the viewport (`diz_target`) off `diz_queue`, fetch + decode its
         // thumbnail, and return it over this channel. See the `colo_folder_diz` field.
         let (colo_diz_tx, colo_diz_rx) = std::sync::mpsc::channel();
-        let diz_queue: Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)> =
+        let diz_queue: DizQueue =
             Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
         let diz_target = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for _ in 0..6 {
@@ -22116,7 +22110,7 @@ impl Kaleidotron {
         }
         let mut adj_owned;
         let adj: &Adjust = if up > 1.05 && self.adjust.pixelate >= 2.0 {
-            adj_owned = self.adjust.clone();
+            adj_owned = self.adjust;
             adj_owned.pixelate *= up;
             &adj_owned
         } else {
@@ -39595,21 +39589,46 @@ impl eframe::App for Kaleidotron {
                                     );
                                     ui.add_space(9.0);
                                     ui.spacing_mut().item_spacing.y = 3.0;
-                                    ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
+                                    // Hand-painted so the icon and label sit in FIXED left columns
+                                    // (add_sized/SelectableLabel centre the content, drifting the
+                                    // icon with the label length — not what "left-justified" means).
+                                    let accent = ui.visuals().hyperlink_color;
+                                    let text_col = ui.visuals().text_color();
+                                    let sel_bg = ui.visuals().selection.bg_fill;
+                                    let hover_bg = ui.visuals().widgets.hovered.bg_fill;
                                     for (i, (name, _, icon)) in PREF_SECTIONS.iter().enumerate() {
                                         let i = i as u8;
-                                        // Left-aligned (SelectableLabel left-justifies its text,
-                                        // unlike a centered Button) with a monochrome icon + gap.
-                                        if ui
-                                            .add_sized(
-                                                [rail_w - 8.0, 32.0],
-                                                egui::SelectableLabel::new(
-                                                    sec == i,
-                                                    format!("{icon}   {name}"),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
+                                        let selected = sec == i;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(rail_w - 8.0, 32.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let r = egui::CornerRadius::same(3);
+                                        if selected {
+                                            ui.painter().rect_filled(rect, r, sel_bg);
+                                        } else if resp.hovered() {
+                                            ui.painter().rect_filled(rect, r, hover_bg);
+                                        }
+                                        let col = if selected { accent } else { text_col };
+                                        let fid = egui::FontId::proportional(14.5);
+                                        let cy = rect.center().y;
+                                        let icon_x = rect.left() + 14.0; // icon column
+                                        let text_x = rect.left() + 40.0; // label column (fixed)
+                                        ui.painter().text(
+                                            egui::pos2(icon_x, cy),
+                                            egui::Align2::LEFT_CENTER,
+                                            *icon,
+                                            fid.clone(),
+                                            col,
+                                        );
+                                        ui.painter().text(
+                                            egui::pos2(text_x, cy),
+                                            egui::Align2::LEFT_CENTER,
+                                            *name,
+                                            fid,
+                                            col,
+                                        );
+                                        if resp.clicked() {
                                             self.prefs_section = i;
                                         }
                                     }
