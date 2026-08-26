@@ -34930,18 +34930,6 @@ impl Kaleidotron {
         ctx.set_visuals(v);
     }
 
-    /// The active theme's accent colour (its `accent` field), else the default scene-art teal.
-    /// Drives card titles, links, and selection highlights across the app.
-    fn accent_color(&self) -> egui::Color32 {
-        self.themes
-            .iter()
-            .filter(|_| self.theme_chrome())
-            .find(|t| t.name.eq_ignore_ascii_case(self.theme_name.trim()))
-            .and_then(|t| t.accent)
-            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
-            .unwrap_or(egui::Color32::from_rgb(78, 201, 208))
-    }
-
     /// Install the chosen code font if it isn't already, then hand back the `FontId` the code
     /// viewer should draw with.
     ///
