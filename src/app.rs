@@ -1945,6 +1945,13 @@ pub struct Kaleidotron {
     // pipeline path (preview / full view / export) and by the headless `--batch`. Persisted
     // (RON under `CROPS_KEY`) so a crop is remembered across sessions + readable by batch.
     crops: std::collections::HashMap<PathBuf, [f32; 4]>,
+    // Auto-crop: isolate the subject on a transparent/flat background automatically. `auto_crop_on`
+    // is the persistent intent (checkbox checked); the other two are transient — `_possible` gates
+    // the (grayed) checkbox for the current image, `_analyzed` tracks the last image analyzed so it
+    // re-runs once per newly-viewed image (see `poll_auto_crop`).
+    auto_crop_on: bool,
+    auto_crop_possible: bool,
+    auto_crop_analyzed: Option<PathBuf>,
     crop_ratio: Option<(u32, u32)>, // locked aspect for drag + ratio buttons (None = free)
     crop_drag: Option<u8>,          // handle grabbed this gesture: 0-3 corners, 4-7 edges, 8 = move
     crop_backup: bool,              // back up the original before a destructive "Apply crop"
@@ -3019,6 +3026,7 @@ impl Kaleidotron {
     const JPEG_CLEAN_MERGE_MAX_KEY: &'static str = "jpeg_clean_merge_max";
     const JPEG_CLEAN_MERGE_RADIUS_KEY: &'static str = "jpeg_clean_merge_radius";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
+    const AUTO_CROP_KEY: &'static str = "auto_crop_on";
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
     const ANSI_PRESETS_KEY: &'static str = "ansi_presets"; // named ANSI-Shade panel presets
@@ -3563,6 +3571,7 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_MERGE_RADIUS_KEY))
             .unwrap_or(4);
+        let auto_crop_on = get_bool(Self::AUTO_CROP_KEY).unwrap_or(false);
         // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
         let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
         let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
@@ -4350,6 +4359,9 @@ impl Kaleidotron {
             jpeg_clean_merge,
             jpeg_clean_merge_max,
             jpeg_clean_merge_radius,
+            auto_crop_on,
+            auto_crop_possible: false,
+            auto_crop_analyzed: None,
             crops,
             crop_ratio: None,
             crop_drag: None,
@@ -21883,6 +21895,42 @@ impl Kaleidotron {
         (ow, oh, out)
     }
 
+    /// Auto-crop: when a newly-viewed image appears, analyze it (from its cached thumbnail) and,
+    /// if it's auto-croppable (transparent/flat background), set its crop to the subject's bounding
+    /// box. Runs once per newly-inspected image (tracked by `auto_crop_analyzed`), so a manual crop
+    /// tweak isn't fought every frame; it re-runs when you navigate back. Always recomputes
+    /// `auto_crop_possible` (for the grayed checkbox), even when the feature is off. A no-op until
+    /// the thumbnail is decoded (then it retries automatically).
+    fn poll_auto_crop(&mut self) {
+        let Some(entry) = self.inspected_entry() else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+        let path = entry.path;
+        if self.auto_crop_analyzed.as_ref() == Some(&path) {
+            return; // already analyzed this image
+        }
+        // Need the thumbnail pixels; request them and retry next frame until they're decoded.
+        let box_opt = {
+            let Some((tw, th, px)) = self.thumb_rgba.get(&path) else {
+                self.thumbs.request(&path, THUMB_PX);
+                return;
+            };
+            auto_crop_box(px, *tw, *th)
+        };
+        self.auto_crop_possible = box_opt.is_some();
+        self.auto_crop_analyzed = Some(path.clone());
+        // Only actually crop when the feature is on AND this image can be cropped; otherwise leave
+        // any existing crop untouched (turning the feature off keeps the last crop, by design).
+        if self.auto_crop_on {
+            if let Some(b) = box_opt {
+                self.set_crop(&path, b);
+            }
+        }
+    }
+
     /// The JPEG-cleanup options for the pipeline's `JpegClean` marker (see `jpeg_clean.rs`),
     /// or `None` when off. The `key` is a placeholder when auto-detect is on — `apply_pipeline`
     /// re-detects it from the live buffer at the marker's position in the order.
@@ -24090,6 +24138,29 @@ impl Kaleidotron {
         let cropped = c != FULL_CROP;
         let dims = self.img_meta.get(path).map(|m| (m.w as f32, m.h as f32));
         let px_aspect = dims.map(|(w, h)| w / h.max(1.0)).unwrap_or(1.0);
+        // Auto-crop: isolate the subject on a transparent/flat background. Grayed (but kept checked)
+        // when the current image can't be auto-cropped; toggling on re-analyzes + crops immediately.
+        ui.horizontal(|ui| {
+            let possible = self.auto_crop_possible;
+            ui.add_enabled_ui(possible, |ui| {
+                if ui
+                    .checkbox(&mut self.auto_crop_on, "Auto crop")
+                    .on_hover_text(
+                        "Automatically crop to the subject on a transparent or flat-colour \
+                         background. Re-analyzes every image as you browse; turning it off keeps \
+                         the current crop (use Reset to clear).",
+                    )
+                    .changed()
+                {
+                    self.auto_crop_analyzed = None; // re-run poll now (apply if on + possible)
+                }
+            });
+            if !possible {
+                ui.weak("· n/a here").on_hover_text(
+                    "This image has no transparent or flat background to crop against.",
+                );
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("Crop");
             if ui
@@ -40042,6 +40113,7 @@ impl eframe::App for Kaleidotron {
         self.poll_remote();
         self.poll_search();
         self.poll_git_status();
+        self.poll_auto_crop();
         self.poll_tasks();
         self.poll_blend_render();
         self.poll_dir_changes(&ctx);
@@ -41664,6 +41736,7 @@ impl eframe::App for Kaleidotron {
             Self::JPEG_CLEAN_MERGE_RADIUS_KEY,
             &self.jpeg_clean_merge_radius,
         );
+        eframe::set_value(storage, Self::AUTO_CROP_KEY, &self.auto_crop_on);
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
         eframe::set_value(
@@ -44561,6 +44634,83 @@ fn palette_hash(pal: &[[u8; 4]]) -> u64 {
 
 /// The identity crop: the whole frame. Stored as *absent* from the crops map.
 const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Compute a tight auto-crop box (normalized `[x, y, w, h]`) around the subject — but ONLY when
+/// the image is auto-croppable: it has a transparent background, or a **flat, uniform** border
+/// colour to key against. Returns `None` when the border is busy (no clear background to trim) or
+/// when the subject already fills the frame (nothing to crop). The bbox is computed at whatever
+/// resolution `rgba` is (a thumbnail is fine — the result is normalized).
+fn auto_crop_box(rgba: &[u8], w: usize, h: usize) -> Option<[f32; 4]> {
+    if w < 2 || h < 2 || rgba.len() < w * h * 4 {
+        return None;
+    }
+    // Border pixel indices (the 1-px frame).
+    let mut border: Vec<usize> = Vec::with_capacity(2 * (w + h));
+    for x in 0..w {
+        border.push(x);
+        border.push((h - 1) * w + x);
+    }
+    for y in 1..h - 1 {
+        border.push(y * w);
+        border.push(y * w + w - 1);
+    }
+    let alpha_present = (0..w * h).any(|i| rgba[i * 4 + 3] < 8);
+    let transparent_border = border.iter().filter(|&&i| rgba[i * 4 + 3] < 8).count();
+
+    // Mode: transparent background (border mostly transparent) vs a flat border colour.
+    let tol2: i64 = 20 * 20;
+    let flat_key = crate::jpeg_clean::detect_background(rgba, w, h);
+    let is_bg = |i: usize, transparent_mode: bool| -> bool {
+        let p = &rgba[i * 4..i * 4 + 4];
+        if p[3] < 8 {
+            return true; // transparent is always background
+        }
+        if transparent_mode {
+            return false;
+        }
+        let dr = p[0] as i64 - flat_key[0] as i64;
+        let dg = p[1] as i64 - flat_key[1] as i64;
+        let db = p[2] as i64 - flat_key[2] as i64;
+        dr * dr + dg * dg + db * db <= tol2
+    };
+
+    let transparent_mode = alpha_present && transparent_border * 2 >= border.len();
+    if !transparent_mode {
+        // Require a genuinely uniform border to call it "flat background".
+        let uniform = border.iter().filter(|&&i| is_bg(i, false)).count();
+        if uniform * 100 < border.len() * 88 {
+            return None; // busy border → not auto-croppable
+        }
+    }
+
+    // Content bounding box.
+    let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0usize, 0usize);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if !is_bg(y * w + x, transparent_mode) {
+                any = true;
+                minx = minx.min(x);
+                maxx = maxx.max(x);
+                miny = miny.min(y);
+                maxy = maxy.max(y);
+            }
+        }
+    }
+    if !any {
+        return None; // fully background
+    }
+    if minx == 0 && miny == 0 && maxx == w - 1 && maxy == h - 1 {
+        return None; // subject already fills the frame — nothing to trim
+    }
+    let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
+    Some([
+        minx as f32 / w as f32,
+        miny as f32 / h as f32,
+        cw as f32 / w as f32,
+        ch as f32 / h as f32,
+    ])
+}
 
 /// A named, reusable crop rectangle (normalized `[x,y,w,h]`) — save/recall/rename/delete from
 /// the crop controls. Being normalized, a preset applies to any image regardless of its size.
@@ -58183,6 +58333,55 @@ mod hold_test {
             5
         )); // beyond tol
         assert!(super::pixel_differs([0, 0, 0, 0], [0, 0, 0, 255], 0)); // alpha counts
+    }
+
+    #[test]
+    fn auto_crop_isolates_the_subject_and_rejects_busy_borders() {
+        // 10×10 flat-black frame with a 4×4 opaque red block at (3,3)..(6,6).
+        let (w, h) = (10usize, 10usize);
+        let mut px = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            px[i * 4 + 3] = 255; // opaque black
+        }
+        for y in 3..7 {
+            for x in 3..7 {
+                let i = (y * w + x) * 4;
+                px[i] = 200;
+                px[i + 3] = 255;
+            }
+        }
+        let b = super::auto_crop_box(&px, w, h).expect("flat border → croppable");
+        // Bounding box is x=3..6, y=3..6 → normalized [0.3, 0.3, 0.4, 0.4].
+        assert!((b[0] - 0.3).abs() < 1e-4 && (b[1] - 0.3).abs() < 1e-4, "origin {b:?}");
+        assert!((b[2] - 0.4).abs() < 1e-4 && (b[3] - 0.4).abs() < 1e-4, "size {b:?}");
+
+        // A subject that fills the frame → nothing to crop → None.
+        let full = vec![200u8; w * h * 4];
+        assert!(super::auto_crop_box(&full, w, h).is_none(), "no margin → None");
+
+        // A busy (non-uniform) border → not auto-croppable → None.
+        let mut noisy = px.clone();
+        for x in 0..w {
+            let i = x * 4; // top row: rainbow-ish, definitely not uniform
+            noisy[i] = (x * 25) as u8;
+            noisy[i + 1] = 255 - (x * 25) as u8;
+            noisy[i + 2] = (x * 13) as u8;
+        }
+        assert!(super::auto_crop_box(&noisy, w, h).is_none(), "busy border → None");
+
+        // Transparent background → croppable via alpha, same bbox.
+        let mut tpx = vec![0u8; w * h * 4]; // fully transparent
+        for y in 3..7 {
+            for x in 3..7 {
+                let i = (y * w + x) * 4;
+                tpx[i] = 50;
+                tpx[i + 1] = 120;
+                tpx[i + 2] = 200;
+                tpx[i + 3] = 255;
+            }
+        }
+        let tb = super::auto_crop_box(&tpx, w, h).expect("transparent bg → croppable");
+        assert!((tb[2] - 0.4).abs() < 1e-4 && (tb[3] - 0.4).abs() < 1e-4, "alpha bbox {tb:?}");
     }
 
     #[test]
