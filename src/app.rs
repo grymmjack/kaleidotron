@@ -21722,8 +21722,6 @@ impl Kaleidotron {
             fx: self.postfx,
             balance: self.balance_offset(),
             palette,
-            jpeg_clean: self.jpeg_clean_opts(),
-            jpeg_clean_auto: self.jpeg_clean_key_auto,
             skip_dither_palette: false,
         }
     }
@@ -21898,12 +21896,36 @@ impl Kaleidotron {
     /// (possibly enlarged) `(w, h, rgba)`. A no-op when the scaler is `None`. Runs
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
     /// palette / post-FX) + Save operate on the enlarged art.
-    fn scale_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
-        if self.scale_algo == crate::scale::Scaler::None {
-            return (w, h, rgba);
+    fn scale_source(&self, mut w: usize, mut h: usize, mut rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+        // The two GEOMETRY ops run here — before the resolution-dependent pipeline — in the
+        // relative order the user placed their lanes: JPEG-clean keys out the background +
+        // recovers pixels (same size); Upscale runs the pixel-art scaler (grows the buffer).
+        // Drag the lanes to swap (clean-then-upscale vs upscale-then-clean). Both no-ops when off.
+        for op in self.adjust.order {
+            match op {
+                OpKind::JpegClean => {
+                    if let Some(mut o) = self.jpeg_clean_opts() {
+                        if self.jpeg_clean_key_auto {
+                            o.key = crate::jpeg_clean::detect_background(&rgba, w, h);
+                        }
+                        let out = crate::jpeg_clean::cleanup(&rgba, w, h, &o);
+                        if out.len() == rgba.len() {
+                            rgba = out;
+                        }
+                    }
+                }
+                OpKind::Upscale => {
+                    if self.scale_algo != crate::scale::Scaler::None {
+                        let (out, ow, oh) = self.scale_algo.apply(&rgba, w, h);
+                        rgba = out;
+                        w = ow;
+                        h = oh;
+                    }
+                }
+                _ => {}
+            }
         }
-        let (out, ow, oh) = self.scale_algo.apply(&rgba, w, h);
-        (ow, oh, out)
+        (w, h, rgba)
     }
 
     /// Auto-crop: when a newly-viewed image appears, analyze it (from its cached thumbnail) and,
@@ -22055,6 +22077,21 @@ impl Kaleidotron {
             unicode_extra: self.unicode_extra.clone(),
             ascii_font: self.ascii_font.clone(),
             unicode_font: self.unicode_font.clone(),
+            jpeg_clean_on: self.jpeg_clean_on,
+            jpeg_clean_key_auto: self.jpeg_clean_key_auto,
+            jpeg_clean_key: self.jpeg_clean_key,
+            jpeg_clean_tol: self.jpeg_clean_tol,
+            jpeg_clean_transparent: self.jpeg_clean_transparent,
+            jpeg_clean_bg: self.jpeg_clean_bg,
+            jpeg_clean_snap: self.jpeg_clean_snap,
+            jpeg_clean_colors: self.jpeg_clean_colors,
+            jpeg_clean_despeckle: self.jpeg_clean_despeckle,
+            jpeg_clean_min_island: self.jpeg_clean_min_island,
+            jpeg_clean_merge: self.jpeg_clean_merge,
+            jpeg_clean_merge_max: self.jpeg_clean_merge_max,
+            jpeg_clean_merge_radius: self.jpeg_clean_merge_radius,
+            jpeg_clean_grid: self.jpeg_clean_grid,
+            jpeg_clean_grid_size: self.jpeg_clean_grid_size,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -22164,6 +22201,22 @@ impl Kaleidotron {
         // Unicode ramp source so the recalled look uses the preset's fonts immediately.
         self.ascii_font = p.ascii_font.clone();
         self.unicode_font = p.unicode_font.clone();
+        // JPEG cleanup (Extract pixels from JPEG) — restored with the preset, ranges clamped.
+        self.jpeg_clean_on = p.jpeg_clean_on;
+        self.jpeg_clean_key_auto = p.jpeg_clean_key_auto;
+        self.jpeg_clean_key = p.jpeg_clean_key;
+        self.jpeg_clean_tol = p.jpeg_clean_tol.min(96);
+        self.jpeg_clean_transparent = p.jpeg_clean_transparent;
+        self.jpeg_clean_bg = p.jpeg_clean_bg;
+        self.jpeg_clean_snap = p.jpeg_clean_snap;
+        self.jpeg_clean_colors = p.jpeg_clean_colors.clamp(2, 256);
+        self.jpeg_clean_despeckle = p.jpeg_clean_despeckle;
+        self.jpeg_clean_min_island = p.jpeg_clean_min_island.clamp(1, 16);
+        self.jpeg_clean_merge = p.jpeg_clean_merge;
+        self.jpeg_clean_merge_max = p.jpeg_clean_merge_max.clamp(1, 64);
+        self.jpeg_clean_merge_radius = p.jpeg_clean_merge_radius.clamp(1, 20);
+        self.jpeg_clean_grid = p.jpeg_clean_grid;
+        self.jpeg_clean_grid_size = p.jpeg_clean_grid_size.clamp(2, 16);
         self.ascii_font_cache = None;
         self.apply_ramp_src();
         // Invalidate derived caches so the recalled look rebuilds.
@@ -22763,8 +22816,6 @@ impl Kaleidotron {
             fx: PostFx::default(),
             balance: self.balance_offset(),
             palette: palette.as_deref(),
-            jpeg_clean: self.jpeg_clean_opts(),
-            jpeg_clean_auto: self.jpeg_clean_key_auto,
             skip_dither_palette: false,
         };
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
@@ -27209,7 +27260,20 @@ impl Kaleidotron {
                                                 } else {
                                                     egui::RichText::new("JPEG clean (off)").weak()
                                                 },
-                                                "Recover crisp pixel art from a lossy JPEG — set it up in the “Extract pixels from JPEG” section. Drag to reorder (e.g. sharpen or resize before/after it).",
+                                                "Recover crisp pixel art from a lossy JPEG — set it up in the “Extract pixels from JPEG” section. A geometry step (runs before the pipeline); drag to swap its order with Upscale.",
+                                            ),
+                                            OpKind::Upscale => (
+                                                if self.scale_algo != crate::scale::Scaler::None {
+                                                    egui::RichText::new(format!(
+                                                        "Upscale · {}",
+                                                        self.scale_algo.label()
+                                                    ))
+                                                    .strong()
+                                                    .color(active)
+                                                } else {
+                                                    egui::RichText::new("Upscale (off)").weak()
+                                                },
+                                                "Pixel-art upscaler — pick it in the Resize section's Upscale dropdown. A geometry step; drag it above/below JPEG clean to upscale before or after the clean.",
                                             ),
                                             _ => unreachable!("non-marker in marker branch"),
                                         };
@@ -27321,7 +27385,7 @@ impl Kaleidotron {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 22]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 23]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -42760,12 +42824,17 @@ enum OpKind {
     /// draggable so you can, e.g., sharpen or resize before/after it. Appended so persisted
     /// order indices stay valid.
     JpegClean,
+    /// Pixel-art upscale (Scale2x/xBR/HQx/…). A GEOMETRY marker — like JpegClean it runs in
+    /// `scale_source` before the resolution-dependent pipeline (it changes the buffer size), and
+    /// the two are reorderable relative to each other (drag to clean-then-upscale vs upscale-then-
+    /// clean). The scaler itself is picked in the Resize section. Appended so indices stay valid.
+    Upscale,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
     /// so persisted order indices stay valid across upgrades.
-    const ALL: [OpKind; 22] = [
+    const ALL: [OpKind; 23] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -42788,6 +42857,7 @@ impl OpKind {
         OpKind::Blur,
         OpKind::Resize,
         OpKind::JpegClean,
+        OpKind::Upscale,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -42809,6 +42879,7 @@ impl OpKind {
                 | OpKind::Phosphor
                 | OpKind::Resize
                 | OpKind::JpegClean
+                | OpKind::Upscale
         )
     }
 
@@ -42839,6 +42910,7 @@ impl OpKind {
             OpKind::Blur => ("Blur", 0.0, 8.0, 0.0, 0.0),
             OpKind::Resize => ("Resize", 0.0, 0.0, 0.0, 0.0),
             OpKind::JpegClean => ("JPEG clean", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Upscale => ("Upscale", 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -42874,7 +42946,7 @@ struct Adjust {
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 22],
+    order: [OpKind; 23],
 }
 
 impl Default for Adjust {
@@ -42902,10 +42974,11 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 22] = [
-        // JPEG cleanup first: recover crisp pixel art from the raw source before anything else
-        // touches it. Drag it later to sharpen/adjust before the clean.
+    const DEFAULT_ORDER: [OpKind; 23] = [
+        // Geometry steps first (both run in scale_source, before the pipeline): clean the raw
+        // source, THEN pixel-art upscale it. Drag to swap (upscale-then-clean).
         OpKind::JpegClean,
+        OpKind::Upscale,
         // Resize next by default: the whole pipeline runs at the reduced resolution (the
         // legacy behavior). Drag it later to run earlier ops at full res before the downscale.
         OpKind::Resize,
@@ -42974,7 +43047,7 @@ impl Adjust {
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 22] {
+    fn order_to_u8(&self) -> [u8; 23] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -43023,7 +43096,23 @@ impl Adjust {
                 ops.insert(0, j);
             }
         }
-        if let Ok(order) = <[OpKind; 22]>::try_from(ops) {
+        // Upscale (new geometry op) defaults to just after JpegClean at the front, preserving the
+        // clean-then-upscale order it had as a pre-pipeline step.
+        if !arr
+            .iter()
+            .any(|&b| OpKind::from_u8(b) == Some(OpKind::Upscale))
+        {
+            if let Some(i) = ops.iter().position(|o| *o == OpKind::Upscale) {
+                let u = ops.remove(i);
+                let at = ops
+                    .iter()
+                    .position(|o| *o == OpKind::JpegClean)
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                ops.insert(at, u);
+            }
+        }
+        if let Ok(order) = <[OpKind; 23]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -43041,7 +43130,8 @@ impl Adjust {
             | OpKind::Vignette
             | OpKind::Phosphor
             | OpKind::Resize
-            | OpKind::JpegClean => {
+            | OpKind::JpegClean
+            | OpKind::Upscale => {
                 unreachable!("marker ops have no slider value")
             }
             OpKind::Invert => &mut self.invert,
@@ -43168,10 +43258,6 @@ struct PipeAux<'a> {
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
-    // JPEG-cleanup marker op: `Some` when active (the `key` is a placeholder, re-detected from
-    // the live buffer when `jpeg_clean_auto`). Runs wherever `JpegClean` sits in the order.
-    jpeg_clean: Option<crate::jpeg_clean::CleanOpts>,
-    jpeg_clean_auto: bool,
     // When set, the `Dither` and `Palette` marker ops are SKIPPED — used by the ANSI
     // textmode export to build the *pre-shade* image (adjustments + resize only) that
     // `ansi_shade_grid` grids once, instead of re-gridding an already-rendered buffer.
@@ -43187,23 +43273,10 @@ struct PipeAux<'a> {
 fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjust, aux: &PipeAux) {
     for op in ops.iter().copied() {
         match op {
-            // The Resize marker is handled by the wrappers (they split the order around it and
-            // downscale between the halves) — here it's a no-op.
-            OpKind::Resize => {}
-            OpKind::JpegClean => {
-                // Recover crisp pixel art from a lossy source: key out the background, snap the
-                // foreground to a palette, despeckle. Same dims, so it runs in place.
-                if let Some(o) = &aux.jpeg_clean {
-                    let mut o = o.clone();
-                    if aux.jpeg_clean_auto {
-                        o.key = crate::jpeg_clean::detect_background(rgba, w, h);
-                    }
-                    let out = crate::jpeg_clean::cleanup(rgba, w, h, &o);
-                    if out.len() == rgba.len() {
-                        rgba.copy_from_slice(&out);
-                    }
-                }
-            }
+            // Resize is handled by the wrappers (they split the order around it); JpegClean +
+            // Upscale are GEOMETRY ops handled in `scale_source` (they change/prepare the buffer
+            // before the pipeline) — all no-ops here.
+            OpKind::Resize | OpKind::JpegClean | OpKind::Upscale => {}
             OpKind::Pixelate => {
                 // Mosaic: average each bw×bh block (alpha untouched, so the sprite's
                 // silhouette stays crisp). Width = a.pixelate, height = aux.pixelate_h,
@@ -43852,6 +43925,38 @@ struct FxPreset {
     ascii_font: AsciiFont,
     #[serde(default)]
     unicode_font: UniFont,
+    // JPEG cleanup (Extract pixels from JPEG) — captured with the preset. Struct-level
+    // `#[serde(default)]` fills these from the Default impl for presets saved before they existed.
+    #[serde(default)]
+    jpeg_clean_on: bool,
+    #[serde(default)]
+    jpeg_clean_key_auto: bool,
+    #[serde(default)]
+    jpeg_clean_key: [u8; 3],
+    #[serde(default)]
+    jpeg_clean_tol: u32,
+    #[serde(default)]
+    jpeg_clean_transparent: bool,
+    #[serde(default)]
+    jpeg_clean_bg: [u8; 3],
+    #[serde(default)]
+    jpeg_clean_snap: bool,
+    #[serde(default)]
+    jpeg_clean_colors: u32,
+    #[serde(default)]
+    jpeg_clean_despeckle: bool,
+    #[serde(default)]
+    jpeg_clean_min_island: u32,
+    #[serde(default)]
+    jpeg_clean_merge: bool,
+    #[serde(default)]
+    jpeg_clean_merge_max: u32,
+    #[serde(default)]
+    jpeg_clean_merge_radius: u32,
+    #[serde(default)]
+    jpeg_clean_grid: bool,
+    #[serde(default)]
+    jpeg_clean_grid_size: u32,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -43943,6 +44048,21 @@ impl Default for FxPreset {
             unicode_extra: String::new(),
             ascii_font: AsciiFont::Cp437,
             unicode_font: UniFont::Pdv,
+            jpeg_clean_on: false,
+            jpeg_clean_key_auto: true,
+            jpeg_clean_key: [0, 0, 0],
+            jpeg_clean_tol: 24,
+            jpeg_clean_transparent: true,
+            jpeg_clean_bg: [0, 0, 0],
+            jpeg_clean_snap: true,
+            jpeg_clean_colors: 64,
+            jpeg_clean_despeckle: true,
+            jpeg_clean_min_island: 2,
+            jpeg_clean_merge: true,
+            jpeg_clean_merge_max: 8,
+            jpeg_clean_merge_radius: 4,
+            jpeg_clean_grid: false,
+            jpeg_clean_grid_size: 4,
             folder: None,
         }
     }
@@ -44331,8 +44451,6 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
-            jpeg_clean: None,
-            jpeg_clean_auto: false,
             skip_dither_palette: false,
         },
     );
@@ -44458,7 +44576,8 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
         | OpKind::Vignette
         | OpKind::Phosphor
         | OpKind::Resize
-        | OpKind::JpegClean => {}
+        | OpKind::JpegClean
+        | OpKind::Upscale => {}
     }
 }
 
@@ -53189,8 +53308,6 @@ fn preset_pipe_aux<'a>(
         fx: PostFx::from_record(&p.postfx),
         balance,
         palette: Some(palette),
-        jpeg_clean: None,
-        jpeg_clean_auto: false,
         skip_dither_palette: false,
     }
 }
@@ -55509,6 +55626,7 @@ mod tests {
             OpKind::Blur,
             OpKind::Resize,
             OpKind::JpegClean,
+            OpKind::Upscale,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -55582,6 +55700,7 @@ mod tests {
                 OpKind::Blur,
                 OpKind::Resize,
                 OpKind::JpegClean,
+                OpKind::Upscale,
             ],
             ..Default::default()
         };
@@ -55641,8 +55760,6 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: Some(&pal),
-            jpeg_clean: None,
-            jpeg_clean_auto: false,
             skip_dither_palette: false,
         };
         let mut last = vec![10u8, 20, 30, 255];
@@ -55872,8 +55989,6 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
-            jpeg_clean: None,
-            jpeg_clean_auto: false,
             skip_dither_palette: false,
         };
         // 4×1: black, grey, grey, light. Downsample to 2×1 (avg pairs), upscale to 4×1.
