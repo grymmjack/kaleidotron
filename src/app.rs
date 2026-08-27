@@ -11811,7 +11811,7 @@ impl Kaleidotron {
             slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
-                eat_scroll(egui::ComboBox::from_id_salt("font_stroke_mode")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("font_stroke_mode")
                     .selected_text(self.font_stroke_mode.label())
                     .show_ui(ui, |ui| {
                         for m in crate::decode::font::StrokeMode::ALL {
@@ -11819,6 +11819,7 @@ impl Kaleidotron {
                         }
                     }))
                     .on_hover_text("Outer = outside the glyph · Center = straddles the edge · Inner = inside");
+                combo_wheel_list(ui, &cr, &mut self.font_stroke_mode, &crate::decode::font::StrokeMode::ALL);
                 ui.checkbox(&mut self.font_stroke_per_char, "Per char").on_hover_text(
                     "On: outline each glyph (strokes cross where glyphs overlap — how Inkscape shows separate paths).\nOff (default): one merged silhouette outline. Both the preview AND the SVG export follow this, so they match.",
                 );
@@ -13608,13 +13609,14 @@ impl Kaleidotron {
             slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
-                eat_scroll(egui::ComboBox::from_id_salt("fon_stroke_mode")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("fon_stroke_mode")
                     .selected_text(self.font_stroke_mode.label())
                     .show_ui(ui, |ui| {
                         for m in crate::decode::font::StrokeMode::ALL {
                             ui.selectable_value(&mut self.font_stroke_mode, m, m.label());
                         }
                     }));
+                combo_wheel_list(ui, &cr, &mut self.font_stroke_mode, &crate::decode::font::StrokeMode::ALL);
             });
             ui.separator();
             ui.checkbox(&mut self.font_apply_recolor, "Recolor")
@@ -27764,7 +27766,7 @@ impl Kaleidotron {
                             let names = crate::decode::PETSCII_PALETTES;
                             let cur = (self.petscii_palette as usize).min(names.len() - 1);
                             let mut changed = false;
-                            eat_scroll(egui::ComboBox::from_id_salt("petscii_pal")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("petscii_pal")
                                 .selected_text(names[cur].0)
                                 .show_ui(ui, |ui| {
                                     for (i, (n, _)) in names.iter().enumerate() {
@@ -27776,6 +27778,7 @@ impl Kaleidotron {
                                         }
                                     }
                                 }));
+                            changed |= combo_wheel(ui, &cr, &mut self.petscii_palette, names.len());
                             // Only re-sync the C64 palette to the quantize selection when NOT using
                             // the selected palette (else it would fight the user's chosen palette).
                             if changed && !self.petscii_use_selected {
@@ -27825,7 +27828,7 @@ impl Kaleidotron {
                             ui.label("Export");
                             const F: [&str; 4] = [".petmate", ".seq", ".json", ".png"];
                             let cur = self.petscii_export_format.min(3) as usize;
-                            eat_scroll(egui::ComboBox::from_id_salt("petscii_fmt")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("petscii_fmt")
                                 .selected_text(F[cur])
                                 .show_ui(ui, |ui| {
                                     for (i, n) in F.iter().enumerate() {
@@ -27836,6 +27839,7 @@ impl Kaleidotron {
                                         );
                                     }
                                 }));
+                            combo_wheel(ui, &cr, &mut self.petscii_export_format, F.len());
                             ui.weak("(use “Export textmode”)");
                         });
                         ui.horizontal(|ui| {
@@ -37935,13 +37939,14 @@ impl Kaleidotron {
                                 .response;
                             combo_wheel(ui, &cr, &mut self.lospec_sort, SORTS.len());
                             const CF: [&str; 4] = ["Any #", "Max", "Min", "Exact"];
-                            eat_scroll(egui::ComboBox::from_id_salt("pal_cf")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("pal_cf")
                                 .selected_text(CF[self.lospec_cfilter.min(3)])
                                 .show_ui(ui, |ui| {
                                     for (i, s) in CF.iter().enumerate() {
                                         ui.selectable_value(&mut self.lospec_cfilter, i, *s);
                                     }
                                 }));
+                            combo_wheel(ui, &cr, &mut self.lospec_cfilter, CF.len());
                             if self.lospec_cfilter != 0 {
                                 let r = ui.add(egui::DragValue::new(&mut self.lospec_cn).range(1..=256));
                                 wheel_adjust(ui, &r, &mut self.lospec_cn, 1.0, 1, 256);
@@ -44504,6 +44509,40 @@ fn combo_wheel<N: egui::emath::Numeric>(
     let new = (cur + step).rem_euclid(count as isize);
     if new != cur {
         *idx = N::from_f64(new as f64);
+        return true;
+    }
+    false
+}
+
+/// Wheel-cycle a ComboBox whose selection is an enum / value (not a plain index): steps `*val`
+/// through `options` on wheel (up = previous, wraps). Returns whether it changed. Consume already
+/// handled by `eat_scroll` on the combo; this only cycles.
+fn combo_wheel_list<T: PartialEq + Copy>(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    val: &mut T,
+    options: &[T],
+) -> bool {
+    if options.len() < 2 || !resp.contains_pointer() {
+        return false;
+    }
+    let notches = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                _ => None,
+            })
+            .sum::<f32>()
+    });
+    if notches == 0.0 {
+        return false;
+    }
+    let cur = options.iter().position(|o| o == val).unwrap_or(0) as isize;
+    let step: isize = if notches < 0.0 { 1 } else { -1 };
+    let new = (cur + step).rem_euclid(options.len() as isize) as usize;
+    if options[new] != *val {
+        *val = options[new];
         return true;
     }
     false
