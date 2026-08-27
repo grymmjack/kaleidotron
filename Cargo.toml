@@ -1,6 +1,6 @@
 [package]
 name = "kaleidotron"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "A fast, pixel-art-first media browser — images, scene art, 3D, video, audio and text"
 

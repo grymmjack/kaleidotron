@@ -626,6 +626,8 @@ including the effects:
   (edge darkening), and **Phosphor** (an RGB aperture-grille mask).
 - Live preview, with the result applied to grid tiles too (**Apply to grid**);
   **Export** the palette as `.GPL` or **Save** the recolored image.
+- **Bypass** (top-right, or the `` ` `` key) — keep every setting but show the *original*
+  everywhere (preview, grid, viewer), for A/B eyeballing colour touch-ups. Nothing is cleared.
 
 **JPEG cleanup ("Extract pixels from JPEG")** — recover crisp pixel art from a lossy
 JPEG sprite sheet. It re-quantizes toward the two things pixel art actually has: a flat
@@ -1259,6 +1261,7 @@ persist to a hand-editable `keybindings.json`. The full, always-current referenc
 | `Space` | Edit the path | Grid |
 | `Ctrl + O` | Open a folder… | Grid |
 | `Ctrl + G` | Recolor grid thumbnails | Grid |
+| `` ` `` | Bypass recolor (show original — keeps settings) | Grid |
 | `Ctrl + Shift + X` | Reset all recolor | Grid |
 | `F` | Fit image to window | Viewer |
 | `W` | Fit image to width | Viewer |

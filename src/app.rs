@@ -1271,6 +1271,7 @@ enum Action {
     RandomPack,
     RecolorReset,
     RecolorGrid,
+    RecolorBypass,
     EditPath,
     GoToRoot,
     GoHome,
@@ -1345,9 +1346,9 @@ impl KeyBind {
     }
     /// A human-readable label for menus / tooltips / the Help window, e.g. `Ctrl+X`, `Alt+E`, `~`.
     fn label(self) -> String {
-        // `~` is Shift+Backtick on a US layout; show the glyph the user actually types.
-        if self.key == egui::Key::Backtick && self.shift && !self.ctrl && !self.alt {
-            return "~".into();
+        // The backtick key: plain = `` ` ``, Shift = `~` (US layout) — show the glyph typed.
+        if self.key == egui::Key::Backtick && !self.ctrl && !self.alt {
+            return if self.shift { "~".into() } else { "`".into() };
         }
         let mut s = String::new();
         if self.ctrl {
@@ -1427,7 +1428,7 @@ impl ActionScope {
 impl Action {
     // New actions are APPENDED so persisted keymap indices (`to_u8`, legacy load) stay valid;
     // `keybindings.json` keys off the stable `id()`, so order here is otherwise free.
-    const ALL: [Action; 32] = [
+    const ALL: [Action; 33] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
@@ -1440,6 +1441,7 @@ impl Action {
         Action::RandomPack,
         Action::RecolorReset,
         Action::RecolorGrid,
+        Action::RecolorBypass,
         Action::EditPath,
         Action::GoToRoot,
         Action::GoHome,
@@ -1475,6 +1477,7 @@ impl Action {
             | Action::RandomPack
             | Action::RecolorReset
             | Action::RecolorGrid
+            | Action::RecolorBypass
             | Action::EditPath
             | Action::GoToRoot
             | Action::GoHome
@@ -1511,6 +1514,7 @@ impl Action {
             Action::RandomPack => "random_pack",
             Action::RecolorReset => "recolor_reset",
             Action::RecolorGrid => "recolor_grid",
+            Action::RecolorBypass => "recolor_bypass",
             Action::EditPath => "edit_path",
             Action::GoToRoot => "go_to_root",
             Action::GoHome => "go_home",
@@ -1550,6 +1554,7 @@ impl Action {
             Action::RandomPack => "Random 16colo.rs pack",
             Action::RecolorReset => "Reset all recolor",
             Action::RecolorGrid => "Recolor grid thumbnails",
+            Action::RecolorBypass => "Bypass recolor (show original)",
             Action::EditPath => "Edit path",
             Action::GoToRoot => "Go to filesystem root",
             Action::GoHome => "Go to home folder",
@@ -1587,6 +1592,7 @@ impl Action {
             Action::RandomPack => KeyBind::key(Key::R),
             Action::RecolorReset => KeyBind { key: Key::X, ctrl: true, alt: false, shift: true },
             Action::RecolorGrid => KeyBind::ctrl(Key::G),
+            Action::RecolorBypass => KeyBind::key(Key::Backtick),
             Action::EditPath => KeyBind::key(Key::Space),
             // `/` stays the vim filter, so the filesystem-root jump is on backslash.
             Action::GoToRoot => KeyBind::key(Key::Backslash),
@@ -40779,6 +40785,9 @@ impl eframe::App for Kaleidotron {
                 if self.take(&ctx, Action::RecolorGrid) {
                     self.recolor_grid = !self.recolor_grid;
                 }
+                if self.take(&ctx, Action::RecolorBypass) {
+                    self.recolor_bypass = !self.recolor_bypass;
+                }
                 if self.take(&ctx, Action::GoToRoot) {
                     self.open_folder(PathBuf::from(std::path::MAIN_SEPARATOR_STR));
                 }
@@ -41014,6 +41023,7 @@ impl eframe::App for Kaleidotron {
                                 (k(Action::OpenFolder), "Open folder…"),
                                 (k(Action::RecolorReset), "Reset all recolor"),
                                 (k(Action::RecolorGrid), "Recolor grid thumbnails"),
+                                (k(Action::RecolorBypass), "Bypass recolor (show original)"),
                                 (k(Action::Refresh), "Refresh folder"),
                                 ("Shift + F5".into(), "Hard refresh — also clear caches"),
                             ],
