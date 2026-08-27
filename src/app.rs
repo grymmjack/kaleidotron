@@ -21901,6 +21901,10 @@ impl Kaleidotron {
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
     /// palette / post-FX) + Save operate on the enlarged art.
     fn scale_source(&self, mut w: usize, mut h: usize, mut rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+        // Bypass skips the geometry ops (JPEG clean + upscale) too — show the original.
+        if self.recolor_bypass {
+            return (w, h, rgba);
+        }
         // The two GEOMETRY ops run here — before the resolution-dependent pipeline — in the
         // relative order the user placed their lanes: JPEG-clean keys out the background +
         // recovers pixels (same size); Upscale runs the pixel-art scaler (grows the buffer).
@@ -22301,6 +22305,11 @@ impl Kaleidotron {
     /// (+ the custom matrix when it's selected) and the color-balance offset, so any
     /// of them changing invalidates the preview/grid/full caches.
     fn pipeline_key(&self) -> String {
+        // Bypass shows the (cropped) original — a distinct key so a cropped-bypass texture never
+        // collides with the cropped-recolored one in the preview/full caches.
+        if self.recolor_bypass {
+            return "bypass".to_string();
+        }
         let off = self.balance_offset();
         let dsig = if self.dither_method == crate::thumb::DITHER_CUSTOM {
             format!("{}:{:?}", self.dither_custom_n, self.dither_custom)
@@ -22525,7 +22534,8 @@ impl Kaleidotron {
     /// Cache key for the active *grid* recolor, or None if "Apply to grid" is off
     /// or nothing is selected.
     fn grid_recolor_key(&self) -> Option<String> {
-        if !self.recolor_grid {
+        // Bypass acts as if "Apply to grid" is off — grid tiles show the original.
+        if self.recolor_bypass || !self.recolor_grid {
             return None;
         }
         let rkey = if let Some(cp) = &self.custom_palette {
@@ -22954,6 +22964,12 @@ impl Kaleidotron {
             }
             // Non-destructive crop first (before the pixel-art upscale + pipeline).
             let (w, h, rgba) = apply_crop_rgba(self.crop_of(path), w, h, &rgba);
+            if self.recolor_bypass {
+                let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
+                self.preview_tex = Some((path.to_path_buf(), vkey, tex.clone()));
+                return Some(tex);
+            }
             let (w, h, mut rgba) = self.scale_source(w, h, rgba);
             let dsx = self.eff_dither_scale(self.dither_scale_x, w, w);
             let dsy = self.eff_dither_scale(self.dither_scale_y, h, h);
@@ -22996,6 +23012,13 @@ impl Kaleidotron {
         // Non-destructive crop first (kept out of preview_src so dragging the box re-crops
         // the cached decode instead of forcing a re-decode).
         let (w, h, rgba) = apply_crop_rgba(self.crop_of(path), w, h, &rgba);
+        // Bypass: show the (cropped) ORIGINAL — skip the upscale + pipeline below.
+        if self.recolor_bypass {
+            let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let tex = ctx.load_texture("pv_preview", color, egui::TextureOptions::NEAREST);
+            self.preview_tex = Some((path.to_path_buf(), key.to_string(), tex.clone()));
+            return Some(tex);
+        }
         // Pixel-art upscale (if any) runs first — the enlarged art then feeds the pipeline.
         let (w, h, mut rgba) = self.scale_source(w, h, rgba);
         // The dither preview-vs-full ratio keys off native dims — scaled by the same
@@ -23734,6 +23757,12 @@ impl Kaleidotron {
         // Non-destructive crop first (kept out of full_src so the crop box re-crops the
         // cached decode instead of re-decoding).
         let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
+        // Bypass: show the (cropped) ORIGINAL — skip every recolor branch below.
+        if self.recolor_bypass {
+            let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [cw, ch], &rgba, view_tex_opts());
+            self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
+            return Some(tt);
+        }
         // Pixel-art upscale (if any) first; the enlarged art feeds the pipeline + Save.
         let (w, h, mut rgba) = self.scale_source(cw, ch, rgba);
         let size = [w, h];
