@@ -1990,6 +1990,8 @@ pub struct Kaleidotron {
     jpeg_clean_merge: bool,       // absorb small colour islands into their surrounding colour
     jpeg_clean_merge_max: u32,    // max island size (px) that gets absorbed
     jpeg_clean_merge_radius: u32, // window radius (px) sampled to pick the absorbing colour
+    jpeg_clean_grid: bool,        // snap to a native pixel grid by majority vote
+    jpeg_clean_grid_size: u32,    // native pixel size (JPEG px per art px) for the grid
     dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
@@ -3025,6 +3027,8 @@ impl Kaleidotron {
     const JPEG_CLEAN_MERGE_KEY: &'static str = "jpeg_clean_merge";
     const JPEG_CLEAN_MERGE_MAX_KEY: &'static str = "jpeg_clean_merge_max";
     const JPEG_CLEAN_MERGE_RADIUS_KEY: &'static str = "jpeg_clean_merge_radius";
+    const JPEG_CLEAN_GRID_KEY: &'static str = "jpeg_clean_grid";
+    const JPEG_CLEAN_GRID_SIZE_KEY: &'static str = "jpeg_clean_grid_size";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const AUTO_CROP_KEY: &'static str = "auto_crop_on";
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
@@ -3570,6 +3574,11 @@ impl Kaleidotron {
         let jpeg_clean_merge_radius = cc
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_MERGE_RADIUS_KEY))
+            .unwrap_or(4);
+        let jpeg_clean_grid = get_bool(Self::JPEG_CLEAN_GRID_KEY).unwrap_or(false);
+        let jpeg_clean_grid_size = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_GRID_SIZE_KEY))
             .unwrap_or(4);
         let auto_crop_on = get_bool(Self::AUTO_CROP_KEY).unwrap_or(false);
         // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
@@ -4359,6 +4368,8 @@ impl Kaleidotron {
             jpeg_clean_merge,
             jpeg_clean_merge_max,
             jpeg_clean_merge_radius,
+            jpeg_clean_grid,
+            jpeg_clean_grid_size,
             auto_crop_on,
             auto_crop_possible: false,
             auto_crop_analyzed: None,
@@ -21950,6 +21961,8 @@ impl Kaleidotron {
             merge_islands: self.jpeg_clean_merge,
             merge_max: self.jpeg_clean_merge_max as usize,
             merge_radius: self.jpeg_clean_merge_radius as usize,
+            grid: self.jpeg_clean_grid,
+            grid_size: self.jpeg_clean_grid_size as usize,
         })
     }
 
@@ -22396,6 +22409,9 @@ impl Kaleidotron {
                     self.jpeg_clean_merge as u8,
                     self.jpeg_clean_merge_max,
                     self.jpeg_clean_merge_radius,
+                ) + &format!(
+                    ":{}:{}",
+                    self.jpeg_clean_grid as u8, self.jpeg_clean_grid_size
                 )
             } else {
                 String::new()
@@ -26415,6 +26431,8 @@ impl Kaleidotron {
         self.jpeg_clean_merge = true;
         self.jpeg_clean_merge_max = 8;
         self.jpeg_clean_merge_radius = 4;
+        self.jpeg_clean_grid = false;
+        self.jpeg_clean_grid_size = 4;
         self.flash = None;
         self.editing_color = None;
     }
@@ -26579,6 +26597,26 @@ impl Kaleidotron {
                     "How far out to look for the dominant surrounding colour — a bigger window \
                      finds the real colour even when the island's own border is noisy",
                 );
+            });
+            // Pixel-grid snap: quantise to a native S×S grid by majority vote. Set the size to the
+            // JPEG's real upscale factor — its "1 pixel" is often ~4 screen pixels — to recover the
+            // true pixels and erase edge fringe.
+            ui.checkbox(&mut self.jpeg_clean_grid, "Snap to pixel grid")
+                .on_hover_text(
+                    "Snap to a native pixel grid: each cell becomes its majority colour. Recovers \
+                     the true pixels of an upscaled JPEG and erases edge fringe. Set the size to \
+                     the JPEG's real pixel size (often ~4).",
+                );
+            let grid_on = self.jpeg_clean_grid;
+            ui.add_enabled_ui(grid_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("  Pixel size");
+                    let r = ui
+                        .add(egui::Slider::new(&mut self.jpeg_clean_grid_size, 2..=16).suffix(" px"));
+                    slider_extras(ui, &r, &mut self.jpeg_clean_grid_size, 4, 1.0, 2, 16);
+                })
+                .response
+                .on_hover_text("The JPEG's native pixel size (screen pixels per art pixel)");
             });
         });
     }
@@ -41736,6 +41774,8 @@ impl eframe::App for Kaleidotron {
             Self::JPEG_CLEAN_MERGE_RADIUS_KEY,
             &self.jpeg_clean_merge_radius,
         );
+        eframe::set_value(storage, Self::JPEG_CLEAN_GRID_KEY, &self.jpeg_clean_grid);
+        eframe::set_value(storage, Self::JPEG_CLEAN_GRID_SIZE_KEY, &self.jpeg_clean_grid_size);
         eframe::set_value(storage, Self::AUTO_CROP_KEY, &self.auto_crop_on);
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);

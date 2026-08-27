@@ -47,6 +47,13 @@ pub struct CleanOpts {
     /// the island into — a larger window finds the *real* dominant colour even when the island's
     /// immediate 1-px border is itself noisy.
     pub merge_radius: usize,
+    /// Snap the image to a native pixel grid: each `grid_size`×`grid_size` cell takes the majority
+    /// vote of its pixels (a colour or background) and becomes that single value. Recovers the true
+    /// low-res pixel from a uniformly-upscaled JPEG (set `grid_size` to the JPEG's real upscale
+    /// factor) and erases sub-cell edge fringe + noise in one pass.
+    pub grid: bool,
+    /// The native pixel size (JPEG pixels per art pixel) — the grid cell for `grid`.
+    pub grid_size: usize,
 }
 
 /// Detect the background colour as the **mode of the border pixels**, coarse-quantised to 4
@@ -130,19 +137,25 @@ pub fn cleanup(rgba: &[u8], w: usize, h: usize, o: &CleanOpts) -> Vec<u8> {
         }
     }
 
-    // 3. Merge small COLOUR islands into their surrounding colour (stray dots inside a sprite),
+    // 3. Pixel-grid snap: quantise to a native S×S grid by majority vote (recovers the true
+    //    low-res pixel from a uniformly-upscaled JPEG, erasing sub-cell edge fringe + noise).
+    if o.grid && o.grid_size >= 2 {
+        grid_snap(&mut out, &mut is_bg, w, h, o.grid_size);
+    }
+
+    // 4. Merge small COLOUR islands into their surrounding colour (stray dots inside a sprite),
     //    sampling a `merge_radius` window so the *real* dominant colour wins even over a noisy
     //    1-px border. Runs on the snapped colours.
     if o.merge_islands && o.merge_max >= 1 {
         merge_color_islands(&mut out, &is_bg, w, h, o.merge_max, o.merge_radius.max(1));
     }
 
-    // 4. Despeckle: drop foreground connected-components smaller than `min_island`.
+    // 5. Despeckle: drop foreground connected-components smaller than `min_island`.
     if o.despeckle && o.min_island > 1 {
         despeckle(&mut is_bg, w, h, o.min_island);
     }
 
-    // 5. Compose: background → transparent or the fill colour; foreground → opaque.
+    // 6. Compose: background → transparent or the fill colour; foreground → opaque.
     for (i, &bg) in is_bg.iter().enumerate() {
         let px = &mut out[i * 4..i * 4 + 4];
         if bg {
@@ -202,6 +215,61 @@ fn despeckle(is_bg: &mut [bool], w: usize, h: usize, min: usize) {
                 is_bg[i] = true;
             }
         }
+    }
+}
+
+/// Snap the image to a native pixel grid of `cell`×`cell`: each cell takes the **majority vote**
+/// of its pixels (a foreground colour, or "background") and the whole cell becomes that single
+/// value. This is *downsample-by-mode* — it recovers the true low-res pixel from a uniformly
+/// upscaled JPEG and erases sub-cell edge fringe + interior noise in one pass. `is_bg` is updated
+/// so the later passes + compose agree. A cell is foreground only when foreground pixels are a
+/// strict majority of the whole cell, which keeps edges tight (fringe cells drop to background).
+fn grid_snap(out: &mut [u8], is_bg: &mut [bool], w: usize, h: usize, cell: usize) {
+    use std::collections::HashMap;
+    if cell < 2 {
+        return;
+    }
+    let mut cy = 0;
+    while cy < h {
+        let y1 = (cy + cell).min(h);
+        let mut cx = 0;
+        while cx < w {
+            let x1 = (cx + cell).min(w);
+            let mut bg_votes = 0usize;
+            let mut area = 0usize;
+            let mut votes: HashMap<[u8; 3], usize> = HashMap::new();
+            for y in cy..y1 {
+                for x in cx..x1 {
+                    area += 1;
+                    let i = y * w + x;
+                    if is_bg[i] {
+                        bg_votes += 1;
+                    } else {
+                        *votes
+                            .entry([out[i * 4], out[i * 4 + 1], out[i * 4 + 2]])
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+            let best = votes.into_iter().max_by_key(|(_, v)| *v);
+            let cell_fg = (area - bg_votes) * 2 > area; // fg only on a strict majority
+            for y in cy..y1 {
+                for x in cx..x1 {
+                    let i = y * w + x;
+                    match (cell_fg, best) {
+                        (true, Some((c, _))) => {
+                            is_bg[i] = false;
+                            out[i * 4] = c[0];
+                            out[i * 4 + 1] = c[1];
+                            out[i * 4 + 2] = c[2];
+                        }
+                        _ => is_bg[i] = true,
+                    }
+                }
+            }
+            cx += cell;
+        }
+        cy += cell;
     }
 }
 
@@ -349,6 +417,8 @@ mod tests {
             merge_islands: false,
             merge_max: 8,
             merge_radius: 4,
+            grid: false,
+            grid_size: 4,
         }
     }
 
@@ -456,6 +526,8 @@ mod tests {
             merge_islands: true,
             merge_max: 4,
             merge_radius: 3,
+            grid: false,
+            grid_size: 4,
         };
         let out = cleanup(&px, w, h, &o);
         assert_eq!(&out[c..c + 3], &a, "the stray blue dot should be absorbed into red");
@@ -490,10 +562,63 @@ mod tests {
             merge_islands: true,
             merge_max: 8, // each half is 32 px > max → untouched
             merge_radius: 3,
+            grid: false,
+            grid_size: 4,
         };
         let out = cleanup(&px, w, h, &o);
         let mid_blue = (0 * w + 6) * 4;
         assert_eq!(&out[mid_blue..mid_blue + 3], &b, "large regions are not merged");
+    }
+
+    #[test]
+    fn grid_snap_recovers_the_native_pixel_and_drops_fringe() {
+        // An 8×8 image = a 2×2 native grid at cell=4. Top-left native pixel is red with one
+        // stray blue fringe pixel; the other three native pixels are solid green.
+        let (w, h, cell) = (8usize, 8usize, 4usize);
+        let red = [200u8, 30, 30];
+        let green = [30u8, 200, 30];
+        let blue = [30u8, 30, 200];
+        let mut px = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            px[i * 4 + 3] = 255;
+        }
+        let put = |px: &mut [u8], x: usize, y: usize, c: [u8; 3]| {
+            let i = (y * w + x) * 4;
+            px[i] = c[0];
+            px[i + 1] = c[1];
+            px[i + 2] = c[2];
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < 4 && y < 4 { red } else { green };
+                put(&mut px, x, y, c);
+            }
+        }
+        put(&mut px, 0, 0, blue); // one stray fringe pixel in the red native cell
+        let o = CleanOpts {
+            key: [255, 255, 255], // nothing matches → no background keyed
+            tol: 0,
+            transparent: false,
+            bg_color: [0, 0, 0],
+            snap: false,
+            colors: 4,
+            despeckle: false,
+            min_island: 2,
+            merge_islands: false,
+            merge_max: 8,
+            merge_radius: 4,
+            grid: true,
+            grid_size: cell,
+        };
+        let out = cleanup(&px, w, h, &o);
+        // The red native cell (majority red, 1 blue) becomes solid red — the fringe is gone.
+        for (x, y) in [(0, 0), (3, 3), (1, 2)] {
+            let i = (y * w + x) * 4;
+            assert_eq!(&out[i..i + 3], &red, "red cell at {x},{y}");
+        }
+        // A green cell stays green.
+        let g = (5 * w + 5) * 4;
+        assert_eq!(&out[g..g + 3], &green);
     }
 
     #[test]
@@ -542,6 +667,8 @@ mod tests {
                 merge_islands: true,
                 merge_max: 8,
                 merge_radius: 4,
+                grid: false,
+                grid_size: 4,
             };
             // Variant A: no snap (preserves ALL colours; bg-key + despeckle only).
             let mut o = base.clone();
@@ -558,6 +685,14 @@ mod tests {
             o.colors = 64;
             o.transparent = true;
             save(dir, &stem, "snap64_transparent", &cleanup(&rgba, w, h, &o), w, h);
+            // Pixel-grid snap at a few cell sizes (recover native pixels + kill fringe).
+            for s in [3usize, 4, 5] {
+                let mut o = base.clone();
+                o.colors = 64;
+                o.grid = true;
+                o.grid_size = s;
+                save(dir, &stem, &format!("grid{s}_black"), &cleanup(&rgba, w, h, &o), w, h);
+            }
         }
     }
 
