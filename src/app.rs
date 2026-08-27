@@ -1904,6 +1904,7 @@ pub struct Kaleidotron {
     grid_gap: f32,          // horizontal spacing between grid tiles, in points
     grid_gap_y: f32,        // vertical spacing between grid rows, in points
     grid_tile_border: bool, // draw a border + padding around each grid tile (persisted)
+    open_on_double_click: bool, // grid/table: require a double-click to open (else single, persisted)
     caption_fields: u16,    // bitmask: what to show under each grid thumbnail
     grid_hover_caption: bool, // hide tile captions; show them OSD-style over the hovered tile
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
@@ -2408,6 +2409,11 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     remote_cache: HashMap<PathBuf, (Vec<Entry>, HashMap<PathBuf, String>)>, // year → packs (session)
     scroll_target: Option<usize>, // grid: scroll so this entry index becomes visible
+    // Grid/table geometry captured each frame, so arrow / PageUp-Down keyboard navigation knows
+    // how far a Up/Down (one row) and a page move the selection. `grid_cols` is 1 in table view.
+    grid_cols: usize,
+    grid_page_rows: usize, // visible rows this frame (a PageUp/PageDown step)
+    grid_first_row: usize, // first visible row this frame (so nav scrolls only when off-screen)
     // Per-folder grid scroll offset (y), so navigating back to a folder restores where
     // you were. egui persists a ScrollArea by id, but the grid shares one id across all
     // folders — so we key the offset by folder path ourselves. `grid_scroll_pending` is
@@ -2444,6 +2450,9 @@ pub struct Kaleidotron {
 
     // Persisted UI scale (egui zoom factor) — what Ctrl +/- adjusts (whole GUI).
     ui_zoom: f32,
+    // Persisted UI *font* scale — multiplies egui's text-style sizes only, independent of `ui_zoom`
+    // (the whole-app zoom). Lets you enlarge text without also scaling every widget/icon/thumbnail.
+    ui_font_scale: f32,
     // Persisted on-screen thumbnail tile size in points — Ctrl+wheel in the grid.
     // Independent of `ui_zoom`: this scales tiles only, not the chrome.
     thumb_size: f32,
@@ -2793,6 +2802,7 @@ enum DizOutcome {
 impl Kaleidotron {
     /// Storage key for the persisted UI zoom factor.
     const ZOOM_KEY: &'static str = "ui_zoom_factor";
+    const UI_FONT_SCALE_KEY: &'static str = "ui_font_scale";
     /// Storage key for the persisted thumbnail tile size.
     const THUMB_KEY: &'static str = "thumb_size";
     /// Storage key for the persisted favorite folders.
@@ -2940,6 +2950,7 @@ impl Kaleidotron {
     const GAP_KEY: &'static str = "grid_gap";
     const GAP_Y_KEY: &'static str = "grid_gap_y";
     const TILE_BORDER_KEY: &'static str = "grid_tile_border";
+    const OPEN_DBLCLICK_KEY: &'static str = "open_on_double_click";
     const CAPTION_KEY: &'static str = "caption_fields";
     const GRID_HOVER_CAPTION_KEY: &'static str = "grid_hover_caption";
     /// Per-category tile backgrounds, stored as one record: `(enabled, folder, archive, container)`.
@@ -3220,6 +3231,11 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<f32>(s, Self::ZOOM_KEY))
             .unwrap_or(1.0);
         cc.egui_ctx.set_zoom_factor(ui_zoom);
+        let ui_font_scale = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::UI_FONT_SCALE_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.6, 2.5);
 
         // Thumbnail tile size: CLI flag wins, else the persisted value, else default.
         let thumb_size = cli
@@ -4231,6 +4247,7 @@ impl Kaleidotron {
             grid_gap,
             grid_gap_y,
             grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
+            open_on_double_click: get_bool(Self::OPEN_DBLCLICK_KEY).unwrap_or(false),
             caption_fields,
             grid_hover_caption: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY)).unwrap_or(false),
             tile_bg_enabled,
@@ -4740,6 +4757,9 @@ impl Kaleidotron {
             dir_pos: 0,
             suppress_history: false,
             scroll_target: None,
+            grid_cols: 1,
+            grid_page_rows: 1,
+            grid_first_row: 0,
             grid_scroll: HashMap::new(),
             grid_scroll_pending: None,
             search: None,
@@ -4760,6 +4780,7 @@ impl Kaleidotron {
             status: "Open a folder to begin.".into(),
             want_repaint: false,
             ui_zoom,
+            ui_font_scale,
             thumb_size,
             table_view,
             table_grid,
@@ -5060,6 +5081,7 @@ impl Kaleidotron {
         vec![
             e(A, "theme", self.theme, "0 = dark, 1 = light"),
             e(A, "ui_zoom", self.ui_zoom, "whole-UI scale (1.0 = 100%)"),
+            e(A, "ui_font_scale", self.ui_font_scale, "UI text size, independent of ui_zoom (1.0 = 100%)"),
             e(A, "thumb_size", self.thumb_size, "grid tile size in points"),
             e(A, "grid_gap", self.grid_gap, "horizontal gap between grid tiles"),
             e(A, "grid_gap_y", self.grid_gap_y, "vertical gap between grid rows"),
@@ -5070,6 +5092,7 @@ impl Kaleidotron {
             e(A, "code_line_highlight", self.code_line_highlight, "tint the line the cursor is on"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
+            e(V, "open_on_double_click", self.open_on_double_click, "grid/table: require a double-click to open (else single-click)"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
             e(A, "grid_hover_caption", self.grid_hover_caption, "hide grid captions; show them on hover as an overlay"),
             e(A, "table_grid", self.table_grid, "dividing lines in the table view"),
@@ -5161,6 +5184,9 @@ impl Kaleidotron {
         if let Some(v) = st::get_f32(&m, "ui_zoom") {
             self.ui_zoom = v.clamp(0.5, 4.0);
         }
+        if let Some(v) = st::get_f32(&m, "ui_font_scale") {
+            self.ui_font_scale = v.clamp(0.6, 2.5);
+        }
         if let Some(v) = st::get_f32(&m, "thumb_size") {
             self.thumb_size = v.clamp(32.0, 1024.0);
         }
@@ -5192,6 +5218,9 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_bool(&m, "grid_tile_border") {
             self.grid_tile_border = v;
+        }
+        if let Some(v) = st::get_bool(&m, "open_on_double_click") {
+            self.open_on_double_click = v;
         }
         if let Some(v) = st::get_u64(&m, "caption_fields") {
             self.caption_fields = v as u16;
@@ -19621,15 +19650,29 @@ impl Kaleidotron {
         }
     }
 
-    /// Move the grid selection to `idx` and scroll it into view (Home / End).
-    fn select_index(&mut self, idx: usize) {
-        if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
-            self.selection.clear();
-            self.selection.insert(p);
-            self.anchor = Some(idx);
-            self.hovered = Some(idx);
-            self.scroll_target = Some(idx);
+    /// Keyboard grid/table navigation: select `idx` and scroll **only when it's off-screen**,
+    /// landing it at the nearest edge (so arrowing through visible tiles doesn't jump the view).
+    /// `scroll_target`'s offset is `first_row * row_h` for both layouts — grid divides the entry
+    /// index by columns, table uses it directly (columns = 1) — so the same `first_row * cols`
+    /// entry index lands that row at the top in either.
+    fn nav_select(&mut self, idx: usize) {
+        let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) else {
+            return;
+        };
+        self.selection.clear();
+        self.selection.insert(p);
+        self.anchor = Some(idx);
+        self.hovered = Some(idx);
+        let cols = self.grid_cols.max(1);
+        let row = idx / cols;
+        if row < self.grid_first_row {
+            self.scroll_target = Some(idx); // above the viewport → top-align
+        } else if row >= self.grid_first_row + self.grid_page_rows {
+            // Below the viewport → bottom-align: make `row` the LAST visible row.
+            let first = (row + 1).saturating_sub(self.grid_page_rows);
+            self.scroll_target = Some(first * cols);
         }
+        // Otherwise it's already visible — leave the scroll position put.
     }
 
     // ----- File operations (round 4) -------------------------------------------
@@ -28808,6 +28851,10 @@ impl Kaleidotron {
         let per_row = (((avail + gap) / (tile + gap)).floor() as usize).max(1);
         let rows = self.entries.len().div_ceil(per_row);
         let row_h = cell_h + gap_y;
+        // Feed keyboard grid navigation (arrows / PageUp-Down): columns per row + how many rows
+        // fit the viewport (a page). Recomputed here every frame as the window / tile size change.
+        self.grid_cols = per_row;
+        self.grid_page_rows = ((ui.available_height() / row_h).floor() as usize).max(1);
 
         // Hover-to-play: decode the hovered GIF's frames (capped) and advance them.
         let hov = self
@@ -28889,7 +28936,7 @@ impl Kaleidotron {
             }
         }
 
-        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+        let mut clicked: Option<(usize, egui::Modifiers, bool)> = None; // (idx, mods, is_double)
         let mut hovered: Option<usize> = None;
         // Right-click file ops are deferred out of the row closure (which holds
         // `&mut self`) and applied afterward. `can_paste` is snapshotted here so
@@ -28919,6 +28966,7 @@ impl Kaleidotron {
         // Ditto the explicit "open this as…" pick.
         let mut open_as: Option<(usize, OpenAs)> = None;
         let mut dosbox_on: Option<usize> = None; // "Run in DOSBox" on this entry
+        let mut dosbox_folder_on: Option<usize> = None; // "Open folder in DOSBox" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // 16colo download (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -28973,6 +29021,7 @@ impl Kaleidotron {
             // `sync_diz` only fetches those, lazily) and its centre (so the workers pull
             // the pack nearest what you're looking at first).
             let n = self.entries.len();
+            self.grid_first_row = row_range.start; // for keyboard nav scroll-into-view
             self.diz_view = ((row_range.start * per_row).min(n), (row_range.end * per_row).min(n));
             let vis_center = (row_range.start + row_range.end) / 2 * per_row + per_row / 2;
             self.diz_target
@@ -29724,8 +29773,10 @@ impl Kaleidotron {
                         };
                         let resp =
                             resp.on_hover_ui(|ui| hover_details(ui, &entry, meta, audio, tracker));
-                        if resp.clicked() {
-                            clicked = Some((idx, ui.input(|i| i.modifiers)));
+                        if resp.double_clicked() {
+                            clicked = Some((idx, ui.input(|i| i.modifiers), true));
+                        } else if resp.clicked() {
+                            clicked = Some((idx, ui.input(|i| i.modifiers), false));
                         }
                         resp.context_menu(|ui| {
                             let pinned = self.favorites.iter().any(|f| f == &entry.path);
@@ -29748,6 +29799,7 @@ impl Kaleidotron {
                                 );
                             let is_dosbox_entry =
                                 is_dos_executable(&entry.path);
+                            let dosbox_folder = entry.is_dir && self.dosbox_path.is_some();
                             if let Some(pick) = entry_context_menu(
                                 ui,
                                 &entry,
@@ -29767,6 +29819,7 @@ impl Kaleidotron {
                                 &task_items,
                                 is_code_entry,
                                 is_dosbox_entry,
+                                dosbox_folder,
                             ) {
                                 match pick {
                                     p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -29796,6 +29849,7 @@ impl Kaleidotron {
                                     TilePick::Task(l) => run_task_on = Some((idx, l)),
                                     TilePick::Open(m) => open_as = Some((idx, m)),
                                     TilePick::RunInDosbox => dosbox_on = Some(idx),
+                                    TilePick::OpenFolderInDosbox => dosbox_folder_on = Some(idx),
                                 }
                             }
                         });
@@ -29818,8 +29872,9 @@ impl Kaleidotron {
             // showing it once the pointer moves off the grid onto a pane.
             self.last_inspected = self.entries.get(i).map(|e| e.path.clone());
         }
-        if let Some((idx, mods)) = clicked {
-            self.handle_click(ctx, idx, mods);
+        if let Some((idx, mods, dbl)) = clicked {
+            let open = dbl || !self.open_on_double_click;
+            self.handle_click(ctx, idx, mods, open);
         }
         if let Some((idx, a)) = ctx_action {
             // Right-clicking a tile outside the current selection retargets the op
@@ -29931,6 +29986,11 @@ impl Kaleidotron {
                 self.run_in_dosbox(&p);
             }
         }
+        if let Some(i) = dosbox_folder_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_folder_in_dosbox(&p);
+            }
+        }
         if pin_current {
             self.pin_current_folder();
         }
@@ -29956,8 +30016,11 @@ impl Kaleidotron {
         let can_paste = self.clipboard.is_some();
         let facts = self.folder_action_items();
         let ai_on = self.plugin_ai && self.folder.is_some();
+        // Right-clicking the empty area offers to open the CURRENT folder in DOSBox (mount as C:).
+        let dosbox_folder = self.dosbox_path.is_some() && self.is_local_dir();
         let mut pick = None;
         let mut want_gen = false;
+        let mut want_dosbox = false;
         bg.context_menu(|ui| {
             if ai_on {
                 if ui
@@ -29970,11 +30033,27 @@ impl Kaleidotron {
                 }
                 ui.separator();
             }
+            if dosbox_folder {
+                if ui
+                    .button("\u{25b6} Open folder in DOSBox")
+                    .on_hover_text("Mount this folder as C: and open the DOSBox prompt there")
+                    .clicked()
+                {
+                    want_dosbox = true;
+                    ui.close();
+                }
+                ui.separator();
+            }
             pick = empty_area_context_menu(ui, can_paste, &facts);
         });
         if want_gen {
             let f = self.folder.clone();
             self.open_ai_generate(f, None);
+        }
+        if want_dosbox {
+            if let Some(dir) = self.folder.clone() {
+                self.open_folder_in_dosbox(&dir);
+            }
         }
         match pick {
             Some(EmptyPick::Paste) => self.paste(),
@@ -30011,6 +30090,9 @@ impl Kaleidotron {
         }
         let scene = self.colo_flat;
         let row_h = 46.0_f32;
+        // Table view is a single column, so keyboard Up/Down move ±1 row; a page = visible rows.
+        self.grid_cols = 1;
+        self.grid_page_rows = ((ui.available_height() / row_h).floor() as usize).max(1);
         let cell_pad = 12.0_f32; // horizontal breathing room inside every cell
                                  // Optional subtle row/column dividers (zebra striping is always on). A faint,
                                  // theme-agnostic translucent grey so it reads on both light and dark.
@@ -30241,7 +30323,7 @@ impl Kaleidotron {
         }
 
         // Deferred actions (the body closure borrows `&mut self`).
-        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+        let mut clicked: Option<(usize, egui::Modifiers, bool)> = None; // (idx, mods, is_double)
         let mut hovered: Option<usize> = None;
         let mut header_sort: Option<SortKey> = None;
         let mut menu_sort: Option<(SortKey, bool)> = None; // right-click: (key, descending)
@@ -30278,6 +30360,7 @@ impl Kaleidotron {
         // Ditto the explicit "open this as…" pick.
         let mut open_as: Option<(usize, OpenAs)> = None;
         let mut dosbox_on: Option<usize> = None; // "Run in DOSBox" on this entry
+        let mut dosbox_folder_on: Option<usize> = None; // "Open folder in DOSBox" on this entry
         let mut pin_current = false; // "Pin <artist/group/search>" in a flat listing
         let mut dl: Option<(usize, bool)> = None; // (idx, want_pack)
         let mut bulk_on: Option<usize> = None; // bulk-download this artist/group/pack folder
@@ -30464,6 +30547,7 @@ impl Kaleidotron {
         }
         scroll.show_rows(ui, row_h, self.entries.len(), |ui, range| {
             // Rows must be exactly `row_h` tall to align with `show_rows`' virtualization.
+            self.grid_first_row = range.start; // for keyboard nav scroll-into-view
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             for idx in range {
                 let entry = self.entries[idx].clone();
@@ -30830,8 +30914,10 @@ impl Kaleidotron {
                     if resp.hovered() {
                         hovered = Some(idx);
                     }
-                    if resp.clicked() {
-                        clicked = Some((idx, ui.input(|i| i.modifiers)));
+                    if resp.double_clicked() {
+                        clicked = Some((idx, ui.input(|i| i.modifiers), true));
+                    } else if resp.clicked() {
+                        clicked = Some((idx, ui.input(|i| i.modifiers), false));
                     }
                     let pinned = self.favorites.iter().any(|f| f == &entry.path);
                     let colo_pin = colo_pin_label.as_deref().map(|l| (l, colo_pin_pinned));
@@ -30854,6 +30940,7 @@ impl Kaleidotron {
                             );
                         let is_dosbox_entry =
                             is_dos_executable(&entry.path);
+                        let dosbox_folder = entry.is_dir && self.dosbox_path.is_some();
                         if let Some(pick) = entry_context_menu(
                             ui,
                             &entry,
@@ -30873,6 +30960,7 @@ impl Kaleidotron {
                             &task_items,
                             is_code_entry,
                             is_dosbox_entry,
+                            dosbox_folder,
                         ) {
                             match pick {
                                 p @ (TilePick::AddToList(_) | TilePick::AddToNewList) => {
@@ -30902,6 +30990,7 @@ impl Kaleidotron {
                                 TilePick::Task(l) => run_task_on = Some((idx, l)),
                                 TilePick::Open(m) => open_as = Some((idx, m)),
                                 TilePick::RunInDosbox => dosbox_on = Some(idx),
+                                TilePick::OpenFolderInDosbox => dosbox_folder_on = Some(idx),
                             }
                         }
                     });
@@ -30975,8 +31064,9 @@ impl Kaleidotron {
             if let Some(dest) = dest {
                 self.open_folder(dest);
             }
-        } else if let Some((idx, mods)) = clicked {
-            self.handle_click(ctx, idx, mods);
+        } else if let Some((idx, mods, dbl)) = clicked {
+            let open = dbl || !self.open_on_double_click;
+            self.handle_click(ctx, idx, mods, open);
         }
         if let Some((idx, a)) = ctx_action {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
@@ -31083,6 +31173,11 @@ impl Kaleidotron {
         if let Some(i) = dosbox_on {
             if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
                 self.run_in_dosbox(&p);
+            }
+        }
+        if let Some(i) = dosbox_folder_on {
+            if let Some(p) = self.entries.get(i).map(|e| e.path.clone()) {
+                self.open_folder_in_dosbox(&p);
             }
         }
         if pin_current {
@@ -34149,7 +34244,10 @@ impl Kaleidotron {
 
     /// Apply a click with modifiers: Ctrl toggles, Shift range-selects, plain
     /// click opens (image -> viewer, folder -> descend) and selects just that one.
-    fn handle_click(&mut self, ctx: &egui::Context, idx: usize, mods: egui::Modifiers) {
+    /// A tile click. `open` = whether this click should open the item in the viewer (single-click
+    /// by default; only a double-click when Preferences → "Open on double-click" is on). Ctrl/Shift
+    /// clicks only ever extend the selection.
+    fn handle_click(&mut self, ctx: &egui::Context, idx: usize, mods: egui::Modifiers, open: bool) {
         if mods.command {
             if let Some(p) = self
                 .entries
@@ -34187,7 +34285,9 @@ impl Kaleidotron {
                 self.selection.insert(p);
             }
             self.anchor = Some(idx);
-            self.activate(ctx, idx);
+            if open {
+                self.activate(ctx, idx);
+            }
         }
     }
 
@@ -34405,6 +34505,50 @@ impl Kaleidotron {
         }
         match cmd.spawn() {
             Ok(_) => self.status = format!("Running {} in DOSBox", short_name(path)),
+            Err(e) => self.status = format!("Couldn't launch DOSBox: {e}"),
+        }
+    }
+
+    /// Mount `dir` as C: and drop into the DOSBox prompt there (no program run) — the grid/table
+    /// "Open folder in DOSBox" action. Shares the machine / SVGA / verbosity settings with
+    /// [`run_in_dosbox`]; there's no `--exit`, so the shell stays open for the user to work in.
+    fn open_folder_in_dosbox(&mut self, dir: &Path) {
+        let Some(dosbox) = self.dosbox_path.clone() else {
+            self.status =
+                "Set the DOSBox binary in Preferences → Format plugins → DOSBox first".into();
+            return;
+        };
+        if !dosbox.exists() {
+            self.status = format!("DOSBox binary not found at {}", dosbox.display());
+            return;
+        }
+        let root = self.resolve_local(dir);
+        if !root.is_dir() {
+            self.status = format!("Not a folder: {}", root.display());
+            return;
+        }
+        let mut cmd = std::process::Command::new(&dosbox);
+        cmd.arg("--noautoexec");
+        cmd.arg("--set").arg("startup_verbosity=quiet");
+        if self.dosbox_svga {
+            cmd.arg("--set").arg("machine=svga_s3");
+        }
+        if let Some((_, cputype, cycles)) = DOSBOX_MACHINES.get(self.dosbox_machine) {
+            if !cputype.is_empty() {
+                cmd.arg("--set").arg(format!("cputype={cputype}"));
+            }
+            if *cycles > 0 {
+                cmd.arg("--set").arg(format!("cpu_cycles={cycles}"));
+                cmd.arg("--set").arg(format!("cpu_cycles_protected={cycles}"));
+            }
+        }
+        cmd.arg("-c")
+            .arg(format!("mount c \"{}\"", root.display()))
+            .arg("-c")
+            .arg("c:");
+        cmd.current_dir(&root);
+        match cmd.spawn() {
+            Ok(_) => self.status = format!("Opened {} in DOSBox", short_name(dir)),
             Err(e) => self.status = format!("Couldn't launch DOSBox: {e}"),
         }
     }
@@ -35249,6 +35393,23 @@ impl Kaleidotron {
         // frame), so the whole app — menus, panels, dialogs, grid — inherits it, not just Prefs.
         stylize_visuals(&mut v, accent);
         ctx.set_visuals(v);
+        self.apply_font_scale(ctx);
+    }
+
+    /// Scale egui's text-style sizes by `ui_font_scale`, INDEPENDENT of the whole-app `zoom_factor`
+    /// (Ctrl +/-). Rescales from the built-in defaults each time (not the current sizes) so it never
+    /// compounds. Text styles live in `Style`, which `set_visuals` / `set_fonts` don't touch, so
+    /// this sticks until re-applied (startup + theme change + the Preferences slider).
+    fn apply_font_scale(&self, ctx: &egui::Context) {
+        let scale = self.ui_font_scale.clamp(0.6, 2.5);
+        let base = egui::Style::default().text_styles;
+        ctx.all_styles_mut(|s| {
+            for (style, id) in base.iter() {
+                if let Some(cur) = s.text_styles.get_mut(style) {
+                    cur.size = id.size * scale;
+                }
+            }
+        });
     }
 
     /// Install the chosen code font if it isn't already, then hand back the `FontId` the code
@@ -39670,11 +39831,54 @@ impl eframe::App for Kaleidotron {
             )
         });
         if self.mode == Mode::Grid && !typing && self.search.is_none() && !self.entries.is_empty() {
+            let cols = self.grid_cols.max(1);
+            let page = (self.grid_page_rows.max(1) * cols).max(1);
+            let last = self.entries.len() - 1;
+            // Arrow / PageUp-Down move the selection through the grid (Up/Down = one row = ±cols;
+            // in the single-column table cols is 1, so Up/Down are ±1). Enter opens the focused
+            // item. `key_pressed` (non-consuming): a key already claimed by the samples/pad panes
+            // (which consume theirs earlier) reads false here, so there's no double-handling.
+            let (up, down, left, right, pgup, pgdn, enter) = ctx.input(|i| {
+                use egui::Key::*;
+                (
+                    i.key_pressed(ArrowUp),
+                    i.key_pressed(ArrowDown),
+                    i.key_pressed(ArrowLeft),
+                    i.key_pressed(ArrowRight),
+                    i.key_pressed(PageUp),
+                    i.key_pressed(PageDown),
+                    i.key_pressed(Enter),
+                )
+            });
             if home {
-                self.select_index(0);
-            }
-            if end {
-                self.select_index(self.entries.len() - 1);
+                self.nav_select(0);
+            } else if end {
+                self.nav_select(last);
+            } else if enter {
+                if let Some(cur) = self.anchor.or(self.hovered) {
+                    self.activate(&ctx, cur);
+                }
+            } else if up || down || left || right || pgup || pgdn {
+                match self.anchor {
+                    // Nothing selected yet → the first nav key lands on the first tile.
+                    None => self.nav_select(0),
+                    Some(cur) => {
+                        let next = if up {
+                            cur.saturating_sub(cols)
+                        } else if down {
+                            (cur + cols).min(last)
+                        } else if left {
+                            cur.saturating_sub(1)
+                        } else if right {
+                            (cur + 1).min(last)
+                        } else if pgup {
+                            cur.saturating_sub(page)
+                        } else {
+                            (cur + page).min(last)
+                        };
+                        self.nav_select(next);
+                    }
+                }
             }
         }
         // The filename filter (vim-style `/`) opens the grid quick-filter.
@@ -40681,6 +40885,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::MIDI_FOLLOW_KEY, &self.midi_follow);
         eframe::set_value(storage, Self::KIT_MAP_LOCK_KEY, &self.kit_map_lock);
         eframe::set_value(storage, Self::ZOOM_KEY, &self.ui_zoom);
+        eframe::set_value(storage, Self::UI_FONT_SCALE_KEY, &self.ui_font_scale);
         eframe::set_value(storage, Self::THUMB_KEY, &self.thumb_size);
         eframe::set_value(storage, Self::FAV_KEY, &self.favorites);
         let fav_colors: Vec<(PathBuf, [u8; 3])> = self
@@ -40959,6 +41164,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::THEME_KEY, &self.theme);
         eframe::set_value(storage, Self::GAP_KEY, &self.grid_gap);
         eframe::set_value(storage, Self::TILE_BORDER_KEY, &self.grid_tile_border);
+        eframe::set_value(storage, Self::OPEN_DBLCLICK_KEY, &self.open_on_double_click);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
         eframe::set_value(storage, Self::GRID_HOVER_CAPTION_KEY, &self.grid_hover_caption);
@@ -49498,6 +49704,7 @@ enum TilePick {
     AddToList(String),     // add this video to the named list (Watch Later / a custom list)
     AddToNewList,          // add this video to a brand-new list (prompt for its name)
     RunInDosbox,           // a DOS .com/.exe/.bat → run it in DOSBox
+    OpenFolderInDosbox,    // a folder → mount it as C: and open the DOSBox prompt there
 }
 
 /// Which slice of the Steam library to list.
@@ -50006,6 +50213,7 @@ fn entry_context_menu(
     tasks: &[TaskItem],     // the project's .vscode tasks (→ "Tasks ▸", run with ${file} = entry)
     is_code: bool,          // a source/text file → offer Preview (image) / View / Edit as text
     dosbox_run: bool,       // a DOS .com/.exe/.bat with DOSBox configured → offer "Run in DOSBox"
+    dosbox_folder: bool,    // a folder with DOSBox configured → offer "Open folder in DOSBox"
 ) -> Option<TilePick> {
     let mut pick = None;
     // A DOS program → run it in DOSBox (top of the menu; it's the primary action for these).
@@ -50016,6 +50224,18 @@ fn entry_context_menu(
             .clicked()
         {
             pick = Some(TilePick::RunInDosbox);
+            ui.close();
+        }
+        ui.separator();
+    }
+    // A folder → mount it as C: and drop into the DOSBox prompt (no program run).
+    if dosbox_folder {
+        if ui
+            .button("\u{25b6} Open folder in DOSBox")
+            .on_hover_text("Mount this folder as C: and open the DOSBox prompt there")
+            .clicked()
+        {
+            pick = Some(TilePick::OpenFolderInDosbox);
             ui.close();
         }
         ui.separator();
@@ -55230,6 +55450,27 @@ impl Kaleidotron {
                             out.theme_apply = true;
                         }
                     });
+                    pref_card(&mut c[0], "Interface", accent, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Text size");
+                            let r = ui.add(
+                                egui::Slider::new(&mut self.ui_font_scale, 0.6..=2.5)
+                                    .step_by(0.05)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                            );
+                            if r.changed() {
+                                self.apply_font_scale(ctx);
+                            }
+                            if ui.small_button("Reset").clicked() {
+                                self.ui_font_scale = 1.0;
+                                self.apply_font_scale(ctx);
+                            }
+                        });
+                        ui.weak(
+                            "Scales UI text only — independent of the whole-app zoom (Ctrl + / \
+                             Ctrl -), which scales every widget, icon and thumbnail too.",
+                        );
+                    });
                     pref_card(&mut c[0], "Code viewer", accent, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Size");
@@ -55298,6 +55539,11 @@ impl Kaleidotron {
                             "Draw a border around each grid tile so they read as separate cards \
                              instead of one continuous row.",
                         );
+                        ui.checkbox(&mut self.open_on_double_click, "Open on double-click")
+                            .on_hover_text(
+                                "Require a double-click to open a file in the viewer (a single \
+                                 click only selects). Off = a single click opens, as usual.",
+                            );
                     });
                     // RIGHT
                     pref_card(&mut c[1], "Thumbnail captions", accent, |ui| {

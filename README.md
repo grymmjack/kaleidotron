@@ -1,4 +1,4 @@
-# kaleidotron
+ -0# kaleidotron
 
 A fast, **pixel-art-first** media **browser** for Linux/macOS/Windows, written in
 Rust with [egui/eframe](https://github.com/emilk/egui).
@@ -288,7 +288,7 @@ big ones in prose; this is the exhaustive index.)
 
 **Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; **export / import your whole setup** to one JSON file (API keys excluded by default); persisted window geometry
 
-**Command line** — headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
+**Command line** — `--open FILE` (full viewer) / `--view FILE` (minimal, chromeless viewer — wire it as a file-association viewer for mc / ranger / xdg-open); headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
 
 ---
 
@@ -380,7 +380,9 @@ Options: **keep the window open** after exit (for outro ANSIs), an emulated-**ma
 preset (XT → Pentium MMX, e.g. 486 DX2/66), and an **SVGA mode** toggle for high-res
 viewers/demos. The welcome banner and your own `autoexec` are suppressed so it drops
 straight into the art. DOS programs are **never** auto-launched by prev/next or the
-slideshow — only an explicit click runs them.
+slideshow — only an explicit click runs them. You can also **▶ Open folder in DOSBox** —
+right-click a folder tile (or the empty area of the current folder) to mount it as `C:` and
+drop straight into the DOSBox prompt, no program to run.
 
 ### 🗜 Archives & online
 
@@ -1223,40 +1225,62 @@ you've already viewed is copied locally without a request.
 
 ## Keyboard shortcuts
 
-The four **navigation keys are rebindable** in **Preferences → Hotkeys** (press
-*Rebind*, then the new key; `Esc` cancels). Their defaults:
+Most shortcuts are **rebindable** in **Preferences → Keyboard** (press *Rebind*, then the
+new key — modifier combos like `Ctrl`/`Alt`/`Shift` are captured too; `Esc` cancels). Bindings
+persist to a hand-editable `keybindings.json`. The full, always-current reference lives in
+**Help → Keyboard shortcuts**, which you can open any time with **`F1`** or **`?`**.
 
-| Key | Action | Where |
+**Rebindable actions** and their defaults, grouped by scope:
+
+| Key | Action | Scope |
 |---|---|---|
-| `←` | Previous image | Viewer |
-| `→` | Next image | Viewer |
-| `Esc` | Back to grid | Viewer |
-| `Backspace` | Parent folder | Anywhere |
+| `←` / `→` | Previous / next image | Navigation |
+| `Esc` | Back to grid | Navigation |
+| `Backspace` | Parent folder | Navigation |
+| `Home` / `End` | First / last item | Navigation |
+| `T` | Grid / Table toggle | Grid |
+| `/` | Filter by filename | Grid |
+| `.` | Show hidden files | Grid |
+| `R` | Random 16colo.rs pack | Grid |
+| `\` | Go to filesystem root | Grid |
+| `~` | Go to home folder | Grid |
+| `Space` | Edit the path | Grid |
+| `Ctrl + O` | Open a folder… | Grid |
+| `Ctrl + G` | Recolor grid thumbnails | Grid |
+| `Ctrl + Shift + X` | Reset all recolor | Grid |
+| `F` | Fit image to window | Viewer |
+| `W` | Fit image to width | Viewer |
+| `S` | Snap zoom to whole steps | Viewer |
+| `A` | Slideshow auto-advance | Viewer |
+| `C` | CRT effects on / off | Viewer |
+| `Alt + E` / `D` / `R` | Toggle Explorer / Details / Recolor pane | Panes |
+| `Alt + F` / `P` | Files / PixelFX section | Panes |
+| `Tab` | Collapse / expand the rail | Panes |
+| `F5` | Refresh folder (`Shift` = hard refresh) | Global |
+| `F11` | Immersive / fullscreen | Global |
+| `Ctrl + ,` | Preferences | Global |
 
-The rest are fixed (this is the same list shown in **Help → Keyboard shortcuts**):
+**Fixed keys** (not rebindable):
 
 | Key | Action |
 |---|---|
+| `F1` / `?` | Open this shortcuts window |
+| `F10` | Access the menu bar |
+| `Ctrl + Alt + Shift + ←/→/↑/↓` | Rail · Recolor pane · Path entry · Task output |
 | `Ctrl +` / `Ctrl -` | Zoom the whole UI |
 | `Ctrl + Wheel` / pinch | Resize thumbnails (grid) · zoom image (viewer) |
 | `Wheel` | Viewer: previous / next image (or scroll a long one) · Grid: scroll |
-| `↑` / `↓` | Viewer: scroll a long image |
+| `←` `→` `↑` `↓` | Grid/table: move the selection · Viewer: scroll a long image |
+| `PageUp` / `PageDown` | Grid/table: move a page · Viewer: scroll 25 lines |
+| `Enter` | Grid/table: open the focused item · Viewer: open in OS default app |
 | Mouse Back / Fwd | Grid: folder history · Viewer: prev / next image |
-| `Home` / `End` | Grid: first / last · Viewer: scroll to top / bottom |
-| `PageUp` / `PageDown` | Viewer: scroll 25 lines (a screen of scene art) |
-| `/` | Grid: filter by filename |
 | `Ctrl + F` | Advanced recursive search · **in the text view: find/replace** |
 | `Ctrl + P` | Quick open — jump to a file by name |
 | `Ctrl + Shift + P` | Command palette — every action, searchable |
 | `Ctrl + S` | Save (text view, while editing) |
 | `Drag` | Pan the image (viewer) |
-| `F` | Fit to window + auto-fit new images (viewer) |
-| `T` | Grid/Table toggle (browse) · Tile preview — fill window (viewer) |
-| `F11` | Immersive / fullscreen |
 | `1` – `5` | Set star rating |
 | `0` | Clear rating |
-| `R` | Jump to a random 16colo.rs pack |
-| `Enter` | Open the current file in its OS default app |
 | `Space` | Play / pause audio · video playback |
 | `i` / `o` | Video: set trim in / out |
 | `m` | Video: drop a chapter marker at the playhead |
@@ -1290,6 +1314,11 @@ USAGE:
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
+        --open <FILE>             Open FILE straight into the FULL viewer (all chrome),
+                                  with its folder loaded so prev/next work.
+        --view <FILE>             Open FILE in a MINIMAL single-window viewer: no menus or
+                                  docks, just the art with scroll / zoom / pan, and Esc to
+                                  quit. Wire it as a file-association viewer (see below).
     -t, --thumbnail-size <SIZE>   Thumbnail tile size: a number (e.g. 160) or
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
@@ -1370,6 +1399,38 @@ kaleidotron --render a.ans b.xb c.rip --outdir out/ --font-9px
   e.g. `--format tga`).
 - Exit code: **0** = all rendered, **1** = one or more failed / nothing found, **2** = bad
   usage (e.g. `-o` with a batch, or an unknown `--format`).
+
+### Opening a single file — `--open` / `--view`
+
+Two flags open one file straight into the viewer, so kaleidotron can be **the** thing that
+shows everything it decodes — from a file manager, a launcher, or a MIME association:
+
+```sh
+kaleidotron --open ART.ANS     # full app, opened on ART.ANS (all chrome, prev/next work)
+kaleidotron --view ART.ANS     # minimal viewer: no chrome, scroll/zoom/pan, Esc quits
+```
+
+`--view` is the one to wire up as a **file-association viewer**. It shows only the art with
+the viewer's controls (drag to pan, Ctrl+wheel / `Z`-chord to zoom, arrows to scroll), and
+**Esc closes it immediately** — exactly what you want when spawning a viewer from another
+program:
+
+```ini
+# Midnight Commander — mc.ext.ini (View/F3 → kaleidotron)
+[ansi]
+    Regex=\.(ans|xb|xbin|bin|rip|idf|adf|tnd|seq|pet)$
+    View=kaleidotron --view %f
+
+# ranger — rifle.conf
+mime ^image, has kaleidotron = kaleidotron --view "$@"
+
+# xdg — as the default app for a MIME type
+#   Exec=kaleidotron --view %f   in a .desktop file, then `xdg-mime default …`
+```
+
+Both accept relative paths and load the file's folder too, so **prev/next flip through the
+rest of the directory**. Point them at any format in the [Supported formats](#supported-formats)
+list — ANSI, XBin, images, PDF, 3D, video, audio waveforms all open through the same window.
 
 ---
 
