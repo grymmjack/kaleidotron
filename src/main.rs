@@ -14,6 +14,7 @@ mod gfonts;
 mod git;
 mod httpfs;
 mod image_types;
+mod jpeg_clean;
 mod keybindings;
 mod secrets;
 mod settings;

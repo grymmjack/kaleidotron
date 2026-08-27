@@ -1968,6 +1968,18 @@ pub struct Kaleidotron {
     quantize_on: bool,       // details palette: reduce to N colors (median cut)
     quantize_n: usize,       // target color count when reducing
     quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
+    // JPEG cleanup — recover crisp pixel art from a lossy JPEG (a pre-pipeline step; see
+    // `jpeg_clean.rs`). Keys out the background, snaps the foreground to a palette, despeckles.
+    jpeg_clean_on: bool,          // master toggle ("Extract pixels from JPEG")
+    jpeg_clean_key_auto: bool,    // auto-detect the background from the border vs. `jpeg_clean_key`
+    jpeg_clean_key: [u8; 3],      // manual key colour (the colour to remove) when not auto
+    jpeg_clean_tol: u32,          // background keying tolerance (RGB distance)
+    jpeg_clean_transparent: bool, // true = background → transparent; false = fill `jpeg_clean_bg`
+    jpeg_clean_bg: [u8; 3],       // background fill colour when not transparent
+    jpeg_clean_snap: bool,        // snap the foreground to a median-cut palette
+    jpeg_clean_colors: u32,       // snap palette size
+    jpeg_clean_despeckle: bool,   // drop isolated foreground specks
+    jpeg_clean_min_island: u32,   // min foreground component size kept (px)
     dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
@@ -2990,6 +3002,16 @@ impl Kaleidotron {
     const QUANT_ON_KEY: &'static str = "quantize_on";
     const QUANT_N_KEY: &'static str = "quantize_n";
     const QUANT_KEEP_BW_KEY: &'static str = "quantize_keep_bw";
+    const JPEG_CLEAN_KEY: &'static str = "jpeg_clean_on";
+    const JPEG_CLEAN_AUTO_KEY: &'static str = "jpeg_clean_auto";
+    const JPEG_CLEAN_KEYCOL_KEY: &'static str = "jpeg_clean_keycol";
+    const JPEG_CLEAN_TOL_KEY: &'static str = "jpeg_clean_tol";
+    const JPEG_CLEAN_TRANSP_KEY: &'static str = "jpeg_clean_transparent";
+    const JPEG_CLEAN_BG_KEY: &'static str = "jpeg_clean_bg";
+    const JPEG_CLEAN_SNAP_KEY: &'static str = "jpeg_clean_snap";
+    const JPEG_CLEAN_COLORS_KEY: &'static str = "jpeg_clean_colors";
+    const JPEG_CLEAN_DESPECKLE_KEY: &'static str = "jpeg_clean_despeckle";
+    const JPEG_CLEAN_ISLAND_KEY: &'static str = "jpeg_clean_min_island";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
@@ -3506,6 +3528,26 @@ impl Kaleidotron {
         let transp_checker_a = get_rgb(Self::TRANSP_CHECKER_A_KEY, [64, 64, 64]);
         let transp_checker_b = get_rgb(Self::TRANSP_CHECKER_B_KEY, [96, 96, 96]);
         let transp_color = get_rgb(Self::TRANSP_COLOR_KEY, [20, 20, 20]);
+        // JPEG cleanup (recover crisp pixel art from a lossy JPEG) — a pre-pipeline recolor step.
+        let jpeg_clean_on = get_bool(Self::JPEG_CLEAN_KEY).unwrap_or(false);
+        let jpeg_clean_key_auto = get_bool(Self::JPEG_CLEAN_AUTO_KEY).unwrap_or(true);
+        let jpeg_clean_key = get_rgb(Self::JPEG_CLEAN_KEYCOL_KEY, [0, 0, 0]);
+        let jpeg_clean_tol = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_TOL_KEY))
+            .unwrap_or(24);
+        let jpeg_clean_transparent = get_bool(Self::JPEG_CLEAN_TRANSP_KEY).unwrap_or(true);
+        let jpeg_clean_bg = get_rgb(Self::JPEG_CLEAN_BG_KEY, [0, 0, 0]);
+        let jpeg_clean_snap = get_bool(Self::JPEG_CLEAN_SNAP_KEY).unwrap_or(true);
+        let jpeg_clean_colors = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_COLORS_KEY))
+            .unwrap_or(64); // a whole sprite-sheet shares one palette — keep it rich by default
+        let jpeg_clean_despeckle = get_bool(Self::JPEG_CLEAN_DESPECKLE_KEY).unwrap_or(true);
+        let jpeg_clean_min_island = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_ISLAND_KEY))
+            .unwrap_or(2);
         // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
         let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
         let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
@@ -4280,6 +4322,16 @@ impl Kaleidotron {
             quantize_on,
             quantize_n,
             quantize_keep_bw,
+            jpeg_clean_on,
+            jpeg_clean_key_auto,
+            jpeg_clean_key,
+            jpeg_clean_tol,
+            jpeg_clean_transparent,
+            jpeg_clean_bg,
+            jpeg_clean_snap,
+            jpeg_clean_colors,
+            jpeg_clean_despeckle,
+            jpeg_clean_min_island,
             crops,
             crop_ratio: None,
             crop_drag: None,
@@ -21804,11 +21856,41 @@ impl Kaleidotron {
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
     /// palette / post-FX) + Save operate on the enlarged art.
     fn scale_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+        // Prepare the source before the pipeline: JPEG-clean first (recover crisp pixel art
+        // from a lossy source), then the pixel-art upscale. Both are no-ops when off, so this
+        // is the single pre-pipeline hook every recolor consumer already routes through.
+        let (w, h, rgba) = self.jpeg_clean_source(w, h, rgba);
         if self.scale_algo == crate::scale::Scaler::None {
             return (w, h, rgba);
         }
         let (out, ow, oh) = self.scale_algo.apply(&rgba, w, h);
         (ow, oh, out)
+    }
+
+    /// The JPEG-cleanup pre-pipeline step (see `jpeg_clean.rs`): key out the background, snap
+    /// the foreground to a palette, despeckle. A no-op unless `jpeg_clean_on`. Runs on the raw
+    /// source at native resolution, before any upscale.
+    fn jpeg_clean_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+        if !self.jpeg_clean_on {
+            return (w, h, rgba);
+        }
+        let key = if self.jpeg_clean_key_auto {
+            crate::jpeg_clean::detect_background(&rgba, w, h)
+        } else {
+            self.jpeg_clean_key
+        };
+        let opts = crate::jpeg_clean::CleanOpts {
+            key,
+            tol: self.jpeg_clean_tol,
+            transparent: self.jpeg_clean_transparent,
+            bg_color: self.jpeg_clean_bg,
+            snap: self.jpeg_clean_snap,
+            colors: self.jpeg_clean_colors as usize,
+            despeckle: self.jpeg_clean_despeckle,
+            min_island: self.jpeg_clean_min_island as usize,
+        };
+        let out = crate::jpeg_clean::cleanup(&rgba, w, h, &opts);
+        (w, h, out)
     }
 
     /// Snapshot the entire recolor stack (adjustments + order, post-FX, dither, color
@@ -22039,6 +22121,7 @@ impl Kaleidotron {
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
             || self.scale_algo != crate::scale::Scaler::None
+            || self.jpeg_clean_on
     }
 
     /// Is ANY recolor active — the value pipeline (`pipeline_active`) OR a **palette snap**
@@ -22234,6 +22317,23 @@ impl Kaleidotron {
             }
             + &if self.textmode_mono().is_some() {
                 format!("|FG{:?}BG{:?}", self.tm_fg, self.tm_bg)
+            } else {
+                String::new()
+            }
+            // JPEG cleanup: any of its knobs changing must invalidate the preview/grid/full caches.
+            + &if self.jpeg_clean_on {
+                format!(
+                    "|JC{}:{:?}:{}:{}:{:?}:{}:{}:{}:{}",
+                    self.jpeg_clean_key_auto as u8,
+                    self.jpeg_clean_key,
+                    self.jpeg_clean_tol,
+                    self.jpeg_clean_transparent as u8,
+                    self.jpeg_clean_bg,
+                    self.jpeg_clean_snap as u8,
+                    self.jpeg_clean_colors,
+                    self.jpeg_clean_despeckle as u8,
+                    self.jpeg_clean_min_island,
+                )
             } else {
                 String::new()
             }
@@ -26258,6 +26358,99 @@ impl Kaleidotron {
         }
     }
 
+    /// The "JPEG cleanup" section of the Recolor pane — recover crisp pixel art from a lossy
+    /// JPEG. Purely a pre-pipeline step (see `jpeg_clean_source`); these controls just set the
+    /// fields that `pipeline_key` folds in, so the live preview re-renders as you drag.
+    fn ui_jpeg_cleanup(&mut self, ui: &mut egui::Ui, path: &std::path::Path) {
+        ui.checkbox(&mut self.jpeg_clean_on, "Extract pixels from JPEG")
+            .on_hover_text(
+                "Recover crisp pixel art from a lossy JPEG: key out the background, snap the \
+                 foreground to a palette, and despeckle. Ideal for JPEG'd sprite sheets.",
+            );
+        if !self.jpeg_clean_on {
+            return;
+        }
+        ui.indent("jpeg_clean_opts", |ui| {
+            // Background: auto-detect (show the detected swatch) or a manual key colour.
+            ui.horizontal(|ui| {
+                ui.label("Background");
+                ui.checkbox(&mut self.jpeg_clean_key_auto, "Auto")
+                    .on_hover_text("Detect the background colour from the image border");
+                if self.jpeg_clean_key_auto {
+                    let detected = self
+                        .thumb_rgba
+                        .get(path)
+                        .map(|(w, h, px)| crate::jpeg_clean::detect_background(px, *w, *h));
+                    if let Some(bg) = detected {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, 2.0, egui::Color32::from_rgb(bg[0], bg[1], bg[2]));
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.weak(format!("#{:02X}{:02X}{:02X}", bg[0], bg[1], bg[2]));
+                    } else {
+                        ui.weak("(auto)");
+                    }
+                } else {
+                    ui.color_edit_button_srgb(&mut self.jpeg_clean_key)
+                        .on_hover_text("The colour to remove");
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Tolerance");
+                let r = ui.add(egui::Slider::new(&mut self.jpeg_clean_tol, 0..=96));
+                slider_extras(ui, &r, &mut self.jpeg_clean_tol, 24, 1.0, 0, 96);
+            })
+            .response
+            .on_hover_text("How close to the background a pixel must be to be removed (kills the speckle)");
+            // Output: Transparency vs BG colour (mutually exclusive).
+            ui.horizontal(|ui| {
+                ui.label("Onto");
+                if ui
+                    .selectable_label(self.jpeg_clean_transparent, "Transparency")
+                    .clicked()
+                {
+                    self.jpeg_clean_transparent = true;
+                }
+                if ui
+                    .selectable_label(!self.jpeg_clean_transparent, "BG color")
+                    .clicked()
+                {
+                    self.jpeg_clean_transparent = false;
+                }
+                if !self.jpeg_clean_transparent {
+                    ui.color_edit_button_srgb(&mut self.jpeg_clean_bg);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.jpeg_clean_snap, "Snap colors")
+                    .on_hover_text("Flatten JPEG gradient noise + harden edges (median-cut palette)");
+                let on = self.jpeg_clean_snap;
+                ui.add_enabled_ui(on, |ui| {
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.jpeg_clean_colors, 2..=256).logarithmic(true),
+                    );
+                    slider_extras(ui, &r, &mut self.jpeg_clean_colors, 64, 1.0, 2, 256);
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.jpeg_clean_despeckle, "Despeckle")
+                    .on_hover_text("Remove isolated foreground specks (leftover mosquito noise)");
+                let on = self.jpeg_clean_despeckle;
+                ui.add_enabled_ui(on, |ui| {
+                    let r =
+                        ui.add(egui::Slider::new(&mut self.jpeg_clean_min_island, 1..=16).suffix(" px"));
+                    slider_extras(ui, &r, &mut self.jpeg_clean_min_island, 2, 1.0, 1, 16);
+                });
+            });
+        });
+    }
+
     fn ui_recolor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -26472,6 +26665,12 @@ impl Kaleidotron {
                         }
                     });
                 }
+                ui.add_space(6.0);
+                ui.separator();
+
+                // ----- JPEG cleanup (recover crisp pixel art from a lossy JPEG) — a
+                //       pre-pipeline source step, so it sits above Resize/Adjustments. -----
+                self.ui_jpeg_cleanup(ui, &entry.path);
                 ui.add_space(6.0);
                 ui.separator();
 
@@ -41379,6 +41578,16 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TRANSP_CHECKER_A_KEY, &self.transp_checker_a);
         eframe::set_value(storage, Self::TRANSP_CHECKER_B_KEY, &self.transp_checker_b);
         eframe::set_value(storage, Self::TRANSP_COLOR_KEY, &self.transp_color);
+        eframe::set_value(storage, Self::JPEG_CLEAN_KEY, &self.jpeg_clean_on);
+        eframe::set_value(storage, Self::JPEG_CLEAN_AUTO_KEY, &self.jpeg_clean_key_auto);
+        eframe::set_value(storage, Self::JPEG_CLEAN_KEYCOL_KEY, &self.jpeg_clean_key);
+        eframe::set_value(storage, Self::JPEG_CLEAN_TOL_KEY, &self.jpeg_clean_tol);
+        eframe::set_value(storage, Self::JPEG_CLEAN_TRANSP_KEY, &self.jpeg_clean_transparent);
+        eframe::set_value(storage, Self::JPEG_CLEAN_BG_KEY, &self.jpeg_clean_bg);
+        eframe::set_value(storage, Self::JPEG_CLEAN_SNAP_KEY, &self.jpeg_clean_snap);
+        eframe::set_value(storage, Self::JPEG_CLEAN_COLORS_KEY, &self.jpeg_clean_colors);
+        eframe::set_value(storage, Self::JPEG_CLEAN_DESPECKLE_KEY, &self.jpeg_clean_despeckle);
+        eframe::set_value(storage, Self::JPEG_CLEAN_ISLAND_KEY, &self.jpeg_clean_min_island);
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
         eframe::set_value(
