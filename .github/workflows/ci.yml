@@ -19,7 +19,7 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # eframe/winit + native decoders (openssl) build/link deps. See CLAUDE.md.
       - name: Install system dependencies
@@ -41,7 +41,7 @@ jobs:
     name: GUI screenshots (artifact)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build deps + a software Vulkan stack: the loader (libvulkan1), Mesa
       # lavapipe (the CPU ICD egui_kittest's wgpu backend renders with), and
@@ -85,7 +85,7 @@ jobs:
 
       - name: Upload screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: gui-screenshots
           # The whole dir: the rendered PNGs + captions.md (per-shot action notes).
