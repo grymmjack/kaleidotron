@@ -55535,6 +55535,25 @@ mod tests {
     }
 
     #[test]
+    fn bundled_fx_presets_parse_and_are_portable() {
+        // The embedded factory blob must parse (a malformed RON silently loads empty), and every
+        // preset must reference only bundled palettes so it resolves on any machine.
+        let v = super::builtin_fx_presets();
+        assert!(v.len() >= 80, "factory presets parsed: {}", v.len());
+        for p in v {
+            assert_eq!(p.folder.as_deref(), Some(super::FX_FACTORY_FOLDER));
+            if let Some(path) = &p.selected_palette {
+                let s = path.to_string_lossy();
+                assert!(
+                    s.starts_with("<built-in palettes>/"),
+                    "preset '{}' references a non-portable palette: {s}",
+                    p.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn palette_op_position_changes_result() {
         // A remap that snaps every pixel to red=100; combined with +brightness.
         // Palette LAST: brightness first, then remap → exactly (100,0,0).
