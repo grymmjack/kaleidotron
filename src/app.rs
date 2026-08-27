@@ -23519,6 +23519,10 @@ impl Kaleidotron {
                 .as_ref()
                 .map(|(p, _)| p.clone())
                 .or_else(|| self.entries.get(self.selected).map(|e| e.path.clone())),
+            // In double-click mode, hovering must NOT drive the Details/Recolor panes — only a
+            // click does (`last_inspected` is then updated by clicks, not hover). In single-click
+            // mode the hovered tile previews live, falling back to the last one when off-grid.
+            Mode::Grid if self.open_on_double_click => self.last_inspected.clone(),
             Mode::Grid => self
                 .hovered
                 .and_then(|i| self.entries.get(i))
@@ -29876,7 +29880,9 @@ impl Kaleidotron {
         }
 
         self.hovered = hovered;
-        if let Some(i) = hovered {
+        // Hover drives the Details/Recolor target only in single-click mode; in double-click mode
+        // a click sets it (see `handle_click`), so passing the pointer over tiles doesn't preview.
+        if let (Some(i), false) = (hovered, self.open_on_double_click) {
             // Remember the last-hovered image so the Details/Recolor panes keep
             // showing it once the pointer moves off the grid onto a pane.
             self.last_inspected = self.entries.get(i).map(|e| e.path.clone());
@@ -31009,7 +31015,8 @@ impl Kaleidotron {
 
         // Apply the deferred actions (now that the body's `&mut self` borrow is done).
         self.hovered = hovered;
-        if let Some(i) = hovered {
+        // Hover previews only in single-click mode (see the matching note in `ui_grid`).
+        if let (Some(i), false) = (hovered, self.open_on_double_click) {
             self.last_inspected = self.entries.get(i).map(|e| e.path.clone());
         }
         if let Some(k) = header_sort {
@@ -34257,6 +34264,9 @@ impl Kaleidotron {
     /// by default; only a double-click when Preferences → "Open on double-click" is on). Ctrl/Shift
     /// clicks only ever extend the selection.
     fn handle_click(&mut self, ctx: &egui::Context, idx: usize, mods: egui::Modifiers, open: bool) {
+        // A click sets the Details/Recolor target (in double-click mode, hover no longer does — so
+        // the panes follow the tile you click, not the one under the pointer).
+        self.last_inspected = self.entries.get(idx).map(|e| e.path.clone());
         if mods.command {
             if let Some(p) = self
                 .entries
@@ -44372,7 +44382,11 @@ fn middle_reset<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, v
             )
         })
     });
-    if hit {
+    // Double-click (primary) also resets — the discoverable gesture most people try. A `Slider`
+    // senses drag, so `resp.double_clicked()` is unreliable; detect it from egui's per-frame
+    // double-click flag while the pointer is over the slider instead.
+    let dbl = resp.contains_pointer() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+    if hit || dbl {
         *v = def;
     }
 }
