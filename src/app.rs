@@ -11262,7 +11262,7 @@ impl Kaleidotron {
             ui.label("Preset");
             let sel = if self.font_preset_name.is_empty() { "— pick —".to_string() } else { self.font_preset_name.clone() };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            egui::ComboBox::from_id_salt("font_preset_pick")
+            eat_scroll(egui::ComboBox::from_id_salt("font_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -11272,7 +11272,7 @@ impl Kaleidotron {
                             recall = Some(p.clone());
                         }
                     }
-                });
+                }));
             ui.add(egui::TextEdit::singleline(&mut self.font_preset_name).desired_width(140.0).hint_text("name…"));
             if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
                 save = true;
@@ -11794,10 +11794,10 @@ impl Kaleidotron {
                 ui.separator();
                 ui.label("Lines");
                 let cur = if self.font_top_down { "Top Down" } else { "Bottom Up" };
-                egui::ComboBox::from_id_salt("font_zorder").selected_text(cur).show_ui(ui, |ui| {
+                eat_scroll(egui::ComboBox::from_id_salt("font_zorder").selected_text(cur).show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.font_top_down, true, "Top Down");
                     ui.selectable_value(&mut self.font_top_down, false, "Bottom Up");
-                });
+                }));
             }
             if ui.small_button("Reset").clicked() {
                 self.font_letter_spacing = 0.0;
@@ -11811,14 +11811,13 @@ impl Kaleidotron {
             slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
-                egui::ComboBox::from_id_salt("font_stroke_mode")
+                eat_scroll(egui::ComboBox::from_id_salt("font_stroke_mode")
                     .selected_text(self.font_stroke_mode.label())
                     .show_ui(ui, |ui| {
                         for m in crate::decode::font::StrokeMode::ALL {
                             ui.selectable_value(&mut self.font_stroke_mode, m, m.label());
                         }
-                    })
-                    .response
+                    }))
                     .on_hover_text("Outer = outside the glyph · Center = straddles the edge · Inner = inside");
                 ui.checkbox(&mut self.font_stroke_per_char, "Per char").on_hover_text(
                     "On: outline each glyph (strokes cross where glyphs overlap — how Inkscape shows separate paths).\nOff (default): one merged silhouette outline. Both the preview AND the SVG export follow this, so they match.",
@@ -12052,7 +12051,7 @@ impl Kaleidotron {
             ui.label(format!("Glyphs ({})", chars.len()));
             ui.separator();
             ui.label("Range");
-            egui::ComboBox::from_id_salt("font_block")
+            eat_scroll(egui::ComboBox::from_id_salt("font_block")
                 .selected_text(UNICODE_BLOCKS[self.font_block].0)
                 .show_ui(ui, |ui| {
                     for (i, (name, _, _)) in UNICODE_BLOCKS.iter().enumerate() {
@@ -12062,7 +12061,7 @@ impl Kaleidotron {
                             self.font_grid_tex = None;
                         }
                     }
-                });
+                }));
             if ui.add_enabled(self.font_page > 0, egui::Button::new("◀").small()).clicked() {
                 self.font_page -= 1;
                 self.font_grid_tex = None;
@@ -12393,7 +12392,7 @@ impl Kaleidotron {
             let n = self.tdf_fonts.len();
             if n > 1 {
                 let cur = self.tdf_fonts[self.tdf_index].0.clone();
-                egui::ComboBox::from_id_salt("tdf_font_pick")
+                eat_scroll(egui::ComboBox::from_id_salt("tdf_font_pick")
                     .width(300.0)
                     .height(420.0)
                     .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
@@ -12409,7 +12408,7 @@ impl Kaleidotron {
                                 self.tdf_page = 0;
                             }
                         }
-                    });
+                    }));
             } else {
                 ui.strong(&self.tdf_fonts[0].0);
             }
@@ -12430,7 +12429,7 @@ impl Kaleidotron {
             // Let the popup grow to (almost) the full screen height when there are many presets;
             // egui shrinks it to the content when there are few.
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            egui::ComboBox::from_id_salt("tdf_preset_pick")
+            eat_scroll(egui::ComboBox::from_id_salt("tdf_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -12441,7 +12440,7 @@ impl Kaleidotron {
                         }
                     }
                     let _ = names;
-                });
+                }));
             ui.add(
                 egui::TextEdit::singleline(&mut self.tdf_preset_name)
                     .desired_width(140.0)
@@ -12596,7 +12595,7 @@ impl Kaleidotron {
                     }
                     ui.label("Lines");
                     let cur = if self.tdf_top_down { "Top Down" } else { "Bottom Up" };
-                    egui::ComboBox::from_id_salt("tdf_zorder")
+                    eat_scroll(egui::ComboBox::from_id_salt("tdf_zorder")
                         .selected_text(cur)
                         .show_ui(ui, |ui| {
                             if ui.selectable_value(&mut self.tdf_top_down, true, "Top Down").clicked()
@@ -12606,8 +12605,7 @@ impl Kaleidotron {
                             {
                                 self.tdf_sample_tex = None;
                             }
-                        })
-                        .response
+                        }))
                         .on_hover_text("Which line wins where multi-line rows overlap");
                 }
             });
@@ -13035,7 +13033,7 @@ impl Kaleidotron {
                 self.amiga_preset_name.clone()
             };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            egui::ComboBox::from_id_salt("amiga_preset_pick")
+            eat_scroll(egui::ComboBox::from_id_salt("amiga_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -13048,7 +13046,7 @@ impl Kaleidotron {
                             recall_amiga = Some(p.clone());
                         }
                     }
-                });
+                }));
             ui.add(
                 egui::TextEdit::singleline(&mut self.amiga_preset_name)
                     .desired_width(140.0)
@@ -13161,7 +13159,7 @@ impl Kaleidotron {
             // makes rows touch. Mirrors the TTF/TDF viewer's "Lines" control.
             ui.label("Lines");
             let cur = if self.amiga_top_down { "Top Down" } else { "Bottom Up" };
-            egui::ComboBox::from_id_salt("amiga_zorder")
+            eat_scroll(egui::ComboBox::from_id_salt("amiga_zorder")
                 .selected_text(cur)
                 .show_ui(ui, |ui| {
                     let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
@@ -13169,8 +13167,7 @@ impl Kaleidotron {
                     if a.changed() || b.changed() {
                         self.amiga_sample_tex = None;
                     }
-                })
-                .response
+                }))
                 .on_hover_text("Which line draws on top where rows overlap");
         });
 
@@ -13559,7 +13556,7 @@ impl Kaleidotron {
             ui.strong(name.clone());
             if self.fon_faces.len() > 1 {
                 let cur = &self.fon_faces[self.fon_index];
-                egui::ComboBox::from_id_salt("fon_face_pick")
+                eat_scroll(egui::ComboBox::from_id_salt("fon_face_pick")
                     .width(200.0)
                     .selected_text(format!("{} pt · {} px", cur.1, cur.2))
                     .show_ui(ui, |ui| {
@@ -13574,7 +13571,7 @@ impl Kaleidotron {
                                 self.fon_page = 0;
                             }
                         }
-                    });
+                    }));
             } else {
                 let (_, pts, h) = &self.fon_faces[0];
                 ui.weak(format!("· {pts} pt · {h} px"));
@@ -13611,13 +13608,13 @@ impl Kaleidotron {
             slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
-                egui::ComboBox::from_id_salt("fon_stroke_mode")
+                eat_scroll(egui::ComboBox::from_id_salt("fon_stroke_mode")
                     .selected_text(self.font_stroke_mode.label())
                     .show_ui(ui, |ui| {
                         for m in crate::decode::font::StrokeMode::ALL {
                             ui.selectable_value(&mut self.font_stroke_mode, m, m.label());
                         }
-                    });
+                    }));
             });
             ui.separator();
             ui.checkbox(&mut self.font_apply_recolor, "Recolor")
@@ -13889,7 +13886,7 @@ impl Kaleidotron {
                 ));
                 ui.separator();
                 ui.label("Speed");
-                egui::ComboBox::from_id_salt("video_speed")
+                eat_scroll(egui::ComboBox::from_id_salt("video_speed")
                     .selected_text(format!("{speed:.2}×"))
                     .show_ui(ui, |ui| {
                         for s in [0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0] {
@@ -13900,7 +13897,7 @@ impl Kaleidotron {
                                 want_speed = Some(s);
                             }
                         }
-                    });
+                    }));
                 ui.separator();
                 ui.label(format!("frame {frame_idx}/{frame_cnt}"));
                 ui.separator();
@@ -15514,7 +15511,7 @@ impl Kaleidotron {
                             self.pads[i].mono = mono;
                         }
                         let cur = (self.pads[i].loop_type as usize).min(2);
-                        egui::ComboBox::from_id_salt("pad_loop_type")
+                        eat_scroll(egui::ComboBox::from_id_salt("pad_loop_type")
                             .selected_text(LOOP_TYPES[cur])
                             .show_ui(ui, |ui| {
                                 for (t, name) in LOOP_TYPES.iter().enumerate() {
@@ -15522,7 +15519,7 @@ impl Kaleidotron {
                                         self.pads[i].loop_type = t as u8;
                                     }
                                 }
-                            });
+                            }));
                         ui.separator();
                         ui.weak("Pitch");
                         let r = ui.add(
@@ -15543,7 +15540,7 @@ impl Kaleidotron {
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("Choke");
                         let cg = self.pads[i].choke_group;
-                        egui::ComboBox::from_id_salt("pad_choke_group")
+                        eat_scroll(egui::ComboBox::from_id_salt("pad_choke_group")
                             .selected_text(if cg == 0 {
                                 "Off".to_string()
                             } else {
@@ -15562,7 +15559,7 @@ impl Kaleidotron {
                                         self.pads[i].choke_group = g;
                                     }
                                 }
-                            });
+                            }));
                         ui.separator();
                         // Envelope target selector — the on-waveform editor shapes whichever target
                         // is selected (Amp / Pitch / Cutoff / Res). Each carries its own ADSR+curves.
@@ -15635,7 +15632,7 @@ impl Kaleidotron {
                             // combo closure so it doesn't borrow `self` twice.
                             let mut apply_preset: Option<[f32; 8]> = None;
                             let mut delete_preset: Option<usize> = None;
-                            egui::ComboBox::from_id_salt("env_preset")
+                            eat_scroll(egui::ComboBox::from_id_salt("env_preset")
                                 .selected_text("Preset")
                                 .width(64.0)
                                 .show_ui(ui, |ui| {
@@ -15663,7 +15660,7 @@ impl Kaleidotron {
                                             });
                                         }
                                     }
-                                });
+                                }));
                             if let Some(v) = apply_preset {
                                 self.pads[i].set_env_values(t, v);
                             }
@@ -15929,7 +15926,7 @@ impl Kaleidotron {
                     }
                     ui.weak("Type");
                     let cur = (ap_loop_type as usize).min(2);
-                    egui::ComboBox::from_id_salt("editor_loop_type")
+                    eat_scroll(egui::ComboBox::from_id_salt("editor_loop_type")
                         .selected_text(LOOP_TYPES[cur])
                         .show_ui(ui, |ui| {
                             for (t, name) in LOOP_TYPES.iter().enumerate() {
@@ -15937,7 +15934,7 @@ impl Kaleidotron {
                                     want_loop_type = Some(t as u8);
                                 }
                             }
-                        });
+                        }));
                     ui.weak("· forward / reverse / ping-pong while looping");
                 });
             }
@@ -16979,7 +16976,7 @@ impl Kaleidotron {
                     ui.weak("drag: select · edges: ↔ · wheel: zoom · over edge → wheel nudge ±1 (Shift 10, +Alt zero-x)");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("zoom_edit_pct")
+                    eat_scroll(egui::ComboBox::from_id_salt("zoom_edit_pct")
                         .selected_text(if self.zoom_edit_pct == 0 {
                             "Zoom Edit: off".to_string()
                         } else {
@@ -16994,8 +16991,7 @@ impl Kaleidotron {
                                 };
                                 ui.selectable_value(&mut self.zoom_edit_pct, v, label);
                             }
-                        })
-                        .response
+                        }))
                         .on_hover_text("Magnification of the edge-edit inset shown while adjusting a selection edge");
                 });
             });
@@ -17548,7 +17544,7 @@ impl Kaleidotron {
                     ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "✓");
                 }
                 let label = current.clone().unwrap_or_else(|| "None".to_string());
-                egui::ComboBox::from_id_salt("midi_in_pick")
+                eat_scroll(egui::ComboBox::from_id_salt("midi_in_pick")
                     .selected_text(elide(&label, 28))
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(current.is_none(), "None").clicked() {
@@ -17565,7 +17561,7 @@ impl Kaleidotron {
                         if self.midi_ports.is_empty() {
                             ui.weak("(no controllers found)");
                         }
-                    });
+                    }));
                 if ui
                     .small_button(icons::REFRESH)
                     .on_hover_text("Re-scan MIDI devices")
@@ -17870,7 +17866,7 @@ impl Kaleidotron {
             // Base-note chooser: auto-maps every non-overridden pad chromatically from here.
             ui.weak("· base");
             let base = self.pad_base_note;
-            egui::ComboBox::from_id_salt("pad_base_note")
+            eat_scroll(egui::ComboBox::from_id_salt("pad_base_note")
                 .selected_text(midi_note_name(base.clamp(0, 127) as u8))
                 .show_ui(ui, |ui| {
                     for oct in 0..=7 {
@@ -17882,7 +17878,7 @@ impl Kaleidotron {
                             want_base = Some(n);
                         }
                     }
-                });
+                }));
             ui.separator();
             // Kit-wide fixed velocity: when on, every pad plays at the slider value (overrides
             // each pad's own V toggle + the incoming MIDI velocity).
@@ -21195,17 +21191,17 @@ impl Kaleidotron {
             } else {
                 SortKey::COMMON.to_vec()
             };
-            let cr = egui::ComboBox::from_id_salt("sort_key")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("sort_key")
                 .selected_text(key.label())
                 .show_ui(ui, |ui| {
                     for k in &keys {
                         ui.selectable_value(&mut key, *k, k.label());
                     }
-                });
+                }));
             // Wheel-cycle within the offered keys; a key not in the list maps to its
             // position if present, else stays put.
             let mut ki = keys.iter().position(|&k| k == key).unwrap_or(0);
-            if wheel_cycle(ui, &cr.response, &mut ki, keys.len()) {
+            if wheel_cycle(ui, &cr, &mut ki, keys.len()) {
                 key = keys[ki];
             }
             let asc_lbl = format!("{} Asc", icons::SORT_ASC);
@@ -21223,7 +21219,7 @@ impl Kaleidotron {
             ui.checkbox(&mut dirs_first, "Dirs first");
             ui.separator();
             ui.label("Rating");
-            let cr = egui::ComboBox::from_id_salt("min_rating")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("min_rating")
                 .selected_text(if min_rating == 0 {
                     "All".to_string()
                 } else {
@@ -21234,9 +21230,9 @@ impl Kaleidotron {
                     for r in 1..=5u8 {
                         ui.selectable_value(&mut min_rating, r, format!("≥ {r}★"));
                     }
-                });
+                }));
             let mut ri = min_rating as usize;
-            if wheel_cycle(ui, &cr.response, &mut ri, 6) {
+            if wheel_cycle(ui, &cr, &mut ri, 6) {
                 min_rating = ri as u8;
             }
         });
@@ -24806,13 +24802,13 @@ impl Kaleidotron {
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Tool");
-                        egui::ComboBox::from_id_salt("ai_gen_tool")
+                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_tool")
                             .selected_text(&cur_tool)
                             .show_ui(ui, |ui| {
                                 for (i, n) in tool_names.iter().enumerate() {
                                     ui.selectable_value(&mut self.ai_gen_tool, i, n);
                                 }
-                            });
+                            }));
                         ui.end_row();
                         ui.label("Style");
                         let st = if self.ai_gen_style == 0 {
@@ -24820,7 +24816,7 @@ impl Kaleidotron {
                         } else {
                             styles.get(self.ai_gen_style - 1).map(|s| s.0.clone()).unwrap_or_default()
                         };
-                        egui::ComboBox::from_id_salt("ai_gen_style")
+                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_style")
                             .selected_text(st)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.ai_gen_style, 0, "(none)");
@@ -24829,7 +24825,7 @@ impl Kaleidotron {
                                         ui.selectable_value(&mut self.ai_gen_style, i + 1, name);
                                     }
                                 }
-                            });
+                            }));
                         ui.end_row();
                         ui.label("Preset");
                         let pt = if self.ai_gen_prompt_sel == 0 {
@@ -24838,7 +24834,7 @@ impl Kaleidotron {
                             prompts.get(self.ai_gen_prompt_sel - 1).map(|p| p.0.clone()).unwrap_or_default()
                         };
                         let mut load_preset: Option<String> = None;
-                        egui::ComboBox::from_id_salt("ai_gen_preset")
+                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_preset")
                             .selected_text(pt)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.ai_gen_prompt_sel, 0, "(none)");
@@ -24850,7 +24846,7 @@ impl Kaleidotron {
                                         load_preset = Some(text.clone());
                                     }
                                 }
-                            });
+                            }));
                         if let Some(t) = load_preset {
                             self.ai_gen_prompt = t;
                         }
@@ -24894,7 +24890,7 @@ impl Kaleidotron {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Size");
                     // Preset dropdown (editable list) — pick to apply.
-                    egui::ComboBox::from_id_salt("ai_gen_size")
+                    eat_scroll(egui::ComboBox::from_id_salt("ai_gen_size")
                         .selected_text(format!("{}×{}", self.ai_gen_w, self.ai_gen_h))
                         .show_ui(ui, |ui| {
                             for s in &sizes {
@@ -24909,7 +24905,7 @@ impl Kaleidotron {
                                     self.ai_gen_h = s[1];
                                 }
                             }
-                        });
+                        }));
                     let r = ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
                     wheel_adjust(ui, &r, &mut self.ai_gen_w, 1.0, 8, 4096);
                     ui.label("×");
@@ -26433,14 +26429,14 @@ impl Kaleidotron {
                                      then flows through the whole recolor stack + Save.",
                                 );
                                 let mut si = self.scale_algo as usize;
-                                let cr = egui::ComboBox::from_id_salt("scale_algo")
+                                let cr = eat_scroll(egui::ComboBox::from_id_salt("scale_algo")
                                     .selected_text(self.scale_algo.label())
                                     .show_ui(ui, |ui| {
                                         for (i, s) in crate::scale::Scaler::ALL.iter().enumerate() {
                                             ui.selectable_value(&mut si, i, s.label());
                                         }
-                                    });
-                                wheel_cycle(ui, &cr.response, &mut si, crate::scale::Scaler::ALL.len());
+                                    }));
+                                wheel_cycle(ui, &cr, &mut si, crate::scale::Scaler::ALL.len());
                                 self.scale_algo = crate::scale::Scaler::from_u8(si as u8);
                             });
                             ui.separator();
@@ -27140,13 +27136,13 @@ impl Kaleidotron {
                                     "Ring", "Ring ×2", "Sawtooth",
                                 ];
                                 let cur = fx.glow_contour.min(7) as usize;
-                                egui::ComboBox::from_id_salt("glow_contour")
+                                eat_scroll(egui::ComboBox::from_id_salt("glow_contour")
                                     .selected_text(NAMES[cur])
                                     .show_ui(ui, |ui| {
                                         for (i, n) in NAMES.iter().enumerate() {
                                             ui.selectable_value(&mut fx.glow_contour, i as u8, *n);
                                         }
-                                    });
+                                    }));
                             })
                             .response
                             .on_hover_text("Reshape the bloom falloff (Photoshop-style contour)");
@@ -27292,7 +27288,7 @@ impl Kaleidotron {
                     ui.horizontal(|ui| {
                         ui.label("Dither");
                         let mut m = self.dither_method as usize;
-                        let cr = egui::ComboBox::from_id_salt("dither_method")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("dither_method")
                             .selected_text(
                                 crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
                             )
@@ -27300,8 +27296,8 @@ impl Kaleidotron {
                                 for (i, name) in crate::thumb::DITHER_NAMES.iter().enumerate() {
                                     ui.selectable_value(&mut m, i, *name);
                                 }
-                            });
-                        wheel_cycle(ui, &cr.response, &mut m, crate::thumb::DITHER_NAMES.len());
+                            }));
+                        wheel_cycle(ui, &cr, &mut m, crate::thumb::DITHER_NAMES.len());
                         let prev = self.dither_method;
                         self.dither_method = m as u8;
                         // Usability: ANSI Shade draws in PALETTE colours, so with nothing
@@ -27453,7 +27449,7 @@ impl Kaleidotron {
                                 .and_then(|i| self.ansi_presets.get(i))
                                 .map(|p| p.name.clone());
                             let mut to_apply: Option<usize> = None;
-                            egui::ComboBox::from_id_salt("ansi_preset")
+                            eat_scroll(egui::ComboBox::from_id_salt("ansi_preset")
                                 .selected_text(sel_name.as_deref().unwrap_or("—"))
                                 .show_ui(ui, |ui| {
                                     if ui
@@ -27473,7 +27469,7 @@ impl Kaleidotron {
                                             to_apply = Some(i);
                                         }
                                     }
-                                });
+                                }));
                             if let Some(i) = to_apply {
                                 self.ansi_preset_sel = Some(i);
                                 let p = self.ansi_presets[i].clone();
@@ -27591,14 +27587,14 @@ impl Kaleidotron {
                                 "Tundra 24-bit (.tnd)",
                                 "REXPaint (.xp)",
                             ];
-                            let cr = egui::ComboBox::from_id_salt("shade_export_format")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("shade_export_format")
                                 .selected_text(FORMATS[f.min(6)])
                                 .show_ui(ui, |ui| {
                                     for (i, name) in FORMATS.iter().enumerate() {
                                         ui.selectable_value(&mut f, i, *name);
                                     }
-                                });
-                            wheel_cycle(ui, &cr.response, &mut f, FORMATS.len());
+                                }));
+                            wheel_cycle(ui, &cr, &mut f, FORMATS.len());
                             self.shade_export_format = f as u8;
                         });
                         // Fit-to-character-grid: force the working image to an exact
@@ -27768,7 +27764,7 @@ impl Kaleidotron {
                             let names = crate::decode::PETSCII_PALETTES;
                             let cur = (self.petscii_palette as usize).min(names.len() - 1);
                             let mut changed = false;
-                            egui::ComboBox::from_id_salt("petscii_pal")
+                            eat_scroll(egui::ComboBox::from_id_salt("petscii_pal")
                                 .selected_text(names[cur].0)
                                 .show_ui(ui, |ui| {
                                     for (i, (n, _)) in names.iter().enumerate() {
@@ -27779,7 +27775,7 @@ impl Kaleidotron {
                                             changed = true;
                                         }
                                     }
-                                });
+                                }));
                             // Only re-sync the C64 palette to the quantize selection when NOT using
                             // the selected palette (else it would fight the user's chosen palette).
                             if changed && !self.petscii_use_selected {
@@ -27829,7 +27825,7 @@ impl Kaleidotron {
                             ui.label("Export");
                             const F: [&str; 4] = [".petmate", ".seq", ".json", ".png"];
                             let cur = self.petscii_export_format.min(3) as usize;
-                            egui::ComboBox::from_id_salt("petscii_fmt")
+                            eat_scroll(egui::ComboBox::from_id_salt("petscii_fmt")
                                 .selected_text(F[cur])
                                 .show_ui(ui, |ui| {
                                     for (i, n) in F.iter().enumerate() {
@@ -27839,7 +27835,7 @@ impl Kaleidotron {
                                             *n,
                                         );
                                     }
-                                });
+                                }));
                             ui.weak("(use “Export textmode”)");
                         });
                         ui.horizontal(|ui| {
@@ -27881,7 +27877,7 @@ impl Kaleidotron {
                         // Render font: built-in CP437, any bundled REXPaint font, or a TTF/OTF.
                         ui.horizontal(|ui| {
                             ui.label("Font");
-                            egui::ComboBox::from_id_salt("ascii_font")
+                            eat_scroll(egui::ComboBox::from_id_salt("ascii_font")
                                 .selected_text(self.ascii_font_name())
                                 .width(180.0)
                                 .show_ui(ui, |ui| {
@@ -27897,7 +27893,7 @@ impl Kaleidotron {
                                             self.ascii_font = AsciiFont::Rex(i);
                                         }
                                     }
-                                });
+                                }));
                             if ui.button("TTF…").on_hover_text("Render with any .ttf/.otf font (rasterized CP437-ordered)").clicked() {
                                 if let Some(p) = rfd::FileDialog::new()
                                     .add_filter("Font", &["ttf", "otf", "ttc"])
@@ -28041,7 +28037,7 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label("Font");
                             let cur = self.rexfont_sel.min(crate::decode::rexfont::rexfont_count() - 1);
-                            egui::ComboBox::from_id_salt("rexfont_sel")
+                            eat_scroll(egui::ComboBox::from_id_salt("rexfont_sel")
                                 .selected_text(crate::decode::rexfont::rexfont_name(cur))
                                 .show_ui(ui, |ui| {
                                     for i in 0..crate::decode::rexfont::rexfont_count() {
@@ -28051,7 +28047,7 @@ impl Kaleidotron {
                                             crate::decode::rexfont::rexfont_name(i),
                                         );
                                     }
-                                });
+                                }));
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.bitfont_color, "Color")
@@ -28105,14 +28101,14 @@ impl Kaleidotron {
                             ui.horizontal(|ui| {
                                 ui.label("Font");
                                 let before = self.unicode_font.clone();
-                                egui::ComboBox::from_id_salt("uni_font")
+                                eat_scroll(egui::ComboBox::from_id_salt("uni_font")
                                     .selected_text(self.unicode_font_name())
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.unicode_font, UniFont::Pdv, "Perfect DOS VGA (crisp)")
                                             .on_hover_text("Pixel-perfect CP437 + Nerd Font icons. No Braille/Geometric.");
                                         ui.selectable_value(&mut self.unicode_font, UniFont::DejaVu, "DejaVu Sans (+Braille)")
                                             .on_hover_text("Wide Unicode coverage — Braille + Geometric Shapes.");
-                                    });
+                                    }));
                                 if ui.button("Browse…").on_hover_text("Use any .ttf/.otf font on disk").clicked() {
                                     if let Some(p) = rfd::FileDialog::new()
                                         .add_filter("Font", &["ttf", "otf", "ttc"])
@@ -31556,7 +31552,7 @@ impl Kaleidotron {
                         want_recolor = self.gif_recolor;
                         ui.checkbox(&mut want_recolor, "Recolor")
                             .on_hover_text("Run the Recolor / PixelFX stack on every frame");
-                        egui::ComboBox::from_id_salt("gif_speed")
+                        eat_scroll(egui::ComboBox::from_id_salt("gif_speed")
                             .selected_text(format!("{speed}×"))
                             .width(64.0)
                             .show_ui(ui, |ui| {
@@ -31565,7 +31561,7 @@ impl Kaleidotron {
                                         want_speed = Some(v);
                                     }
                                 }
-                            });
+                            }));
                         if ui
                             .button(format!("{} PNG", icons::DOWNLOAD))
                             .on_hover_text("Save this frame beside the GIF (recoloured if on)")
@@ -31680,7 +31676,7 @@ impl Kaleidotron {
                     sheets,
                     names.get(sheet).map(String::as_str).unwrap_or("")
                 );
-                egui::ComboBox::from_id_salt("xmind_sheet_picker")
+                eat_scroll(egui::ComboBox::from_id_salt("xmind_sheet_picker")
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         for (i, name) in names.iter().enumerate() {
@@ -31691,7 +31687,7 @@ impl Kaleidotron {
                                 goto = Some(i);
                             }
                         }
-                    });
+                    }));
                 if ui
                     .add_enabled(sheet + 1 < sheets, egui::Button::new("Next ➡"))
                     .clicked()
@@ -31719,7 +31715,7 @@ impl Kaleidotron {
                 if ui.add_enabled(index > 0, egui::Button::new("⬅ Prev")).clicked() {
                     goto = Some(index.saturating_sub(1));
                 }
-                egui::ComboBox::from_id_salt("ico_image_picker")
+                eat_scroll(egui::ComboBox::from_id_salt("ico_image_picker")
                     .selected_text(format!("Image {} / {}: {}", index + 1, n, labels.get(index).cloned().unwrap_or_default()))
                     .show_ui(ui, |ui| {
                         for (i, lab) in labels.iter().enumerate() {
@@ -31727,7 +31723,7 @@ impl Kaleidotron {
                                 goto = Some(i);
                             }
                         }
-                    });
+                    }));
                 if ui.add_enabled(index + 1 < n, egui::Button::new("Next ➡")).clicked() {
                     goto = Some(index + 1);
                 }
@@ -31786,14 +31782,13 @@ impl Kaleidotron {
                             }
                             // Baud picker, right by the transport controls: simulate a modem
                             // typing the art out. RIP and ANSI keep separate remembered speeds.
-                            egui::ComboBox::from_id_salt("baud_pick")
+                            eat_scroll(egui::ComboBox::from_id_salt("baud_pick")
                                 .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
                                 .show_ui(ui, |ui| {
                                     for b in Baud::ALL {
                                         ui.selectable_value(&mut baud_choice, b, b.label());
                                     }
-                                })
-                                .response
+                                }))
                                 .on_hover_text(
                                     "Simulated modem baud rate — replay the art as it would have \
                                  typed out over a dial-up connection (None = instant). RIP and \
@@ -33061,7 +33056,7 @@ impl Kaleidotron {
                 want_save = true;
             }
             if !self.saved_compares.is_empty() {
-                egui::ComboBox::from_id_salt("compare_recall")
+                eat_scroll(egui::ComboBox::from_id_salt("compare_recall")
                     .selected_text("Recall ▾")
                     .show_ui(ui, |ui| {
                         for i in 0..self.saved_compares.len() {
@@ -33075,7 +33070,7 @@ impl Kaleidotron {
                                 }
                             });
                         }
-                    });
+                    }));
             }
         });
         ui.separator();
@@ -35875,7 +35870,7 @@ impl Kaleidotron {
                 // was read AS is part of reading it, and a file that decodes cleanly as UTF-8 can
                 // still be a CP437 file that happens to contain only ASCII.
                 let enc = self.text_enc;
-                egui::ComboBox::from_id_salt("text_enc")
+                eat_scroll(egui::ComboBox::from_id_salt("text_enc")
                     .selected_text(enc.label())
                     .width(84.0)
                     .show_ui(ui, |ui| {
@@ -35884,8 +35879,7 @@ impl Kaleidotron {
                                 want_enc = Some(e);
                             }
                         }
-                    })
-                    .response
+                    }))
                     .on_hover_text("Re-read this file as a different code page");
                 // The project's own build/run commands, straight from its .vscode/tasks.json.
                 // Hidden entirely when the folder has none, so it costs nothing everywhere else.
@@ -36575,7 +36569,7 @@ impl Kaleidotron {
                                     } else {
                                         crate::decode::rexfont::rexfont_name(sel - 1).to_string()
                                     };
-                                    egui::ComboBox::from_id_salt("xp_view_font")
+                                    eat_scroll(egui::ComboBox::from_id_salt("xp_view_font")
                                         .selected_text(cur_name)
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(&mut sel, 0, "VGA (default)");
@@ -36586,7 +36580,7 @@ impl Kaleidotron {
                                                     crate::decode::rexfont::rexfont_name(i),
                                                 );
                                             }
-                                        });
+                                        }));
                                     ui.label("view font")
                                         .on_hover_text("Render this .xp in a bundled REXPaint font");
                                     if sel != self.xp_view_font {
@@ -37941,13 +37935,13 @@ impl Kaleidotron {
                                 .response;
                             combo_wheel(ui, &cr, &mut self.lospec_sort, SORTS.len());
                             const CF: [&str; 4] = ["Any #", "Max", "Min", "Exact"];
-                            egui::ComboBox::from_id_salt("pal_cf")
+                            eat_scroll(egui::ComboBox::from_id_salt("pal_cf")
                                 .selected_text(CF[self.lospec_cfilter.min(3)])
                                 .show_ui(ui, |ui| {
                                     for (i, s) in CF.iter().enumerate() {
                                         ui.selectable_value(&mut self.lospec_cfilter, i, *s);
                                     }
-                                });
+                                }));
                             if self.lospec_cfilter != 0 {
                                 let r = ui.add(egui::DragValue::new(&mut self.lospec_cn).range(1..=256));
                                 wheel_adjust(ui, &r, &mut self.lospec_cn, 1.0, 1, 256);
@@ -38032,7 +38026,7 @@ impl Kaleidotron {
                         // Lospec Gallery: Medium / Category / Sorting / Time / tag / masterpiece → Browse.
                         use crate::lospec_gallery as g;
                         let mut gallery_go = false;
-                        egui::ComboBox::from_id_salt("gal_medium")
+                        eat_scroll(egui::ComboBox::from_id_salt("gal_medium")
                             .selected_text(g::MEDIUMS.get(self.gallery_medium).map_or("All", |m| m.1))
                             .show_ui(ui, |ui| {
                                 for (i, (_, label)) in g::MEDIUMS.iter().enumerate() {
@@ -38041,7 +38035,7 @@ impl Kaleidotron {
                                         self.gallery_category = "all".to_string();
                                     }
                                 }
-                            });
+                            }));
                         // Category (depends on the selected medium; hidden for mediums with none).
                         let medium_slug = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
                         let cats = g::categories_for(medium_slug);
@@ -38050,7 +38044,7 @@ impl Kaleidotron {
                                 .iter()
                                 .find(|(s, _)| *s == self.gallery_category)
                                 .map_or("All", |(_, l)| *l);
-                            egui::ComboBox::from_id_salt("gal_cat")
+                            eat_scroll(egui::ComboBox::from_id_salt("gal_cat")
                                 .selected_text(cur)
                                 .show_ui(ui, |ui| {
                                     for (slug, label) in cats {
@@ -38058,23 +38052,23 @@ impl Kaleidotron {
                                             self.gallery_category = slug.to_string();
                                         }
                                     }
-                                });
+                                }));
                         }
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("gal_sort")
+                            eat_scroll(egui::ComboBox::from_id_salt("gal_sort")
                                 .selected_text(g::SORTINGS.get(self.gallery_sorting).map_or("Latest", |s| s.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in g::SORTINGS.iter().enumerate() {
                                         ui.selectable_value(&mut self.gallery_sorting, i, *label);
                                     }
-                                });
-                            egui::ComboBox::from_id_salt("gal_time")
+                                }));
+                            eat_scroll(egui::ComboBox::from_id_salt("gal_time")
                                 .selected_text(g::TIMES.get(self.gallery_time).map_or("All", |t| t.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in g::TIMES.iter().enumerate() {
                                         ui.selectable_value(&mut self.gallery_time, i, *label);
                                     }
-                                });
+                                }));
                         });
                         ui.horizontal(|ui| {
                             ui.add(
@@ -44457,6 +44451,18 @@ fn middle_reset<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, v
     if hit || dbl {
         *v = def;
     }
+}
+
+/// Consume the mouse-wheel while the pointer is over a ComboBox (any input), so it can't scroll the
+/// panel behind it — the same "gobble every hovered frame" rule as `wheel_adjust`, but field-
+/// agnostic. Takes the combo's `InnerResponse` (so there's no `ui` arg to fight the closure's own
+/// `ui` borrow) and returns its `.response`, so it wraps a call inline:
+/// `eat_scroll(ComboBox::…show_ui(ui, |ui| {..})).on_hover_text(..)`.
+fn eat_scroll<T>(ir: egui::InnerResponse<T>) -> egui::Response {
+    if ir.response.contains_pointer() {
+        ir.response.ctx.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+    }
+    ir.response
 }
 
 /// Wheel-cycle a ComboBox's selection: hovering the (closed) combo and scrolling steps the numeric
@@ -55549,7 +55555,7 @@ impl Kaleidotron {
                     // LEFT
                     pref_card(&mut c[0], "Theme", accent, |ui| {
                         let mut pick: Option<String> = None;
-                        egui::ComboBox::from_id_salt("theme_pick")
+                        eat_scroll(egui::ComboBox::from_id_salt("theme_pick")
                             .selected_text(if self.theme_name.trim().is_empty() {
                                 "Built-in".to_string()
                             } else {
@@ -55571,7 +55577,7 @@ impl Kaleidotron {
                                         pick = Some(t.name.clone());
                                     }
                                 }
-                            });
+                            }));
                         ui.horizontal(|ui| {
                             if ui.small_button("Reload themes").clicked() {
                                 self.themes = crate::theme::load_all(&self.themes_dir);
@@ -55781,13 +55787,13 @@ impl Kaleidotron {
                     });
                     pref_card(&mut c[0], "Text-mode (ANSI/scene) zoom", accent, |ui| {
                         let mut tz = self.textmode_zoom.round() as i32;
-                        egui::ComboBox::from_id_salt("textmode_zoom")
+                        eat_scroll(egui::ComboBox::from_id_salt("textmode_zoom")
                             .selected_text(format!("{tz}×"))
                             .show_ui(ui, |ui| {
                                 for n in [1, 2, 3, 4, 5, 6, 8] {
                                     ui.selectable_value(&mut tz, n, format!("{n}×"));
                                 }
-                            });
+                            }));
                         if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
                             self.textmode_zoom = tz as f32;
                             if self.viewing_textmode && !self.fit_mode {
@@ -56068,7 +56074,7 @@ impl Kaleidotron {
                                     0 => "Best".to_string(),
                                     h => format!("{h}p"),
                                 };
-                                egui::ComboBox::from_id_salt("yt_quality")
+                                eat_scroll(egui::ComboBox::from_id_salt("yt_quality")
                                     .selected_text(cur)
                                     .show_ui(ui, |ui| {
                                         for (lbl, h) in [
@@ -56081,7 +56087,7 @@ impl Kaleidotron {
                                         ] {
                                             ui.selectable_value(&mut self.yt_max_height, h, lbl);
                                         }
-                                    });
+                                    }));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Cookies");
@@ -56090,7 +56096,7 @@ impl Kaleidotron {
                                 } else {
                                     self.yt_cookies_browser.clone()
                                 };
-                                egui::ComboBox::from_id_salt("yt_cookies")
+                                eat_scroll(egui::ComboBox::from_id_salt("yt_cookies")
                                     .selected_text(cur)
                                     .show_ui(ui, |ui| {
                                         for b in [
@@ -56104,7 +56110,7 @@ impl Kaleidotron {
                                                 lbl,
                                             );
                                         }
-                                    });
+                                    }));
                             });
                             ui.weak(
                                 "Pick your browser if YouTube says \"confirm you're not a bot\" or a \
@@ -57130,15 +57136,15 @@ mod gui_tests {
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, s: &mut S| {
                 let names = ["a", "b", "c", "d"];
-                let cr = egui::ComboBox::from_id_salt("t")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("t")
                     .selected_text(names[s.idx])
                     .show_ui(ui, |ui| {
                         for (i, n) in names.iter().enumerate() {
                             ui.selectable_value(&mut s.idx, i, *n);
                         }
-                    });
-                s.rect = cr.response.rect;
-                wheel_cycle(ui, &cr.response, &mut s.idx, names.len());
+                    }));
+                s.rect = cr.rect;
+                wheel_cycle(ui, &cr, &mut s.idx, names.len());
             },
             S {
                 idx: 1,
