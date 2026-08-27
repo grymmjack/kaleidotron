@@ -44399,6 +44399,12 @@ fn wheel_adjust<N: egui::emath::Numeric>(
     if !resp.contains_pointer() {
         return false;
     }
+    // GOBBLE the scroll EVERY frame the pointer is over the control, not just the notch frame:
+    // `smooth_scroll_delta` is animated for several frames after one wheel notch, and the enclosing
+    // ScrollArea reads it each of those frames — so consuming only on the notch frame lets the
+    // residual leak through and scroll the panel behind the input. Zeroing while hovered keeps the
+    // wheel on the control and off the panel (the panel still scrolls over its bar / empty areas).
+    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
     let (notches, shift) = ui.input(|i| {
         // Discrete wheel events (not the smoothed delta) → one step per notch.
         let dy: f32 = i
@@ -44412,7 +44418,6 @@ fn wheel_adjust<N: egui::emath::Numeric>(
         (dy, i.modifiers.shift)
     });
     if notches != 0.0 {
-        ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0); // consume the scroll
         let mult = if shift { 10.0 } else { 1.0 };
         let nv =
             (v.to_f64() + notches.signum() as f64 * step * mult).clamp(lo.to_f64(), hi.to_f64());
@@ -44464,7 +44469,14 @@ fn combo_wheel<N: egui::emath::Numeric>(
     idx: &mut N,
     count: usize,
 ) -> bool {
-    if count < 2 || !resp.contains_pointer() {
+    if !resp.contains_pointer() {
+        return false;
+    }
+    // Gobble the scroll every frame while hovered (see the note in `wheel_adjust`) so the smoothed
+    // residual can't scroll the panel behind the combo. Do this even when `count < 2` — a 1-option
+    // combo still shouldn't let the wheel fall through to the panel.
+    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+    if count < 2 {
         return false;
     }
     let notches = ui.input(|i| {
@@ -44480,7 +44492,6 @@ fn combo_wheel<N: egui::emath::Numeric>(
         return false;
     }
     let shift = ui.input(|i| i.modifiers.shift);
-    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
     // Scroll UP = previous option (toward the top of the list), like every other list.
     let step = if shift { 10isize } else { 1 } * if notches < 0.0 { 1 } else { -1 };
     let cur = idx.to_f64() as isize;
