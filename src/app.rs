@@ -14,6 +14,15 @@ use std::time::SystemTime;
 
 const THUMB_PX: u32 = 512; // max thumbnail dimension; smaller art is kept at source res
 const DEFAULT_TILE: f32 = 140.0; // default tile box (square) in points — the "100%" thumbnail size
+// Preset UI text scales (label %, scale factor) for Preferences → Appearance → Interface.
+const FONT_SCALE_PRESETS: &[(u32, f32)] = &[
+    (80, 0.8),
+    (100, 1.0),
+    (120, 1.2),
+    (133, 1.3333),
+    (150, 1.5),
+    (200, 2.0),
+];
 const MIN_TILE: f32 = 56.0;
 const MAX_TILE: f32 = 640.0; // zoom thumbnails further than Gwenview, toward Dolphin
 const GAP: f32 = 10.0; // default horizontal gap between grid tiles, in points
@@ -55451,18 +55460,19 @@ impl Kaleidotron {
                         }
                     });
                     pref_card(&mut c[0], "Interface", accent, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Text size");
-                            let r = ui.add(
-                                egui::Slider::new(&mut self.ui_font_scale, 0.6..=2.5)
-                                    .step_by(0.05)
-                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                            );
-                            if r.changed() {
-                                self.apply_font_scale(ctx);
+                            // Preset scales (the % each row shows). The current value is "on" when it
+                            // matches within a small epsilon, so a persisted 1.333 lights up "133%".
+                            let mut apply: Option<f32> = None;
+                            for &(pct, scale) in FONT_SCALE_PRESETS {
+                                let on = (self.ui_font_scale - scale).abs() < 0.005;
+                                if ui.selectable_label(on, format!("{pct}%")).clicked() {
+                                    apply = Some(scale);
+                                }
                             }
-                            if ui.small_button("Reset").clicked() {
-                                self.ui_font_scale = 1.0;
+                            if let Some(s) = apply {
+                                self.ui_font_scale = s;
                                 self.apply_font_scale(ctx);
                             }
                         });
