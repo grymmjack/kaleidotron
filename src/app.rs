@@ -15781,7 +15781,7 @@ impl Kaleidotron {
                                     .max_decimals(1),
                             );
                             wheel_adjust(ui, &r, &mut self.bpm, 1.0, 20.0, 300.0);
-                            egui::ComboBox::from_id_salt("env_grid_div")
+                            let cr = egui::ComboBox::from_id_salt("env_grid_div")
                                 .selected_text(
                                     BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].0,
                                 )
@@ -15790,7 +15790,9 @@ impl Kaleidotron {
                                     for (di, (name, _)) in BEAT_DIVS.iter().enumerate() {
                                         ui.selectable_value(&mut self.musical_div, di as u8, *name);
                                     }
-                                });
+                                })
+                                .response;
+                            combo_wheel(ui, &cr, &mut self.musical_div, BEAT_DIVS.len());
                         }
                     });
                     // LFO for the CURRENT target (tremolo / vibrato / filter wobble) — shown while
@@ -15804,18 +15806,20 @@ impl Kaleidotron {
                                  filter wobble). Tempo-syncs to the BPM when Sync is on.",
                             );
                             if l.on {
-                                egui::ComboBox::from_id_salt("lfo_wave")
+                                let cr = egui::ComboBox::from_id_salt("lfo_wave")
                                     .selected_text(LFO_WAVES[(l.wave as usize).min(5)])
                                     .width(66.0)
                                     .show_ui(ui, |ui| {
                                         for (wi, name) in LFO_WAVES.iter().enumerate() {
                                             ui.selectable_value(&mut l.wave, wi as u8, *name);
                                         }
-                                    });
+                                    })
+                                    .response;
+                                combo_wheel(ui, &cr, &mut l.wave, LFO_WAVES.len());
                                 ui.checkbox(&mut l.sync, "Sync")
                                     .on_hover_text("Lock the rate to the BPM (beat divisions)");
                                 if l.sync {
-                                    egui::ComboBox::from_id_salt("lfo_div")
+                                    let cr = egui::ComboBox::from_id_salt("lfo_div")
                                         .selected_text(
                                             BEAT_DIVS
                                                 [(l.sync_div as usize).min(BEAT_DIVS.len() - 1)]
@@ -15830,7 +15834,9 @@ impl Kaleidotron {
                                                     *name,
                                                 );
                                             }
-                                        });
+                                        })
+                                        .response;
+                                    combo_wheel(ui, &cr, &mut l.sync_div, BEAT_DIVS.len());
                                 } else {
                                     ui.weak("Rate");
                                     let r = ui.add(
@@ -17037,7 +17043,7 @@ impl Kaleidotron {
                         self.musical_on = m_on;
                     }
                     if self.musical_on {
-                        egui::ComboBox::from_id_salt("musical_div")
+                        let cr = egui::ComboBox::from_id_salt("musical_div")
                             .selected_text(
                                 BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].0,
                             )
@@ -17046,7 +17052,9 @@ impl Kaleidotron {
                                 for (i, (name, _)) in BEAT_DIVS.iter().enumerate() {
                                     ui.selectable_value(&mut self.musical_div, i as u8, *name);
                                 }
-                            });
+                            })
+                            .response;
+                        combo_wheel(ui, &cr, &mut self.musical_div, BEAT_DIVS.len());
                     }
                     ui.weak("BPM");
                     let r = ui.add(
@@ -37923,13 +37931,15 @@ impl Kaleidotron {
                         let mut pal_go = false;
                         ui.horizontal(|ui| {
                             const SORTS: [&str; 4] = ["Default", "A-Z", "Downloads", "Newest"];
-                            egui::ComboBox::from_id_salt("pal_sort")
+                            let cr = egui::ComboBox::from_id_salt("pal_sort")
                                 .selected_text(SORTS[self.lospec_sort.min(3)])
                                 .show_ui(ui, |ui| {
                                     for (i, s) in SORTS.iter().enumerate() {
                                         ui.selectable_value(&mut self.lospec_sort, i, *s);
                                     }
-                                });
+                                })
+                                .response;
+                            combo_wheel(ui, &cr, &mut self.lospec_sort, SORTS.len());
                             const CF: [&str; 4] = ["Any #", "Max", "Min", "Exact"];
                             egui::ComboBox::from_id_salt("pal_cf")
                                 .selected_text(CF[self.lospec_cfilter.min(3)])
@@ -38110,13 +38120,15 @@ impl Kaleidotron {
                         }
                         let mut da_go = false;
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("da_facet")
+                            let cr = egui::ComboBox::from_id_salt("da_facet")
                                 .selected_text(da::FACETS.get(self.da_facet).map_or("Daily Deviations", |f| f.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in da::FACETS.iter().enumerate() {
                                         ui.selectable_value(&mut self.da_facet, i, *label);
                                     }
-                                });
+                                })
+                                .response;
+                            combo_wheel(ui, &cr, &mut self.da_facet, da::FACETS.len());
                             // Tag/Topic search by name; Daily/Home take no query (DeviantArt's API has
                             // no general keyword search — Tag is the keyword path).
                             let needs_q = matches!(self.da_facet, 2 | 3);
@@ -44440,6 +44452,44 @@ fn middle_reset<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, v
     if hit || dbl {
         *v = def;
     }
+}
+
+/// Wheel-cycle a ComboBox's selection: hovering the (closed) combo and scrolling steps the numeric
+/// index by ±1 (Shift = ±10), wrapped to `count` options. `resp` is the combo's `.response`; `idx`
+/// is the selected index/enum-discriminant field. Returns whether it changed. Double-click still
+/// opens the dropdown (egui default).
+fn combo_wheel<N: egui::emath::Numeric>(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    idx: &mut N,
+    count: usize,
+) -> bool {
+    if count < 2 || !resp.contains_pointer() {
+        return false;
+    }
+    let notches = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                _ => None,
+            })
+            .sum::<f32>()
+    });
+    if notches == 0.0 {
+        return false;
+    }
+    let shift = ui.input(|i| i.modifiers.shift);
+    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+    // Scroll UP = previous option (toward the top of the list), like every other list.
+    let step = if shift { 10isize } else { 1 } * if notches < 0.0 { 1 } else { -1 };
+    let cur = idx.to_f64() as isize;
+    let new = (cur + step).rem_euclid(count as isize);
+    if new != cur {
+        *idx = N::from_f64(new as f64);
+        return true;
+    }
+    false
 }
 
 /// Both slider affordances in one call for a plain `ui.add(Slider::new(..))`: double/middle-click
@@ -55770,13 +55820,15 @@ impl Kaleidotron {
                                 ui.label("Size");
                                 let size_label =
                                     ["Small", "Medium", "Large"][self.transp_checker_size.min(2) as usize];
-                                egui::ComboBox::from_id_salt("transp_checker_size")
+                                let cr = egui::ComboBox::from_id_salt("transp_checker_size")
                                     .selected_text(size_label)
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.transp_checker_size, 0, "Small");
                                         ui.selectable_value(&mut self.transp_checker_size, 1, "Medium");
                                         ui.selectable_value(&mut self.transp_checker_size, 2, "Large");
-                                    });
+                                    })
+                                    .response;
+                                combo_wheel(ui, &cr, &mut self.transp_checker_size, 3);
                                 ui.label("Colors");
                                 ui.color_edit_button_srgb(&mut self.transp_checker_a);
                                 ui.color_edit_button_srgb(&mut self.transp_checker_b);
@@ -55964,13 +56016,15 @@ impl Kaleidotron {
                             );
                         ui.horizontal(|ui| {
                             ui.label("Machine");
-                            egui::ComboBox::from_id_salt("dosbox_machine")
+                            let cr = egui::ComboBox::from_id_salt("dosbox_machine")
                                 .selected_text(DOSBOX_MACHINES[self.dosbox_machine].0)
                                 .show_ui(ui, |ui| {
                                     for (i, (label, ..)) in DOSBOX_MACHINES.iter().enumerate() {
                                         ui.selectable_value(&mut self.dosbox_machine, i, *label);
                                     }
-                                });
+                                })
+                                .response;
+                            combo_wheel(ui, &cr, &mut self.dosbox_machine, DOSBOX_MACHINES.len());
                         })
                         .response
                         .on_hover_text(
