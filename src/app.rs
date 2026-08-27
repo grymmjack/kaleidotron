@@ -31688,7 +31688,7 @@ impl Kaleidotron {
                         want_recolor = self.gif_recolor;
                         ui.checkbox(&mut want_recolor, "Recolor")
                             .on_hover_text("Run the Recolor / PixelFX stack on every frame");
-                        eat_scroll(egui::ComboBox::from_id_salt("gif_speed")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("gif_speed")
                             .selected_text(format!("{speed}×"))
                             .width(64.0)
                             .show_ui(ui, |ui| {
@@ -31698,6 +31698,12 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        let step = combo_scroll_step(ui, &cr);
+                        if step != 0 {
+                            const SP: [f32; 6] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0];
+                            let cur = SP.iter().position(|v| speed == *v).unwrap_or(2);
+                            want_speed = Some(SP[(cur as isize + step).rem_euclid(SP.len() as isize) as usize]);
+                        }
                         if ui
                             .button(format!("{} PNG", icons::DOWNLOAD))
                             .on_hover_text("Save this frame beside the GIF (recoloured if on)")
@@ -31812,7 +31818,7 @@ impl Kaleidotron {
                     sheets,
                     names.get(sheet).map(String::as_str).unwrap_or("")
                 );
-                eat_scroll(egui::ComboBox::from_id_salt("xmind_sheet_picker")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("xmind_sheet_picker")
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         for (i, name) in names.iter().enumerate() {
@@ -31824,6 +31830,10 @@ impl Kaleidotron {
                             }
                         }
                     }));
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 && sheets > 0 {
+                    goto = Some((sheet as isize + step).rem_euclid(sheets as isize) as usize);
+                }
                 if ui
                     .add_enabled(sheet + 1 < sheets, egui::Button::new("Next ➡"))
                     .clicked()
@@ -31851,7 +31861,7 @@ impl Kaleidotron {
                 if ui.add_enabled(index > 0, egui::Button::new("⬅ Prev")).clicked() {
                     goto = Some(index.saturating_sub(1));
                 }
-                eat_scroll(egui::ComboBox::from_id_salt("ico_image_picker")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("ico_image_picker")
                     .selected_text(format!("Image {} / {}: {}", index + 1, n, labels.get(index).cloned().unwrap_or_default()))
                     .show_ui(ui, |ui| {
                         for (i, lab) in labels.iter().enumerate() {
@@ -31860,6 +31870,10 @@ impl Kaleidotron {
                             }
                         }
                     }));
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 && n > 0 {
+                    goto = Some((index as isize + step).rem_euclid(n as isize) as usize);
+                }
                 if ui.add_enabled(index + 1 < n, egui::Button::new("Next ➡")).clicked() {
                     goto = Some(index + 1);
                 }
@@ -31918,7 +31932,7 @@ impl Kaleidotron {
                             }
                             // Baud picker, right by the transport controls: simulate a modem
                             // typing the art out. RIP and ANSI keep separate remembered speeds.
-                            eat_scroll(egui::ComboBox::from_id_salt("baud_pick")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("baud_pick")
                                 .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
                                 .show_ui(ui, |ui| {
                                     for b in Baud::ALL {
@@ -31930,6 +31944,7 @@ impl Kaleidotron {
                                  typed out over a dial-up connection (None = instant). RIP and \
                                  ANSI keep separate speeds.",
                                 );
+                            combo_wheel_list(ui, &cr, &mut baud_choice, &Baud::ALL);
                             let mut pos = p.pos;
                             let r = ui.add(egui::Slider::new(&mut pos, 0..=len).text("byte"));
                             let ch = slider_extras(ui, &r, &mut pos, 0, 1.0, 0, len);
@@ -36006,7 +36021,7 @@ impl Kaleidotron {
                 // was read AS is part of reading it, and a file that decodes cleanly as UTF-8 can
                 // still be a CP437 file that happens to contain only ASCII.
                 let enc = self.text_enc;
-                eat_scroll(egui::ComboBox::from_id_salt("text_enc")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("text_enc")
                     .selected_text(enc.label())
                     .width(84.0)
                     .show_ui(ui, |ui| {
@@ -36017,6 +36032,15 @@ impl Kaleidotron {
                         }
                     }))
                     .on_hover_text("Re-read this file as a different code page");
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 {
+                    let all = crate::decode::Encoding::ALL;
+                    let cur = all.iter().position(|e| *e == enc).unwrap_or(0);
+                    let ne = all[(cur as isize + step).rem_euclid(all.len() as isize) as usize];
+                    if ne != enc {
+                        want_enc = Some(ne);
+                    }
+                }
                 // The project's own build/run commands, straight from its .vscode/tasks.json.
                 // Hidden entirely when the folder has none, so it costs nothing everywhere else.
                 if !self.tasks.is_empty() {
@@ -36705,7 +36729,7 @@ impl Kaleidotron {
                                     } else {
                                         crate::decode::rexfont::rexfont_name(sel - 1).to_string()
                                     };
-                                    eat_scroll(egui::ComboBox::from_id_salt("xp_view_font")
+                                    let cr = eat_scroll(egui::ComboBox::from_id_salt("xp_view_font")
                                         .selected_text(cur_name)
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(&mut sel, 0, "VGA (default)");
@@ -36717,6 +36741,7 @@ impl Kaleidotron {
                                                 );
                                             }
                                         }));
+                                    combo_wheel(ui, &cr, &mut sel, crate::decode::rexfont::rexfont_count() + 1);
                                     ui.label("view font")
                                         .on_hover_text("Render this .xp in a bundled REXPaint font");
                                     if sel != self.xp_view_font {
@@ -38163,7 +38188,7 @@ impl Kaleidotron {
                         // Lospec Gallery: Medium / Category / Sorting / Time / tag / masterpiece → Browse.
                         use crate::lospec_gallery as g;
                         let mut gallery_go = false;
-                        eat_scroll(egui::ComboBox::from_id_salt("gal_medium")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("gal_medium")
                             .selected_text(g::MEDIUMS.get(self.gallery_medium).map_or("All", |m| m.1))
                             .show_ui(ui, |ui| {
                                 for (i, (_, label)) in g::MEDIUMS.iter().enumerate() {
@@ -38173,6 +38198,9 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        if combo_wheel(ui, &cr, &mut self.gallery_medium, g::MEDIUMS.len()) {
+                            self.gallery_category = "all".to_string();
+                        }
                         // Category (depends on the selected medium; hidden for mediums with none).
                         let medium_slug = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
                         let cats = g::categories_for(medium_slug);
@@ -38181,7 +38209,7 @@ impl Kaleidotron {
                                 .iter()
                                 .find(|(s, _)| *s == self.gallery_category)
                                 .map_or("All", |(_, l)| *l);
-                            eat_scroll(egui::ComboBox::from_id_salt("gal_cat")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("gal_cat")
                                 .selected_text(cur)
                                 .show_ui(ui, |ui| {
                                     for (slug, label) in cats {
@@ -38190,22 +38218,33 @@ impl Kaleidotron {
                                         }
                                     }
                                 }));
+                            let step = combo_scroll_step(ui, &cr);
+                            if step != 0 && cats.len() > 1 {
+                                let c = cats
+                                    .iter()
+                                    .position(|(s, _)| *s == self.gallery_category)
+                                    .unwrap_or(0);
+                                self.gallery_category =
+                                    cats[(c as isize + step).rem_euclid(cats.len() as isize) as usize].0.to_string();
+                            }
                         }
                         ui.horizontal(|ui| {
-                            eat_scroll(egui::ComboBox::from_id_salt("gal_sort")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("gal_sort")
                                 .selected_text(g::SORTINGS.get(self.gallery_sorting).map_or("Latest", |s| s.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in g::SORTINGS.iter().enumerate() {
                                         ui.selectable_value(&mut self.gallery_sorting, i, *label);
                                     }
                                 }));
-                            eat_scroll(egui::ComboBox::from_id_salt("gal_time")
+                            combo_wheel(ui, &cr, &mut self.gallery_sorting, g::SORTINGS.len());
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("gal_time")
                                 .selected_text(g::TIMES.get(self.gallery_time).map_or("All", |t| t.1))
                                 .show_ui(ui, |ui| {
                                     for (i, (_, label)) in g::TIMES.iter().enumerate() {
                                         ui.selectable_value(&mut self.gallery_time, i, *label);
                                     }
                                 }));
+                            combo_wheel(ui, &cr, &mut self.gallery_time, g::TIMES.len());
                         });
                         ui.horizontal(|ui| {
                             ui.add(
@@ -55752,7 +55791,7 @@ impl Kaleidotron {
                     // LEFT
                     pref_card(&mut c[0], "Theme", accent, |ui| {
                         let mut pick: Option<String> = None;
-                        eat_scroll(egui::ComboBox::from_id_salt("theme_pick")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("theme_pick")
                             .selected_text(if self.theme_name.trim().is_empty() {
                                 "Built-in".to_string()
                             } else {
@@ -55775,6 +55814,26 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        // Cycle through [Built-in, theme0, theme1, …]; applied via `pick` below.
+                        let step = combo_scroll_step(ui, &cr);
+                        if step != 0 {
+                            let n = self.themes.len() as isize + 1;
+                            let cur = if self.theme_name.is_empty() {
+                                0isize
+                            } else {
+                                self.themes
+                                    .iter()
+                                    .position(|t| t.name == self.theme_name)
+                                    .map(|i| i as isize + 1)
+                                    .unwrap_or(0)
+                            };
+                            let ni = (cur + step).rem_euclid(n);
+                            pick = Some(if ni == 0 {
+                                String::new()
+                            } else {
+                                self.themes[(ni - 1) as usize].name.clone()
+                            });
+                        }
                         ui.horizontal(|ui| {
                             if ui.small_button("Reload themes").clicked() {
                                 self.themes = crate::theme::load_all(&self.themes_dir);
@@ -55984,13 +56043,14 @@ impl Kaleidotron {
                     });
                     pref_card(&mut c[0], "Text-mode (ANSI/scene) zoom", accent, |ui| {
                         let mut tz = self.textmode_zoom.round() as i32;
-                        eat_scroll(egui::ComboBox::from_id_salt("textmode_zoom")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("textmode_zoom")
                             .selected_text(format!("{tz}×"))
                             .show_ui(ui, |ui| {
                                 for n in [1, 2, 3, 4, 5, 6, 8] {
                                     ui.selectable_value(&mut tz, n, format!("{n}×"));
                                 }
                             }));
+                        combo_wheel_list(ui, &cr, &mut tz, &[1, 2, 3, 4, 5, 6, 8]);
                         if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
                             self.textmode_zoom = tz as f32;
                             if self.viewing_textmode && !self.fit_mode {
@@ -56271,7 +56331,7 @@ impl Kaleidotron {
                                     0 => "Best".to_string(),
                                     h => format!("{h}p"),
                                 };
-                                eat_scroll(egui::ComboBox::from_id_salt("yt_quality")
+                                let cr = eat_scroll(egui::ComboBox::from_id_salt("yt_quality")
                                     .selected_text(cur)
                                     .show_ui(ui, |ui| {
                                         for (lbl, h) in [
@@ -56285,6 +56345,7 @@ impl Kaleidotron {
                                             ui.selectable_value(&mut self.yt_max_height, h, lbl);
                                         }
                                     }));
+                                combo_wheel_list(ui, &cr, &mut self.yt_max_height, &[480, 720, 1080, 1440, 2160, 0]);
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Cookies");
@@ -56293,7 +56354,7 @@ impl Kaleidotron {
                                 } else {
                                     self.yt_cookies_browser.clone()
                                 };
-                                eat_scroll(egui::ComboBox::from_id_salt("yt_cookies")
+                                let cr = eat_scroll(egui::ComboBox::from_id_salt("yt_cookies")
                                     .selected_text(cur)
                                     .show_ui(ui, |ui| {
                                         for b in [
@@ -56308,6 +56369,20 @@ impl Kaleidotron {
                                             );
                                         }
                                     }));
+                                let step = combo_scroll_step(ui, &cr);
+                                if step != 0 {
+                                    const BROWSERS: [&str; 8] = [
+                                        "", "firefox", "chrome", "chromium", "brave", "edge", "vivaldi",
+                                        "opera",
+                                    ];
+                                    let c = BROWSERS
+                                        .iter()
+                                        .position(|b| *b == self.yt_cookies_browser)
+                                        .unwrap_or(0);
+                                    self.yt_cookies_browser = BROWSERS
+                                        [(c as isize + step).rem_euclid(BROWSERS.len() as isize) as usize]
+                                        .to_string();
+                                }
                             });
                             ui.weak(
                                 "Pick your browser if YouTube says \"confirm you're not a bot\" or a \
