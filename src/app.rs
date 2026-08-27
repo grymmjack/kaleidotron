@@ -1275,12 +1275,14 @@ enum Action {
     GoToRoot,
     GoHome,
     OpenFolder,
+    OpenSelected,
     // ── Viewer ──
     FitToScreen,
     AutoAdvance,
     ToggleCrt,
     FitWidth,
     SnapZoom,
+    OpenExternal,
     // ── Panes ──
     PaneExplorer,
     PaneDetails,
@@ -1425,7 +1427,7 @@ impl ActionScope {
 impl Action {
     // New actions are APPENDED so persisted keymap indices (`to_u8`, legacy load) stay valid;
     // `keybindings.json` keys off the stable `id()`, so order here is otherwise free.
-    const ALL: [Action; 30] = [
+    const ALL: [Action; 32] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
@@ -1442,11 +1444,13 @@ impl Action {
         Action::GoToRoot,
         Action::GoHome,
         Action::OpenFolder,
+        Action::OpenSelected,
         Action::FitToScreen,
         Action::AutoAdvance,
         Action::ToggleCrt,
         Action::FitWidth,
         Action::SnapZoom,
+        Action::OpenExternal,
         Action::PaneExplorer,
         Action::PaneDetails,
         Action::PaneRecolor,
@@ -1474,12 +1478,14 @@ impl Action {
             | Action::EditPath
             | Action::GoToRoot
             | Action::GoHome
-            | Action::OpenFolder => ActionScope::Grid,
+            | Action::OpenFolder
+            | Action::OpenSelected => ActionScope::Grid,
             Action::FitToScreen
             | Action::AutoAdvance
             | Action::ToggleCrt
             | Action::FitWidth
-            | Action::SnapZoom => ActionScope::Viewer,
+            | Action::SnapZoom
+            | Action::OpenExternal => ActionScope::Viewer,
             Action::PaneExplorer
             | Action::PaneDetails
             | Action::PaneRecolor
@@ -1509,11 +1515,13 @@ impl Action {
             Action::GoToRoot => "go_to_root",
             Action::GoHome => "go_home",
             Action::OpenFolder => "open_folder",
+            Action::OpenSelected => "open_selected",
             Action::FitToScreen => "fit_to_screen",
             Action::AutoAdvance => "auto_advance",
             Action::ToggleCrt => "toggle_crt",
             Action::FitWidth => "fit_width",
             Action::SnapZoom => "snap_zoom",
+            Action::OpenExternal => "open_external",
             Action::PaneExplorer => "pane_explorer",
             Action::PaneDetails => "pane_details",
             Action::PaneRecolor => "pane_recolor",
@@ -1546,11 +1554,13 @@ impl Action {
             Action::GoToRoot => "Go to filesystem root",
             Action::GoHome => "Go to home folder",
             Action::OpenFolder => "Open folder…",
+            Action::OpenSelected => "Open selected item",
             Action::FitToScreen => "Fit image to window",
             Action::AutoAdvance => "Slideshow auto-advance",
             Action::ToggleCrt => "CRT effects on / off",
             Action::FitWidth => "Fit image to width",
             Action::SnapZoom => "Snap zoom to whole steps",
+            Action::OpenExternal => "Open in default app",
             Action::PaneExplorer => "Explorer pane",
             Action::PaneDetails => "Details pane",
             Action::PaneRecolor => "Recolor pane",
@@ -1582,11 +1592,13 @@ impl Action {
             Action::GoToRoot => KeyBind::key(Key::Backslash),
             Action::GoHome => KeyBind::shift(Key::Backtick), // `~`
             Action::OpenFolder => KeyBind::ctrl(Key::O),
+            Action::OpenSelected => KeyBind::key(Key::Enter),
             Action::FitToScreen => KeyBind::key(Key::F),
             Action::AutoAdvance => KeyBind::key(Key::A),
             Action::ToggleCrt => KeyBind::key(Key::C),
             Action::FitWidth => KeyBind::key(Key::W),
             Action::SnapZoom => KeyBind::key(Key::S),
+            Action::OpenExternal => KeyBind::key(Key::Enter),
             Action::PaneExplorer => KeyBind::alt(Key::E),
             Action::PaneDetails => KeyBind::alt(Key::D),
             Action::PaneRecolor => KeyBind::alt(Key::R),
@@ -4256,7 +4268,7 @@ impl Kaleidotron {
             grid_gap,
             grid_gap_y,
             grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
-            open_on_double_click: get_bool(Self::OPEN_DBLCLICK_KEY).unwrap_or(false),
+            open_on_double_click: get_bool(Self::OPEN_DBLCLICK_KEY).unwrap_or(true),
             caption_fields,
             grid_hover_caption: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY)).unwrap_or(false),
             tile_bg_enabled,
@@ -31281,6 +31293,7 @@ impl Kaleidotron {
         let prev_key = self.bind_for(Action::PrevImage);
         let next_key = self.bind_for(Action::NextImage);
         let fit_key = self.bind_for(Action::FitToScreen);
+        let ext_key = self.bind_for(Action::OpenExternal); // "open in default app" (rebindable)
         let typing = self.keyboard_captured(ctx);
         let (prev, next, fit, tile, edit) = if typing {
             (false, false, false, false, false)
@@ -31291,7 +31304,7 @@ impl Kaleidotron {
                     next_key.matches(i),
                     fit_key.matches(i),
                     i.key_pressed(egui::Key::T),
-                    i.key_pressed(egui::Key::Enter),
+                    ext_key.matches(i),
                 )
             })
         };
@@ -39866,10 +39879,10 @@ impl eframe::App for Kaleidotron {
             let page = (self.grid_page_rows.max(1) * cols).max(1);
             let last = self.entries.len() - 1;
             // Arrow / PageUp-Down move the selection through the grid (Up/Down = one row = ±cols;
-            // in the single-column table cols is 1, so Up/Down are ±1). Enter opens the focused
-            // item. `key_pressed` (non-consuming): a key already claimed by the samples/pad panes
-            // (which consume theirs earlier) reads false here, so there's no double-handling.
-            let (up, down, left, right, pgup, pgdn, enter) = ctx.input(|i| {
+            // in the single-column table cols is 1, so Up/Down are ±1). `key_pressed` (non-consuming):
+            // a key already claimed by the samples/pad panes (which consume theirs earlier) reads
+            // false here, so there's no double-handling.
+            let (up, down, left, right, pgup, pgdn) = ctx.input(|i| {
                 use egui::Key::*;
                 (
                     i.key_pressed(ArrowUp),
@@ -39878,9 +39891,11 @@ impl eframe::App for Kaleidotron {
                     i.key_pressed(ArrowRight),
                     i.key_pressed(PageUp),
                     i.key_pressed(PageDown),
-                    i.key_pressed(Enter),
                 )
             });
+            // OpenSelected (default Enter) opens the focused item. CONSUMED so, when it flips into
+            // the viewer this same frame, the viewer's own Open-in-default-app key doesn't also fire.
+            let enter = self.take(&ctx, Action::OpenSelected);
             if home {
                 self.nav_select(0);
             } else if end {
@@ -40293,6 +40308,7 @@ impl eframe::App for Kaleidotron {
                             "Grid & browser",
                             vec![
                                 (k(Action::ToggleView), "Toggle grid / table view"),
+                                (k(Action::OpenSelected), "Open the focused item"),
                                 (k(Action::FilterFilenames), "Filter filenames"),
                                 (k(Action::ToggleHidden), "Show hidden files"),
                                 (k(Action::RandomPack), "Random 16colo.rs pack"),
@@ -40318,7 +40334,7 @@ impl eframe::App for Kaleidotron {
                                 ("T".into(), "Tile preview — fill window"),
                                 ("Drag".into(), "Pan the image"),
                                 ("Ctrl + Wheel".into(), "Resize thumbs · zoom image"),
-                                ("Enter".into(), "Open in default app"),
+                                (k(Action::OpenExternal), "Open in default app"),
                                 ("Ctrl + F".into(), "Advanced recursive search"),
                             ],
                         ),
@@ -55509,17 +55525,23 @@ impl Kaleidotron {
                         }
                     });
                     pref_card(&mut c[0], "Interface", accent, |ui| {
-                        ui.horizontal_wrapped(|ui| {
+                        // A single-row **segmented pill** (egui has no native one): tight-joined
+                        // selectable buttons with short labels, so it never wraps to a second row
+                        // (which was adding a scrollbar). The current value lights up within a small
+                        // epsilon, so a persisted 1.333 selects "133".
+                        ui.horizontal(|ui| {
                             ui.label("Text size");
-                            // Preset scales (the % each row shows). The current value is "on" when it
-                            // matches within a small epsilon, so a persisted 1.333 lights up "133%".
+                            ui.add_space(4.0);
+                            ui.spacing_mut().item_spacing.x = 1.0; // joined look
                             let mut apply: Option<f32> = None;
                             for &(pct, scale) in FONT_SCALE_PRESETS {
                                 let on = (self.ui_font_scale - scale).abs() < 0.005;
-                                if ui.selectable_label(on, format!("{pct}%")).clicked() {
+                                if ui.add(egui::Button::selectable(on, format!("{pct}"))).clicked() {
                                     apply = Some(scale);
                                 }
                             }
+                            ui.add_space(4.0);
+                            ui.weak("%");
                             if let Some(s) = apply {
                                 self.ui_font_scale = s;
                                 self.apply_font_scale(ctx);
@@ -55601,8 +55623,9 @@ impl Kaleidotron {
                         );
                         ui.checkbox(&mut self.open_on_double_click, "Open on double-click")
                             .on_hover_text(
-                                "Require a double-click to open a file in the viewer (a single \
-                                 click only selects). Off = a single click opens, as usual.",
+                                "Double-click to open a file in the viewer; a single click only \
+                                 selects (and hovering doesn't preview). On by default. Turn off \
+                                 for single-click-to-open with live hover preview.",
                             );
                     });
                     // RIGHT
