@@ -35405,20 +35405,14 @@ impl Kaleidotron {
         self.apply_font_scale(ctx);
     }
 
-    /// Scale egui's text-style sizes by `ui_font_scale`, INDEPENDENT of the whole-app `zoom_factor`
-    /// (Ctrl +/-). Rescales from the built-in defaults each time (not the current sizes) so it never
-    /// compounds. Text styles live in `Style`, which `set_visuals` / `set_fonts` don't touch, so
-    /// this sticks until re-applied (startup + theme change + the Preferences slider).
+    /// Apply the UI font scale as a **persistent multiplier on egui's `zoom_factor`**, so the WHOLE
+    /// interface scales uniformly and coherently — text, widgets, checkboxes, spacing, painted rail /
+    /// caption text, icons, docks, dialogs — through the one point→pixel mapping, with no per-widget
+    /// patching. It stays independent of the transient Ctrl +/- zoom by composing: the effective
+    /// `zoom_factor` is `ui_zoom · ui_font_scale`, and `ui()` divides `ui_font_scale` back out each
+    /// frame when it captures `ui_zoom`, so the two never contaminate each other.
     fn apply_font_scale(&self, ctx: &egui::Context) {
-        let scale = self.ui_font_scale.clamp(0.6, 2.5);
-        let base = egui::Style::default().text_styles;
-        ctx.all_styles_mut(|s| {
-            for (style, id) in base.iter() {
-                if let Some(cur) = s.text_styles.get_mut(style) {
-                    cur.size = id.size * scale;
-                }
-            }
-        });
+        ctx.set_zoom_factor(self.ui_zoom * self.ui_font_scale.clamp(0.6, 2.5));
     }
 
     /// Install the chosen code font if it isn't already, then hand back the `FontId` the code
@@ -39133,8 +39127,10 @@ impl eframe::App for Kaleidotron {
         if self.view_only && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // Track the live zoom factor (changed by Ctrl +/-) so `save` can persist it.
-        self.ui_zoom = ctx.zoom_factor();
+        // Track the live user zoom (changed by Ctrl +/-) so `save` can persist it. The effective
+        // `zoom_factor` is `ui_zoom · ui_font_scale`, so divide the font scale back out to recover
+        // the pure user-zoom component (a Ctrl+ then reads back as a proportional bump to ui_zoom).
+        self.ui_zoom = ctx.zoom_factor() / self.ui_font_scale.clamp(0.6, 2.5);
         self.want_repaint = false;
         // Keep the resolved ASCII render font in sync with the selection + VGA50 toggle (cheap:
         // returns immediately when unchanged) so the pipeline always has it.
@@ -40385,6 +40381,8 @@ impl eframe::App for Kaleidotron {
             // dialog and collapse `ui.columns` into an overlapping strip, and (b) let a user-widened
             // window sprawl the two columns to opposite edges. A fixed size fits every section (the
             // inner ScrollArea is the safety net for short displays) and never opens too small.
+            // Sizes are in POINTS — `ui_font_scale` scales the whole app via `zoom_factor`, so the
+            // window + its content scale with it automatically (no per-metric scaling needed here).
             let pref_size = egui::vec2(
                 1080.0_f32.min(screen.width() - 40.0),
                 800.0_f32.min(screen.height() - 40.0),
@@ -55477,8 +55475,8 @@ impl Kaleidotron {
                             }
                         });
                         ui.weak(
-                            "Scales UI text only — independent of the whole-app zoom (Ctrl + / \
-                             Ctrl -), which scales every widget, icon and thumbnail too.",
+                            "A persistent scale for the whole interface. The transient Ctrl + / \
+                             Ctrl - zoom still adjusts on top of it.",
                         );
                     });
                     pref_card(&mut c[0], "Code viewer", accent, |ui| {
@@ -56610,6 +56608,47 @@ mod gui_tests {
         if let Ok(img) = harness.render() {
             img.save(format!("{dir}/main_menu.png")).unwrap();
             eprintln!("wrote {dir}/main_menu.png");
+        }
+    }
+
+    /// Eyeball the UI at 200% font scale — the whole chrome (grid, docks, preferences) should scale
+    /// uniformly via zoom_factor, with no clipped labels / tiny checkboxes / empty dock gaps.
+    #[cfg(feature = "gui-screenshots")]
+    #[test]
+    fn shoot_font_scale_200() {
+        let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = std::env::current_dir().unwrap().join("assets/palettes");
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1500.0, 980.0))
+            .wgpu()
+            .build_eframe(|cc| {
+                Kaleidotron::new(
+                    cc,
+                    CliArgs {
+                        folder: Some(folder.clone()),
+                        ..CliArgs::default()
+                    },
+                )
+            });
+        {
+            let st = h.state_mut();
+            st.ui_font_scale = 2.0;
+            st.show_details = true;
+            st.show_recolor = true;
+        }
+        let ctx = h.ctx.clone();
+        h.state().apply_font_scale(&ctx);
+        h.run_steps(6);
+        if let Ok(img) = h.render() {
+            img.save(format!("{dir}/font_200_grid.png")).unwrap();
+            eprintln!("wrote {dir}/font_200_grid.png");
+        }
+        h.state_mut().show_prefs = true;
+        h.run_steps(4);
+        if let Ok(img) = h.render() {
+            img.save(format!("{dir}/font_200_prefs.png")).unwrap();
+            eprintln!("wrote {dir}/font_200_prefs.png");
         }
     }
 
