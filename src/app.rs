@@ -13124,16 +13124,14 @@ impl Kaleidotron {
                 .add(egui::Slider::new(&mut self.amiga_spacing, -20..=20).show_value(false))
                 .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with");
             changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_spacing, 0, 1.0, -20, 20);
-            if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40)).changed() {
-                changed = true;
-            }
+            let r = ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40));
+            changed |= r.changed() | wheel_adjust(ui, &r, &mut self.amiga_spacing, 1.0, -40, 40);
             ui.separator();
             ui.label("Line height");
             let r = ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false));
             changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_line_gap, 2, 1.0, -20, 40);
-            if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80)).changed() {
-                changed = true;
-            }
+            let r = ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80));
+            changed |= r.changed() | wheel_adjust(ui, &r, &mut self.amiga_line_gap, 1.0, -40, 80);
             ui.separator();
             ui.label("Zoom");
             let r = ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
@@ -15527,11 +15525,12 @@ impl Kaleidotron {
                             });
                         ui.separator();
                         ui.weak("Pitch");
-                        ui.add(
+                        let r = ui.add(
                             egui::DragValue::new(&mut self.pads[i].pitch)
                                 .range(-24..=24)
                                 .suffix(" st"),
                         );
+                        wheel_adjust(ui, &r, &mut self.pads[i].pitch, 1.0, -24, 24);
                         if ui.small_button("Oct −").clicked() {
                             self.pads[i].pitch = (self.pads[i].pitch - 12).max(-24);
                         }
@@ -15701,44 +15700,40 @@ impl Kaleidotron {
                             let mut v = self.pads[i].env_values(t);
                             let mut ch = false;
                             ui.weak("A");
-                            ch |= ui
-                                .add(
-                                    egui::DragValue::new(&mut v[0])
-                                        .range(0.0..=4.0)
-                                        .speed(0.005)
-                                        .suffix(" s")
-                                        .max_decimals(3),
-                                )
-                                .changed();
+                            let r = ui.add(
+                                egui::DragValue::new(&mut v[0])
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
+                            );
+                            ch |= r.changed() | wheel_adjust(ui, &r, &mut v[0], 0.05, 0.0, 4.0);
                             ui.weak("D");
-                            ch |= ui
-                                .add(
-                                    egui::DragValue::new(&mut v[1])
-                                        .range(0.0..=4.0)
-                                        .speed(0.005)
-                                        .suffix(" s")
-                                        .max_decimals(3),
-                                )
-                                .changed();
+                            let r = ui.add(
+                                egui::DragValue::new(&mut v[1])
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
+                            );
+                            ch |= r.changed() | wheel_adjust(ui, &r, &mut v[1], 0.05, 0.0, 4.0);
                             ui.weak("S");
-                            ch |= ui
-                                .add(
-                                    egui::DragValue::new(&mut v[2])
-                                        .range(0.0..=1.0)
-                                        .speed(0.01)
-                                        .max_decimals(2),
-                                )
-                                .changed();
+                            let r = ui.add(
+                                egui::DragValue::new(&mut v[2])
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .max_decimals(2),
+                            );
+                            ch |= r.changed() | wheel_adjust(ui, &r, &mut v[2], 0.05, 0.0, 1.0);
                             ui.weak("R");
-                            ch |= ui
-                                .add(
-                                    egui::DragValue::new(&mut v[3])
-                                        .range(0.0..=4.0)
-                                        .speed(0.005)
-                                        .suffix(" s")
-                                        .max_decimals(3),
-                                )
-                                .changed();
+                            let r = ui.add(
+                                egui::DragValue::new(&mut v[3])
+                                    .range(0.0..=4.0)
+                                    .speed(0.005)
+                                    .suffix(" s")
+                                    .max_decimals(3),
+                            );
+                            ch |= r.changed() | wheel_adjust(ui, &r, &mut v[3], 0.05, 0.0, 4.0);
                             if ch {
                                 self.pads[i].set_env_values(t, v);
                             }
@@ -15746,7 +15741,7 @@ impl Kaleidotron {
                             match t {
                                 EnvTarget::Pitch => {
                                     ui.weak("Depth");
-                                    ui.add(
+                                    let r = ui.add(
                                         egui::DragValue::new(&mut self.pads[i].pitch_depth)
                                             .range(-48.0..=48.0)
                                             .speed(0.2)
@@ -15756,10 +15751,11 @@ impl Kaleidotron {
                                     .on_hover_text(
                                         "Pitch swing at full envelope (semitones; negative = drop)",
                                     );
+                                    wheel_adjust(ui, &r, &mut self.pads[i].pitch_depth, 1.0, -48.0, 48.0);
                                 }
                                 EnvTarget::Cutoff => {
                                     ui.weak("Top");
-                                    ui.add(
+                                    let r = ui.add(
                                         egui::DragValue::new(&mut self.pads[i].cutoff_hz)
                                             .range(20.0..=20000.0)
                                             .speed(50.0)
@@ -15767,6 +15763,7 @@ impl Kaleidotron {
                                             .max_decimals(0),
                                     )
                                     .on_hover_text("The sweep peaks at this cutoff (30 Hz → here)");
+                                    wheel_adjust(ui, &r, &mut self.pads[i].cutoff_hz, 50.0, 20.0, 20000.0);
                                 }
                                 _ => {}
                             }
@@ -15777,12 +15774,13 @@ impl Kaleidotron {
                             ui.checkbox(&mut self.env_snap, "Snap")
                                 .on_hover_text("Snap dragged nodes to the grid");
                             ui.weak("BPM");
-                            ui.add(
+                            let r = ui.add(
                                 egui::DragValue::new(&mut self.bpm)
                                     .range(20.0..=300.0)
                                     .speed(0.5)
                                     .max_decimals(1),
                             );
+                            wheel_adjust(ui, &r, &mut self.bpm, 1.0, 20.0, 300.0);
                             egui::ComboBox::from_id_salt("env_grid_div")
                                 .selected_text(
                                     BEAT_DIVS[(self.musical_div as usize).min(BEAT_DIVS.len() - 1)].0,
@@ -15835,13 +15833,14 @@ impl Kaleidotron {
                                         });
                                 } else {
                                     ui.weak("Rate");
-                                    ui.add(
+                                    let r = ui.add(
                                         egui::DragValue::new(&mut l.rate_hz)
                                             .range(0.01..=120.0)
                                             .speed(0.1)
                                             .suffix(" Hz")
                                             .max_decimals(2),
                                     );
+                                    wheel_adjust(ui, &r, &mut l.rate_hz, 0.5, 0.01, 120.0);
                                 }
                                 ui.weak("Depth");
                                 let (dmax, suffix) = match t {
@@ -15849,21 +15848,23 @@ impl Kaleidotron {
                                     EnvTarget::Cutoff => (4.0, " oct"),
                                     _ => (1.0, ""),
                                 };
-                                ui.add(
+                                let r = ui.add(
                                     egui::DragValue::new(&mut l.depth)
                                         .range(0.0..=dmax)
                                         .speed(dmax / 200.0)
                                         .suffix(suffix)
                                         .max_decimals(2),
                                 );
+                                wheel_adjust(ui, &r, &mut l.depth, (dmax / 20.0) as f64, 0.0, dmax);
                                 ui.weak("Fade");
-                                ui.add(
+                                let r = ui.add(
                                     egui::DragValue::new(&mut l.fade)
                                         .range(0.0..=4.0)
                                         .speed(0.01)
                                         .suffix(" s")
                                         .max_decimals(2),
                                 );
+                                wheel_adjust(ui, &r, &mut l.fade, 0.1, 0.0, 4.0);
                             }
                         });
                     }
@@ -15883,20 +15884,22 @@ impl Kaleidotron {
                         }
                         if self.pads[i].filter_on {
                             ui.weak("Cutoff");
-                            ui.add(
+                            let r = ui.add(
                                 egui::DragValue::new(&mut self.pads[i].cutoff_hz)
                                     .range(20.0..=20000.0)
                                     .speed(50.0)
                                     .suffix(" Hz")
                                     .max_decimals(0),
                             );
+                            wheel_adjust(ui, &r, &mut self.pads[i].cutoff_hz, 50.0, 20.0, 20000.0);
                             ui.weak("Res");
-                            ui.add(
+                            let r = ui.add(
                                 egui::DragValue::new(&mut self.pads[i].resonance)
                                     .range(0.0..=1.0)
                                     .speed(0.01)
                                     .max_decimals(2),
                             );
+                            wheel_adjust(ui, &r, &mut self.pads[i].resonance, 0.05, 0.0, 1.0);
                         }
                     });
                 }
@@ -17046,11 +17049,12 @@ impl Kaleidotron {
                             });
                     }
                     ui.weak("BPM");
-                    ui.add(
+                    let r = ui.add(
                         egui::DragValue::new(&mut self.bpm)
                             .range(30.0..=300.0)
                             .speed(0.5),
                     );
+                    wheel_adjust(ui, &r, &mut self.bpm, 1.0, 30.0, 300.0);
                     if ui
                         .button("Detect")
                         .on_hover_text("Estimate BPM from detected transients")
@@ -24060,9 +24064,8 @@ impl Kaleidotron {
             ui.horizontal(|ui| {
                 for (lbl, i, mx) in [("X", 0usize, iw), ("Y", 1, ih), ("W", 2, iw), ("H", 3, ih)] {
                     ui.label(lbl);
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut v[i]).range(0.0..=mx).speed(1.0))
-                        .changed();
+                    let r = ui.add(egui::DragValue::new(&mut v[i]).range(0.0..=mx).speed(1.0));
+                    changed |= r.changed() | wheel_adjust(ui, &r, &mut v[i], 1.0, 0.0, mx);
                 }
             });
             if changed {
@@ -24899,9 +24902,11 @@ impl Kaleidotron {
                                 }
                             }
                         });
-                    ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
+                    let r = ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
+                    wheel_adjust(ui, &r, &mut self.ai_gen_w, 1.0, 8, 4096);
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut self.ai_gen_h).range(8..=4096));
+                    let r = ui.add(egui::DragValue::new(&mut self.ai_gen_h).range(8..=4096));
+                    wheel_adjust(ui, &r, &mut self.ai_gen_h, 1.0, 8, 4096);
                     if ui
                         .small_button("＋")
                         .on_hover_text("Add this size to the presets")
@@ -24918,10 +24923,12 @@ impl Kaleidotron {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Count");
-                    ui.add(egui::DragValue::new(&mut self.ai_gen_count).range(1..=20));
+                    let r = ui.add(egui::DragValue::new(&mut self.ai_gen_count).range(1..=20));
+                    wheel_adjust(ui, &r, &mut self.ai_gen_count, 1.0, 1, 20);
                     ui.separator();
                     ui.label("Seed");
-                    ui.add(egui::DragValue::new(&mut self.ai_gen_seed));
+                    let r = ui.add(egui::DragValue::new(&mut self.ai_gen_seed));
+                    wheel_adjust(ui, &r, &mut self.ai_gen_seed, 1.0, 0, i64::MAX);
                     if ui.small_button("🎲").on_hover_text("Random each run (seed 0)").clicked() {
                         self.ai_gen_seed = 0;
                     }
@@ -25159,7 +25166,8 @@ impl Kaleidotron {
                         ui.text_edit_singleline(&mut s.args_extra).on_hover_text("CLI flags (e.g. --style ega)");
                         ui.end_row();
                         ui.label("Seed lock");
-                        ui.add(egui::DragValue::new(&mut s.seed)).on_hover_text("0 = don't force");
+                        let r = ui.add(egui::DragValue::new(&mut s.seed)).on_hover_text("0 = don't force");
+                        wheel_adjust(ui, &r, &mut s.seed, 1.0, 0, i64::MAX);
                         ui.end_row();
                     });
                 }
@@ -27594,16 +27602,18 @@ impl Kaleidotron {
                                      (cols·cell_w × rows·cell_h px). The source aspect ratio \
                                      is NOT preserved — it's stretched to the char grid.",
                                 );
-                            ui.add(
+                            let r = ui.add(
                                 egui::DragValue::new(&mut self.shade_fit_cols)
                                     .range(1..=1000)
                                     .prefix("cols "),
                             );
-                            ui.add(
+                            wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 1000);
+                            let r = ui.add(
                                 egui::DragValue::new(&mut self.shade_fit_rows)
                                     .range(1..=1000)
                                     .prefix("rows "),
                             );
+                            wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 1000);
                         });
                         ui.horizontal(|ui| {
                             for (label, c, r) in
@@ -27780,9 +27790,11 @@ impl Kaleidotron {
                             );
                         ui.horizontal(|ui| {
                             ui.label("Cols");
-                            ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
+                            let r = ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
+                            wheel_adjust(ui, &r, &mut self.petscii_cols, 1.0, 1, 120);
                             ui.label("Rows");
-                            ui.add(egui::DragValue::new(&mut self.petscii_rows).range(1..=120));
+                            let r = ui.add(egui::DragValue::new(&mut self.petscii_rows).range(1..=120));
+                            wheel_adjust(ui, &r, &mut self.petscii_rows, 1.0, 1, 120);
                             if ui.small_button("40×25").on_hover_text("C64 screen").clicked() {
                                 self.petscii_cols = 40;
                                 self.petscii_rows = 25;
@@ -27946,9 +27958,11 @@ impl Kaleidotron {
                                 .on_hover_text("Force an exact cols×rows character canvas");
                             if self.shade_fit_chars {
                                 ui.label("Cols");
-                                ui.add(egui::DragValue::new(&mut self.shade_fit_cols).range(1..=300));
+                                let r = ui.add(egui::DragValue::new(&mut self.shade_fit_cols).range(1..=300));
+                                wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 300);
                                 ui.label("Rows");
-                                ui.add(egui::DragValue::new(&mut self.shade_fit_rows).range(1..=300));
+                                let r = ui.add(egui::DragValue::new(&mut self.shade_fit_rows).range(1..=300));
+                                wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 300);
                                 if ui.small_button("80×25").clicked() {
                                     self.shade_fit_cols = 80;
                                     self.shade_fit_rows = 25;
@@ -37925,7 +37939,8 @@ impl Kaleidotron {
                                     }
                                 });
                             if self.lospec_cfilter != 0 {
-                                ui.add(egui::DragValue::new(&mut self.lospec_cn).range(1..=256));
+                                let r = ui.add(egui::DragValue::new(&mut self.lospec_cn).range(1..=256));
+                                wheel_adjust(ui, &r, &mut self.lospec_cn, 1.0, 1, 256);
                             }
                         });
                         ui.horizontal(|ui| {
@@ -44357,6 +44372,8 @@ fn palette_label(path: &Path) -> String {
 /// While `resp` is hovered, let the mouse wheel nudge `*v` by `step` per notch
 /// (×10 with Shift), clamped to `lo..=hi`. Vertical scroll is consumed while the
 /// pointer is over the control, so an enclosing ScrollArea doesn't also move.
+/// Returns `true` if the wheel changed the value — so a caller that gates a re-render / deferred
+/// write-back on `resp.changed()` can OR this in (the wheel mutates AFTER the response).
 fn wheel_adjust<N: egui::emath::Numeric>(
     ui: &egui::Ui,
     resp: &egui::Response,
@@ -44364,11 +44381,11 @@ fn wheel_adjust<N: egui::emath::Numeric>(
     step: f64,
     lo: N,
     hi: N,
-) {
+) -> bool {
     // contains_pointer() (not hovered()) — inside a ScrollArea, hovered() can read
     // false while the scroll gesture is being processed.
     if !resp.contains_pointer() {
-        return;
+        return false;
     }
     let (notches, shift) = ui.input(|i| {
         // Discrete wheel events (not the smoothed delta) → one step per notch.
@@ -44382,13 +44399,15 @@ fn wheel_adjust<N: egui::emath::Numeric>(
             .sum();
         (dy, i.modifiers.shift)
     });
-    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0); // consume the scroll
     if notches != 0.0 {
+        ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0); // consume the scroll
         let mult = if shift { 10.0 } else { 1.0 };
         let nv =
             (v.to_f64() + notches.signum() as f64 * step * mult).clamp(lo.to_f64(), hi.to_f64());
         *v = N::from_f64(nv);
+        return true;
     }
+    false
 }
 
 /// A middle-button click inside `resp`'s rect resets `*v` to `def`. Reads the
@@ -44545,11 +44564,12 @@ fn value_slider<N: egui::emath::Numeric>(
         egui::vec2(value_w, h),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
-            ui.add(
+            let r = ui.add(
                 egui::DragValue::new(&mut *v)
                     .range(lo..=hi)
                     .fixed_decimals(decimals),
             );
+            wheel_adjust(ui, &r, &mut *v, wstep, lo, hi);
         },
     );
 }
