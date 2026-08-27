@@ -37,6 +37,16 @@ pub struct CleanOpts {
     pub despeckle: bool,
     /// Minimum foreground component size (pixels) kept when `despeckle`.
     pub min_island: usize,
+    /// Absorb small **colour** islands (a blob of one colour embedded in a region of another)
+    /// into their surrounding colour — cleans stray JPEG dots *inside* a sprite. Runs after the
+    /// palette snap (on the quantised colours), so it needs `snap` to be effective.
+    pub merge_islands: bool,
+    /// Max size (pixels) of a colour island that is a candidate to be absorbed (the "island").
+    pub merge_max: usize,
+    /// How far out (pixels) to sample the surrounding region when deciding which colour to absorb
+    /// the island into — a larger window finds the *real* dominant colour even when the island's
+    /// immediate 1-px border is itself noisy.
+    pub merge_radius: usize,
 }
 
 /// Detect the background colour as the **mode of the border pixels**, coarse-quantised to 4
@@ -120,12 +130,19 @@ pub fn cleanup(rgba: &[u8], w: usize, h: usize, o: &CleanOpts) -> Vec<u8> {
         }
     }
 
-    // 3. Despeckle: drop foreground connected-components smaller than `min_island`.
+    // 3. Merge small COLOUR islands into their surrounding colour (stray dots inside a sprite),
+    //    sampling a `merge_radius` window so the *real* dominant colour wins even over a noisy
+    //    1-px border. Runs on the snapped colours.
+    if o.merge_islands && o.merge_max >= 1 {
+        merge_color_islands(&mut out, &is_bg, w, h, o.merge_max, o.merge_radius.max(1));
+    }
+
+    // 4. Despeckle: drop foreground connected-components smaller than `min_island`.
     if o.despeckle && o.min_island > 1 {
         despeckle(&mut is_bg, w, h, o.min_island);
     }
 
-    // 4. Compose: background → transparent or the fill colour; foreground → opaque.
+    // 5. Compose: background → transparent or the fill colour; foreground → opaque.
     for (i, &bg) in is_bg.iter().enumerate() {
         let px = &mut out[i * 4..i * 4 + 4];
         if bg {
@@ -188,6 +205,106 @@ fn despeckle(is_bg: &mut [bool], w: usize, h: usize, min: usize) {
     }
 }
 
+/// A same-colour foreground component: its pixels + bounding box.
+struct Island {
+    pixels: Vec<usize>,
+    minx: usize,
+    miny: usize,
+    maxx: usize,
+    maxy: usize,
+}
+
+/// Absorb small colour islands into the dominant colour of a surrounding window.
+///
+/// Two governing sizes: `max_size` (the *island* — a blob up to this many pixels is a candidate)
+/// and `radius` (the *influence* window — how far out to sample the surrounding colour). Sampling
+/// a window rather than just the 1-px border is what makes it pick the *real* colour when the
+/// border itself is JPEG-noisy. Targets are computed from the pre-merge buffer and applied at the
+/// end, so every little island independently adopts its region's colour (they don't cascade).
+fn merge_color_islands(out: &mut [u8], is_bg: &[bool], w: usize, h: usize, max_size: usize, radius: usize) {
+    use std::collections::HashMap;
+    let n = w * h;
+    let col_at = |i: usize| [out[i * 4], out[i * 4 + 1], out[i * 4 + 2]];
+
+    // 1. Label every foreground component by exact (snapped) colour.
+    let mut comp_id = vec![-1i32; n];
+    let mut islands: Vec<Island> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if is_bg[start] || comp_id[start] >= 0 {
+            continue;
+        }
+        let color = col_at(start);
+        let id = islands.len() as i32;
+        let mut pixels = Vec::new();
+        let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, 0usize, 0usize);
+        stack.clear();
+        stack.push(start);
+        comp_id[start] = id;
+        while let Some(i) = stack.pop() {
+            pixels.push(i);
+            let (x, y) = (i % w, i / w);
+            minx = minx.min(x);
+            maxx = maxx.max(x);
+            miny = miny.min(y);
+            maxy = maxy.max(y);
+            let mut nbrs = [usize::MAX; 4];
+            let mut k = 0;
+            if x > 0 { nbrs[k] = i - 1; k += 1; }
+            if x + 1 < w { nbrs[k] = i + 1; k += 1; }
+            if y > 0 { nbrs[k] = i - w; k += 1; }
+            if y + 1 < h { nbrs[k] = i + w; k += 1; }
+            for &nb in &nbrs[..k] {
+                if !is_bg[nb] && comp_id[nb] < 0 && col_at(nb) == color {
+                    comp_id[nb] = id;
+                    stack.push(nb);
+                }
+            }
+        }
+        islands.push(Island { pixels, minx, miny, maxx, maxy });
+    }
+
+    // 2. For each small island, vote the dominant surrounding colour in a `radius` window.
+    let mut targets: Vec<(usize, [u8; 3])> = Vec::new();
+    for (ci, isl) in islands.iter().enumerate() {
+        if isl.pixels.len() > max_size {
+            continue;
+        }
+        let x0 = isl.minx.saturating_sub(radius);
+        let y0 = isl.miny.saturating_sub(radius);
+        let x1 = (isl.maxx + radius).min(w - 1);
+        let y1 = (isl.maxy + radius).min(h - 1);
+        let mut votes: HashMap<[u8; 3], usize> = HashMap::new();
+        let mut total = 0usize;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let j = y * w + x;
+                total += 1; // bg + other colours both count toward the majority denominator
+                if is_bg[j] || comp_id[j] == ci as i32 {
+                    continue;
+                }
+                *votes.entry(col_at(j)).or_insert(0) += 1;
+            }
+        }
+        if let Some((best, bv)) = votes.into_iter().max_by_key(|(_, v)| *v) {
+            // Only absorb when the winning colour genuinely dominates the sampled window — an
+            // island floating in mostly-background (an edge speck) is left for despeckle.
+            if bv * 2 >= total.max(1) {
+                targets.push((ci, best));
+            }
+        }
+    }
+
+    // 3. Apply all recolours.
+    for (ci, color) in targets {
+        for &i in &islands[ci].pixels {
+            out[i * 4] = color[0];
+            out[i * 4 + 1] = color[1];
+            out[i * 4 + 2] = color[2];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +346,9 @@ mod tests {
             colors: 4,
             despeckle: false,
             min_island: 2,
+            merge_islands: false,
+            merge_max: 8,
+            merge_radius: 4,
         }
     }
 
@@ -307,6 +427,76 @@ mod tests {
     }
 
     #[test]
+    fn merge_absorbs_a_stray_dot_into_the_surrounding_colour() {
+        // 7×7 field of colour A (red) with a single stray blue pixel in the middle.
+        let (w, h) = (7, 7);
+        let a = [200u8, 30, 30];
+        let b = [30u8, 30, 200];
+        let mut px = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            px[i * 4] = a[0];
+            px[i * 4 + 1] = a[1];
+            px[i * 4 + 2] = a[2];
+            px[i * 4 + 3] = 255;
+        }
+        let c = (3 * w + 3) * 4;
+        px[c] = b[0];
+        px[c + 1] = b[1];
+        px[c + 2] = b[2];
+        // No background here (opaque everywhere), snap off, despeckle off — isolate the merge.
+        let o = CleanOpts {
+            key: [255, 255, 255], // nothing matches → no background
+            tol: 0,
+            transparent: false,
+            bg_color: [0, 0, 0],
+            snap: false,
+            colors: 4,
+            despeckle: false,
+            min_island: 2,
+            merge_islands: true,
+            merge_max: 4,
+            merge_radius: 3,
+        };
+        let out = cleanup(&px, w, h, &o);
+        assert_eq!(&out[c..c + 3], &a, "the stray blue dot should be absorbed into red");
+    }
+
+    #[test]
+    fn merge_leaves_a_large_region_alone() {
+        // Two equal 4×8 halves (red | blue). Neither is a small "island" → nothing merges.
+        let (w, h) = (8, 8);
+        let a = [200u8, 30, 30];
+        let b = [30u8, 30, 200];
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let c = if x < 4 { a } else { b };
+                let i = (y * w + x) * 4;
+                px[i] = c[0];
+                px[i + 1] = c[1];
+                px[i + 2] = c[2];
+                px[i + 3] = 255;
+            }
+        }
+        let o = CleanOpts {
+            key: [255, 255, 255],
+            tol: 0,
+            transparent: false,
+            bg_color: [0, 0, 0],
+            snap: false,
+            colors: 4,
+            despeckle: false,
+            min_island: 2,
+            merge_islands: true,
+            merge_max: 8, // each half is 32 px > max → untouched
+            merge_radius: 3,
+        };
+        let out = cleanup(&px, w, h, &o);
+        let mid_blue = (0 * w + 6) * 4;
+        assert_eq!(&out[mid_blue..mid_blue + 3], &b, "large regions are not merged");
+    }
+
+    #[test]
     fn empty_or_short_buffer_is_returned_unchanged() {
         assert!(cleanup(&[], 0, 0, &opts()).is_empty());
         let short = vec![1, 2, 3];
@@ -349,6 +539,9 @@ mod tests {
                 colors: 32,
                 despeckle: true,
                 min_island: 2,
+                merge_islands: true,
+                merge_max: 8,
+                merge_radius: 4,
             };
             // Variant A: no snap (preserves ALL colours; bg-key + despeckle only).
             let mut o = base.clone();

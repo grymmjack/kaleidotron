@@ -1980,6 +1980,9 @@ pub struct Kaleidotron {
     jpeg_clean_colors: u32,       // snap palette size
     jpeg_clean_despeckle: bool,   // drop isolated foreground specks
     jpeg_clean_min_island: u32,   // min foreground component size kept (px)
+    jpeg_clean_merge: bool,       // absorb small colour islands into their surrounding colour
+    jpeg_clean_merge_max: u32,    // max island size (px) that gets absorbed
+    jpeg_clean_merge_radius: u32, // window radius (px) sampled to pick the absorbing colour
     dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
@@ -3012,6 +3015,9 @@ impl Kaleidotron {
     const JPEG_CLEAN_COLORS_KEY: &'static str = "jpeg_clean_colors";
     const JPEG_CLEAN_DESPECKLE_KEY: &'static str = "jpeg_clean_despeckle";
     const JPEG_CLEAN_ISLAND_KEY: &'static str = "jpeg_clean_min_island";
+    const JPEG_CLEAN_MERGE_KEY: &'static str = "jpeg_clean_merge";
+    const JPEG_CLEAN_MERGE_MAX_KEY: &'static str = "jpeg_clean_merge_max";
+    const JPEG_CLEAN_MERGE_RADIUS_KEY: &'static str = "jpeg_clean_merge_radius";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
     const CROP_PRESETS_KEY: &'static str = "crop_presets"; // named reusable crop rects
@@ -3548,6 +3554,15 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_ISLAND_KEY))
             .unwrap_or(2);
+        let jpeg_clean_merge = get_bool(Self::JPEG_CLEAN_MERGE_KEY).unwrap_or(true);
+        let jpeg_clean_merge_max = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_MERGE_MAX_KEY))
+            .unwrap_or(8);
+        let jpeg_clean_merge_radius = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_MERGE_RADIUS_KEY))
+            .unwrap_or(4);
         // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
         let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
         let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
@@ -4332,6 +4347,9 @@ impl Kaleidotron {
             jpeg_clean_colors,
             jpeg_clean_despeckle,
             jpeg_clean_min_island,
+            jpeg_clean_merge,
+            jpeg_clean_merge_max,
+            jpeg_clean_merge_radius,
             crops,
             crop_ratio: None,
             crop_drag: None,
@@ -21681,6 +21699,8 @@ impl Kaleidotron {
             fx: self.postfx,
             balance: self.balance_offset(),
             palette,
+            jpeg_clean: self.jpeg_clean_opts(),
+            jpeg_clean_auto: self.jpeg_clean_key_auto,
             skip_dither_palette: false,
         }
     }
@@ -21856,10 +21876,6 @@ impl Kaleidotron {
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
     /// palette / post-FX) + Save operate on the enlarged art.
     fn scale_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
-        // Prepare the source before the pipeline: JPEG-clean first (recover crisp pixel art
-        // from a lossy source), then the pixel-art upscale. Both are no-ops when off, so this
-        // is the single pre-pipeline hook every recolor consumer already routes through.
-        let (w, h, rgba) = self.jpeg_clean_source(w, h, rgba);
         if self.scale_algo == crate::scale::Scaler::None {
             return (w, h, rgba);
         }
@@ -21867,20 +21883,15 @@ impl Kaleidotron {
         (ow, oh, out)
     }
 
-    /// The JPEG-cleanup pre-pipeline step (see `jpeg_clean.rs`): key out the background, snap
-    /// the foreground to a palette, despeckle. A no-op unless `jpeg_clean_on`. Runs on the raw
-    /// source at native resolution, before any upscale.
-    fn jpeg_clean_source(&self, w: usize, h: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+    /// The JPEG-cleanup options for the pipeline's `JpegClean` marker (see `jpeg_clean.rs`),
+    /// or `None` when off. The `key` is a placeholder when auto-detect is on — `apply_pipeline`
+    /// re-detects it from the live buffer at the marker's position in the order.
+    fn jpeg_clean_opts(&self) -> Option<crate::jpeg_clean::CleanOpts> {
         if !self.jpeg_clean_on {
-            return (w, h, rgba);
+            return None;
         }
-        let key = if self.jpeg_clean_key_auto {
-            crate::jpeg_clean::detect_background(&rgba, w, h)
-        } else {
-            self.jpeg_clean_key
-        };
-        let opts = crate::jpeg_clean::CleanOpts {
-            key,
+        Some(crate::jpeg_clean::CleanOpts {
+            key: self.jpeg_clean_key,
             tol: self.jpeg_clean_tol,
             transparent: self.jpeg_clean_transparent,
             bg_color: self.jpeg_clean_bg,
@@ -21888,9 +21899,10 @@ impl Kaleidotron {
             colors: self.jpeg_clean_colors as usize,
             despeckle: self.jpeg_clean_despeckle,
             min_island: self.jpeg_clean_min_island as usize,
-        };
-        let out = crate::jpeg_clean::cleanup(&rgba, w, h, &opts);
-        (w, h, out)
+            merge_islands: self.jpeg_clean_merge,
+            merge_max: self.jpeg_clean_merge_max as usize,
+            merge_radius: self.jpeg_clean_merge_radius as usize,
+        })
     }
 
     /// Snapshot the entire recolor stack (adjustments + order, post-FX, dither, color
@@ -22323,7 +22335,7 @@ impl Kaleidotron {
             // JPEG cleanup: any of its knobs changing must invalidate the preview/grid/full caches.
             + &if self.jpeg_clean_on {
                 format!(
-                    "|JC{}:{:?}:{}:{}:{:?}:{}:{}:{}:{}",
+                    "|JC{}:{:?}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}:{}",
                     self.jpeg_clean_key_auto as u8,
                     self.jpeg_clean_key,
                     self.jpeg_clean_tol,
@@ -22333,6 +22345,9 @@ impl Kaleidotron {
                     self.jpeg_clean_colors,
                     self.jpeg_clean_despeckle as u8,
                     self.jpeg_clean_min_island,
+                    self.jpeg_clean_merge as u8,
+                    self.jpeg_clean_merge_max,
+                    self.jpeg_clean_merge_radius,
                 )
             } else {
                 String::new()
@@ -22684,6 +22699,8 @@ impl Kaleidotron {
             fx: PostFx::default(),
             balance: self.balance_offset(),
             palette: palette.as_deref(),
+            jpeg_clean: self.jpeg_clean_opts(),
+            jpeg_clean_auto: self.jpeg_clean_key_auto,
             skip_dither_palette: false,
         };
         apply_pipeline_resized(&mut rgba, w, h, tw, th, &self.adjust, &aux);
@@ -26313,6 +26330,20 @@ impl Kaleidotron {
         self.balance_color = [128, 128, 128];
         self.balance_strength = 0.0;
         self.balance_hex = "808080".into();
+        // JPEG cleanup — uncheck it and restore every knob to its default (matches new()).
+        self.jpeg_clean_on = false;
+        self.jpeg_clean_key_auto = true;
+        self.jpeg_clean_key = [0, 0, 0];
+        self.jpeg_clean_tol = 24;
+        self.jpeg_clean_transparent = true;
+        self.jpeg_clean_bg = [0, 0, 0];
+        self.jpeg_clean_snap = true;
+        self.jpeg_clean_colors = 64;
+        self.jpeg_clean_despeckle = true;
+        self.jpeg_clean_min_island = 2;
+        self.jpeg_clean_merge = true;
+        self.jpeg_clean_merge_max = 8;
+        self.jpeg_clean_merge_radius = 4;
         self.flash = None;
         self.editing_color = None;
     }
@@ -26447,6 +26478,36 @@ impl Kaleidotron {
                         ui.add(egui::Slider::new(&mut self.jpeg_clean_min_island, 1..=16).suffix(" px"));
                     slider_extras(ui, &r, &mut self.jpeg_clean_min_island, 2, 1.0, 1, 16);
                 });
+            });
+            // Merge stray colour dots inside a sprite into the surrounding colour. Two knobs:
+            // the island size to absorb, and how far out to sample the "real" colour to absorb into.
+            ui.checkbox(&mut self.jpeg_clean_merge, "Merge stray dots")
+                .on_hover_text(
+                    "Absorb small colour islands inside a sprite (stray JPEG dots) into the \
+                     surrounding colour. Needs Snap colours on to be effective.",
+                );
+            let merge_on = self.jpeg_clean_merge;
+            ui.add_enabled_ui(merge_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("  Island ≤");
+                    let r = ui
+                        .add(egui::Slider::new(&mut self.jpeg_clean_merge_max, 1..=64).suffix(" px"));
+                    slider_extras(ui, &r, &mut self.jpeg_clean_merge_max, 8, 1.0, 1, 64);
+                })
+                .response
+                .on_hover_text("Max size of a colour blob that gets absorbed into its neighbour");
+                ui.horizontal(|ui| {
+                    ui.label("  Sample");
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.jpeg_clean_merge_radius, 1..=20).suffix(" px"),
+                    );
+                    slider_extras(ui, &r, &mut self.jpeg_clean_merge_radius, 4, 1.0, 1, 20);
+                })
+                .response
+                .on_hover_text(
+                    "How far out to look for the dominant surrounding colour — a bigger window \
+                     finds the real colour even when the island's own border is noisy",
+                );
             });
         });
     }
@@ -27033,6 +27094,14 @@ impl Kaleidotron {
                                                 },
                                                 "Resample split point — set width/height in the Resize section. Ops ABOVE run full-res; ops BELOW run at the reduced size. Drag to reorder.",
                                             ),
+                                            OpKind::JpegClean => (
+                                                if self.jpeg_clean_on {
+                                                    egui::RichText::new("JPEG clean").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("JPEG clean (off)").weak()
+                                                },
+                                                "Recover crisp pixel art from a lossy JPEG — set it up in the “Extract pixels from JPEG” section. Drag to reorder (e.g. sharpen or resize before/after it).",
+                                            ),
                                             _ => unreachable!("non-marker in marker branch"),
                                         };
                                         ui.add_sized(
@@ -27143,7 +27212,7 @@ impl Kaleidotron {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 21]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 22]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -41588,6 +41657,13 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::JPEG_CLEAN_COLORS_KEY, &self.jpeg_clean_colors);
         eframe::set_value(storage, Self::JPEG_CLEAN_DESPECKLE_KEY, &self.jpeg_clean_despeckle);
         eframe::set_value(storage, Self::JPEG_CLEAN_ISLAND_KEY, &self.jpeg_clean_min_island);
+        eframe::set_value(storage, Self::JPEG_CLEAN_MERGE_KEY, &self.jpeg_clean_merge);
+        eframe::set_value(storage, Self::JPEG_CLEAN_MERGE_MAX_KEY, &self.jpeg_clean_merge_max);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_MERGE_RADIUS_KEY,
+            &self.jpeg_clean_merge_radius,
+        );
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
         eframe::set_value(
@@ -42565,12 +42641,18 @@ enum OpKind {
     /// first by default (whole pipeline at low res, the legacy behavior); drag it later to run
     /// some adjustments full-res before the downscale. Appended so persisted indices stay valid.
     Resize,
+    /// JPEG cleanup — recover crisp pixel art from a lossy source (key out the background, snap
+    /// the foreground to a palette, despeckle). A marker op; its controls live in the "Extract
+    /// pixels from JPEG" section. Placed FIRST by default (clean the raw source before anything),
+    /// draggable so you can, e.g., sharpen or resize before/after it. Appended so persisted
+    /// order indices stay valid.
+    JpegClean,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
     /// so persisted order indices stay valid across upgrades.
-    const ALL: [OpKind; 21] = [
+    const ALL: [OpKind; 22] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -42592,6 +42674,7 @@ impl OpKind {
         OpKind::Phosphor,
         OpKind::Blur,
         OpKind::Resize,
+        OpKind::JpegClean,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -42612,6 +42695,7 @@ impl OpKind {
                 | OpKind::Vignette
                 | OpKind::Phosphor
                 | OpKind::Resize
+                | OpKind::JpegClean
         )
     }
 
@@ -42641,6 +42725,7 @@ impl OpKind {
             OpKind::Phosphor => ("Phosphor", 0.0, 0.0, 0.0, 0.0),
             OpKind::Blur => ("Blur", 0.0, 8.0, 0.0, 0.0),
             OpKind::Resize => ("Resize", 0.0, 0.0, 0.0, 0.0),
+            OpKind::JpegClean => ("JPEG clean", 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -42676,7 +42761,7 @@ struct Adjust {
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 21],
+    order: [OpKind; 22],
 }
 
 impl Default for Adjust {
@@ -42704,8 +42789,11 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 21] = [
-        // Resize first by default: the whole pipeline runs at the reduced resolution (the
+    const DEFAULT_ORDER: [OpKind; 22] = [
+        // JPEG cleanup first: recover crisp pixel art from the raw source before anything else
+        // touches it. Drag it later to sharpen/adjust before the clean.
+        OpKind::JpegClean,
+        // Resize next by default: the whole pipeline runs at the reduced resolution (the
         // legacy behavior). Drag it later to run earlier ops at full res before the downscale.
         OpKind::Resize,
         OpKind::Pixelate,
@@ -42773,7 +42861,7 @@ impl Adjust {
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 21] {
+    fn order_to_u8(&self) -> [u8; 22] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -42811,7 +42899,18 @@ impl Adjust {
                 ops.insert(0, r);
             }
         }
-        if let Ok(order) = <[OpKind; 21]>::try_from(ops) {
+        // Likewise an order saved before JpegClean existed gets it at the very FRONT, preserving
+        // the "clean the raw source first" behavior it had as a pre-pipeline step.
+        if !arr
+            .iter()
+            .any(|&b| OpKind::from_u8(b) == Some(OpKind::JpegClean))
+        {
+            if let Some(i) = ops.iter().position(|o| *o == OpKind::JpegClean) {
+                let j = ops.remove(i);
+                ops.insert(0, j);
+            }
+        }
+        if let Ok(order) = <[OpKind; 22]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -42828,7 +42927,8 @@ impl Adjust {
             | OpKind::Glow
             | OpKind::Vignette
             | OpKind::Phosphor
-            | OpKind::Resize => {
+            | OpKind::Resize
+            | OpKind::JpegClean => {
                 unreachable!("marker ops have no slider value")
             }
             OpKind::Invert => &mut self.invert,
@@ -42955,6 +43055,10 @@ struct PipeAux<'a> {
     fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
+    // JPEG-cleanup marker op: `Some` when active (the `key` is a placeholder, re-detected from
+    // the live buffer when `jpeg_clean_auto`). Runs wherever `JpegClean` sits in the order.
+    jpeg_clean: Option<crate::jpeg_clean::CleanOpts>,
+    jpeg_clean_auto: bool,
     // When set, the `Dither` and `Palette` marker ops are SKIPPED — used by the ANSI
     // textmode export to build the *pre-shade* image (adjustments + resize only) that
     // `ansi_shade_grid` grids once, instead of re-gridding an already-rendered buffer.
@@ -42973,6 +43077,20 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
             // The Resize marker is handled by the wrappers (they split the order around it and
             // downscale between the halves) — here it's a no-op.
             OpKind::Resize => {}
+            OpKind::JpegClean => {
+                // Recover crisp pixel art from a lossy source: key out the background, snap the
+                // foreground to a palette, despeckle. Same dims, so it runs in place.
+                if let Some(o) = &aux.jpeg_clean {
+                    let mut o = o.clone();
+                    if aux.jpeg_clean_auto {
+                        o.key = crate::jpeg_clean::detect_background(rgba, w, h);
+                    }
+                    let out = crate::jpeg_clean::cleanup(rgba, w, h, &o);
+                    if out.len() == rgba.len() {
+                        rgba.copy_from_slice(&out);
+                    }
+                }
+            }
             OpKind::Pixelate => {
                 // Mosaic: average each bw×bh block (alpha untouched, so the sprite's
                 // silhouette stays crisp). Width = a.pixelate, height = aux.pixelate_h,
@@ -44100,6 +44218,8 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
+            jpeg_clean: None,
+            jpeg_clean_auto: false,
             skip_dither_palette: false,
         },
     );
@@ -44224,7 +44344,8 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
         | OpKind::Glow
         | OpKind::Vignette
         | OpKind::Phosphor
-        | OpKind::Resize => {}
+        | OpKind::Resize
+        | OpKind::JpegClean => {}
     }
 }
 
@@ -52878,6 +52999,8 @@ fn preset_pipe_aux<'a>(
         fx: PostFx::from_record(&p.postfx),
         balance,
         palette: Some(palette),
+        jpeg_clean: None,
+        jpeg_clean_auto: false,
         skip_dither_palette: false,
     }
 }
@@ -55195,6 +55318,7 @@ mod tests {
             OpKind::Phosphor,
             OpKind::Blur,
             OpKind::Resize,
+            OpKind::JpegClean,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -55248,6 +55372,7 @@ mod tests {
                 OpKind::Phosphor,
                 OpKind::Blur,
                 OpKind::Resize,
+                OpKind::JpegClean,
             ],
             ..Default::default()
         };
@@ -55307,6 +55432,8 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: Some(&pal),
+            jpeg_clean: None,
+            jpeg_clean_auto: false,
             skip_dither_palette: false,
         };
         let mut last = vec![10u8, 20, 30, 255];
@@ -55536,6 +55663,8 @@ mod tests {
             fx: PostFx::default(),
             balance: [0, 0, 0],
             palette: None,
+            jpeg_clean: None,
+            jpeg_clean_auto: false,
             skip_dither_palette: false,
         };
         // 4×1: black, grey, grey, light. Downsample to 2×1 (avg pairs), upscale to 4×1.
