@@ -1260,11 +1260,127 @@ enum Action {
     FilterFilenames,
     ToggleHidden,
     RandomPack,
+    RecolorReset,
+    RecolorGrid,
+    EditPath,
+    GoToRoot,
+    GoHome,
+    OpenFolder,
     // ── Viewer ──
     FitToScreen,
+    AutoAdvance,
+    ToggleCrt,
+    FitWidth,
+    SnapZoom,
+    // ── Panes ──
+    PaneExplorer,
+    PaneDetails,
+    PaneRecolor,
+    PaneFiles,
+    PanePixelFx,
+    RailToggle,
     // ── Global / window ──
     Refresh,
     Fullscreen,
+    OpenPrefs,
+}
+
+/// A key plus its modifier state — the value a rebindable [`Action`] maps to. `ctrl` is matched
+/// against egui's `command` modifier (Ctrl on Linux/Windows, ⌘ on macOS) so bindings are portable.
+/// Serialised to `keybindings.json` as a `"Ctrl+Alt+X"`-style string (a bare `"X"` = no modifiers,
+/// which is also how every pre-modifier config file still loads).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct KeyBind {
+    key: egui::Key,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+}
+
+impl KeyBind {
+    /// A modifier-free binding.
+    const fn key(key: egui::Key) -> Self {
+        Self { key, ctrl: false, alt: false, shift: false }
+    }
+    const fn ctrl(key: egui::Key) -> Self {
+        Self { key, ctrl: true, alt: false, shift: false }
+    }
+    const fn alt(key: egui::Key) -> Self {
+        Self { key, ctrl: false, alt: true, shift: false }
+    }
+    const fn shift(key: egui::Key) -> Self {
+        Self { key, ctrl: false, alt: false, shift: true }
+    }
+    /// The egui modifier set this binding requires (for `consume_key`).
+    fn modifiers(self) -> egui::Modifiers {
+        let mut m = egui::Modifiers::NONE;
+        if self.ctrl {
+            m |= egui::Modifiers::COMMAND;
+        }
+        if self.alt {
+            m |= egui::Modifiers::ALT;
+        }
+        if self.shift {
+            m |= egui::Modifiers::SHIFT;
+        }
+        m
+    }
+    /// True this frame when the key was pressed with *exactly* this modifier set.
+    fn matches(self, i: &egui::InputState) -> bool {
+        i.key_pressed(self.key)
+            && i.modifiers.command == self.ctrl
+            && i.modifiers.alt == self.alt
+            && i.modifiers.shift == self.shift
+    }
+    /// A human-readable label for menus / tooltips / the Help window, e.g. `Ctrl+X`, `Alt+E`, `~`.
+    fn label(self) -> String {
+        // `~` is Shift+Backtick on a US layout; show the glyph the user actually types.
+        if self.key == egui::Key::Backtick && self.shift && !self.ctrl && !self.alt {
+            return "~".into();
+        }
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        if self.shift {
+            s.push_str("Shift+");
+        }
+        s.push_str(self.key.symbol_or_name());
+        s
+    }
+    /// Serialise to the `"Ctrl+Alt+X"` config string stored in `keybindings.json`.
+    fn to_config(self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        if self.shift {
+            s.push_str("Shift+");
+        }
+        s.push_str(self.key.name());
+        s
+    }
+    /// Parse a config string. Tolerant of `Ctrl`/`Control`/`Cmd`/`Alt`/`Opt`/`Shift` prefixes in any
+    /// order and case; a bare key name (the pre-modifier format) yields a modifier-free binding.
+    fn from_config(s: &str) -> Option<Self> {
+        let (mut ctrl, mut alt, mut shift) = (false, false, false);
+        let mut key = None;
+        for part in s.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" | "cmd" | "command" | "super" | "meta" => ctrl = true,
+                "alt" | "opt" | "option" => alt = true,
+                "shift" => shift = true,
+                _ => key = egui::Key::from_name(part),
+            }
+        }
+        key.map(|key| Self { key, ctrl, alt, shift })
+    }
 }
 
 /// The use-case grouping a rebindable [`Action`] belongs to — drives the grouped cards in
@@ -1274,14 +1390,16 @@ enum ActionScope {
     Navigation,
     Grid,
     Viewer,
+    Panes,
     Global,
 }
 
 impl ActionScope {
-    const ALL: [ActionScope; 4] = [
+    const ALL: [ActionScope; 5] = [
         ActionScope::Navigation,
         ActionScope::Grid,
         ActionScope::Viewer,
+        ActionScope::Panes,
         ActionScope::Global,
     ];
     fn title(self) -> &'static str {
@@ -1289,6 +1407,7 @@ impl ActionScope {
             ActionScope::Navigation => "Navigation",
             ActionScope::Grid => "Grid & browser",
             ActionScope::Viewer => "Viewer",
+            ActionScope::Panes => "Panes",
             ActionScope::Global => "Global",
         }
     }
@@ -1297,7 +1416,7 @@ impl ActionScope {
 impl Action {
     // New actions are APPENDED so persisted keymap indices (`to_u8`, legacy load) stay valid;
     // `keybindings.json` keys off the stable `id()`, so order here is otherwise free.
-    const ALL: [Action; 13] = [
+    const ALL: [Action; 30] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
@@ -1308,9 +1427,26 @@ impl Action {
         Action::FilterFilenames,
         Action::ToggleHidden,
         Action::RandomPack,
+        Action::RecolorReset,
+        Action::RecolorGrid,
+        Action::EditPath,
+        Action::GoToRoot,
+        Action::GoHome,
+        Action::OpenFolder,
         Action::FitToScreen,
+        Action::AutoAdvance,
+        Action::ToggleCrt,
+        Action::FitWidth,
+        Action::SnapZoom,
+        Action::PaneExplorer,
+        Action::PaneDetails,
+        Action::PaneRecolor,
+        Action::PaneFiles,
+        Action::PanePixelFx,
+        Action::RailToggle,
         Action::Refresh,
         Action::Fullscreen,
+        Action::OpenPrefs,
     ];
     /// Which use-case group this action belongs to (for the Preferences → Keyboard cards).
     fn scope(self) -> ActionScope {
@@ -1323,9 +1459,25 @@ impl Action {
             | Action::LastItem
             | Action::FilterFilenames
             | Action::ToggleHidden
-            | Action::RandomPack => ActionScope::Grid,
-            Action::FitToScreen => ActionScope::Viewer,
-            Action::Refresh | Action::Fullscreen => ActionScope::Global,
+            | Action::RandomPack
+            | Action::RecolorReset
+            | Action::RecolorGrid
+            | Action::EditPath
+            | Action::GoToRoot
+            | Action::GoHome
+            | Action::OpenFolder => ActionScope::Grid,
+            Action::FitToScreen
+            | Action::AutoAdvance
+            | Action::ToggleCrt
+            | Action::FitWidth
+            | Action::SnapZoom => ActionScope::Viewer,
+            Action::PaneExplorer
+            | Action::PaneDetails
+            | Action::PaneRecolor
+            | Action::PaneFiles
+            | Action::PanePixelFx
+            | Action::RailToggle => ActionScope::Panes,
+            Action::Refresh | Action::Fullscreen | Action::OpenPrefs => ActionScope::Global,
         }
     }
     /// Stable id used in `keybindings.json`. Unlike the old `to_u8` index this doesn't constrain
@@ -1342,9 +1494,26 @@ impl Action {
             Action::FilterFilenames => "filter_filenames",
             Action::ToggleHidden => "toggle_hidden",
             Action::RandomPack => "random_pack",
+            Action::RecolorReset => "recolor_reset",
+            Action::RecolorGrid => "recolor_grid",
+            Action::EditPath => "edit_path",
+            Action::GoToRoot => "go_to_root",
+            Action::GoHome => "go_home",
+            Action::OpenFolder => "open_folder",
             Action::FitToScreen => "fit_to_screen",
+            Action::AutoAdvance => "auto_advance",
+            Action::ToggleCrt => "toggle_crt",
+            Action::FitWidth => "fit_width",
+            Action::SnapZoom => "snap_zoom",
+            Action::PaneExplorer => "pane_explorer",
+            Action::PaneDetails => "pane_details",
+            Action::PaneRecolor => "pane_recolor",
+            Action::PaneFiles => "pane_files",
+            Action::PanePixelFx => "pane_pixelfx",
+            Action::RailToggle => "rail_toggle",
             Action::Refresh => "refresh",
             Action::Fullscreen => "fullscreen",
+            Action::OpenPrefs => "open_prefs",
         }
     }
     fn from_id(id: &str) -> Option<Action> {
@@ -1362,26 +1531,62 @@ impl Action {
             Action::FilterFilenames => "Filter filenames",
             Action::ToggleHidden => "Show hidden files",
             Action::RandomPack => "Random 16colo.rs pack",
+            Action::RecolorReset => "Reset all recolor",
+            Action::RecolorGrid => "Recolor grid thumbnails",
+            Action::EditPath => "Edit path",
+            Action::GoToRoot => "Go to filesystem root",
+            Action::GoHome => "Go to home folder",
+            Action::OpenFolder => "Open folder…",
             Action::FitToScreen => "Fit image to window",
+            Action::AutoAdvance => "Slideshow auto-advance",
+            Action::ToggleCrt => "CRT effects on / off",
+            Action::FitWidth => "Fit image to width",
+            Action::SnapZoom => "Snap zoom to whole steps",
+            Action::PaneExplorer => "Explorer pane",
+            Action::PaneDetails => "Details pane",
+            Action::PaneRecolor => "Recolor pane",
+            Action::PaneFiles => "Files section",
+            Action::PanePixelFx => "PixelFX section",
+            Action::RailToggle => "Collapse / expand rail",
             Action::Refresh => "Refresh folder",
             Action::Fullscreen => "Immersive fullscreen",
+            Action::OpenPrefs => "Preferences",
         }
     }
-    fn default_key(self) -> egui::Key {
+    fn default_bind(self) -> KeyBind {
+        use egui::Key;
         match self {
-            Action::PrevImage => egui::Key::ArrowLeft,
-            Action::NextImage => egui::Key::ArrowRight,
-            Action::BackToGrid => egui::Key::Escape,
-            Action::ParentDir => egui::Key::Backspace,
-            Action::ToggleView => egui::Key::T,
-            Action::FirstItem => egui::Key::Home,
-            Action::LastItem => egui::Key::End,
-            Action::FilterFilenames => egui::Key::Slash,
-            Action::ToggleHidden => egui::Key::Period,
-            Action::RandomPack => egui::Key::R,
-            Action::FitToScreen => egui::Key::F,
-            Action::Refresh => egui::Key::F5,
-            Action::Fullscreen => egui::Key::F11,
+            Action::PrevImage => KeyBind::key(Key::ArrowLeft),
+            Action::NextImage => KeyBind::key(Key::ArrowRight),
+            Action::BackToGrid => KeyBind::key(Key::Escape),
+            Action::ParentDir => KeyBind::key(Key::Backspace),
+            Action::ToggleView => KeyBind::key(Key::T),
+            Action::FirstItem => KeyBind::key(Key::Home),
+            Action::LastItem => KeyBind::key(Key::End),
+            Action::FilterFilenames => KeyBind::key(Key::Slash), // vim-style `/`
+            Action::ToggleHidden => KeyBind::key(Key::Period),
+            Action::RandomPack => KeyBind::key(Key::R),
+            Action::RecolorReset => KeyBind { key: Key::X, ctrl: true, alt: false, shift: true },
+            Action::RecolorGrid => KeyBind::ctrl(Key::G),
+            Action::EditPath => KeyBind::key(Key::Space),
+            // `/` stays the vim filter, so the filesystem-root jump is on backslash.
+            Action::GoToRoot => KeyBind::key(Key::Backslash),
+            Action::GoHome => KeyBind::shift(Key::Backtick), // `~`
+            Action::OpenFolder => KeyBind::ctrl(Key::O),
+            Action::FitToScreen => KeyBind::key(Key::F),
+            Action::AutoAdvance => KeyBind::key(Key::A),
+            Action::ToggleCrt => KeyBind::key(Key::C),
+            Action::FitWidth => KeyBind::key(Key::W),
+            Action::SnapZoom => KeyBind::key(Key::S),
+            Action::PaneExplorer => KeyBind::alt(Key::E),
+            Action::PaneDetails => KeyBind::alt(Key::D),
+            Action::PaneRecolor => KeyBind::alt(Key::R),
+            Action::PaneFiles => KeyBind::alt(Key::F),
+            Action::PanePixelFx => KeyBind::alt(Key::P),
+            Action::RailToggle => KeyBind::key(Key::Tab),
+            Action::Refresh => KeyBind::key(Key::F5),
+            Action::Fullscreen => KeyBind::key(Key::F11),
+            Action::OpenPrefs => KeyBind::ctrl(Key::Comma),
         }
     }
     fn to_u8(self) -> u8 {
@@ -1873,7 +2078,7 @@ pub struct Kaleidotron {
     shade_swatch_tex: HashMap<u8, egui::TextureHandle>,
     shade_swatch_key: Option<(u32, u32)>,
     // hotkeys (round 2 #12)
-    keymap: HashMap<Action, egui::Key>,
+    keymap: HashMap<Action, KeyBind>,
     rebinding: Option<Action>, // the action awaiting a new key, if any
 
     // single-view state
@@ -2063,6 +2268,7 @@ pub struct Kaleidotron {
     crt_scanline_scale: bool, // scale scanline spacing with the zoom (persisted)
     glow: bool,             // phosphor-glow bloom around bright pixels (persisted)
     glow_amt: f32,          // phosphor-glow intensity (persisted)
+    crt_fx_saved: Option<(f32, bool)>, // remembered (scanline_dark, glow) for the CRT master toggle
     black_bg: bool,         // fill the viewer background black instead of dark grey (persisted)
     // Transparency backdrop: what shows *through* an image's transparent pixels in the
     // viewer (checkerboard or a solid colour of the user's choosing). All persisted.
@@ -2096,6 +2302,8 @@ pub struct Kaleidotron {
     slide_shuffle: bool, // slideshow: auto-advance in a random order (persisted)
     shuffle_bag: Vec<PathBuf>, // remaining images this shuffle pass; refilled (reshuffled) when empty
     immersive: bool,  // F11 fullscreen: hide all bars/UI, show only the art
+    view_only: bool,  // `--view FILE`: a minimal viewer — no chrome, Esc quits. Not persisted.
+    pending_cli_open: Option<PathBuf>, // `--open`/`--view` FILE, opened on the first frame
     // DEBUG_MODE=true: dock the window to the bottom-right corner on startup (so a dev test
     // instance stays out of the way). Consumed once the monitor size is known. Not persisted.
     debug_dock_pending: bool,
@@ -3074,12 +3282,28 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::FOLDER_KEY))
             .flatten();
-        // CLI --folder wins over the last-opened folder; canonicalize so a relative
-        // path from the shell becomes a clean absolute one for the breadcrumb.
-        let open_target = cli
-            .folder
+        // `--open FILE` / `--view FILE`: open one file straight into the viewer. The file is
+        // opened on the first frame (`pending_cli_open`); here we just make its FOLDER the launch
+        // target so prev/next work and `resolve_local` has a real base. `--view` also flips
+        // `view_only` (minimal chrome, Esc quits).
+        let cli_view_only = cli.view.is_some();
+        let cli_open_file = cli
+            .open
+            .clone()
+            .or_else(|| cli.view.clone())
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-            .or(last_folder);
+            .filter(|p| p.is_file());
+        // CLI --folder wins over the last-opened folder; canonicalize so a relative
+        // path from the shell becomes a clean absolute one for the breadcrumb. A --open/--view
+        // file's parent folder wins over both.
+        let open_target = cli_open_file
+            .as_ref()
+            .and_then(|f| f.parent().map(|p| p.to_path_buf()))
+            .or_else(|| {
+                cli.folder
+                    .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                    .or(last_folder)
+            });
 
         let get_u8 = |k| cc.storage.and_then(|s| eframe::get_value::<u8>(s, k));
         let get_bool = |k| cc.storage.and_then(|s| eframe::get_value::<bool>(s, k));
@@ -3624,8 +3848,8 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::SELECTED_PAL_KEY))
             .flatten();
 
-        let mut keymap: HashMap<Action, egui::Key> =
-            Action::ALL.iter().map(|&a| (a, a.default_key())).collect();
+        let mut keymap: HashMap<Action, KeyBind> =
+            Action::ALL.iter().map(|&a| (a, a.default_bind())).collect();
         // `keybindings.json` is the source of truth when it exists; otherwise fall back to the
         // legacy persisted blob (and it gets written out as JSON on the next save, migrating once).
         let kb_file = crate::keybindings::path(&data_dir);
@@ -3654,7 +3878,7 @@ impl Kaleidotron {
         let themes = crate::theme::load_all(&themes_dir);
         if let Some(entries) = crate::keybindings::load(&kb_file) {
             for (aid, kn) in entries {
-                if let (Some(a), Some(k)) = (Action::from_id(&aid), egui::Key::from_name(&kn)) {
+                if let (Some(a), Some(k)) = (Action::from_id(&aid), KeyBind::from_config(&kn)) {
                     keymap.insert(a, k);
                 }
             }
@@ -3664,7 +3888,7 @@ impl Kaleidotron {
         {
             for (au, kn) in saved {
                 if let (Some(&a), Some(k)) =
-                    (Action::ALL.get(au as usize), egui::Key::from_name(&kn))
+                    (Action::ALL.get(au as usize), KeyBind::from_config(&kn))
                 {
                     keymap.insert(a, k);
                 }
@@ -3675,7 +3899,7 @@ impl Kaleidotron {
         if !kb_file.exists() {
             let entries: Vec<(String, String)> = Action::ALL
                 .iter()
-                .filter_map(|a| keymap.get(a).map(|k| (a.id().to_string(), k.name().to_string())))
+                .filter_map(|a| keymap.get(a).map(|k| (a.id().to_string(), k.to_config())))
                 .collect();
             let labels = |id: &str| Action::from_id(id).map(|a| a.label().to_string());
             let _ = crate::keybindings::save(&kb_file, &entries, &labels);
@@ -4464,6 +4688,7 @@ impl Kaleidotron {
             osd_dismissed: false,
             glow,
             glow_amt,
+            crt_fx_saved: None,
             scanline_tex: None,
             auto_next,
             auto_next_secs,
@@ -4472,6 +4697,8 @@ impl Kaleidotron {
             slide_shuffle: get_bool(Self::SLIDE_SHUFFLE_KEY).unwrap_or(false),
             shuffle_bag: Vec::new(),
             immersive: false,
+            view_only: cli_view_only,
+            pending_cli_open: cli_open_file,
             debug_dock_pending: std::env::var("DEBUG_MODE")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
                 .unwrap_or(false),
@@ -5163,7 +5390,7 @@ impl Kaleidotron {
         let mut keys = Map::new();
         for a in Action::ALL {
             if let Some(k) = self.keymap.get(&a) {
-                keys.insert(a.id().to_string(), Value::String(k.name().to_string()));
+                keys.insert(a.id().to_string(), Value::String(k.to_config()));
             }
         }
         let mut root = Map::new();
@@ -5241,7 +5468,7 @@ impl Kaleidotron {
         if let Some(obj) = root.get("keybindings").and_then(|v| v.as_object()) {
             for (aid, v) in obj {
                 if let (Some(a), Some(k)) =
-                    (Action::from_id(aid), v.as_str().and_then(egui::Key::from_name))
+                    (Action::from_id(aid), v.as_str().and_then(KeyBind::from_config))
                 {
                     self.keymap.insert(a, k);
                 }
@@ -19354,12 +19581,19 @@ impl Kaleidotron {
         }
     }
 
-    /// The key bound to an action (falls back to its default).
-    fn key_for(&self, a: Action) -> egui::Key {
+    /// The binding for an action (falls back to its default).
+    fn bind_for(&self, a: Action) -> KeyBind {
         self.keymap
             .get(&a)
             .copied()
-            .unwrap_or_else(|| a.default_key())
+            .unwrap_or_else(|| a.default_bind())
+    }
+
+    /// Consume `a`'s binding if it was pressed this frame (removes the key event so it can't also
+    /// reach a lower-priority handler — e.g. Ctrl+X for Reset-recolor vs. the file-op Cut).
+    fn take(&self, ctx: &egui::Context, a: Action) -> bool {
+        let b = self.bind_for(a);
+        ctx.input_mut(|i| i.consume_key(b.modifiers(), b.key))
     }
 
     /// Navigate the folder history (mouse back/forward in the grid).
@@ -25769,6 +26003,79 @@ impl Kaleidotron {
 
     /// The Recolor dock: live recolored preview + palette-swap / reduce / dither /
     /// random controls + swatches + export/save, all acting on `inspected_entry`.
+    /// Clear the whole Recolor panel — adjustments, balance, palette / reduce / dither (incl. ANSI
+    /// Shade), resize/scale, post-FX and any hand-edits. Shared by the "⟲ Reset all" button and the
+    /// `RecolorReset` hotkey (Ctrl+X, when the pane is open).
+    fn reset_recolor(&mut self) {
+        self.adjust = Adjust::default();
+        self.selected_palette = None;
+        self.custom_palette = None;
+        self.quantize_on = false;
+        self.quantize_n = 16;
+        self.quantize_keep_bw = false;
+        self.dither_method = 0;
+        self.dither_amount = 1.0;
+        self.dither_custom_n = 4;
+        self.dither_custom = crate::thumb::bayer_values(4);
+        self.dither_scale_x = 1;
+        self.dither_scale_y = 1;
+        // ANSI Shade is a whole sub-panel of its own (F1–F8, shading / smoothness / detail,
+        // snap / iCE / fit) — reset it to the same baseline its own ↺ button uses.
+        self.reset_ansi_shade();
+        self.pixelate_h = 0.0;
+        self.postfx = PostFx::default();
+        self.scale_algo = crate::scale::Scaler::None;
+        self.resize_on = false;
+        self.resize_fx = 1.0;
+        self.resize_fy = 1.0;
+        self.balance_color = [128, 128, 128];
+        self.balance_strength = 0.0;
+        self.balance_hex = "808080".into();
+        self.flash = None;
+        self.editing_color = None;
+    }
+
+    /// Open the breadcrumb path editor, seeded with the current folder + focused (the `EditPath`
+    /// hotkey / the Ctrl+Alt+Shift+Up chord / clicking the ✎ button).
+    fn open_path_edit(&mut self) {
+        if let Some(folder) = self.folder.clone() {
+            self.path_edit = Some(self.to_display(&folder).to_string_lossy().into_owned());
+            self.focus_path = true;
+        }
+    }
+
+    /// Master CRT-effects toggle (the `ToggleCrt` hotkey, default `C`): flip scanlines + phosphor
+    /// glow off together, remembering their levels so a second press restores exactly what was on.
+    fn toggle_crt_fx(&mut self) {
+        if self.crt_scanline_dark > 0.0 || self.glow {
+            self.crt_fx_saved = Some((self.crt_scanline_dark, self.glow));
+            self.crt_scanline_dark = 0.0;
+            self.glow = false;
+        } else {
+            let (d, g) = self.crt_fx_saved.take().unwrap_or((0.4, true));
+            self.crt_scanline_dark = if d > 0.0 { d } else { 0.4 };
+            self.glow = g || d <= 0.0;
+        }
+    }
+
+    /// Toggle a Places rail SECTION (Files / PixelFX): show the Explorer on that section, or hide it
+    /// if it's already the one showing. Mirrors clicking the rail button (`ui_rail`).
+    fn toggle_rail_section(&mut self, sec: RailSection) {
+        if self.show_explorer && self.rail_section == sec {
+            self.show_explorer = false;
+            return;
+        }
+        self.rail_section = sec;
+        self.show_explorer = true;
+        self.explorer_tab = 0;
+        if let Some((i, _)) = sec.tabs().iter().find(|(i, _)| self.places_tab_enabled(*i)) {
+            self.places_tab = *i;
+            if *i == 2 {
+                self.kit_editor = true;
+            }
+        }
+    }
+
     fn ui_recolor(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -25783,33 +26090,7 @@ impl Kaleidotron {
                 )
                 .clicked()
             {
-                self.adjust = Adjust::default();
-                self.selected_palette = None;
-                self.custom_palette = None;
-                self.quantize_on = false;
-                self.quantize_n = 16;
-                self.quantize_keep_bw = false;
-                self.dither_method = 0;
-                self.dither_amount = 1.0;
-                self.dither_custom_n = 4;
-                self.dither_custom = crate::thumb::bayer_values(4);
-                self.dither_scale_x = 1;
-                self.dither_scale_y = 1;
-                // ANSI Shade is a whole sub-panel of its own (F1–F8, shading / smoothness /
-                // detail, snap / iCE / fit) — reset it to the same baseline its own ↺ button
-                // uses, so "Reset all" leaves nothing behind.
-                self.reset_ansi_shade();
-                self.pixelate_h = 0.0;
-                self.postfx = PostFx::default();
-                self.scale_algo = crate::scale::Scaler::None;
-                self.resize_on = false;
-                self.resize_fx = 1.0;
-                self.resize_fy = 1.0;
-                self.balance_color = [128, 128, 128];
-                self.balance_strength = 0.0;
-                self.balance_hex = "808080".into();
-                self.flash = None;
-                self.editing_color = None;
+                self.reset_recolor();
             }
         });
         ui.separator();
@@ -30877,18 +31158,18 @@ impl Kaleidotron {
     }
 
     fn ui_single(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        let prev_key = self.key_for(Action::PrevImage);
-        let next_key = self.key_for(Action::NextImage);
-        let fit_key = self.key_for(Action::FitToScreen);
+        let prev_key = self.bind_for(Action::PrevImage);
+        let next_key = self.bind_for(Action::NextImage);
+        let fit_key = self.bind_for(Action::FitToScreen);
         let typing = self.keyboard_captured(ctx);
         let (prev, next, fit, tile, edit) = if typing {
             (false, false, false, false, false)
         } else {
             ui.input(|i| {
                 (
-                    i.key_pressed(prev_key),
-                    i.key_pressed(next_key),
-                    i.key_pressed(fit_key),
+                    prev_key.matches(i),
+                    next_key.matches(i),
+                    fit_key.matches(i),
                     i.key_pressed(egui::Key::T),
                     i.key_pressed(egui::Key::Enter),
                 )
@@ -34516,6 +34797,22 @@ impl Kaleidotron {
         let gear_h = btn_h + 16.0;
         let list_h = (ui.available_height() - gear_h).max(60.0);
 
+        // The rebindable-action keys shown in each rail button's tooltip (built once so they
+        // outlive the ScrollArea closure that references them).
+        let open_key = self.bind_for(Action::OpenFolder).label();
+        let rail_key = self.bind_for(Action::RailToggle).label();
+        let exp_key = self.bind_for(Action::PaneExplorer).label();
+        let det_key = self.bind_for(Action::PaneDetails).label();
+        let rec_key = self.bind_for(Action::PaneRecolor).label();
+        let collapse_tip = format!(
+            "{} the rail  ({rail_key})",
+            if expanded { "Collapse" } else { "Expand" }
+        );
+        let files_tip = format!(
+            "Files \u{2014} folders, favorites, filters  ({})",
+            self.bind_for(Action::PaneFiles).label()
+        );
+        let fx_tip = format!("PixelFX presets  ({})", self.bind_for(Action::PanePixelFx).label());
         egui::ScrollArea::vertical()
             .max_height(list_h)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -34526,27 +34823,27 @@ impl Kaleidotron {
                     if expanded { "\u{00AB}" } else { "\u{00BB}" },
                     "Collapse",
                     false,
-                    if expanded { "Collapse the rail" } else { "Expand the rail (show labels)" },
+                    &collapse_tip,
                 ).clicked() {
                     self.rail_expanded = !self.rail_expanded;
                 }
                 ui.add_space(6.0);
 
-                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, "Open folder\u{2026}").clicked() {
+                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, &format!("Open folder\u{2026}  ({open_key})")).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.open_folder(dir);
                     }
                 }
                 ui.add_space(8.0);
-                if row(ui, "\u{2630}", "Explorer", self.show_explorer, "Explorer pane").clicked() {
+                if row(ui, "\u{2630}", "Explorer", self.show_explorer, &format!("Explorer pane  ({exp_key})")).clicked() {
                     self.show_explorer = !self.show_explorer;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{2139}", "Details", self.show_details, "Details pane").clicked() {
+                if row(ui, "\u{2139}", "Details", self.show_details, &format!("Details pane  ({det_key})")).clicked() {
                     self.show_details = !self.show_details;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, "Recolor pane").clicked() {
+                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, &format!("Recolor pane  ({rec_key})")).clicked() {
                     self.show_recolor = !self.show_recolor;
                 }
                 ui.add_space(12.0);
@@ -34555,9 +34852,9 @@ impl Kaleidotron {
                 // Places sections. Clicking one swaps what the Explorer pane shows (and opens it
                 // if hidden — otherwise the click would appear to do nothing).
                 for (sec, glyph, label, tip) in [
-                    (RailSection::Files, "\u{1F4C1}", "Files", "Files \u{2014} folders, favorites, filters"),
+                    (RailSection::Files, "\u{1F4C1}", "Files", files_tip.as_str()),
                     (RailSection::Audio, "\u{1F3B9}", "Audio", "Audio \u{2014} kits and samples"),
-                    (RailSection::Fx, "\u{2728}", "PixelFX", "PixelFX presets"),
+                    (RailSection::Fx, "\u{2728}", "PixelFX", fx_tip.as_str()),
                     (RailSection::Ai, icons::ROBOT, "AI", "AI generation"),
                 ] {
                     let available = match sec {
@@ -35979,10 +36276,11 @@ impl Kaleidotron {
                         }
                         if ui
                             .checkbox(&mut self.zoom_lock, "Snap")
-                            .on_hover_text(
+                            .on_hover_text(format!(
                                 "Lock zoom to whole device-pixel steps (N×) — \
-                                 pixel-perfect nearest-neighbor scaling",
-                            )
+                                 pixel-perfect nearest-neighbor scaling  ({})",
+                                self.bind_for(Action::SnapZoom).label()
+                            ))
                             .changed()
                             && self.zoom_lock
                         {
@@ -35993,7 +36291,10 @@ impl Kaleidotron {
                         // re-applies it after you've zoomed away.
                         if ui
                             .button("Fit W")
-                            .on_hover_text("Fit the art to the viewport width")
+                            .on_hover_text(format!(
+                                "Fit the art to the viewport width  ({})",
+                                self.bind_for(Action::FitWidth).label()
+                            ))
                             .clicked()
                         {
                             self.fit_width_on_open = true;
@@ -36081,7 +36382,10 @@ impl Kaleidotron {
                                     .show_value(false)
                                     .text("scanlines"),
                             )
-                            .on_hover_text("Scanline darkness (0 = off)");
+                            .on_hover_text(format!(
+                                "Scanline darkness (0 = off) — {} toggles scanlines + glow together",
+                                self.bind_for(Action::ToggleCrt).label()
+                            ));
                             ui.checkbox(&mut self.crt_scanline_scale, "scale with zoom")
                                 .on_hover_text(
                                     "Scale the scanline spacing with the zoom — one line per \
@@ -36129,10 +36433,16 @@ impl Kaleidotron {
                                 egui::RichText::new("auto-advance")
                             };
                             let hover = if self.auto_paused {
-                                "Slideshow paused — you took control. Click to resume."
+                                format!(
+                                    "Slideshow paused — you took control. Click to resume.  ({})",
+                                    self.bind_for(Action::AutoAdvance).label()
+                                )
                             } else {
-                                "Auto-advance to the next file after it finishes drawing \
-                                 plus the chosen delay — flip through a whole pack hands-free"
+                                format!(
+                                    "Auto-advance to the next file after it finishes drawing \
+                                     plus the chosen delay — flip through a whole pack hands-free  ({})",
+                                    self.bind_for(Action::AutoAdvance).label()
+                                )
                             };
                             if ui
                                 .checkbox(&mut self.auto_next, label)
@@ -36552,15 +36862,15 @@ impl Kaleidotron {
                     ui.close();
                 }
                 ui.separator();
-                if check(ui, self.show_explorer, "Explorer pane", "") {
+                if check(ui, self.show_explorer, "Explorer pane", &self.bind_for(Action::PaneExplorer).label()) {
                     action = Some(MenuAction::ToggleExplorer);
                     ui.close();
                 }
-                if check(ui, self.show_details, "Details pane", "") {
+                if check(ui, self.show_details, "Details pane", &self.bind_for(Action::PaneDetails).label()) {
                     action = Some(MenuAction::ToggleDetails);
                     ui.close();
                 }
-                if check(ui, self.show_recolor, "Recolor pane", "") {
+                if check(ui, self.show_recolor, "Recolor pane", &self.bind_for(Action::PaneRecolor).label()) {
                     action = Some(MenuAction::ToggleRecolor);
                     ui.close();
                 }
@@ -36603,14 +36913,16 @@ impl Kaleidotron {
                     }
                 }
                 ui.separator();
-                if ui.selectable_label(self.sort_desc, "Descending").clicked() {
+                // Descending / Directories first are independent booleans, not part of the
+                // radio-style sort-key group above — so they render as checkboxes (matching
+                // the View menu), while the keys stay selectable_labels.
+                let mut desc = self.sort_desc;
+                if ui.checkbox(&mut desc, "Descending").clicked() {
                     action = Some(MenuAction::ToggleDesc);
                     ui.close();
                 }
-                if ui
-                    .selectable_label(self.dirs_first, "Directories first")
-                    .clicked()
-                {
+                let mut dirs_first = self.dirs_first;
+                if ui.checkbox(&mut dirs_first, "Directories first").clicked() {
                     action = Some(MenuAction::ToggleDirsFirst);
                     ui.close();
                 }
@@ -38640,6 +38952,17 @@ impl eframe::App for Kaleidotron {
     // `show_inside(ui, ..)` and we clone the context off the `Ui` for the rest.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // `--open FILE` / `--view FILE`: open the file straight into the viewer, on the first frame
+        // (deferred here so the GPU context is ready for the texture upload, and the folder scan
+        // kicked off in `new()` has populated `entries` for prev/next).
+        if let Some(f) = self.pending_cli_open.take() {
+            self.load_full(&ctx, f);
+        }
+        // `--view`: Esc quits immediately (consumed, so it doesn't also fall through to the
+        // back-to-grid handler — there's no grid to go back to in the bare viewer).
+        if self.view_only && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Track the live zoom factor (changed by Ctrl +/-) so `save` can persist it.
         self.ui_zoom = ctx.zoom_factor();
         self.want_repaint = false;
@@ -38741,11 +39064,55 @@ impl eframe::App for Kaleidotron {
                 ),
             }
         }
-        let fullscreen_key = self.key_for(Action::Fullscreen);
-        if ctx.input(|i| i.key_pressed(fullscreen_key)) {
+        let fullscreen_key = self.bind_for(Action::Fullscreen);
+        if ctx.input(|i| fullscreen_key.matches(i)) {
             self.immersive = !self.immersive;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.immersive));
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.immersive));
+        }
+        // F10 — the conventional "access the menu bar" key: hand keyboard focus to the first
+        // focusable widget, which is the leftmost menu button (the menu bar is the first panel).
+        // From there arrows/Enter open + walk the menus. (Tab is claimed by the rail toggle and no
+        // longer walks focus into the menu — see the RailToggle handler.)
+        if !typing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F10)) {
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
+        }
+        // F1 / ? — open the keyboard-shortcuts help window (the conventional Help keys). `?` is its
+        // own egui key (Shift+/), so it doesn't collide with the `/` filter.
+        if !typing
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::F1)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Questionmark)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Questionmark)
+            })
+        {
+            self.show_hotkeys = true;
+        }
+        // Global panel chords — Ctrl+Alt+Shift+Arrows, active in any mode (even the viewer / while a
+        // field is focused). Hardcoded like Ctrl+Shift+B; additional to the primary keys
+        // (Alt+R / Tab / Space). Consumed so they never leak to a field or a nav binding.
+        if self.rebinding.is_none() {
+            let m = egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT;
+            let (right, left, up, down) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(m, egui::Key::ArrowRight),
+                    i.consume_key(m, egui::Key::ArrowLeft),
+                    i.consume_key(m, egui::Key::ArrowUp),
+                    i.consume_key(m, egui::Key::ArrowDown),
+                )
+            });
+            if right {
+                self.show_recolor = !self.show_recolor; // Toggle Recolor pane
+            }
+            if left {
+                self.rail_expanded = !self.rail_expanded; // Expand / collapse the rail
+            }
+            if up {
+                self.open_path_edit(); // Jump to the path entry
+            }
+            if down {
+                self.show_tasks_panel = !self.show_tasks_panel; // Toggle task output
+            }
         }
         // Ctrl+Alt+K — abort an in-flight AI generation (kills the generator process).
         if self.ai_job_rx.is_some()
@@ -38762,9 +39129,19 @@ impl eframe::App for Kaleidotron {
         // Shift+F5 — the heavier "hard refresh": additionally DROP the cached thumbnail /
         // metadata / SAUCE / montage for every item in this place so they re-decode from
         // disk (catches a file whose *contents* changed but whose path didn't).
-        let refresh_key = self.key_for(Action::Refresh);
-        if !typing && ctx.input(|i| i.key_pressed(refresh_key)) {
-            if ctx.input(|i| i.modifiers.shift) {
+        // Shift is the "hard refresh" sub-modifier, so match the refresh key ignoring shift, then
+        // branch on it (rather than exact `matches`, which would reject Shift+F5).
+        let refresh_key = self.bind_for(Action::Refresh);
+        let (refresh_hit, shift_held) = ctx.input(|i| {
+            (
+                i.key_pressed(refresh_key.key)
+                    && i.modifiers.command == refresh_key.ctrl
+                    && i.modifiers.alt == refresh_key.alt,
+                i.modifiers.shift,
+            )
+        });
+        if !typing && refresh_hit {
+            if shift_held {
                 self.clear_current_view_cache();
             } else {
                 self.refresh();
@@ -38773,8 +39150,8 @@ impl eframe::App for Kaleidotron {
         // `.` — toggle hidden (dotfile) entries in the grid/table, like a shell's
         // `ls -a` or Dolphin's Alt+.  A pure view filter, so it re-filters instantly
         // (no re-scan). Guarded by `!typing` so it can't fire while editing a field.
-        let hidden_key = self.key_for(Action::ToggleHidden);
-        if !typing && ctx.input(|i| i.key_pressed(hidden_key)) {
+        let hidden_key = self.bind_for(Action::ToggleHidden);
+        if !typing && ctx.input(|i| hidden_key.matches(i)) {
             self.show_hidden = !self.show_hidden;
             self.rebuild_view();
         }
@@ -38936,7 +39313,10 @@ impl eframe::App for Kaleidotron {
         // Which chrome edges are visible: all of them normally; in immersive mode only the
         // edge the mouse is hovering (within EDGE px of the window border).
         let mut hide_cursor = false;
-        let (show_top, show_bottom, show_left, show_right) = if self.immersive {
+        let (show_top, show_bottom, show_left, show_right) = if self.view_only {
+            // `--view`: a bare viewer — no menus, rail, docks or status bar; just the art.
+            (false, false, false, false)
+        } else if self.immersive {
             const EDGE: f32 = 48.0;
             const CURSOR_HIDE_SECS: f32 = 1.5;
             let win = ctx.content_rect();
@@ -38979,11 +39359,11 @@ impl eframe::App for Kaleidotron {
         };
 
         // R — jump to a new random 16colo.rs pack (skip a dud). Not while typing/searching.
-        let random_key = self.key_for(Action::RandomPack);
+        let random_key = self.bind_for(Action::RandomPack);
         if !typing
             && self.search.is_none()
             && !self.show_search
-            && ctx.input(|i| i.key_pressed(random_key))
+            && ctx.input(|i| random_key.matches(i))
         {
             self.start_random_pack();
         }
@@ -39122,19 +39502,32 @@ impl eframe::App for Kaleidotron {
             }
         }
 
-        // Hotkey rebinding: the next key press becomes the binding (Esc cancels).
+        // Hotkey rebinding: the next key press (with its modifiers) becomes the binding — so
+        // Ctrl+X, Alt+E and the like can be captured, not just bare keys. Esc cancels. A bare
+        // modifier press emits no `Key` event, so this naturally waits for a real key.
         if let Some(a) = self.rebinding {
             let pressed = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Key {
-                        key, pressed: true, ..
-                    } => Some(*key),
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
                     _ => None,
                 })
             });
-            if let Some(k) = pressed {
-                if k != egui::Key::Escape {
-                    self.keymap.insert(a, k);
+            if let Some((key, m)) = pressed {
+                if key != egui::Key::Escape {
+                    self.keymap.insert(
+                        a,
+                        KeyBind {
+                            key,
+                            ctrl: m.command || m.ctrl,
+                            alt: m.alt,
+                            shift: m.shift,
+                        },
+                    );
                 }
                 self.rebinding = None;
             }
@@ -39171,9 +39564,9 @@ impl eframe::App for Kaleidotron {
         // typing into any field (path, rename, search box, criteria) must not rate
         // images or trigger nav keys — `typing` now also covers focused text fields.
         {
-            let back_key = self.key_for(Action::BackToGrid);
-            let parent_key = self.key_for(Action::ParentDir);
-            let view_key = self.key_for(Action::ToggleView);
+            let back_key = self.bind_for(Action::BackToGrid);
+            let parent_key = self.bind_for(Action::ParentDir);
+            let view_key = self.bind_for(Action::ToggleView);
             let (rate, esc, back, z_held, zoom_set, zoom_step, toggle_view) = ctx.input(|i| {
                 use egui::Key::*;
                 let z_held = i.key_down(Z); // DRAW-style zoom chord modifier
@@ -39208,12 +39601,12 @@ impl eframe::App for Kaleidotron {
                     - i32::from(i.key_pressed(Minus));
                 (
                     rate,
-                    i.key_pressed(back_key) && !i.modifiers.shift, // Shift+Esc is Panic, not Back
-                    i.key_pressed(parent_key),
+                    back_key.matches(i), // exact-NONE match ⇒ Shift+Esc (Panic) isn't Back
+                    parent_key.matches(i),
                     z_held,
                     zoom_set,
                     zoom_step,
-                    i.key_pressed(view_key),
+                    view_key.matches(i),
                 )
             });
             // Toggle grid/table only in the browse view (in the single view the same
@@ -39267,9 +39660,9 @@ impl eframe::App for Kaleidotron {
 
         // Grid: Home/End jump+scroll to first/last; mouse back/forward = folder
         // history. Single view: mouse back/forward = previous/next image.
-        let first_key = self.key_for(Action::FirstItem);
-        let last_key = self.key_for(Action::LastItem);
-        let (home, end) = ctx.input(|i| (i.key_pressed(first_key), i.key_pressed(last_key)));
+        let first_key = self.bind_for(Action::FirstItem);
+        let last_key = self.bind_for(Action::LastItem);
+        let (home, end) = ctx.input(|i| (first_key.matches(i), last_key.matches(i)));
         let (mouse_back, mouse_fwd) = ctx.input(|i| {
             (
                 i.pointer.button_pressed(egui::PointerButton::Extra1),
@@ -39284,18 +39677,21 @@ impl eframe::App for Kaleidotron {
                 self.select_index(self.entries.len() - 1);
             }
         }
-        // '/' opens the grid filename filter (vim-style). `egui_wants_keyboard_input` is the
-        // load-bearing guard: '/' is a plain character, so without it a slash typed into ANY
-        // focused text field (a URL in the Web tab, a ModArchive/Poly Haven query, …) is stolen by
-        // the filter instead of being typed. The explicit `path_edit`/`search` flags only cover
-        // this file's own two fields, not egui's focus in general.
-        let filter_key = self.key_for(Action::FilterFilenames);
+        // The filename filter (vim-style `/`) opens the grid quick-filter.
+        // `egui_wants_keyboard_input` is the load-bearing guard: a plain character key, so without
+        // it a `/` typed into ANY focused text field (a URL in the Web tab, a ModArchive/Poly Haven
+        // query, …) is stolen by the filter instead of being typed. The explicit `path_edit`/
+        // `search` flags only cover this file's own two fields, not egui's focus in general.
+        let filter_key = self.bind_for(Action::FilterFilenames);
+        // If the filter and Go-to-root are ever rebound to the same key, Go-to-root wins and the
+        // filter yields (they default to `/` and `\`, so this guard is normally inert).
         if self.mode == Mode::Grid
             && self.path_edit.is_none()
             && self.rebinding.is_none()
             && self.search.is_none()
+            && filter_key != self.bind_for(Action::GoToRoot)
             && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(filter_key))
+            && ctx.input(|i| filter_key.matches(i))
         {
             self.search = Some(String::new());
             self.focus_search = true;
@@ -39365,6 +39761,91 @@ impl eframe::App for Kaleidotron {
                 Mode::Grid => self.go_history(false),
                 Mode::Single | Mode::ThreeD => self.step_image(&ctx, true),
                 Mode::Compare => {}
+            }
+        }
+
+        // ── New rebindable actions (viewer / grid / panes / global) ────────────────────────────
+        // Consumed via `self.take(...)` so a modifier combo (Ctrl+X, Alt+E, …) doesn't also reach
+        // the file-op / focus handlers below. `OpenPrefs` is handled first so Ctrl+, can also CLOSE
+        // an open Preferences window; everything else is suppressed while a modal dialog owns the
+        // screen. Each `take` consumes only its own bound combo, so unrelated keys fall through.
+        let modal = self.show_prefs
+            || self.show_associations
+            || self.show_hotkeys
+            || self.show_font_preview_edit;
+        if !typing && self.rebinding.is_none() && self.take(&ctx, Action::OpenPrefs) {
+            self.show_prefs = !self.show_prefs;
+            self.want_repaint = true;
+        }
+        if !typing && !modal && self.rebinding.is_none() {
+            // Panes / rail — available in any mode.
+            if self.take(&ctx, Action::PaneExplorer) {
+                self.show_explorer = !self.show_explorer;
+            }
+            if self.take(&ctx, Action::PaneDetails) {
+                self.show_details = !self.show_details;
+            }
+            if self.take(&ctx, Action::PaneRecolor) {
+                self.show_recolor = !self.show_recolor;
+            }
+            if self.take(&ctx, Action::PaneFiles) {
+                self.toggle_rail_section(RailSection::Files);
+            }
+            if self.take(&ctx, Action::PanePixelFx) {
+                self.toggle_rail_section(RailSection::Fx);
+            }
+            if self.take(&ctx, Action::RailToggle) {
+                self.rail_expanded = !self.rail_expanded;
+                // egui latches Tab→focus-move at begin_pass (before this handler), so *consuming*
+                // the key can't stop it — cancel the pending move directly, or a second Tab walks
+                // focus into the menu bar. Menu access is F10 instead (below).
+                ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            }
+            if self.take(&ctx, Action::OpenFolder) {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.open_folder(dir);
+                }
+            }
+            // Viewer — the single-image view only (NOT the 3D viewer, whose WASD is the fly-cam).
+            if self.mode == Mode::Single {
+                if self.take(&ctx, Action::AutoAdvance) {
+                    self.auto_next = !self.auto_next;
+                    self.auto_paused = false;
+                }
+                if self.take(&ctx, Action::ToggleCrt) {
+                    self.toggle_crt_fx();
+                }
+                if self.take(&ctx, Action::FitWidth) {
+                    self.fit_width_on_open = true;
+                }
+                if self.take(&ctx, Action::SnapZoom) {
+                    self.zoom_lock = !self.zoom_lock;
+                }
+            }
+            // Grid / table.
+            if self.mode == Mode::Grid {
+                // Reset-recolor is Ctrl+Shift+X, so it never collides with file-Cut (Ctrl+X).
+                if self.take(&ctx, Action::RecolorReset) {
+                    self.reset_recolor();
+                }
+                if self.take(&ctx, Action::RecolorGrid) {
+                    self.recolor_grid = !self.recolor_grid;
+                }
+                if self.take(&ctx, Action::GoToRoot) {
+                    self.open_folder(PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+                }
+                if self.take(&ctx, Action::GoHome) {
+                    if let Some(h) = home_dir() {
+                        self.open_folder(h);
+                    }
+                }
+                // Space edits the path — but yield to an open audio/video player, which owns Space.
+                if self.audio_player.is_none()
+                    && self.video_player.is_none()
+                    && self.take(&ctx, Action::EditPath)
+                {
+                    self.open_path_edit();
+                }
             }
         }
 
@@ -39555,10 +40036,10 @@ impl eframe::App for Kaleidotron {
                     // Grouped into titled cards by use-case (like the Preferences sections).
                     // Rebindable actions show their LIVE key from the keymap; the rest are the
                     // fixed mouse / chord shortcuts. This window is the FULL reference — the
-                    // Preferences → Keyboard section lists only the (13) *rebindable* actions.
+                    // Preferences → Keyboard section lists only the *rebindable* actions.
                     let accent = ui.visuals().hyperlink_color;
-                    let k = |a: Action| self.key_for(a).symbol_or_name().to_string();
-                    let groups: [(&str, Vec<(String, &str)>); 6] = [
+                    let k = |a: Action| self.bind_for(a).label();
+                    let groups: [(&str, Vec<(String, &str)>); 7] = [
                         (
                             "Navigation",
                             vec![
@@ -39568,6 +40049,8 @@ impl eframe::App for Kaleidotron {
                                 (k(Action::ParentDir), "Parent folder"),
                                 (k(Action::FirstItem), "First item (grid)"),
                                 (k(Action::LastItem), "Last item (grid)"),
+                                (k(Action::GoToRoot), "Go to filesystem root"),
+                                (k(Action::GoHome), "Go to home folder"),
                                 ("Mouse Back / Fwd".into(), "Folder history · prev / next image"),
                             ],
                         ),
@@ -39578,6 +40061,10 @@ impl eframe::App for Kaleidotron {
                                 (k(Action::FilterFilenames), "Filter filenames"),
                                 (k(Action::ToggleHidden), "Show hidden files"),
                                 (k(Action::RandomPack), "Random 16colo.rs pack"),
+                                (k(Action::EditPath), "Edit path"),
+                                (k(Action::OpenFolder), "Open folder…"),
+                                (k(Action::RecolorReset), "Reset all recolor"),
+                                (k(Action::RecolorGrid), "Recolor grid thumbnails"),
                                 (k(Action::Refresh), "Refresh folder"),
                                 ("Shift + F5".into(), "Hard refresh — also clear caches"),
                             ],
@@ -39586,17 +40073,34 @@ impl eframe::App for Kaleidotron {
                             "Viewer",
                             vec![
                                 (k(Action::FitToScreen), "Fit image to window"),
+                                (k(Action::FitWidth), "Fit image to width"),
+                                (k(Action::SnapZoom), "Snap zoom to whole steps"),
+                                (k(Action::AutoAdvance), "Slideshow auto-advance"),
+                                (k(Action::ToggleCrt), "CRT effects on / off"),
                                 (k(Action::Fullscreen), "Immersive fullscreen"),
                                 ("Home / End".into(), "Scroll to top / bottom"),
-                                ("PageUp / PageDown".into(), "Scroll 25 lines"),
-                                ("Arrow Up / Down".into(), "Scroll a long image"),
                                 ("Z + 1–9 / 0".into(), "Zoom 100 % – 1000 %"),
                                 ("T".into(), "Tile preview — fill window"),
                                 ("Drag".into(), "Pan the image"),
-                                ("Wheel".into(), "Prev / next image · grid scroll"),
                                 ("Ctrl + Wheel".into(), "Resize thumbs · zoom image"),
                                 ("Enter".into(), "Open in default app"),
                                 ("Ctrl + F".into(), "Advanced recursive search"),
+                            ],
+                        ),
+                        (
+                            "Panes",
+                            vec![
+                                (k(Action::PaneExplorer), "Explorer pane"),
+                                (k(Action::PaneDetails), "Details pane"),
+                                (k(Action::PaneRecolor), "Recolor pane"),
+                                (k(Action::PaneFiles), "Files section"),
+                                (k(Action::PanePixelFx), "PixelFX section"),
+                                (k(Action::RailToggle), "Collapse / expand rail"),
+                                (k(Action::OpenPrefs), "Preferences"),
+                                ("Ctrl+Alt+Shift+Right".into(), "Toggle Recolor pane"),
+                                ("Ctrl+Alt+Shift+Left".into(), "Collapse / expand rail"),
+                                ("Ctrl+Alt+Shift+Up".into(), "Jump to path entry"),
+                                ("Ctrl+Alt+Shift+Down".into(), "Toggle task output"),
                             ],
                         ),
                         (
@@ -39626,13 +40130,15 @@ impl eframe::App for Kaleidotron {
                                 ("Shift + Click".into(), "Range-select"),
                                 ("Right-click".into(), "File operations menu"),
                                 ("Ctrl + / Ctrl -".into(), "Zoom the whole UI"),
+                                ("F10".into(), "Access the menu bar"),
+                                ("F1 / ?".into(), "This shortcuts window"),
                             ],
                         ),
                     ];
                     let w = (ctx.content_rect().width() - 80.0).clamp(720.0, 1180.0);
                     ui.set_width(w);
-                    // Assign the 6 groups to 3 columns for a balanced height (Viewer is the tallest).
-                    let layout: [&[usize]; 3] = [&[0, 4], &[1, 3, 5], &[2]];
+                    // Assign the 7 groups to 3 columns for a balanced height (Viewer is the tallest).
+                    let layout: [&[usize]; 3] = [&[0, 4, 6], &[1, 5, 3], &[2]];
                     ui.columns(3, |cols| {
                         for (ci, gis) in layout.iter().enumerate() {
                             for &gi in *gis {
@@ -40586,14 +41092,14 @@ impl eframe::App for Kaleidotron {
         let km: Vec<(u8, String)> = self
             .keymap
             .iter()
-            .map(|(a, k)| (a.to_u8(), k.name().to_string()))
+            .map(|(a, k)| (a.to_u8(), k.to_config()))
             .collect();
         eframe::set_value(storage, Self::KEYMAP_KEY, &km);
         // Also write the hand-editable file. Actions are emitted in `ALL` order so the file has a
         // stable, reviewable diff rather than HashMap iteration order.
         let entries: Vec<(String, String)> = Action::ALL
             .iter()
-            .filter_map(|a| self.keymap.get(a).map(|k| (a.id().to_string(), k.name().to_string())))
+            .filter_map(|a| self.keymap.get(a).map(|k| (a.id().to_string(), k.to_config())))
             .collect();
         let labels = |id: &str| Action::from_id(id).map(|a| a.label().to_string());
         if let Err(e) = crate::keybindings::save(&self.keybindings_file, &entries, &labels) {
@@ -51021,6 +51527,11 @@ fn search_walk(
 #[derive(Default)]
 pub struct CliArgs {
     pub folder: Option<PathBuf>,
+    // Open one file straight into the viewer on launch. `open` = the full app (all chrome), `view`
+    // = a minimal single-window viewer (no chrome, Esc quits) — for wiring as a file-association
+    // viewer from mc / ranger / xdg-open. Both open the file's folder too, so prev/next work.
+    pub open: Option<PathBuf>,
+    pub view: Option<PathBuf>,
     pub thumb_size: Option<f32>,
     // Headless render-to-file mode. When `render_inputs` is non-empty, `main` runs the
     // conversion and exits *without* opening a window (works over SSH / in a batch script).
@@ -51057,6 +51568,11 @@ USAGE:
 
 OPTIONS:
     -f, --folder <PATH>           Open this folder on launch
+        --open <FILE>             Open FILE straight into the FULL viewer (all chrome), with
+                                  its folder loaded so prev/next work.
+        --view <FILE>             Open FILE in a MINIMAL single-window viewer: no menus/docks,
+                                  just the art with scroll / zoom / pan, and Esc to quit. Ideal
+                                  as a file-association viewer from mc / ranger / xdg-open.
     -t, --thumbnail-size <SIZE>   Thumbnail tile size: a number (e.g. 160) or
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
@@ -51119,6 +51635,14 @@ impl CliArgs {
                 "-f" | "--folder" => match args.next() {
                     Some(v) => out.folder = Some(PathBuf::from(v)),
                     None => cli_fail("--folder requires a path"),
+                },
+                "--open" => match args.next() {
+                    Some(v) => out.open = Some(PathBuf::from(v)),
+                    None => cli_fail("--open requires a file path"),
+                },
+                "--view" => match args.next() {
+                    Some(v) => out.view = Some(PathBuf::from(v)),
+                    None => cli_fail("--view requires a file path"),
                 },
                 "-t" | "--thumbnail-size" | "--thumb-size" => match args.next() {
                     Some(v) => match parse_thumb_size(&v) {
@@ -53552,12 +54076,28 @@ mod tests {
     }
 
     #[test]
-    fn action_default_keys_round_trip_through_key_names() {
-        // Persistence stores key.name() and reloads via Key::from_name.
+    fn action_default_binds_round_trip_through_config_strings() {
+        // Persistence stores KeyBind::to_config() and reloads via KeyBind::from_config.
         for a in Action::ALL {
-            let k = a.default_key();
-            assert_eq!(egui::Key::from_name(k.name()), Some(k), "{:?}", a.label());
+            let b = a.default_bind();
+            assert_eq!(KeyBind::from_config(&b.to_config()), Some(b), "{:?}", a.label());
         }
+    }
+
+    #[test]
+    fn keybind_parses_modifier_prefixes_and_bare_keys() {
+        use egui::Key;
+        // A bare key name (the pre-modifier config format) loads as a modifier-free bind.
+        assert_eq!(KeyBind::from_config("ArrowLeft"), Some(KeyBind::key(Key::ArrowLeft)));
+        // Modifier prefixes, any order/case, with Cmd/Ctrl treated as the same (portable) modifier.
+        assert_eq!(KeyBind::from_config("Ctrl+X"), Some(KeyBind::ctrl(Key::X)));
+        assert_eq!(KeyBind::from_config("alt+e"), Some(KeyBind::alt(Key::E)));
+        assert_eq!(KeyBind::from_config("Cmd+O"), Some(KeyBind::ctrl(Key::O)));
+        // `~` (Shift+Backtick) survives the round-trip and shows its glyph.
+        let tilde = KeyBind::shift(Key::Backtick);
+        assert_eq!(KeyBind::from_config(&tilde.to_config()), Some(tilde));
+        assert_eq!(tilde.label(), "~");
+        assert_eq!(KeyBind::ctrl(Key::X).label(), "Ctrl+X");
     }
 
     #[test]
@@ -54917,7 +55457,7 @@ impl Kaleidotron {
                                     for a in Action::ALL.into_iter().filter(|a| a.scope() == *scope) {
                                         ui.label(a.label());
                                         let cur =
-                                            self.keymap.get(&a).copied().unwrap_or_else(|| a.default_key());
+                                            self.keymap.get(&a).copied().unwrap_or_else(|| a.default_bind());
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -54927,7 +55467,7 @@ impl Kaleidotron {
                                                     new_rebind = Some(if waiting { None } else { Some(a) });
                                                 }
                                                 ui.add_space(6.0);
-                                                ui.strong(cur.symbol_or_name());
+                                                ui.strong(cur.label());
                                             },
                                         );
                                         ui.end_row();
@@ -55814,6 +56354,33 @@ mod gui_tests {
         if let Ok(img) = harness.render() {
             img.save(format!("{dir}/main_menu.png")).unwrap();
             eprintln!("wrote {dir}/main_menu.png");
+        }
+    }
+
+    /// Eyeball `--view FILE`: the minimal single-window viewer (no chrome, just the art).
+    #[cfg(feature = "gui-screenshots")]
+    #[test]
+    fn shoot_view_only() {
+        let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::env::current_dir().unwrap().join("assets/kaleidotron.png");
+        let mut harness = Harness::builder()
+            .with_size(egui::Vec2::new(1100.0, 760.0))
+            .wgpu()
+            .build_eframe(|cc| {
+                Kaleidotron::new(
+                    cc,
+                    CliArgs {
+                        view: Some(file.clone()),
+                        ..CliArgs::default()
+                    },
+                )
+            });
+        harness.run_steps(8);
+        assert!(harness.state().view_only, "--view sets view_only");
+        if let Ok(img) = harness.render() {
+            img.save(format!("{dir}/view_only.png")).unwrap();
+            eprintln!("wrote {dir}/view_only.png");
         }
     }
 

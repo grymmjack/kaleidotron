@@ -141,7 +141,8 @@ pub fn to_json(entries: &[(String, String)], labels: &dyn Fn(&str) -> Option<Str
     let mut s = String::from(
         "// kaleidotron key bindings.\n\
          // Edit and save — changes apply without restarting.\n\
-         // \"key\" uses egui key names: ArrowLeft, PageDown, F5, A, Num1, …\n\
+         // \"key\" uses egui key names, optionally with Ctrl/Alt/Shift prefixes:\n\
+         //   \"ArrowLeft\", \"F5\", \"Ctrl+X\", \"Alt+E\", \"Shift+Backtick\" (= ~).\n\
          // Delete this file to restore the defaults.\n[\n",
     );
     for (i, (a, k)) in entries.iter().enumerate() {
