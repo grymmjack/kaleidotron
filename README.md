@@ -19,9 +19,9 @@ to the new name:*
 - **It converts, not just views** — a full **image → ANSI / ASCII / Unicode / PETSCII /
   ATASCII / Apple ][ / REXPaint** art pipeline, exportable back to `.ans` / `.xb` / `.petmate` / …
 - **A non-destructive Recolor stack** — reorderable adjustments, dithering
-  (Bayer / custom / Floyd–Steinberg / Atkinson), palette remap + reduce-to-N, pixel-art
-  upscalers (xBR / HQx / Scale2x / 2xSaI), CRT post-FX — saved as reusable **PixelFX presets**
-  (83 bundled)
+  (Bayer / custom / Floyd–Steinberg / Atkinson), palette remap + reduce-to-N, **JPEG cleanup**
+  (recover crisp pixel art from a lossy JPEG), pixel-art upscalers (xBR / HQx / Scale2x /
+  2xSaI), CRT post-FX — saved as reusable **PixelFX presets** (88 bundled)
 - **Grew a sampler + DAW corner** — waveform editor, a **16-pad Battery-style sampler** with
   ADSR/MSEG envelopes, LFOs, filters, MIDI-learn, hardware MIDI in, kit save/load, native SFZ
   export; plays trackers (MOD/XM/S3M/IT/…), MIDI (SoundFont), and RAD (OPL3 FM)
@@ -227,13 +227,14 @@ big ones in prose; this is the exhaustive index.)
 **Recolor / colorizer pipeline** (fully reorderable)
 - Adjustments: brightness, contrast, gamma, shadows, highlights, posterize, hue, saturation, **vibrance**, sharpen, **invert**
 - **Pixelate** (per-axis W×H + lock), **palette remap**, **reduce-to-N** (works on any image)
+- **JPEG cleanup** — recover crisp pixel art from a lossy JPEG: key out the background (auto-detected or picked) → transparency or a fill colour, snap to a palette, **merge stray colour dots**, and **snap to a native pixel grid** to erase edge fringe
 - **Dithering**: ordered/Bayer, editable **custom matrix**, error-diffusion (Floyd–Steinberg / Atkinson), per-axis cell + **Auto-detect**
 - **Color balance** (per-channel offset), **resize/resample** at reduced resolution
-- **Pixel-art upscalers**: Scale2x/3x, Eagle, xBR 2×/3×/4×, HQ2x/3x/4x, 2xSaI / Super2xSaI / SuperEagle
+- **Pixel-art upscalers**: Scale2x/3x, Eagle, xBR 2×/3×/4×, HQ2x/3x/4x, 2xSaI / Super2xSaI / SuperEagle — as a reorderable **Upscale lane**
 - **CRT post-FX** (bakeable, positionable): scanlines, glow (contour profiles), vignette, phosphor
-- **PixelFX presets** — save the whole stack; folders; **83 Factory presets** bundled; applies to 16colo.rs art too
+- **PixelFX presets** — save the whole stack (incl. JPEG cleanup); folders; **88 Factory presets** bundled; applies to 16colo.rs art too
 
-**Crop** — non-destructive & per-image, zoom/pan placement, Thirds/Golden/Grid/Spiral guides, Free/4:3/16:9/16:10 aspect + flip, named presets, optional bake-to-file
+**Crop** — non-destructive & per-image, **Auto-crop** (isolate the subject on a transparent/flat background, hands-free as you browse), zoom/pan placement, Thirds/Golden/Grid/Spiral guides, Free/4:3/16:9/16:10 aspect + flip, named presets, optional bake-to-file
 
 **Image → text-art converters** — **ANSI Shade**, **ASCII**, **Unicode** (half-block / Braille / ramp), **PETSCII**, **ATASCII**, **Apple ][**, and **REXPaint font** (45 bundled fonts); a shared drag-select **glyph picker**; exports to `.ans` / `.xb` / `.tnd` / `.xp` / `.petmate` / `.seq` / `.json` / `.txt` / `.png`
 
@@ -626,11 +627,22 @@ including the effects:
 - Live preview, with the result applied to grid tiles too (**Apply to grid**);
   **Export** the palette as `.GPL` or **Save** the recolored image.
 
+**JPEG cleanup ("Extract pixels from JPEG")** — recover crisp pixel art from a lossy
+JPEG sprite sheet. It re-quantizes toward the two things pixel art actually has: a flat
+background and a small palette. **Background key** (auto-detected from the border, or
+picked) drops the JPEG speckle to **transparency** or a fill colour; **Snap colours**
+flattens the gradient noise and hardens smeared edges; **Merge stray dots** absorbs small
+colour islands into the surrounding colour (two knobs — the island size, and how far out to
+sample the *real* colour); and **Snap to pixel grid** recovers the true low-res pixel by
+majority-vote per cell — set the pixel size to the JPEG's real upscale factor and edge
+fringe disappears. It's a reorderable **geometry lane** alongside **Upscale**, so you can
+clean-then-upscale (xBR the recovered pixels) or upscale-then-clean.
+
 **PixelFX presets** — save the *entire* recolor stack (adjustments + order, post-FX,
-dither, color balance, resize, reduce, and the active palette) as a named preset in
-the **Places → PixelFX** tab. Click to apply, right-click to rename, remove, or set a
-background + text color (text auto-contrasts for readability). Build a library of
-looks and slam any of them onto an image in one click.
+dither, color balance, resize, reduce, **JPEG cleanup**, and the active palette) as a named
+preset in the **Places → PixelFX** tab. Click to apply, right-click to rename, remove, or
+set a background + text color (text auto-contrasts for readability). Build a library of
+looks and slam any of them onto an image in one click. **88 Factory presets** ship bundled.
 
 The whole pipeline — adjustments, PixelFX presets, reduce, dither, post-FX — also
 works while **browsing 16colo.rs** (both the details preview and *Apply to grid*).
