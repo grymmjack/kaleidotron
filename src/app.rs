@@ -11761,7 +11761,8 @@ impl Kaleidotron {
             .collect();
         ui.horizontal_wrapped(|ui| {
             ui.label("Size");
-            ui.add(egui::Slider::new(&mut self.font_size, 12.0..=400.0).suffix("px"));
+            let r = ui.add(egui::Slider::new(&mut self.font_size, 12.0..=400.0).suffix("px"));
+            slider_extras(ui, &r, &mut self.font_size, 48.0, 1.0, 12.0, 400.0);
             ui.label("Ink");
             ui.color_edit_button_srgb(&mut self.font_ink).on_hover_text("Glyph colour (the Recolor pane runs on top)");
             ui.checkbox(&mut self.font_bg_on, "BG");
@@ -11771,10 +11772,12 @@ impl Kaleidotron {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Letter spacing");
-            ui.add(egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0).fixed_decimals(0));
+            let r = ui.add(egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0).fixed_decimals(0));
+            slider_extras(ui, &r, &mut self.font_letter_spacing, 0.0, 1.0, -1000.0, 1000.0);
             ui.separator();
             ui.label("Line height");
-            ui.add(egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0));
+            let r = ui.add(egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0));
+            slider_extras(ui, &r, &mut self.font_line_gap, 0.0, 1.0, -1000.0, 1000.0);
             if self.font_sample.contains('\n') {
                 ui.separator();
                 ui.label("Lines");
@@ -11791,8 +11794,9 @@ impl Kaleidotron {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Stroke");
-            ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
+            let r = ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
                 .on_hover_text("Outline width (0 = none)");
+            slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
                 egui::ComboBox::from_id_salt("font_stroke_mode")
@@ -11814,12 +11818,13 @@ impl Kaleidotron {
             );
             ui.separator();
             ui.label("Preview");
-            ui.add(
+            let r = ui.add(
                 egui::Slider::new(&mut self.font_preview_zoom, 0.25..=4.0)
                     .suffix("×")
                     .fixed_decimals(2),
             )
             .on_hover_text("Preview on-screen size only (re-rendered crisp at any zoom; doesn't affect the exported logo)");
+            slider_extras(ui, &r, &mut self.font_preview_zoom, 1.0, 0.05, 0.25, 4.0);
             if ui.small_button("1×").on_hover_text("Reset preview zoom").clicked() {
                 self.font_preview_zoom = 1.0;
             }
@@ -11830,10 +11835,12 @@ impl Kaleidotron {
         if self.font_3d_on {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Depth");
-                ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                let r = ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                slider_extras(ui, &r, &mut self.font_3d_depth, 0.2, 0.05, 0.0, 1.0);
                 ui.label("Bevel");
-                ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
+                let r = ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
                     .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
+                slider_extras(ui, &r, &mut self.font_3d_bevel, 0.0, 0.005, 0.0, 0.06);
                 ui.separator();
                 ui.label("Face");
                 ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front-face colour");
@@ -11844,10 +11851,12 @@ impl Kaleidotron {
                 ui.separator();
                 ui.label("Light");
                 let pi = std::f32::consts::PI;
-                ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2))
+                let r = ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2))
                     .on_hover_text("Light azimuth");
-                ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
+                slider_extras(ui, &r, &mut self.font_3d_light_yaw, 0.5, 0.05, -pi, pi);
+                let r = ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
                     .on_hover_text("Light elevation");
+                slider_extras(ui, &r, &mut self.font_3d_light_pitch, 0.7, 0.05, -1.5, 1.5);
                 ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
                 ui.separator();
                 ui.checkbox(&mut self.font_3d_spin, "Spin").on_hover_text("Auto-rotate the logo");
@@ -12056,10 +12065,9 @@ impl Kaleidotron {
             }
             ui.separator();
             ui.label("Cell");
-            if ui
-                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
-                .changed()
-            {
+            let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+            let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
+            if r.changed() || ch {
                 self.font_grid_tex = None;
             }
         });
@@ -12521,15 +12529,18 @@ impl Kaleidotron {
         // Letter-spacing + line-height + preview zoom + VGA rendering toggles.
         ui.horizontal_wrapped(|ui| {
             ui.label("Spacing");
-            ui.add(egui::Slider::new(&mut self.tdf_spacing, -20..=20).show_value(true))
+            let r = ui.add(egui::Slider::new(&mut self.tdf_spacing, -20..=20).show_value(true))
                 .on_hover_text("Adjust inter-letter gap; negative overlaps letters");
+            slider_extras(ui, &r, &mut self.tdf_spacing, 0, 1.0, -20, 20);
             ui.separator();
             ui.label("Line height");
-            ui.add(egui::Slider::new(&mut self.tdf_line_gap, -20..=40).show_value(true))
+            let r = ui.add(egui::Slider::new(&mut self.tdf_line_gap, -20..=40).show_value(true))
                 .on_hover_text("Vertical gap between multi-line rows; negative tightens / overlaps");
+            slider_extras(ui, &r, &mut self.tdf_line_gap, 1, 1.0, -20, 40);
             ui.separator();
             ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.tdf_zoom, 0.25..=8.0).show_value(true).suffix("×"));
+            let r = ui.add(egui::Slider::new(&mut self.tdf_zoom, 0.25..=8.0).show_value(true).suffix("×"));
+            slider_extras(ui, &r, &mut self.tdf_zoom, 1.0, 0.25, 0.25, 8.0);
             ui.separator();
             ui.checkbox(&mut self.tdf_font_9px, "9px")
                 .on_hover_text("Render the authentic 9-dot VGA cell (box rules join), like the ANSI viewer");
@@ -12718,10 +12729,9 @@ impl Kaleidotron {
                 }
                 ui.separator();
                 ui.label("Cell");
-                if ui
-                    .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
-                    .changed()
-                {
+                let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+                let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
+                if r.changed() || ch {
                     self.tdf_grid_tex = None;
                 }
             });
@@ -13098,27 +13108,24 @@ impl Kaleidotron {
         // ── Controls row: sliders for spacing / line height / zoom + toggles ─
         ui.horizontal_wrapped(|ui| {
             ui.label("Spacing");
-            if ui
+            let r = ui
                 .add(egui::Slider::new(&mut self.amiga_spacing, -20..=20).show_value(false))
-                .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with")
-                .changed()
-            {
-                changed = true;
-            }
+                .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with");
+            changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_spacing, 0, 1.0, -20, 20);
             if ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40)).changed() {
                 changed = true;
             }
             ui.separator();
             ui.label("Line height");
-            if ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false)).changed() {
-                changed = true;
-            }
+            let r = ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false));
+            changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_line_gap, 2, 1.0, -20, 40);
             if ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80)).changed() {
                 changed = true;
             }
             ui.separator();
             ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
+            let r = ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
+            slider_extras(ui, &r, &mut self.amiga_zoom, 2.0, 0.25, 0.25, 8.0);
             ui.label(format!("{:.1}×", self.amiga_zoom));
             ui.separator();
             // Snap = integer preview scale (crisp pixels); CRT = ~1.2x vertical stretch.
@@ -13250,7 +13257,8 @@ impl Kaleidotron {
                 ui.label(format!("Glyphs ({})", font.glyphs.len()));
                 ui.separator();
                 ui.label("Cell");
-                ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
+                let r = ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
+                slider_extras(ui, &r, &mut cell_edit, 64, 1.0, 24, 160);
             });
             if let Some((id, [w, h])) = grid {
                 ui.add_space(4.0);
@@ -13588,8 +13596,9 @@ impl Kaleidotron {
             });
             ui.separator();
             ui.label("Stroke");
-            ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
+            let r = ui.add(egui::Slider::new(&mut self.font_stroke_w, 0.0..=40.0).suffix("px").fixed_decimals(0))
                 .on_hover_text("Outline width (0 = none)");
+            slider_extras(ui, &r, &mut self.font_stroke_w, 0.0, 1.0, 0.0, 40.0);
             ui.add_enabled_ui(self.font_stroke_w > 0.5, |ui| {
                 ui.color_edit_button_srgb(&mut self.font_stroke_color).on_hover_text("Outline colour");
                 egui::ComboBox::from_id_salt("fon_stroke_mode")
@@ -13674,10 +13683,9 @@ impl Kaleidotron {
             }
             ui.separator();
             ui.label("Cell");
-            if ui
-                .add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false))
-                .changed()
-            {
+            let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+            let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
+            if r.changed() || ch {
                 self.fon_grid_tex = None;
             }
         });
@@ -16930,15 +16938,15 @@ impl Kaleidotron {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(amp_rect).layout(
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 ));
-                if child
+                let r = child
                     .add(
                         egui::Slider::new(&mut v, 1.0..=8.0)
                             .vertical()
                             .show_value(false),
                     )
-                    .on_hover_text(format!("Waveform height ×{:.1}", self.wave_amp))
-                    .changed()
-                {
+                    .on_hover_text(format!("Waveform height ×{:.1}", self.wave_amp));
+                let ch = slider_extras(&child, &r, &mut v, 1.0, 0.5, 1.0, 8.0);
+                if r.changed() || ch {
                     self.wave_amp = v.clamp(1.0, 8.0);
                 }
             }
@@ -16985,11 +16993,11 @@ impl Kaleidotron {
                     if self.transients_on {
                         let mut s = self.transient_sens;
                         ui.spacing_mut().slider_width = 80.0;
-                        if ui
+                        let r = ui
                             .add(egui::Slider::new(&mut s, 0.0..=1.0).show_value(false))
-                            .on_hover_text("Sensitivity — right = more markers")
-                            .changed()
-                        {
+                            .on_hover_text("Sensitivity — right = more markers");
+                        let ch = slider_extras(ui, &r, &mut s, 0.35, 0.05, 0.0, 1.0);
+                        if r.changed() || ch {
                             self.transient_sens = s;
                             self.transient_dirty = true;
                         }
@@ -17859,11 +17867,11 @@ impl Kaleidotron {
             if self.kit_global_vel {
                 let mut v = self.kit_global_vel_amt as f32;
                 ui.spacing_mut().slider_width = 90.0;
-                if ui
+                let r = ui
                     .add(egui::Slider::new(&mut v, 0.0..=127.0).step_by(1.0))
-                    .on_hover_text("Velocity applied to every pad (0–127)")
-                    .changed()
-                {
+                    .on_hover_text("Velocity applied to every pad (0–127)");
+                let ch = slider_extras(ui, &r, &mut v, 100.0, 1.0, 0.0, 127.0);
+                if r.changed() || ch {
                     self.kit_global_vel_amt = v.round().clamp(0.0, 127.0) as u8;
                 }
             }
@@ -18121,15 +18129,15 @@ impl Kaleidotron {
                             // right at the bottom border. Pin it to the fader's own height so it fills
                             // the tile and never overflows.
                             fchild.spacing_mut().slider_width = (fader_bottom - fader_top).max(8.0);
-                            if fchild
+                            let r = fchild
                                 .add(
                                     egui::Slider::new(&mut volume, 0.0..=1.0)
                                         .vertical()
                                         .show_value(false),
                                 )
-                                .on_hover_text(format!("Volume {:.0}%", volume * 100.0))
-                                .changed()
-                            {
+                                .on_hover_text(format!("Volume {:.0}%", volume * 100.0));
+                            let ch = slider_extras(&fchild, &r, &mut volume, 1.0, 0.05, 0.0, 1.0);
+                            if r.changed() || ch {
                                 want_vol = Some((i, volume));
                             }
                         }
@@ -28143,7 +28151,8 @@ impl Kaleidotron {
                         }
                         ui.horizontal(|ui| {
                             ui.label("Cols");
-                            ui.add(egui::Slider::new(&mut self.unicode_cols, 16..=300));
+                            let r = ui.add(egui::Slider::new(&mut self.unicode_cols, 16..=300));
+                            slider_extras(ui, &r, &mut self.unicode_cols, 120, 1.0, 16, 300);
                             ui.checkbox(&mut self.unicode_invert, "Invert")
                                 .on_hover_text("Flip the dot/tone on-off test");
                         });
@@ -31502,10 +31511,9 @@ impl Kaleidotron {
                             anim.playing = !anim.playing;
                         }
                         let mut cur = anim.current;
-                        if ui
-                            .add(egui::Slider::new(&mut cur, 0..=n.saturating_sub(1)).text("frame"))
-                            .changed()
-                        {
+                        let r = ui.add(egui::Slider::new(&mut cur, 0..=n.saturating_sub(1)).text("frame"));
+                        let ch = slider_extras(ui, &r, &mut cur, 0, 1.0, 0, n.saturating_sub(1));
+                        if r.changed() || ch {
                             anim.current = cur;
                             anim.acc_ms = 0.0;
                             anim.playing = false;
@@ -31757,10 +31765,9 @@ impl Kaleidotron {
                                  ANSI keep separate speeds.",
                                 );
                             let mut pos = p.pos;
-                            if ui
-                                .add(egui::Slider::new(&mut pos, 0..=len).text("byte"))
-                                .changed()
-                            {
+                            let r = ui.add(egui::Slider::new(&mut pos, 0..=len).text("byte"));
+                            let ch = slider_extras(ui, &r, &mut pos, 0, 1.0, 0, len);
+                            if r.changed() || ch {
                                 p.pos = pos;
                                 p.acc = 0.0;
                                 p.playing = false;
@@ -31925,9 +31932,11 @@ impl Kaleidotron {
                 if self.svg_3d_on {
                     ui.separator();
                     ui.label("Depth");
-                    ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                    let r = ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                    slider_extras(ui, &r, &mut self.font_3d_depth, 0.2, 0.05, 0.0, 1.0);
                     ui.label("Bevel");
-                    ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3));
+                    let r = ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3));
+                    slider_extras(ui, &r, &mut self.font_3d_bevel, 0.0, 0.005, 0.0, 0.06);
                     ui.separator();
                     ui.label("Face");
                     ui.color_edit_button_srgb(&mut self.font_3d_face);
@@ -31938,8 +31947,10 @@ impl Kaleidotron {
                     ui.separator();
                     ui.label("Light");
                     let pi = std::f32::consts::PI;
-                    ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2));
-                    ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2));
+                    let r = ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2));
+                    slider_extras(ui, &r, &mut self.font_3d_light_yaw, 0.5, 0.05, -pi, pi);
+                    let r = ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2));
+                    slider_extras(ui, &r, &mut self.font_3d_light_pitch, 0.7, 0.05, -1.5, 1.5);
                     ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
                     ui.checkbox(&mut self.font_3d_spin, "Spin");
                     if ui.small_button("Reset view").clicked() {
@@ -32559,8 +32570,10 @@ impl Kaleidotron {
                 ui.separator();
                 ui.label("Key light");
                 let pi = std::f32::consts::PI;
-                ui.add(egui::Slider::new(&mut self.td_light_yaw, -pi..=pi).text("↔ azimuth"));
-                ui.add(egui::Slider::new(&mut self.td_light_pitch, -1.5..=1.5).text("↕ elevation"));
+                let r = ui.add(egui::Slider::new(&mut self.td_light_yaw, -pi..=pi).text("↔ azimuth"));
+                slider_extras(ui, &r, &mut self.td_light_yaw, 0.4, 0.05, -pi, pi);
+                let r = ui.add(egui::Slider::new(&mut self.td_light_pitch, -1.5..=1.5).text("↕ elevation"));
+                slider_extras(ui, &r, &mut self.td_light_pitch, 0.6, 0.05, -1.5, 1.5);
                 ui.horizontal(|ui| {
                     ui.label("Background");
                     ui.color_edit_button_srgb(&mut self.td_bg);
@@ -32981,18 +32994,17 @@ impl Kaleidotron {
                 });
             });
             let mut op = self.compare_opacity;
-            if ui
-                .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"))
-                .changed()
-            {
+            let r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"));
+            let ch = slider_extras(ui, &r, &mut op, 0.6, 0.05, 0.0, 1.0);
+            if r.changed() || ch {
                 self.compare_opacity = op; // paint-time tint; no overlay rebuild
             }
             let mut tol = self.compare_tolerance;
-            if ui
+            let r = ui
                 .add(egui::Slider::new(&mut tol, 0..=64).text("Tolerance"))
-                .on_hover_text("Per-channel: 0 = exact match, higher ignores small differences")
-                .changed()
-            {
+                .on_hover_text("Per-channel: 0 = exact match, higher ignores small differences");
+            let ch = slider_extras(ui, &r, &mut tol, 0, 1.0, 0, 64);
+            if r.changed() || ch {
                 self.compare_tolerance = tol;
                 self.compare.dirty = true;
             }
@@ -36551,7 +36563,7 @@ impl Kaleidotron {
                                 }
                                 ui.separator();
                             }
-                            ui.add(
+                            let r = ui.add(
                                 egui::Slider::new(&mut self.crt_scanline_dark, 0.0..=1.0)
                                     .show_value(false)
                                     .text("scanlines"),
@@ -36560,6 +36572,7 @@ impl Kaleidotron {
                                 "Scanline darkness (0 = off) — {} toggles scanlines + glow together",
                                 self.bind_for(Action::ToggleCrt).label()
                             ));
+                            slider_extras(ui, &r, &mut self.crt_scanline_dark, 0.0, 0.05, 0.0, 1.0);
                             ui.checkbox(&mut self.crt_scanline_scale, "scale with zoom")
                                 .on_hover_text(
                                     "Scale the scanline spacing with the zoom — one line per \
@@ -36570,13 +36583,16 @@ impl Kaleidotron {
                                 "Phosphor glow — a soft bloom around bright pixels, like a \
                                  late-night CRT",
                             );
-                            ui.add_enabled(
+                            let r = ui.add_enabled(
                                 self.glow,
                                 egui::Slider::new(&mut self.glow_amt, 0.0..=1.0)
                                     .show_value(false)
                                     .text("amt"),
                             )
                             .on_hover_text("Phosphor glow intensity");
+                            if self.glow {
+                                slider_extras(ui, &r, &mut self.glow_amt, 0.5, 0.05, 0.0, 1.0);
+                            }
                             ui.checkbox(&mut self.black_bg, "black background")
                                 .on_hover_text("Fill the viewer background black (off = dark grey)");
                         })
@@ -37160,11 +37176,11 @@ impl Kaleidotron {
                     ui.add_space(6.0);
                     ui.spacing_mut().slider_width = 90.0;
                     let mut vol = self.audio_volume;
-                    if ui
+                    let r = ui
                         .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
-                        .on_hover_text(format!("Volume {:.0}%", vol * 100.0))
-                        .changed()
-                    {
+                        .on_hover_text(format!("Volume {:.0}%", vol * 100.0));
+                    let ch = slider_extras(ui, &r, &mut vol, 1.0, 0.05, 0.0, 1.0);
+                    if r.changed() || ch {
                         audio_vol = Some(vol);
                     }
                     if ui.button(icons::STOP).on_hover_text("Stop audio").clicked() {
@@ -44389,6 +44405,27 @@ fn middle_reset<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, v
     if hit || dbl {
         *v = def;
     }
+}
+
+/// Both slider affordances in one call for a plain `ui.add(Slider::new(..))`: double/middle-click
+/// resets `*v` to `def`, and the mouse-wheel over it steps by `step` (Shift = ×10), clamped to
+/// `lo..=hi`. Applied to the sliders that don't go through `value_slider`. Returns `true` if it
+/// changed the value — so a caller that gates a re-render on `resp.changed()` can OR this in (the
+/// wheel/reset mutate AFTER the response, which `changed()` wouldn't otherwise catch).
+#[allow(clippy::too_many_arguments)]
+fn slider_extras<N: egui::emath::Numeric>(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    v: &mut N,
+    def: N,
+    step: f64,
+    lo: N,
+    hi: N,
+) -> bool {
+    let before = v.to_f64();
+    middle_reset(ui, resp, v, def);
+    wheel_adjust(ui, resp, v, step, lo, hi);
+    v.to_f64() != before
 }
 
 /// Snap a viewer zoom to the next/previous step on the 100%-lock ladder: whole
@@ -55496,11 +55533,12 @@ impl Kaleidotron {
                     pref_card(&mut c[0], "Code viewer", accent, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Size");
-                            ui.add(
+                            let r = ui.add(
                                 egui::Slider::new(&mut self.code_font_size, 6.0..=32.0)
                                     .step_by(0.5)
                                     .suffix(" pt"),
                             );
+                            slider_extras(ui, &r, &mut self.code_font_size, 13.0, 1.0, 6.0, 32.0);
                         });
                         ui.horizontal(|ui| {
                             ui.label("Font");
@@ -55672,12 +55710,13 @@ impl Kaleidotron {
                                 ui.selectable_value(&mut self.osd_position, 7, "Bot R");
                                 ui.end_row();
                             });
-                            ui.add(
+                            let r = ui.add(
                                 egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
                                     .suffix(" s")
                                     .text("Hold"),
                             )
                             .on_hover_text("How long it stays before fading out");
+                            slider_extras(ui, &r, &mut self.osd_secs, 3.0, 0.5, 0.5, 15.0);
                         });
                     });
                     pref_card(&mut c[0], "Transparency", accent, |ui| {
