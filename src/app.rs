@@ -40760,6 +40760,11 @@ impl eframe::App for Kaleidotron {
                     self.open_folder(dir);
                 }
             }
+            // Recolor Bypass works in ANY mode — the recolor affects the viewer AND the grid, so
+            // you can A/B it while looking at a full image or scanning tiles.
+            if self.take(&ctx, Action::RecolorBypass) {
+                self.recolor_bypass = !self.recolor_bypass;
+            }
             // Viewer — the single-image view only (NOT the 3D viewer, whose WASD is the fly-cam).
             if self.mode == Mode::Single {
                 if self.take(&ctx, Action::AutoAdvance) {
@@ -40784,9 +40789,6 @@ impl eframe::App for Kaleidotron {
                 }
                 if self.take(&ctx, Action::RecolorGrid) {
                     self.recolor_grid = !self.recolor_grid;
-                }
-                if self.take(&ctx, Action::RecolorBypass) {
-                    self.recolor_bypass = !self.recolor_bypass;
                 }
                 if self.take(&ctx, Action::GoToRoot) {
                     self.open_folder(PathBuf::from(std::path::MAIN_SEPARATOR_STR));
