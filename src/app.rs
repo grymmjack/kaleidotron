@@ -1792,6 +1792,7 @@ pub struct Kaleidotron {
     show_details: bool,
     show_recolor: bool,                      // the Recolor dock pane
     recolor_grid: bool,                      // apply the active recolor to grid thumbnails too
+    recolor_bypass: bool,                    // keep all recolor settings but show the ORIGINAL (A/B compare)
     last_inspected: Option<PathBuf>,         // sticky target for details/recolor in grid mode
     custom_palette: Option<Vec<[u8; 4]>>,    // a generated/edited palette (e.g. Random)
     flash: Option<[u8; 4]>,                  // swatch held down: highlight this color
@@ -2954,6 +2955,7 @@ impl Kaleidotron {
     const KIT_MAP_LOCK_KEY: &'static str = "kit_map_lock";
     const RECOLOR_KEY: &'static str = "show_recolor";
     const RECOLOR_GRID_KEY: &'static str = "recolor_grid";
+    const RECOLOR_BYPASS_KEY: &'static str = "recolor_bypass";
     const ZOOM_LOCK_KEY: &'static str = "zoom_lock";
     const FIT_MODE_KEY: &'static str = "fit_mode";
     const TEXTMODE_ZOOM_KEY: &'static str = "textmode_zoom";
@@ -3452,6 +3454,7 @@ impl Kaleidotron {
         let show_details = get_bool(Self::DETAILS_KEY).unwrap_or(false);
         let show_recolor = get_bool(Self::RECOLOR_KEY).unwrap_or(false);
         let recolor_grid = get_bool(Self::RECOLOR_GRID_KEY).unwrap_or(false);
+        let recolor_bypass = get_bool(Self::RECOLOR_BYPASS_KEY).unwrap_or(false);
         let zoom_lock = get_bool(Self::ZOOM_LOCK_KEY).unwrap_or(true);
         let fit_mode = get_bool(Self::FIT_MODE_KEY).unwrap_or(false);
         // Adjust values: current = [f32; 12] (with invert); fall back to the legacy
@@ -4253,6 +4256,7 @@ impl Kaleidotron {
             show_details,
             show_recolor,
             recolor_grid,
+            recolor_bypass,
             last_inspected: None,
             custom_palette: None,
             flash: None,
@@ -22229,6 +22233,10 @@ impl Kaleidotron {
     /// Is *any* pipeline stage active (an adjustment, color balance, or dither)?
     /// Drives the "render a processed preview" gate and the "Adjustments *" marker.
     fn pipeline_active(&self) -> bool {
+        // Bypass keeps every setting but shows the ORIGINAL — so nothing downstream applies it.
+        if self.recolor_bypass {
+            return false;
+        }
         !self.adjust.is_identity()
             || self.balance_offset() != [0, 0, 0]
             || (self.dither_method != 0
@@ -22255,6 +22263,9 @@ impl Kaleidotron {
     /// Gameboy / most PixelFX presets), so the *video* view must gate on this broader check or a
     /// palette-only recolor silently affects the little preview but not the actual playback.
     fn any_recolor_active(&self) -> bool {
+        if self.recolor_bypass {
+            return false;
+        }
         self.pipeline_active()
             || self.custom_palette.is_some()
             || self.selected_palette.is_some()
@@ -22476,6 +22487,10 @@ impl Kaleidotron {
     /// selected GPL palette, then the Reduce-to-N median cut, then nothing. The
     /// dither/balance/adjust state is keyed separately via [`pipeline_key`].
     fn active_recolor(&mut self, path: &Path) -> Option<(String, Vec<[u8; 4]>)> {
+        // Bypass shows the original — no palette snap applied (settings are untouched).
+        if self.recolor_bypass {
+            return None;
+        }
         // A generated/edited palette (Random, or color edits) wins over everything.
         if let Some(cp) = self.custom_palette.clone() {
             return Some((format!("custom:{}", palette_hash(&cp)), cp));
@@ -26688,6 +26703,21 @@ impl Kaleidotron {
             {
                 self.reset_recolor();
             }
+            // Bypass (flush-right): keep every setting but show the ORIGINAL — for A/B
+            // eyeballing colour touch-ups. Highlighted yellow while on so it's obviously off.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.recolor_bypass {
+                    egui::RichText::new("Bypass")
+                        .strong()
+                        .color(egui::Color32::from_rgb(240, 200, 60))
+                } else {
+                    egui::RichText::new("Bypass")
+                };
+                ui.checkbox(&mut self.recolor_bypass, label).on_hover_text(
+                    "Keep every recolor setting but show the ORIGINAL image — for A/B \
+                     eyeballing colour touch-ups. Nothing is cleared.",
+                );
+            });
         });
         ui.separator();
         let Some(entry) = self.inspected_entry() else {
@@ -41794,6 +41824,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TITLE_PATH_KEY, &self.title_show_path);
         eframe::set_value(storage, Self::RECOLOR_KEY, &self.show_recolor);
         eframe::set_value(storage, Self::RECOLOR_GRID_KEY, &self.recolor_grid);
+        eframe::set_value(storage, Self::RECOLOR_BYPASS_KEY, &self.recolor_bypass);
         eframe::set_value(storage, Self::FIT_MODE_KEY, &self.fit_mode);
         eframe::set_value(storage, Self::TEXTMODE_ZOOM_KEY, &self.textmode_zoom);
         eframe::set_value(storage, Self::CRT_ASPECT_KEY, &self.crt_aspect);
