@@ -11262,7 +11262,7 @@ impl Kaleidotron {
             ui.label("Preset");
             let sel = if self.font_preset_name.is_empty() { "— pick —".to_string() } else { self.font_preset_name.clone() };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            eat_scroll(egui::ComboBox::from_id_salt("font_preset_pick")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("font_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -11273,6 +11273,13 @@ impl Kaleidotron {
                         }
                     }
                 }));
+            let step = combo_scroll_step(ui, &cr);
+            if step != 0 && !self.font_presets.is_empty() {
+                let n = self.font_presets.len() as isize;
+                let cur = self.font_presets.iter().position(|p| p.name == self.font_preset_name);
+                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                recall = Some(self.font_presets[ni].clone());
+            }
             ui.add(egui::TextEdit::singleline(&mut self.font_preset_name).desired_width(140.0).hint_text("name…"));
             if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
                 save = true;
@@ -12052,7 +12059,7 @@ impl Kaleidotron {
             ui.label(format!("Glyphs ({})", chars.len()));
             ui.separator();
             ui.label("Range");
-            eat_scroll(egui::ComboBox::from_id_salt("font_block")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("font_block")
                 .selected_text(UNICODE_BLOCKS[self.font_block].0)
                 .show_ui(ui, |ui| {
                     for (i, (name, _, _)) in UNICODE_BLOCKS.iter().enumerate() {
@@ -12063,6 +12070,10 @@ impl Kaleidotron {
                         }
                     }
                 }));
+            if combo_wheel(ui, &cr, &mut self.font_block, UNICODE_BLOCKS.len()) {
+                self.font_page = 0;
+                self.font_grid_tex = None;
+            }
             if ui.add_enabled(self.font_page > 0, egui::Button::new("◀").small()).clicked() {
                 self.font_page -= 1;
                 self.font_grid_tex = None;
@@ -12393,7 +12404,7 @@ impl Kaleidotron {
             let n = self.tdf_fonts.len();
             if n > 1 {
                 let cur = self.tdf_fonts[self.tdf_index].0.clone();
-                eat_scroll(egui::ComboBox::from_id_salt("tdf_font_pick")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_font_pick")
                     .width(300.0)
                     .height(420.0)
                     .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
@@ -12410,6 +12421,11 @@ impl Kaleidotron {
                             }
                         }
                     }));
+                if combo_wheel(ui, &cr, &mut self.tdf_index, n) {
+                    self.tdf_sample_tex = None;
+                    self.tdf_grid_tex = None;
+                    self.tdf_page = 0;
+                }
             } else {
                 ui.strong(&self.tdf_fonts[0].0);
             }
@@ -12430,7 +12446,7 @@ impl Kaleidotron {
             // Let the popup grow to (almost) the full screen height when there are many presets;
             // egui shrinks it to the content when there are few.
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            eat_scroll(egui::ComboBox::from_id_salt("tdf_preset_pick")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -12442,6 +12458,13 @@ impl Kaleidotron {
                     }
                     let _ = names;
                 }));
+            let step = combo_scroll_step(ui, &cr);
+            if step != 0 && !self.tdf_presets.is_empty() {
+                let n = self.tdf_presets.len() as isize;
+                let cur = self.tdf_presets.iter().position(|p| p.name == self.tdf_preset_name);
+                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                recall_preset = Some(self.tdf_presets[ni].clone());
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.tdf_preset_name)
                     .desired_width(140.0)
@@ -12596,7 +12619,7 @@ impl Kaleidotron {
                     }
                     ui.label("Lines");
                     let cur = if self.tdf_top_down { "Top Down" } else { "Bottom Up" };
-                    eat_scroll(egui::ComboBox::from_id_salt("tdf_zorder")
+                    let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_zorder")
                         .selected_text(cur)
                         .show_ui(ui, |ui| {
                             if ui.selectable_value(&mut self.tdf_top_down, true, "Top Down").clicked()
@@ -12608,6 +12631,9 @@ impl Kaleidotron {
                             }
                         }))
                         .on_hover_text("Which line wins where multi-line rows overlap");
+                    if combo_wheel_list(ui, &cr, &mut self.tdf_top_down, &[true, false]) {
+                        self.tdf_sample_tex = None;
+                    }
                 }
             });
         }
@@ -13034,7 +13060,7 @@ impl Kaleidotron {
                 self.amiga_preset_name.clone()
             };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            eat_scroll(egui::ComboBox::from_id_salt("amiga_preset_pick")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("amiga_preset_pick")
                 .width(220.0)
                 .height(max_h)
                 .selected_text(sel)
@@ -13048,6 +13074,13 @@ impl Kaleidotron {
                         }
                     }
                 }));
+            let step = combo_scroll_step(ui, &cr);
+            if step != 0 && !self.amiga_presets.is_empty() {
+                let n = self.amiga_presets.len() as isize;
+                let cur = self.amiga_presets.iter().position(|p| p.name == self.amiga_preset_name);
+                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                recall_amiga = Some(self.amiga_presets[ni].clone());
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.amiga_preset_name)
                     .desired_width(140.0)
@@ -13160,7 +13193,7 @@ impl Kaleidotron {
             // makes rows touch. Mirrors the TTF/TDF viewer's "Lines" control.
             ui.label("Lines");
             let cur = if self.amiga_top_down { "Top Down" } else { "Bottom Up" };
-            eat_scroll(egui::ComboBox::from_id_salt("amiga_zorder")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("amiga_zorder")
                 .selected_text(cur)
                 .show_ui(ui, |ui| {
                     let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
@@ -13170,6 +13203,9 @@ impl Kaleidotron {
                     }
                 }))
                 .on_hover_text("Which line draws on top where rows overlap");
+            if combo_wheel_list(ui, &cr, &mut self.amiga_top_down, &[true, false]) {
+                self.amiga_sample_tex = None;
+            }
         });
 
         // ── Design metrics readout, like TDF's "Design: W × H chars" ────────
@@ -13557,7 +13593,7 @@ impl Kaleidotron {
             ui.strong(name.clone());
             if self.fon_faces.len() > 1 {
                 let cur = &self.fon_faces[self.fon_index];
-                eat_scroll(egui::ComboBox::from_id_salt("fon_face_pick")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("fon_face_pick")
                     .width(200.0)
                     .selected_text(format!("{} pt · {} px", cur.1, cur.2))
                     .show_ui(ui, |ui| {
@@ -13573,6 +13609,11 @@ impl Kaleidotron {
                             }
                         }
                     }));
+                if combo_wheel(ui, &cr, &mut self.fon_index, self.fon_faces.len()) {
+                    self.fon_sample_tex = None;
+                    self.fon_grid_tex = None;
+                    self.fon_page = 0;
+                }
             } else {
                 let (_, pts, h) = &self.fon_faces[0];
                 ui.weak(format!("· {pts} pt · {h} px"));
@@ -13888,7 +13929,7 @@ impl Kaleidotron {
                 ));
                 ui.separator();
                 ui.label("Speed");
-                eat_scroll(egui::ComboBox::from_id_salt("video_speed")
+                let cr = eat_scroll(egui::ComboBox::from_id_salt("video_speed")
                     .selected_text(format!("{speed:.2}×"))
                     .show_ui(ui, |ui| {
                         for s in [0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0] {
@@ -13900,6 +13941,12 @@ impl Kaleidotron {
                             }
                         }
                     }));
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 {
+                    const SPEEDS: [f32; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0];
+                    let cur = SPEEDS.iter().position(|s| (speed - s).abs() < 0.01).unwrap_or(3);
+                    want_speed = Some(SPEEDS[(cur as isize + step).rem_euclid(SPEEDS.len() as isize) as usize]);
+                }
                 ui.separator();
                 ui.label(format!("frame {frame_idx}/{frame_cnt}"));
                 ui.separator();
@@ -15513,7 +15560,7 @@ impl Kaleidotron {
                             self.pads[i].mono = mono;
                         }
                         let cur = (self.pads[i].loop_type as usize).min(2);
-                        eat_scroll(egui::ComboBox::from_id_salt("pad_loop_type")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("pad_loop_type")
                             .selected_text(LOOP_TYPES[cur])
                             .show_ui(ui, |ui| {
                                 for (t, name) in LOOP_TYPES.iter().enumerate() {
@@ -15522,6 +15569,7 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        combo_wheel(ui, &cr, &mut self.pads[i].loop_type, LOOP_TYPES.len());
                         ui.separator();
                         ui.weak("Pitch");
                         let r = ui.add(
@@ -15542,7 +15590,7 @@ impl Kaleidotron {
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("Choke");
                         let cg = self.pads[i].choke_group;
-                        eat_scroll(egui::ComboBox::from_id_salt("pad_choke_group")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("pad_choke_group")
                             .selected_text(if cg == 0 {
                                 "Off".to_string()
                             } else {
@@ -15562,6 +15610,7 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        combo_wheel(ui, &cr, &mut self.pads[i].choke_group, 9);
                         ui.separator();
                         // Envelope target selector — the on-waveform editor shapes whichever target
                         // is selected (Amp / Pitch / Cutoff / Res). Each carries its own ADSR+curves.
@@ -15928,7 +15977,7 @@ impl Kaleidotron {
                     }
                     ui.weak("Type");
                     let cur = (ap_loop_type as usize).min(2);
-                    eat_scroll(egui::ComboBox::from_id_salt("editor_loop_type")
+                    let cr = eat_scroll(egui::ComboBox::from_id_salt("editor_loop_type")
                         .selected_text(LOOP_TYPES[cur])
                         .show_ui(ui, |ui| {
                             for (t, name) in LOOP_TYPES.iter().enumerate() {
@@ -15937,6 +15986,10 @@ impl Kaleidotron {
                                 }
                             }
                         }));
+                    let step = combo_scroll_step(ui, &cr);
+                    if step != 0 {
+                        want_loop_type = Some((cur as isize + step).rem_euclid(LOOP_TYPES.len() as isize) as u8);
+                    }
                     ui.weak("· forward / reverse / ping-pong while looping");
                 });
             }
@@ -16978,7 +17031,7 @@ impl Kaleidotron {
                     ui.weak("drag: select · edges: ↔ · wheel: zoom · over edge → wheel nudge ±1 (Shift 10, +Alt zero-x)");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    eat_scroll(egui::ComboBox::from_id_salt("zoom_edit_pct")
+                    let cr = eat_scroll(egui::ComboBox::from_id_salt("zoom_edit_pct")
                         .selected_text(if self.zoom_edit_pct == 0 {
                             "Zoom Edit: off".to_string()
                         } else {
@@ -16995,6 +17048,7 @@ impl Kaleidotron {
                             }
                         }))
                         .on_hover_text("Magnification of the edge-edit inset shown while adjusting a selection edge");
+                    combo_wheel_list(ui, &cr, &mut self.zoom_edit_pct, &[0, 200, 400, 1000, 2000, 4000]);
                 });
             });
             // Transients + BPM + musical grid (item 10) — big view only (room).
@@ -17868,7 +17922,7 @@ impl Kaleidotron {
             // Base-note chooser: auto-maps every non-overridden pad chromatically from here.
             ui.weak("· base");
             let base = self.pad_base_note;
-            eat_scroll(egui::ComboBox::from_id_salt("pad_base_note")
+            let cr = eat_scroll(egui::ComboBox::from_id_salt("pad_base_note")
                 .selected_text(midi_note_name(base.clamp(0, 127) as u8))
                 .show_ui(ui, |ui| {
                     for oct in 0..=7 {
@@ -17881,6 +17935,12 @@ impl Kaleidotron {
                         }
                     }
                 }));
+            let step = combo_scroll_step(ui, &cr);
+            if step != 0 {
+                const BASES: [i32; 8] = [12, 24, 36, 48, 60, 72, 84, 96]; // C0…C7
+                let cur = BASES.iter().position(|&n| n == base).unwrap_or(3);
+                want_base = Some(BASES[(cur as isize + step).rem_euclid(BASES.len() as isize) as usize]);
+            }
             ui.separator();
             // Kit-wide fixed velocity: when on, every pad plays at the slider value (overrides
             // each pad's own V toggle + the incoming MIDI velocity).
@@ -24804,13 +24864,14 @@ impl Kaleidotron {
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Tool");
-                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_tool")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_tool")
                             .selected_text(&cur_tool)
                             .show_ui(ui, |ui| {
                                 for (i, n) in tool_names.iter().enumerate() {
                                     ui.selectable_value(&mut self.ai_gen_tool, i, n);
                                 }
                             }));
+                        combo_wheel(ui, &cr, &mut self.ai_gen_tool, tool_names.len());
                         ui.end_row();
                         ui.label("Style");
                         let st = if self.ai_gen_style == 0 {
@@ -24818,7 +24879,7 @@ impl Kaleidotron {
                         } else {
                             styles.get(self.ai_gen_style - 1).map(|s| s.0.clone()).unwrap_or_default()
                         };
-                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_style")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_style")
                             .selected_text(st)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.ai_gen_style, 0, "(none)");
@@ -24828,6 +24889,20 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        // Cycle only through the *in-scope* entries (the list is scope-filtered by tool).
+                        let step = combo_scroll_step(ui, &cr);
+                        if step != 0 {
+                            let mut opts = vec![0usize];
+                            for (i, (_, scope)) in styles.iter().enumerate() {
+                                if scope.is_empty() || *scope == cur_tool {
+                                    opts.push(i + 1);
+                                }
+                            }
+                            if opts.len() > 1 {
+                                let c = opts.iter().position(|&o| o == self.ai_gen_style).unwrap_or(0);
+                                self.ai_gen_style = opts[(c as isize + step).rem_euclid(opts.len() as isize) as usize];
+                            }
+                        }
                         ui.end_row();
                         ui.label("Preset");
                         let pt = if self.ai_gen_prompt_sel == 0 {
@@ -24836,7 +24911,7 @@ impl Kaleidotron {
                             prompts.get(self.ai_gen_prompt_sel - 1).map(|p| p.0.clone()).unwrap_or_default()
                         };
                         let mut load_preset: Option<String> = None;
-                        eat_scroll(egui::ComboBox::from_id_salt("ai_gen_preset")
+                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_preset")
                             .selected_text(pt)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.ai_gen_prompt_sel, 0, "(none)");
@@ -24849,6 +24924,13 @@ impl Kaleidotron {
                                     }
                                 }
                             }));
+                        // Cycling a preset loads its prompt text too (landing on "(none)" leaves it).
+                        if combo_wheel(ui, &cr, &mut self.ai_gen_prompt_sel, prompts.len() + 1)
+                            && self.ai_gen_prompt_sel > 0
+                        {
+                            load_preset =
+                                prompts.get(self.ai_gen_prompt_sel - 1).map(|p| p.1.clone());
+                        }
                         if let Some(t) = load_preset {
                             self.ai_gen_prompt = t;
                         }
@@ -24892,7 +24974,7 @@ impl Kaleidotron {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Size");
                     // Preset dropdown (editable list) — pick to apply.
-                    eat_scroll(egui::ComboBox::from_id_salt("ai_gen_size")
+                    let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_size")
                         .selected_text(format!("{}×{}", self.ai_gen_w, self.ai_gen_h))
                         .show_ui(ui, |ui| {
                             for s in &sizes {
@@ -24908,6 +24990,16 @@ impl Kaleidotron {
                                 }
                             }
                         }));
+                    let step = combo_scroll_step(ui, &cr);
+                    if step != 0 && !sizes.is_empty() {
+                        let cur = sizes
+                            .iter()
+                            .position(|s| [self.ai_gen_w, self.ai_gen_h] == *s)
+                            .unwrap_or(0);
+                        let ns = sizes[(cur as isize + step).rem_euclid(sizes.len() as isize) as usize];
+                        self.ai_gen_w = ns[0];
+                        self.ai_gen_h = ns[1];
+                    }
                     let r = ui.add(egui::DragValue::new(&mut self.ai_gen_w).range(8..=4096));
                     wheel_adjust(ui, &r, &mut self.ai_gen_w, 1.0, 8, 4096);
                     ui.label("×");
@@ -27138,13 +27230,14 @@ impl Kaleidotron {
                                     "Ring", "Ring ×2", "Sawtooth",
                                 ];
                                 let cur = fx.glow_contour.min(7) as usize;
-                                eat_scroll(egui::ComboBox::from_id_salt("glow_contour")
+                                let cr = eat_scroll(egui::ComboBox::from_id_salt("glow_contour")
                                     .selected_text(NAMES[cur])
                                     .show_ui(ui, |ui| {
                                         for (i, n) in NAMES.iter().enumerate() {
                                             ui.selectable_value(&mut fx.glow_contour, i as u8, *n);
                                         }
                                     }));
+                                combo_wheel(ui, &cr, &mut fx.glow_contour, NAMES.len());
                             })
                             .response
                             .on_hover_text("Reshape the bloom falloff (Photoshop-style contour)");
@@ -27451,7 +27544,7 @@ impl Kaleidotron {
                                 .and_then(|i| self.ansi_presets.get(i))
                                 .map(|p| p.name.clone());
                             let mut to_apply: Option<usize> = None;
-                            eat_scroll(egui::ComboBox::from_id_salt("ansi_preset")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("ansi_preset")
                                 .selected_text(sel_name.as_deref().unwrap_or("—"))
                                 .show_ui(ui, |ui| {
                                     if ui
@@ -27472,6 +27565,21 @@ impl Kaleidotron {
                                         }
                                     }
                                 }));
+                            // Cycle through [— , preset0, preset1, …]; landing on a preset applies it.
+                            let step = combo_scroll_step(ui, &cr);
+                            if step != 0 {
+                                let n = self.ansi_presets.len() as isize + 1;
+                                let cur = match self.ansi_preset_sel {
+                                    None => 0isize,
+                                    Some(i) => i as isize + 1,
+                                };
+                                let ni = (cur + step).rem_euclid(n);
+                                if ni == 0 {
+                                    self.ansi_preset_sel = None;
+                                } else {
+                                    to_apply = Some((ni - 1) as usize);
+                                }
+                            }
                             if let Some(i) = to_apply {
                                 self.ansi_preset_sel = Some(i);
                                 let p = self.ansi_presets[i].clone();
@@ -27881,7 +27989,7 @@ impl Kaleidotron {
                         // Render font: built-in CP437, any bundled REXPaint font, or a TTF/OTF.
                         ui.horizontal(|ui| {
                             ui.label("Font");
-                            eat_scroll(egui::ComboBox::from_id_salt("ascii_font")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("ascii_font")
                                 .selected_text(self.ascii_font_name())
                                 .width(180.0)
                                 .show_ui(ui, |ui| {
@@ -27898,6 +28006,21 @@ impl Kaleidotron {
                                         }
                                     }
                                 }));
+                            // Cycle CP437 + the bundled REXPaint fonts (a File font is set via TTF…, not cycled).
+                            let step = combo_scroll_step(ui, &cr);
+                            if step != 0 {
+                                let n = crate::decode::rexfont::rexfont_count() as isize + 1;
+                                let cur = match self.ascii_font {
+                                    AsciiFont::Rex(j) => (j as isize + 1).min(n - 1),
+                                    _ => 0,
+                                };
+                                let ni = (cur + step).rem_euclid(n);
+                                self.ascii_font = if ni == 0 {
+                                    AsciiFont::Cp437
+                                } else {
+                                    AsciiFont::Rex((ni - 1) as usize)
+                                };
+                            }
                             if ui.button("TTF…").on_hover_text("Render with any .ttf/.otf font (rasterized CP437-ordered)").clicked() {
                                 if let Some(p) = rfd::FileDialog::new()
                                     .add_filter("Font", &["ttf", "otf", "ttc"])
@@ -28041,7 +28164,7 @@ impl Kaleidotron {
                         ui.horizontal(|ui| {
                             ui.label("Font");
                             let cur = self.rexfont_sel.min(crate::decode::rexfont::rexfont_count() - 1);
-                            eat_scroll(egui::ComboBox::from_id_salt("rexfont_sel")
+                            let cr = eat_scroll(egui::ComboBox::from_id_salt("rexfont_sel")
                                 .selected_text(crate::decode::rexfont::rexfont_name(cur))
                                 .show_ui(ui, |ui| {
                                     for i in 0..crate::decode::rexfont::rexfont_count() {
@@ -28052,6 +28175,7 @@ impl Kaleidotron {
                                         );
                                     }
                                 }));
+                            combo_wheel(ui, &cr, &mut self.rexfont_sel, crate::decode::rexfont::rexfont_count());
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.bitfont_color, "Color")
@@ -28105,7 +28229,7 @@ impl Kaleidotron {
                             ui.horizontal(|ui| {
                                 ui.label("Font");
                                 let before = self.unicode_font.clone();
-                                eat_scroll(egui::ComboBox::from_id_salt("uni_font")
+                                let cr = eat_scroll(egui::ComboBox::from_id_salt("uni_font")
                                     .selected_text(self.unicode_font_name())
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.unicode_font, UniFont::Pdv, "Perfect DOS VGA (crisp)")
@@ -28113,6 +28237,14 @@ impl Kaleidotron {
                                         ui.selectable_value(&mut self.unicode_font, UniFont::DejaVu, "DejaVu Sans (+Braille)")
                                             .on_hover_text("Wide Unicode coverage — Braille + Geometric Shapes.");
                                     }));
+                                // Toggle the two built-ins (a Browse-picked File font isn't cycled); the
+                                // `!= before` block below then loads + installs it.
+                                if combo_scroll_step(ui, &cr) != 0 {
+                                    self.unicode_font = match self.unicode_font {
+                                        UniFont::DejaVu => UniFont::Pdv,
+                                        _ => UniFont::DejaVu,
+                                    };
+                                }
                                 if ui.button("Browse…").on_hover_text("Use any .ttf/.otf font on disk").clicked() {
                                     if let Some(p) = rfd::FileDialog::new()
                                         .add_filter("Font", &["ttf", "otf", "ttc"])
@@ -44546,6 +44678,32 @@ fn combo_wheel_list<T: PartialEq + Copy>(
         return true;
     }
     false
+}
+
+/// The raw wheel step for a ComboBox that has no plain index/enum field to cycle — a
+/// name-keyed preset picker, a dynamic port/recall list, an apply-on-select combo. Returns
+/// the signed step the wheel implies (`±1`, Shift = `±10`; **up = negative = previous**, matching
+/// `combo_wheel`), or `0` when the pointer isn't over the combo or there was no wheel notch. The
+/// caller resolves the current index, applies `rem_euclid(len)`, and fires whatever side effect the
+/// selection normally triggers. Consume is already handled by `eat_scroll` on the combo itself.
+fn combo_scroll_step(ui: &egui::Ui, resp: &egui::Response) -> isize {
+    if !resp.contains_pointer() {
+        return 0;
+    }
+    let notches = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                _ => None,
+            })
+            .sum::<f32>()
+    });
+    if notches == 0.0 {
+        return 0;
+    }
+    let mag = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
+    if notches < 0.0 { mag } else { -mag }
 }
 
 /// Both slider affordances in one call for a plain `ui.add(Slider::new(..))`: double/middle-click
