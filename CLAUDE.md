@@ -546,9 +546,12 @@ The Recolor pane (`ui_recolor`) applies per-image **adjustments** then a **palet
 rematch**, and the *order* of all of it is user-controlled.
 
 - **Pane layout: 8 collapsible, drag-reorderable sections (`RecolorSection`).** Below the
-  always-visible preview + toolbar row (`ui_recolor_toolbar`: Export/Save on the left,
-  collapse/expand-all flush right — see below), the pane is a `for` loop over
-  `self.recolor_order` — `Palette · N colors` (the swatch grid) / `Cleaning` (the JPEG-clean
+  always-visible preview + toolbar row (`ui_recolor_toolbar`: the image Save/export actions
+  on the left, collapse/expand-all flush right — see below), the pane is a `for` loop over
+  `self.recolor_order` — `Palette · N colors` (the swatch grid + `Export .GPL…`, which is
+  about the palette and nothing else, so it lives with the swatches rather than on the
+  toolbar; it raises its request through the `gpl_export` out-param since the section body
+  is a closure) / `Cleaning` (the JPEG-clean
   + de-block + undither checkboxes, grouped) / `Resize` / `Adjustments` / `Pixelate` /
   `Color balance` / `Post FX` / `Recolor` (Reduce + the palette chooser + dither + the
   textmode export). Each renders through the free fn **`recolor_section`** = a drag grip
@@ -569,8 +572,8 @@ rematch**, and the *order* of all of it is user-controlled.
     dragging over an expanded section lands where it looks like it should.
   - **The toolbar row (`ui_recolor_toolbar`) is NOT one of the sections** — Save has to stay
     reachable on a small screen whatever is collapsed, and the collapse-all button obviously
-    can't live inside the thing it collapses. It always draws (even with no palette to
-    export) so the toggle is always there. The button is flush right in a
+    can't live inside the thing it collapses. It always draws (even with nothing to save) so
+    the toggle is always there. The button is flush right in a
     `Layout::right_to_left`, directly over the sections it acts on, and styled like VSCode's
     Explorer toolbar: icon-only (`icons::COLLAPSE_ALL`/`EXPAND_ALL`, the Codicons) and
     `frame_when_inactive(false)` so it's frameless until hovered. It lived in the pane's

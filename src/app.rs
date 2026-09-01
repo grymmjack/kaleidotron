@@ -28534,12 +28534,12 @@ impl Kaleidotron {
                     self.want_repaint = true;
                 }
 
-                // ----- The pane toolbar: Export/Save on the left (kept directly under
-                //       the preview so they stay reachable on a small screen, whatever
-                //       the sections are collapsed to) + collapse/expand-all flush
-                //       right, over the sections it acts on. -----
-                let req = self.ui_recolor_toolbar(ui, &entry.path, &display, recolor.is_some());
-                do_export = req.gpl;
+                // ----- The pane toolbar: the image Save/export actions on the left
+                //       (kept directly under the preview so they stay reachable on a
+                //       small screen, whatever the sections are collapsed to) +
+                //       collapse/expand-all flush right, over the sections it acts
+                //       on. Exporting the palette lives with the swatches instead. -----
+                let req = self.ui_recolor_toolbar(ui, &display, recolor.is_some());
                 save_request = req.save;
                 ans_request = req.textmode;
                 ui.add_space(4.0);
@@ -28556,7 +28556,7 @@ impl Kaleidotron {
                 let order = self.recolor_order.clone();
                 let mut sec_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
                 for (i, &sec) in order.iter().enumerate() {
-                    sec_rects.push(self.ui_recolor_one_section(ui, sec, i, &cx));
+                    sec_rects.push(self.ui_recolor_one_section(ui, sec, i, &cx, &mut do_export));
                     ui.add_space(2.0);
                 }
                 self.recolor_section_drag(ui, &sec_rects);
@@ -28742,6 +28742,7 @@ impl Kaleidotron {
         sec: RecolorSection,
         idx: usize,
         cx: &RecolorCtx<'_>,
+        gpl_export: &mut Option<(String, Vec<[u8; 4]>)>,
     ) -> egui::Rect {
         let (entry, display, pal_state, has_recolor) =
             (cx.entry, cx.display, cx.pal_state, cx.has_recolor);
@@ -28749,7 +28750,9 @@ impl Kaleidotron {
         let open = self.recolor_open[sec as usize];
         let top = ui.cursor().top();
         let head = recolor_section(ui, sec.id(), &title, open, |ui| match sec {
-            RecolorSection::Palette => self.ui_sec_palette(ui, display, pal_state),
+            RecolorSection::Palette => {
+                self.ui_sec_palette(ui, &entry.path, display, pal_state, gpl_export)
+            }
             RecolorSection::Cleaning => {
                 // Three sibling source-repair steps, all pre-pipeline: recover
                 // crisp pixel art from a JPEG, de-block a continuous-tone JPEG,
@@ -28832,8 +28835,10 @@ impl Kaleidotron {
     fn ui_sec_palette(
         &mut self,
         ui: &mut egui::Ui,
+        path: &Path,
         display: &Option<Vec<[u8; 4]>>,
         pal_state: &Option<Option<Vec<[u8; 4]>>>,
+        gpl_export: &mut Option<(String, Vec<[u8; 4]>)>,
     ) {
         // The section header already reads "Palette · N colors", so this is just
         // the swatch grid.
@@ -28907,6 +28912,18 @@ impl Kaleidotron {
                 }
             }
             ui.spacing_mut().item_spacing = prev;
+            // Exporting the swatches as a .gpl is about the palette and nothing
+            // else, so it lives with them rather than on the pane toolbar (which
+            // keeps the actions that write the *image*). Deferred like the rest —
+            // the file dialog needs `&mut self` back.
+            ui.add_space(6.0);
+            if ui
+                .button("Export .GPL…")
+                .on_hover_text("Write these swatches out as a GIMP palette")
+                .clicked()
+            {
+                *gpl_export = Some((short_name(path), d.clone()));
+            }
         } else if matches!(pal_state, Some(None)) {
             ui.add_space(4.0);
             ui.weak(format!(
@@ -28917,7 +28934,9 @@ impl Kaleidotron {
     }
 
     /// The Recolor pane's toolbar row, sitting between the preview and the
-    /// sections: Export/Save on the left, collapse/expand-all flush right.
+    /// sections: the image save/export actions on the left, collapse/expand-all
+    /// flush right. (Export .GPL… is NOT here — it's about the palette, so it
+    /// sits with the swatches inside the Palette section.)
     ///
     /// Deliberately NOT one of the collapsible sections — Save has to stay
     /// reachable on a small screen whatever is collapsed, and the collapse-all
@@ -28927,20 +28946,17 @@ impl Kaleidotron {
     fn ui_recolor_toolbar(
         &mut self,
         ui: &mut egui::Ui,
-        path: &Path,
         display: &Option<Vec<[u8; 4]>>,
         has_recolor: bool,
     ) -> ExportReq {
-        let mut do_export: Option<(String, Vec<[u8; 4]>)> = None;
         let mut save_request: Option<bool> = None;
         let mut ans_request = false; // export the recolored image as ANSI art (.ans)
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if let Some(d) = display {
-                if ui.button("Export .GPL…").clicked() {
-                    do_export = Some((short_name(path), d.clone()));
-                }
-                // Save the processed image (recolor and/or adjustments).
+            if display.is_some() {
+                // Save the processed image (recolor and/or adjustments). Exporting
+                // the *palette* isn't here — it sits with the swatches, in the
+                // Palette section.
                 if has_recolor || self.pipeline_active() {
                     if ui
                         .button("💾 Save recolored")
@@ -29012,7 +29028,6 @@ impl Kaleidotron {
             });
         });
         ExportReq {
-            gpl: do_export,
             save: save_request,
             textmode: ans_request,
         }
@@ -48323,12 +48338,12 @@ struct RecolorCtx<'a> {
     has_recolor: bool,
 }
 
-/// The deferred clicks from the Export/Save row — applied after the pane's
-/// `ScrollArea` closure releases its borrow of `self`.
+/// The deferred clicks from the pane toolbar — applied after the pane's
+/// `ScrollArea` closure releases its borrow of `self`. (Exporting the palette
+/// as a `.gpl` is not here: that button lives with the swatches in the Palette
+/// section, and raises its request through `ui_recolor_one_section`.)
 #[derive(Default)]
 struct ExportReq {
-    /// Export the shown palette as a `.gpl`: `(suggested name, colours)`.
-    gpl: Option<(String, Vec<[u8; 4]>)>,
     /// Save the processed image; `true` = through a Save-As dialog.
     save: Option<bool>,
     /// Export the recolored image as textmode art.
