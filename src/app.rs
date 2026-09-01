@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 const THUMB_PX: u32 = 512; // max thumbnail dimension; smaller art is kept at source res
 const DEFAULT_TILE: f32 = 140.0; // default tile box (square) in points — the "100%" thumbnail size
-// Preset UI text scales (label %, scale factor) for Preferences → Appearance → Interface.
+                                 // Preset UI text scales (label %, scale factor) for Preferences → Appearance → Interface.
 const FONT_SCALE_PRESETS: &[(u32, f32)] = &[
     (80, 0.8),
     (100, 1.0),
@@ -332,7 +332,7 @@ enum SndMsg {
 /// carries everything the grid needs (name / dir / size), so there's no side metadata map.
 enum WebMsg {
     Hit(Entry, String), // (entry, its absolute URL)
-    Done(usize, bool), // (count, needed_plain_http)
+    Done(usize, bool),  // (count, needed_plain_http)
     Failed(String),
 }
 
@@ -1005,12 +1005,32 @@ impl RailSection {
             (9, "\u{2726}", "Icons", "Icon search"),
             (10, "\u{270E}", "Vectors", "Vector art search"),
             (11, "\u{1F3A8}", "Lospec Palettes", "Lospec palettes"),
-            (18, "\u{1F5BC}", "Lospec Gallery", "Lospec Gallery — pixel / voxel / textmode art"),
-            (19, "\u{1F3A8}", "DeviantArt", "DeviantArt — browse public art"),
-            (12, icons::CUBE, "3D / CC0", "Poly Haven — 3D / textures / HDRIs"),
+            (
+                18,
+                "\u{1F5BC}",
+                "Lospec Gallery",
+                "Lospec Gallery — pixel / voxel / textmode art",
+            ),
+            (
+                19,
+                "\u{1F3A8}",
+                "DeviantArt",
+                "DeviantArt — browse public art",
+            ),
+            (
+                12,
+                icons::CUBE,
+                "3D / CC0",
+                "Poly Haven — 3D / textures / HDRIs",
+            ),
             (13, "\u{1F170}", "Fonts", "Google Fonts"),
             (14, "\u{1F50A}", "Audio", "Free audio search"),
-            (15, icons::MUSIC, "Modules", "The Mod Archive — tracker modules"),
+            (
+                15,
+                icons::MUSIC,
+                "Modules",
+                "The Mod Archive — tracker modules",
+            ),
             (6, "\u{1F3AE}", "Steam", "Steam library"),
         ]
     }
@@ -1094,9 +1114,9 @@ enum MenuAction {
     Search,
     ToggleTasksPanel, // show/hide the task output panel
     ReloadTasks,      // re-read this project's .vscode/tasks.json
-    AmigaFonts,  // open the bundled Amiga ColorFonts collection
-    Refresh,     // re-scan the current folder (F5)
-    HardRefresh, // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
+    AmigaFonts,       // open the bundled Amiga ColorFonts collection
+    Refresh,          // re-scan the current folder (F5)
+    HardRefresh,      // + drop cached thumbnails/metadata so items re-decode (Shift+F5)
 }
 
 /// The advanced-search form: every field is optional (empty = no constraint). The
@@ -1312,16 +1332,36 @@ struct KeyBind {
 impl KeyBind {
     /// A modifier-free binding.
     const fn key(key: egui::Key) -> Self {
-        Self { key, ctrl: false, alt: false, shift: false }
+        Self {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
     }
     const fn ctrl(key: egui::Key) -> Self {
-        Self { key, ctrl: true, alt: false, shift: false }
+        Self {
+            key,
+            ctrl: true,
+            alt: false,
+            shift: false,
+        }
     }
     const fn alt(key: egui::Key) -> Self {
-        Self { key, ctrl: false, alt: true, shift: false }
+        Self {
+            key,
+            ctrl: false,
+            alt: true,
+            shift: false,
+        }
     }
     const fn shift(key: egui::Key) -> Self {
-        Self { key, ctrl: false, alt: false, shift: true }
+        Self {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: true,
+        }
     }
     /// The egui modifier set this binding requires (for `consume_key`).
     fn modifiers(self) -> egui::Modifiers {
@@ -1391,7 +1431,12 @@ impl KeyBind {
                 _ => key = egui::Key::from_name(part),
             }
         }
-        key.map(|key| Self { key, ctrl, alt, shift })
+        key.map(|key| Self {
+            key,
+            ctrl,
+            alt,
+            shift,
+        })
     }
 }
 
@@ -1590,7 +1635,12 @@ impl Action {
             Action::FilterFilenames => KeyBind::key(Key::Slash), // vim-style `/`
             Action::ToggleHidden => KeyBind::key(Key::Period),
             Action::RandomPack => KeyBind::key(Key::R),
-            Action::RecolorReset => KeyBind { key: Key::X, ctrl: true, alt: false, shift: true },
+            Action::RecolorReset => KeyBind {
+                key: Key::X,
+                ctrl: true,
+                alt: false,
+                shift: true,
+            },
             Action::RecolorGrid => KeyBind::ctrl(Key::G),
             Action::RecolorBypass => KeyBind::key(Key::Backtick),
             Action::EditPath => KeyBind::key(Key::Space),
@@ -1651,7 +1701,10 @@ const SCROLL_GUTTER: f32 = 16.0;
 
 /// Shared work queue for the `.diz`-thumbnail worker pool: a LIFO stack of (index, path, text)
 /// jobs behind a Condvar (mirrors the ThumbBuilder pattern).
-type DizQueue = Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)>;
+type DizQueue = Arc<(
+    std::sync::Mutex<Vec<(usize, PathBuf, String)>>,
+    std::sync::Condvar,
+)>;
 
 pub struct Kaleidotron {
     registry: Arc<Registry>,
@@ -1798,23 +1851,23 @@ pub struct Kaleidotron {
     show_details: bool,
     show_recolor: bool,                      // the Recolor dock pane
     recolor_grid: bool,                      // apply the active recolor to grid thumbnails too
-    recolor_bypass: bool,                    // keep all recolor settings but show the ORIGINAL (A/B compare)
-    last_inspected: Option<PathBuf>,         // sticky target for details/recolor in grid mode
-    custom_palette: Option<Vec<[u8; 4]>>,    // a generated/edited palette (e.g. Random)
-    flash: Option<[u8; 4]>,                  // swatch held down: highlight this color
+    recolor_bypass: bool, // keep all recolor settings but show the ORIGINAL (A/B compare)
+    last_inspected: Option<PathBuf>, // sticky target for details/recolor in grid mode
+    custom_palette: Option<Vec<[u8; 4]>>, // a generated/edited palette (e.g. Random)
+    flash: Option<[u8; 4]>, // swatch held down: highlight this color
     editing_color: Option<(usize, [u8; 4])>, // swatch right-click: editing palette[idx]
     swatch_rect: Option<egui::Rect>, // screen rect of the palette swatch row (Edit-color anchor)
-    adjust: Adjust,                  // tone adjustments applied before the palette map
-    explorer_filter: String,         // folder-tree search box (runtime only)
-    colo_search: String,             // 16colo.rs nav-bar search box (runtime only)
-    explorer_tab: u8,                // 0 = Places, 1 = Folders
+    adjust: Adjust,       // tone adjustments applied before the palette map
+    explorer_filter: String, // folder-tree search box (runtime only)
+    colo_search: String,  // 16colo.rs nav-bar search box (runtime only)
+    explorer_tab: u8,     // 0 = Places, 1 = Folders
     rail_section: RailSection, // which group the Places panel is showing
     /// Recently visited locations, most-recent-first. Stores the **display** path, not the real
     /// one: inside an archive or a downloaded pack the real path is a temp dir that's gone next
     /// run, which is the same reason `save()` persists the display path for the last folder.
     recent_dirs: Vec<PathBuf>,
-    rail_icon_size: f32, // activity-rail glyph size in points
-    rail_expanded: bool, // rail shows icon + label instead of icon only
+    rail_icon_size: f32,      // activity-rail glyph size in points
+    rail_expanded: bool,      // rail shows icon + label instead of icon only
     rail_settings_menu: bool, // the gear's settings menu is open
     prefs_section: u8,        // which Preferences section is showing
     /// The open text/code file: (path, contents). Kept separate from `full_tex` — the grid tile
@@ -1853,7 +1906,7 @@ pub struct Kaleidotron {
     palette: Option<bool>,
     palette_query: String,
     palette_sel: usize,
-    toasts: Vec<Toast>,       // transient "that finished" notifications
+    toasts: Vec<Toast>, // transient "that finished" notifications
     places_tab: u8, // Places sub-tab: 0 = Local, 1 = 16colo.rs, 2 = Kits, 3 = Samples, 4 = PixelFX
     // PixelFX presets: saved snapshots of the whole recolor stack, recalled from the
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
@@ -1906,8 +1959,8 @@ pub struct Kaleidotron {
     ai_gen_pad: Option<usize>,      // Some(i) = load the (audio) result into pad i
     ai_sizes: Vec<[u32; 2]>,        // editable size presets for the Generate dialog (persisted)
     ai_gen_save_prompt_name: String, // transient — "save prompt as preset" name buffer
-    ai_gen_save_style_name: String,  // transient — "save style" name buffer
-    ai_gen_save_style_text: String,  // transient — "save style" suffix/text buffer
+    ai_gen_save_style_name: String, // transient — "save style" name buffer
+    ai_gen_save_style_text: String, // transient — "save style" suffix/text buffer
     // AI editor inline selections.
     ai_tool_sel: usize,
     ai_style_sel: usize,
@@ -1928,13 +1981,13 @@ pub struct Kaleidotron {
     opener_icons: HashMap<PathBuf, Option<egui::TextureHandle>>,
 
     // preferences (round 2 #10)
-    theme: u8,              // 0 = dark, 1 = light
-    grid_gap: f32,          // horizontal spacing between grid tiles, in points
-    grid_gap_y: f32,        // vertical spacing between grid rows, in points
-    grid_tile_border: bool, // draw a border + padding around each grid tile (persisted)
+    theme: u8,                  // 0 = dark, 1 = light
+    grid_gap: f32,              // horizontal spacing between grid tiles, in points
+    grid_gap_y: f32,            // vertical spacing between grid rows, in points
+    grid_tile_border: bool,     // draw a border + padding around each grid tile (persisted)
     open_on_double_click: bool, // grid/table: require a double-click to open (else single, persisted)
-    caption_fields: u16,    // bitmask: what to show under each grid thumbnail
-    grid_hover_caption: bool, // hide tile captions; show them OSD-style over the hovered tile
+    caption_fields: u16,        // bitmask: what to show under each grid thumbnail
+    grid_hover_caption: bool,   // hide tile captions; show them OSD-style over the hovered tile
     // Per-category grid-tile backgrounds: a subtle accent behind folder / archive /
     // sample-bank tiles so container kinds read at a glance. Accents are blended into
     // the theme background (`tile_category_bg`); off = the plain default everywhere.
@@ -1965,23 +2018,23 @@ pub struct Kaleidotron {
     // Zoom/pan of the crop surface (the Details thumbnail) for pixel-precise selections —
     // wheel zooms (cursor-centred), middle-drag pans, middle-click resets. This is a VIEW of
     // the source only; the stored crop stays in full-image coords. Reset when the image changes.
-    crop_zoom: f32,                 // 1.0 = whole image fits; higher = zoomed in
-    crop_center: egui::Vec2,        // normalized centre of the view window (0.5,0.5 = centre)
-    crop_view_for: Option<PathBuf>, // which image the zoom/pan applies to (else reset)
-    crop_mid_active: bool,          // a middle-button gesture is in progress
-    crop_mid_moved: f32,            // accumulated middle-drag movement (px) → click vs drag
-    crop_guide: u8,                 // composition overlay: 0 thirds,1 golden,2 grid,3 spiral,4 none
-    crop_presets: Vec<CropPreset>,  // named reusable crop rects (persisted)
-    crop_preset_new: String,        // name buffer for "Save current crop"
+    crop_zoom: f32,                    // 1.0 = whole image fits; higher = zoomed in
+    crop_center: egui::Vec2,           // normalized centre of the view window (0.5,0.5 = centre)
+    crop_view_for: Option<PathBuf>,    // which image the zoom/pan applies to (else reset)
+    crop_mid_active: bool,             // a middle-button gesture is in progress
+    crop_mid_moved: f32,               // accumulated middle-drag movement (px) → click vs drag
+    crop_guide: u8, // composition overlay: 0 thirds,1 golden,2 grid,3 spiral,4 none
+    crop_presets: Vec<CropPreset>, // named reusable crop rects (persisted)
+    crop_preset_new: String, // name buffer for "Save current crop"
     crop_preset_rename: Option<usize>, // preset being renamed inline
-    crop_presets_open: bool,        // show the inline presets panel (not a menu — text edits work)
+    crop_presets_open: bool, // show the inline presets panel (not a menu — text edits work)
     // Named presets for JUST the ANSI-Shade panel (below PixelFX). Persisted.
     ansi_presets: Vec<AnsiPreset>,
-    ansi_preset_sel: Option<usize>,    // last-applied preset (dropdown display)
+    ansi_preset_sel: Option<usize>, // last-applied preset (dropdown display)
     ansi_preset_rename: Option<usize>, // preset being renamed inline
-    quantize_on: bool,       // details palette: reduce to N colors (median cut)
-    quantize_n: usize,       // target color count when reducing
-    quantize_keep_bw: bool,  // force pure black+white into the reduced palette (snap darkest/lightest)
+    quantize_on: bool,              // details palette: reduce to N colors (median cut)
+    quantize_n: usize,              // target color count when reducing
+    quantize_keep_bw: bool, // force pure black+white into the reduced palette (snap darkest/lightest)
     // JPEG cleanup — recover crisp pixel art from a lossy JPEG (a pre-pipeline step; see
     // `jpeg_clean.rs`). Keys out the background, snaps the foreground to a palette, despeckles.
     jpeg_clean_on: bool,          // master toggle ("Extract pixels from JPEG")
@@ -1999,37 +2052,37 @@ pub struct Kaleidotron {
     jpeg_clean_merge_radius: u32, // window radius (px) sampled to pick the absorbing colour
     jpeg_clean_grid: bool,        // snap to a native pixel grid by majority vote
     jpeg_clean_grid_size: u32,    // native pixel size (JPEG px per art px) for the grid
-    dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
-    dither_amount: f32,      // 0..1 dither strength
-    dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
-    dither_custom_n: usize,  // custom matrix dimension (n×n; 2/4/8)
-    dither_scale_x: usize,   // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
-    dither_scale_y: usize,   // ordered-dither cell HEIGHT in px (≥1)
-    dither_scale_lock: bool, // lock the dither cell square (scale_x == scale_y)
+    dither_method: u8,            // index into thumb::DITHER_NAMES (0 = none)
+    dither_amount: f32,           // 0..1 dither strength
+    dither_custom: Vec<u32>,      // custom ordered-dither threshold matrix (row-major)
+    dither_custom_n: usize,       // custom matrix dimension (n×n; 2/4/8)
+    dither_scale_x: usize,        // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
+    dither_scale_y: usize,        // ordered-dither cell HEIGHT in px (≥1)
+    dither_scale_lock: bool,      // lock the dither cell square (scale_x == scale_y)
     // ANSI Shade dither params (DITHER_ANSI): the fill fractions the ░▒▓ shade
     // blocks stand for, whether half-blocks are allowed, and whether to force the
     // authentic 9×16 VGA text cell (overriding Cell W/H).
-    shade_f1: f32,        // ░ fill fraction (default 0.25)
-    shade_f2: f32,        // ▒ fill fraction (default 0.50)
-    shade_f3: f32,        // ▓ fill fraction (default 0.75)
-    shade_half: bool,     // allow half-block glyphs ▀▄▌▐
-    shade_snap916: bool,  // force 9×16 VGA cells (overrides Cell W/H)
-    shade_f1_on: bool,    // include ░ (176) as a shade candidate
-    shade_f2_on: bool,    // include ▒ (177) as a shade candidate
-    shade_f3_on: bool,    // include ▓ (178) as a shade candidate
+    shade_f1: f32,       // ░ fill fraction (default 0.25)
+    shade_f2: f32,       // ▒ fill fraction (default 0.50)
+    shade_f3: f32,       // ▓ fill fraction (default 0.75)
+    shade_half: bool,    // allow half-block glyphs ▀▄▌▐
+    shade_snap916: bool, // force 9×16 VGA cells (overrides Cell W/H)
+    shade_f1_on: bool,   // include ░ (176) as a shade candidate
+    shade_f2_on: bool,   // include ▒ (177) as a shade candidate
+    shade_f3_on: bool,   // include ▓ (178) as a shade candidate
     // Per half-block controls (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐), gated by `shade_half`.
     // `shade_half_on[i]` includes that glyph as a candidate; `shade_half_use[i]` in
     // 0..1 biases how often it's chosen (0.5 = neutral, higher = more).
     shade_half_on: [bool; 4],
     shade_half_use: [f32; 4],
-    shade_vga50: bool,    // force 8×8 VGA50 cells + the 8×8 font (overrides snap 9×16)
-    shade_amount: f32,    // 0..1: how much shading vs flat color (low = flats stay solid)
-    shade_smooth: f32,    // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
-    shade_detail: f32,    // 0..1: half-block detail weight (high = keep edges crisp when shrunk)
-    shade_ice: bool,      // iCE color: unlock all 16 colors as backgrounds (else 8)
-    shade_invert: bool,   // ANSI Shade inverse video — swap fg/bg per cell (default off)
+    shade_vga50: bool, // force 8×8 VGA50 cells + the 8×8 font (overrides snap 9×16)
+    shade_amount: f32, // 0..1: how much shading vs flat color (low = flats stay solid)
+    shade_smooth: f32, // 0..1: contrast penalty on shade blocks (high = avoid garish dithers)
+    shade_detail: f32, // 0..1: half-block detail weight (high = keep edges crisp when shrunk)
+    shade_ice: bool,   // iCE color: unlock all 16 colors as backgrounds (else 8)
+    shade_invert: bool, // ANSI Shade inverse video — swap fg/bg per cell (default off)
     ansi_mask: Vec<bool>, // ANSI Shade glyph-picker mask over CP437 (256); default = the block set
-    ansi_picker: bool,    // ANSI glyph-picker popup open
+    ansi_picker: bool, // ANSI glyph-picker popup open
     // Textmode EXPORT format (explicit): 0=Auto, 1=ANSI16 .ans, 2=ANSI256 .ans,
     // 3=ANSI truecolor .ans, 4=XBin .xb, 5=Tundra .tnd.
     shade_export_format: u8,
@@ -2045,58 +2098,62 @@ pub struct Kaleidotron {
     petscii_purity: f32,
     petscii_page: usize, // 0 upper/graphics, 1 lower
     petscii_bg_auto: bool,
-    petscii_bg: u8, // manual background (VIC-II 0..15) when not auto
-    petscii_export_format: u8, // 0 .petmate, 1 .seq, 2 .json, 3 .png
-    petscii_palette: u8,       // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
+    petscii_bg: u8,               // manual background (VIC-II 0..15) when not auto
+    petscii_export_format: u8,    // 0 .petmate, 1 .seq, 2 .json, 3 .png
+    petscii_palette: u8, // index into crate::decode::PETSCII_PALETTES (petmate/colodore/pepto/vice)
     petscii_use_selected: bool, // render with the selected Palettes-list palette (like ANSI), not C64
     petscii_pal16: [[u8; 4]; 16], // resolved 16-colour render palette (cache; refreshed each frame)
-    petscii_mask: Vec<bool>,   // which C64 glyphs the matcher may use (all-on = all)
-    petscii_picker: bool,      // PETSCII glyph-picker popup open
+    petscii_mask: Vec<bool>,    // which C64 glyphs the matcher may use (all-on = all)
+    petscii_picker: bool,       // PETSCII glyph-picker popup open
     // ASCII converter (DITHER_ASCII): brightness→glyph over a chosen character pool.
-    ascii_high: bool,    // include high ASCII (128..255 — CP437 extended)
-    ascii_control: bool, // include control chars (0..31)
-    ascii_blocks: bool,  // include the ░▒▓█ + half/quarter block glyphs
-    ascii_box: bool,     // include box-drawing glyphs (179..218)
-    ascii_color: bool,   // per-cell colour from the active palette (else monochrome)
-    ascii_invert: bool,  // inverse video — swap ink/paper
-    ascii_chars: String, // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
+    ascii_high: bool,      // include high ASCII (128..255 — CP437 extended)
+    ascii_control: bool,   // include control chars (0..31)
+    ascii_blocks: bool,    // include the ░▒▓█ + half/quarter block glyphs
+    ascii_box: bool,       // include box-drawing glyphs (179..218)
+    ascii_color: bool,     // per-cell colour from the active palette (else monochrome)
+    ascii_invert: bool,    // inverse video — swap ink/paper
+    ascii_chars: String,   // "Use only chars": when non-empty, the exact glyph pool (e.g. " .oOX$")
     ascii_mask: Vec<bool>, // glyph-picker mask over CP437 (256); intersects the ramp pool
     ascii_picker: bool,    // ASCII glyph-picker popup open
     ascii_font: AsciiFont, // which font the converter renders/measures from (CP437 / REXPaint / TTF)
     // Resolved render font: (cache key, glyph font, Some(vga50) when it's the CP437 9-dot renderer).
-    ascii_font_cache: Option<(u64, std::sync::Arc<crate::decode::rexfont::GlyphFont>, Option<bool>)>,
+    ascii_font_cache: Option<(
+        u64,
+        std::sync::Arc<crate::decode::rexfont::GlyphFont>,
+        Option<bool>,
+    )>,
     ascii_font_file: Option<(PathBuf, std::sync::Arc<crate::decode::rexfont::GlyphFont>)>, // TTF cache
     // Unified foreground / background for the mono char converters (ASCII / ATASCII / Apple ][).
     tm_fg: [u8; 3],
     tm_bg: [u8; 3],
     // ATASCII / Apple ][ converters (DITHER_ATASCII / DITHER_APPLE): generic 8×8 bit-font art.
-    bitfont_color: bool,   // per-cell colour from the palette (shared by both modes; else mono)
-    atascii_invert: bool,  // ATASCII inverse video (swap ink/paper)
-    apple_invert: bool,    // Apple ][ inverse video
+    bitfont_color: bool, // per-cell colour from the palette (shared by both modes; else mono)
+    atascii_invert: bool, // ATASCII inverse video (swap ink/paper)
+    apple_invert: bool,  // Apple ][ inverse video
     atascii_mask: Vec<bool>, // which ATASCII glyphs the converter may use (all-on = all)
-    apple_mask: Vec<bool>,   // which Apple ][ glyphs the converter may use
-    atascii_picker: bool,    // ATASCII glyph-picker popup open
-    apple_picker: bool,      // Apple ][ glyph-picker popup open
+    apple_mask: Vec<bool>, // which Apple ][ glyphs the converter may use
+    atascii_picker: bool, // ATASCII glyph-picker popup open
+    apple_picker: bool,  // Apple ][ glyph-picker popup open
     apple_mousetext: bool, // include the Apple //e MouseText glyphs in the pool
-    apple_col80: bool,     // false = PR#0 (40-column font), true = PR#3 (80-column font)
+    apple_col80: bool,   // false = PR#0 (40-column font), true = PR#3 (80-column font)
     // REXPaint-font converter (DITHER_REXFONT): image→art over a bundled REXPaint font.
-    rexfont_sel: usize,    // index into crate::decode::rexfont::REXFONTS (the converter font)
-    rexfont_invert: bool,  // inverse video for the REXPaint-font converter
+    rexfont_sel: usize, // index into crate::decode::rexfont::REXFONTS (the converter font)
+    rexfont_invert: bool, // inverse video for the REXPaint-font converter
     rexfont_mask: Vec<bool>, // 256 flags: which glyphs the converter may use (all-on = all)
-    rexfont_picker: bool,  // the glyph-picker popup is open
+    rexfont_picker: bool, // the glyph-picker popup is open
     glyph_drag: Option<bool>, // shared: value being painted during a glyph-picker drag
     // Unicode text-art converter (DITHER_UNICODE): half-block / Braille → real UTF-8.
     unicode_style: u8,   // thumb::UNI_HALFBLOCK / UNI_BRAILLE / UNI_RAMP
     unicode_cols: usize, // target character width
     unicode_invert: bool,
-    unicode_ranges: u8,  // Ramp style: enabled Unicode ranges (crate::decode::uniart::R_*)
+    unicode_ranges: u8, // Ramp style: enabled Unicode ranges (crate::decode::uniart::R_*)
     unicode_disabled: Vec<u32>, // Ramp glyph-picker: codepoints the user disabled
-    unicode_extra: String,      // Ramp: user "codepoints" field — extra glyphs beyond the ranges
-    unicode_font: UniFont,      // Ramp: which font to rasterize glyphs from
+    unicode_extra: String, // Ramp: user "codepoints" field — extra glyphs beyond the ranges
+    unicode_font: UniFont, // Ramp: which font to rasterize glyphs from
     unicode_font_bytes: Option<(PathBuf, std::sync::Arc<Vec<u8>>)>, // cached bytes for UniFont::File
-    unicode_picker: bool,       // Unicode glyph-picker popup open
-    pixelate_h: f32,         // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
-    pixelate_lock: bool,     // lock the pixelate block square (height == width)
+    unicode_picker: bool, // Unicode glyph-picker popup open
+    pixelate_h: f32,      // Pixelate block HEIGHT in px (width = adjust.pixelate); <2 = square
+    pixelate_lock: bool,  // lock the pixelate block square (height == width)
     // Resize/resample preview: downsample the art to a fraction of native, run the
     // whole pipeline (dither/palette) at that lower resolution, then nearest-upscale
     // back to native — so it displays at the SAME screen size but shows the
@@ -2143,16 +2200,16 @@ pub struct Kaleidotron {
     // The two files chosen from the grid/table context menu (Compare ▸ source / diff).
     compare_source: Option<PathBuf>,
     compare_diff: Option<PathBuf>,
-    compare_color: [u8; 3],            // diff-highlight colour (persisted)
-    compare_hex: String,               // hex entry buffer for the colour field (transient)
-    compare_opacity: f32,              // diff overlay opacity 0..1 (persisted)
-    compare_tolerance: u8,             // per-channel diff tolerance, 0 = exact match (persisted)
-    compare_swapped: bool,             // swap which side shows source vs diff (transient)
-    compare_sync: bool,                // pan/zoom moves both panes together (persisted)
-    compare_name: String,              // "save as…" name buffer (transient)
-    compare: Compare,                  // transient runtime (textures, per-pane view, overlay)
+    compare_color: [u8; 3],                // diff-highlight colour (persisted)
+    compare_hex: String,                   // hex entry buffer for the colour field (transient)
+    compare_opacity: f32,                  // diff overlay opacity 0..1 (persisted)
+    compare_tolerance: u8, // per-channel diff tolerance, 0 = exact match (persisted)
+    compare_swapped: bool, // swap which side shows source vs diff (transient)
+    compare_sync: bool,    // pan/zoom moves both panes together (persisted)
+    compare_name: String,  // "save as…" name buffer (transient)
+    compare: Compare,      // transient runtime (textures, per-pane view, overlay)
     saved_compares: Vec<SavedCompare>, // saved, recallable comparisons (persisted)
-    video_lists: Vec<VideoList>,       // Watch Later + custom video lists (persisted); shown in Places
+    video_lists: Vec<VideoList>, // Watch Later + custom video lists (persisted); shown in Places
     list_rename: Option<(String, String)>, // (list being renamed, edit buffer) — transient
 
     anim: Option<AnimState>,         // Some when viewing an animated GIF
@@ -2168,14 +2225,14 @@ pub struct Kaleidotron {
     font_bytes: Vec<u8>,
     font_info: Option<crate::decode::font::FontInfo>,
     font_chars: Vec<char>,
-    font_sample: String, // the viewer's type-to-sample text (persisted)
-    font_ink: [u8; 3],   // TTF/OTF viewer ink colour (the base render colour; recolor pipeline runs on top), persisted
-    font_bg: [u8; 3],    // TTF/OTF background colour (used when font_bg_on), persisted
-    font_bg_on: bool,    // fill the TTF/OTF preview background (else transparent), persisted
+    font_sample: String,        // the viewer's type-to-sample text (persisted)
+    font_ink: [u8; 3], // TTF/OTF viewer ink colour (the base render colour; recolor pipeline runs on top), persisted
+    font_bg: [u8; 3],  // TTF/OTF background colour (used when font_bg_on), persisted
+    font_bg_on: bool,  // fill the TTF/OTF preview background (else transparent), persisted
     font_letter_spacing: f32, // TTF/OTF extra px between glyphs (negative overlaps), persisted
-    font_line_gap: f32,  // TTF/OTF extra px between lines (negative overlaps), persisted
+    font_line_gap: f32, // TTF/OTF extra px between lines (negative overlaps), persisted
     font_top_down: bool, // TTF/OTF multi-line overlap order (upper lines on top), persisted
-    font_stroke_w: f32,  // TTF/OTF/FON outline width in px (0 = none), persisted
+    font_stroke_w: f32, // TTF/OTF/FON outline width in px (0 = none), persisted
     font_stroke_color: [u8; 3], // TTF/OTF/FON outline colour, persisted
     font_stroke_mode: crate::decode::font::StrokeMode, // outer/center/inner, persisted
     font_stroke_per_char: bool, // true = outline each glyph; false = one merged silhouette (default), persisted
@@ -2183,35 +2240,35 @@ pub struct Kaleidotron {
     font_preview_zoom: f32, // logo-maker preview on-screen magnification (the sample is supersampled to device res × this, then shown 1:1 → crisp, no moiré), persisted
     font_preview_h: f32, // logo-maker preview pane height in points (draggable divider), persisted
     // --- 3D font extrusion (the "3D logo maker") ---
-    font_3d_on: bool,          // show the interactive 3D extruded preview instead of the flat one, persisted
-    font_3d_depth: f32,        // extrusion depth (em-normalized), persisted
-    font_3d_bevel: f32,        // chamfer bevel size (em-normalized; 0 = flat block), persisted
-    font_3d_face: [u8; 3],     // front-face colour, persisted
-    font_3d_back: [u8; 3],     // back-face colour, persisted
-    font_3d_side: [u8; 3],     // extruded body (side wall) colour, persisted
-    font_3d_light_yaw: f32,    // key-light azimuth (view space), persisted
-    font_3d_light_pitch: f32,  // key-light elevation, persisted
+    font_3d_on: bool, // show the interactive 3D extruded preview instead of the flat one, persisted
+    font_3d_depth: f32, // extrusion depth (em-normalized), persisted
+    font_3d_bevel: f32, // chamfer bevel size (em-normalized; 0 = flat block), persisted
+    font_3d_face: [u8; 3], // front-face colour, persisted
+    font_3d_back: [u8; 3], // back-face colour, persisted
+    font_3d_side: [u8; 3], // extruded body (side wall) colour, persisted
+    font_3d_light_yaw: f32, // key-light azimuth (view space), persisted
+    font_3d_light_pitch: f32, // key-light elevation, persisted
     font_3d_light_rgb: [u8; 3], // key-light colour, persisted
-    font_3d_yaw: f32,          // orbit camera yaw, persisted
-    font_3d_pitch: f32,        // orbit camera pitch, persisted
-    font_3d_zoom: f32,         // orbit camera zoom, persisted
-    font_3d_pan: [f32; 2],     // orbit camera pan (fraction of viewport), session-only
-    font_3d_spin: bool,        // auto-rotate the 3D view, persisted
+    font_3d_yaw: f32, // orbit camera yaw, persisted
+    font_3d_pitch: f32, // orbit camera pitch, persisted
+    font_3d_zoom: f32, // orbit camera zoom, persisted
+    font_3d_pan: [f32; 2], // orbit camera pan (fraction of viewport), session-only
+    font_3d_spin: bool, // auto-rotate the 3D view, persisted
     font_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached mesh (key = geometry params)
-    font_3d_tex: Option<(String, egui::TextureHandle)>,            // cached render (key = mesh + camera + light + size)
+    font_3d_tex: Option<(String, egui::TextureHandle)>, // cached render (key = mesh + camera + light + size)
     svg_3d_on: bool, // view an opened SVG as an interactive 3D extrusion (reuses the font 3D controls), persisted
     svg_3d_mesh: Option<(String, crate::decode::mesh3d::Mesh3D)>, // cached extruded-SVG mesh
     font_preview_text: String, // the sample rendered on font GRID TILES (Preferences, persisted)
-    font_preview_on: bool,     // use `font_preview_text` on font tiles (else defaults), persisted
+    font_preview_on: bool, // use `font_preview_text` on font tiles (else defaults), persisted
     show_font_preview_edit: bool, // the multiline preview-text editor popup is open (transient)
-    font_size: f32,      // sample render height in px
-    font_page: usize,    // glyph-grid page
+    font_size: f32,  // sample render height in px
+    font_page: usize, // glyph-grid page
     font_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "sample|size"
     #[allow(clippy::type_complexity)]
     font_grid_tex: Option<(usize, egui::TextureHandle, usize, [usize; 2])>, // (page, tex, rows, [cols,cell])
     font_grid_key: String, // full cache key (page|cell|ink|recolor) so colour changes re-render the grid
     font_presets: Vec<FontPreset>, // saved TTF/OTF/FON logo setups, persisted
-    font_preset_name: String,      // the Save-as name field (shared across the font viewers)
+    font_preset_name: String, // the Save-as name field (shared across the font viewers)
     font_pending_face: Option<usize>, // FON face to select once the font finishes loading (recall)
     // TheDraw font (.tdf) viewer: one file holds several named fonts; pick one + type a sample.
     tdf_path: Option<PathBuf>,
@@ -2220,15 +2277,15 @@ pub struct Kaleidotron {
     // mirrors the TDF controls. Persisted where it makes sense so a session's look survives.
     amiga_font: Option<crate::decode::amiga_font::ColorFont>, // the loaded font (None until opened)
     amiga_path: Option<PathBuf>,                              // what `amiga_font` was decoded from
-    amiga_spacing: i32,  // per-glyph advance delta; negative kerns the overlap these fonts draw with
+    amiga_spacing: i32, // per-glyph advance delta; negative kerns the overlap these fonts draw with
     amiga_line_gap: i32, // extra pixels between rows of multi-line sample text
-    amiga_zoom: f32,     // preview zoom multiplier (persisted)
+    amiga_zoom: f32,    // preview zoom multiplier (persisted)
     amiga_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "path|sample|spacing|recolor"
     amiga_snap: bool, // snap the preview zoom to an integer scale (crisp pixels), persisted
     amiga_crt: bool,  // ~1.2x vertical CRT-aspect stretch in the preview, persisted
     amiga_cell: u32,  // glyph-grid cell size in px, persisted
-    amiga_bg: [u8; 3],  // solid background colour for the preview + PNG/Copy (when amiga_bg_on)
-    amiga_bg_on: bool,  // fill the background (else a transparency checkerboard), persisted
+    amiga_bg: [u8; 3], // solid background colour for the preview + PNG/Copy (when amiga_bg_on)
+    amiga_bg_on: bool, // fill the background (else a transparency checkerboard), persisted
     amiga_top_down: bool, // multi-line overlap z-order: top line wins (else bottom), persisted
     amiga_presets: Vec<AmigaPreset>, // saved logo-maker setups (like the TDF/TTF viewers), persisted
     amiga_preset_name: String,       // the Save-as / pick name field
@@ -2238,24 +2295,24 @@ pub struct Kaleidotron {
     tdf_fonts: Vec<(String, &'static str, usize)>, // (name, type, glyph_count) per font
     tdf_index: usize,                              // selected font
     tdf_sample_tex: Option<(String, egui::TextureHandle)>, // cached by "index|sample|recolor"
-    tdf_spacing: i32,   // TDF letter-spacing delta (negative overlaps), persisted
-    tdf_line_gap: i32,  // TDF line-height delta between multi-line rows (negative tightens), persisted
-    tdf_zoom: f32,      // TDF preview zoom multiplier, persisted
+    tdf_spacing: i32,    // TDF letter-spacing delta (negative overlaps), persisted
+    tdf_line_gap: i32, // TDF line-height delta between multi-line rows (negative tightens), persisted
+    tdf_zoom: f32,     // TDF preview zoom multiplier, persisted
     tdf_font_9px: bool, // TDF: render the 9-dot VGA cell (like the ANSI viewer), persisted
-    tdf_crt: bool,      // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
-    tdf_snap: bool,     // TDF: snap the preview zoom to an integer scale (pixel-perfect), persisted
-    tdf_ruler: bool,    // TDF: draw a column-width guide line down the preview (persisted)
+    tdf_crt: bool,     // TDF: ~1.2× vertical CRT-aspect stretch in the preview, persisted
+    tdf_snap: bool,    // TDF: snap the preview zoom to an integer scale (pixel-perfect), persisted
+    tdf_ruler: bool,   // TDF: draw a column-width guide line down the preview (persisted)
     tdf_ruler_cols: u32, // TDF: the ruler column count (40 / 80 / 132), persisted
-    tdf_fg: u8,         // TDF single-colour foreground palette index (outline/block fonts), persisted
-    tdf_bg: u8,         // TDF single-colour background palette index, persisted
+    tdf_fg: u8, // TDF single-colour foreground palette index (outline/block fonts), persisted
+    tdf_bg: u8, // TDF single-colour background palette index, persisted
     tdf_top_down: bool, // TDF multi-line overlap: true = upper lines on top, persisted
-    tdf_page: usize,    // TDF glyph-grid page
+    tdf_page: usize, // TDF glyph-grid page
     #[allow(clippy::type_complexity)]
     tdf_grid_tex: Option<(String, egui::TextureHandle, usize, Vec<char>)>, // key, tex, cols, chars
     tdf_presets: Vec<TdfPreset>, // saved TDF "setups" (BBS menu configs), persisted
-    tdf_preset_name: String,     // the Save-as name field
+    tdf_preset_name: String, // the Save-as name field
     tdf_pending_index: Option<usize>, // a font variant to select once the .tdf finishes loading
-                                      // (preset recall across files — survives ensure_tdf_loaded's reset)
+    // (preset recall across files — survives ensure_tdf_loaded's reset)
     // Windows bitmap-font (.fon/.fnt) viewer: several point-size faces per file.
     fon_path: Option<PathBuf>,
     fon_bytes: Vec<u8>,
@@ -2279,11 +2336,11 @@ pub struct Kaleidotron {
     fps_blit_ms: f32,   // ms spent in draw_image_view (last frame)
     fps_total_ms: f32,  // ms spent in draw_video_ui total (last frame)
     video_markers: Vec<VideoMarker>, // chapter markers (timecode + title + notes) from the `.md`
-    video_md_header: String,         // any `.md` text before the first marker (preserved on save)
+    video_md_header: String, // any `.md` text before the first marker (preserved on save)
     video_marker_sel: Option<usize>, // the marker whose notes editor is open (click to toggle)
-    video_marker_focus: bool,        // request focus on a freshly-added marker's title field
-    video_speed: f32,                // remembered video playback speed (this session)
-    video_scrub: Option<f32>,        // seek-bar drag position (Some while dragging the scrubber)
+    video_marker_focus: bool, // request focus on a freshly-added marker's title field
+    video_speed: f32,   // remembered video playback speed (this session)
+    video_scrub: Option<f32>, // seek-bar drag position (Some while dragging the scrubber)
     video_scrub_t: f64, // last scrub-preview time (throttles ffmpeg respawns while dragging)
     video_seek_input: String, // the "go to time" text field (mm:ss / hh:mm:ss)
     video_trim_in: Option<f32>, // trim/export In point (seconds); i-key or ⟦In
@@ -2354,8 +2411,8 @@ pub struct Kaleidotron {
     auto_paused: bool, // slideshow paused by a user interaction (scroll/key/drag); not persisted
     slide_shuffle: bool, // slideshow: auto-advance in a random order (persisted)
     shuffle_bag: Vec<PathBuf>, // remaining images this shuffle pass; refilled (reshuffled) when empty
-    immersive: bool,  // F11 fullscreen: hide all bars/UI, show only the art
-    view_only: bool,  // `--view FILE`: a minimal viewer — no chrome, Esc quits. Not persisted.
+    immersive: bool,           // F11 fullscreen: hide all bars/UI, show only the art
+    view_only: bool, // `--view FILE`: a minimal viewer — no chrome, Esc quits. Not persisted.
     pending_cli_open: Option<PathBuf>, // `--open`/`--view` FILE, opened on the first frame
     // DEBUG_MODE=true: dock the window to the bottom-right corner on startup (so a dev test
     // instance stays out of the way). Consumed once the monitor size is known. Not persisted.
@@ -2370,7 +2427,7 @@ pub struct Kaleidotron {
     // dedupes so we only push a `ViewportCommand::Title` when the string actually changes.
     title_show_path: bool,
     title_last: String,
-    idle_t: f32,   // seconds of mouse stillness (immersive cursor auto-hide)
+    idle_t: f32, // seconds of mouse stillness (immersive cursor auto-hide)
     imm_edges: (bool, bool, bool, bool), // last immersive chrome edges (top,bottom,left,right); frozen while a popup is open
     shuffle: bool, // screensaver: at a pack's end, load another random pack (persisted)
     // screensaver: a worker picking a random 16colo.rs pack → (year, name, download URL)
@@ -2432,7 +2489,7 @@ pub struct Kaleidotron {
     /// into every task and resolvable as `${env:NAME}`. This is where a toolchain path lives —
     /// deliberately kaleidotron's own configuration rather than another editor's.
     task_env: std::collections::HashMap<String, String>,
-    task_inputs: std::collections::HashMap<String, String>,  // resolvable `${input:…}` values
+    task_inputs: std::collections::HashMap<String, String>, // resolvable `${input:…}` values
     /// `<data>/tasks/` — a **global** tasks.json (+ settings.json) folded into every folder's set,
     /// so a general tool ("open this in GIMP") isn't confined to the one repo that declared it.
     tasks_dir: PathBuf,
@@ -2478,7 +2535,7 @@ pub struct Kaleidotron {
     // populated (which is async for 16colo listings) into `highlight_entry`.
     came_from: Option<(PathBuf, PathBuf)>,
     highlight_entry: Option<PathBuf>, // grid/table tile to outline as "you were here"
-    highlight_born: f64,              // ctx time the outline first painted (for the fade); <0 = unset
+    highlight_born: f64, // ctx time the outline first painted (for the fade); <0 = unset
     search: Option<String>, // grid: live filename filter (vim-style '/')
     focus_search: bool,
     // advanced recursive search → a "Search results" grid
@@ -2559,7 +2616,11 @@ pub struct Kaleidotron {
     // BACK to a search (breadcrumb / back button) restores the results instead of re-running the
     // search. Cleared by F5 so an explicit refresh still re-fetches.
     #[allow(clippy::type_complexity)]
-    yt_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::youtube::YtVideo>)>,
+    yt_search_cache: Option<(
+        PathBuf,
+        Vec<Entry>,
+        HashMap<PathBuf, crate::youtube::YtVideo>,
+    )>,
     yt_rx: Option<std::sync::mpsc::Receiver<YtMsg>>,
     yt_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     yt_files: HashMap<PathBuf, PathBuf>,
@@ -2595,7 +2656,11 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     img_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[allow(clippy::type_complexity)]
-    img_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::imgsearch::ImgResult>)>,
+    img_search_cache: Option<(
+        PathBuf,
+        Vec<Entry>,
+        HashMap<PathBuf, crate::imgsearch::ImgResult>,
+    )>,
     // Icon (Iconify) + vector (Wikimedia) search — mirrors img_* but the SVG asset is the download.
     asset_results: HashMap<PathBuf, crate::assetsearch::AssetResult>,
     asset_icons_query: String,   // the Icons Places search box
@@ -2606,15 +2671,19 @@ pub struct Kaleidotron {
     #[allow(clippy::type_complexity)]
     asset_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
     #[allow(clippy::type_complexity)]
-    asset_search_cache: Option<(PathBuf, Vec<Entry>, HashMap<PathBuf, crate::assetsearch::AssetResult>)>,
+    asset_search_cache: Option<(
+        PathBuf,
+        Vec<Entry>,
+        HashMap<PathBuf, crate::assetsearch::AssetResult>,
+    )>,
     // Lospec palette browser/downloader. A palette tile renders its swatches (colours are inline in
     // the API), clicking one downloads the `.gpl` into the palette library + selects it in Recolor.
     lospec_palettes: HashMap<PathBuf, crate::lospec::LospecPalette>,
     lospec_query: String,
-    lospec_sort: usize,    // 0=Default 1=A-Z 2=Downloads 3=Newest (Filtering Options → Sorting)
+    lospec_sort: usize, // 0=Default 1=A-Z 2=Downloads 3=Newest (Filtering Options → Sorting)
     lospec_cfilter: usize, // 0=Any 1=Max 2=Min 3=Exact (Number of colors)
-    lospec_cn: u32,        // the colour count for Max/Min/Exact
-    lospec_want: usize,    // how many palettes to fetch (Load more bumps it)
+    lospec_cn: u32,     // the colour count for Max/Min/Exact
+    lospec_want: usize, // how many palettes to fetch (Load more bumps it)
     lospec_rx: Option<std::sync::mpsc::Receiver<LospecMsg>>,
     lospec_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[allow(clippy::type_complexity)]
@@ -2638,10 +2707,10 @@ pub struct Kaleidotron {
     gallery_masterpiece: bool,                // "Monthly masterpieces only"
     gallery_want: usize,                      // how many pieces to fetch (Load more bumps this)
     // DeviantArt (official OAuth2 client-credentials API — browse public art).
-    da_client_id: String,     // registered app credentials (secrets.json, like the Steam key)
+    da_client_id: String, // registered app credentials (secrets.json, like the Steam key)
     da_client_secret: String,
-    da_token: String,         // cached app-only access token
-    da_token_expires: i64,    // unix seconds when the token lapses (re-minted on demand)
+    da_token: String,      // cached app-only access token
+    da_token_expires: i64, // unix seconds when the token lapses (re-minted on demand)
     da_devs: HashMap<PathBuf, crate::deviantart::DaDeviation>,
     da_rx: Option<std::sync::mpsc::Receiver<DaMsg>>,
     da_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -2701,7 +2770,7 @@ pub struct Kaleidotron {
     ma_files: HashMap<PathBuf, PathBuf>,
     #[allow(clippy::type_complexity)]
     ma_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
-    ma_dir: PathBuf, // <data>/modules — downloaded tracker modules
+    ma_dir: PathBuf,           // <data>/modules — downloaded tracker modules
     keybindings_file: PathBuf, // <data>/keybindings.json (hand-editable)
     settings_file: PathBuf,    // <data>/settings.json (hand-editable)
     secrets_file: PathBuf,     // <data>/secrets.json (API keys; excluded from sync)
@@ -2747,26 +2816,26 @@ pub struct Kaleidotron {
     plugin_ma: bool,
     // Sources that used to be always-on; now gated like every other web source (Preferences →
     // Sources), so a clean profile shows only what you switched on.
-    plugin_16c: bool,        // 16colo.rs ANSI/ASCII art archive
-    plugin_youtube: bool,    // YouTube search + playback
-    plugin_steam: bool,      // Steam library → video search
-    plugin_images: bool,     // Openverse image search
+    plugin_16c: bool,         // 16colo.rs ANSI/ASCII art archive
+    plugin_youtube: bool,     // YouTube search + playback
+    plugin_steam: bool,       // Steam library → video search
+    plugin_images: bool,      // Openverse image search
     plugin_audiosearch: bool, // Openverse audio search
-    plugin_deviantart: bool, // DeviantArt (official OAuth2 API)
-    gif_recolor: bool, // run the Recolor/PixelFX stack on animated GIF frames
-    gif_speed: f32,    // GIF playback rate (0.25×–4×), like the video player's Speed
+    plugin_deviantart: bool,  // DeviantArt (official OAuth2 API)
+    gif_recolor: bool,        // run the Recolor/PixelFX stack on animated GIF frames
+    gif_speed: f32,           // GIF playback rate (0.25×–4×), like the video player's Speed
     // HTTP filesystem browser: point at any auto-indexed URL and browse it like a folder tree.
-    web_url: String,                             // the Places URL box
-    web_http: HashMap<String, bool>,             // host → needs plain HTTP (remembered per session)
+    web_url: String,                 // the Places URL box
+    web_http: HashMap<String, bool>, // host → needs plain HTTP (remembered per session)
     /// Virtual path → the entry's real absolute URL. Needed because a link found on an ordinary
     /// page can point anywhere, which the segment-appending path model can't express.
     web_urls: HashMap<PathBuf, String>,
     web_rx: Option<std::sync::mpsc::Receiver<WebMsg>>,
     web_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    web_files: HashMap<PathBuf, PathBuf>,        // virtual → downloaded local file
+    web_files: HashMap<PathBuf, PathBuf>, // virtual → downloaded local file
     #[allow(clippy::type_complexity)]
     web_open_rx: Option<std::sync::mpsc::Receiver<Result<(PathBuf, PathBuf), String>>>,
-    web_dir: PathBuf, // <data>/web — downloaded files
+    web_dir: PathBuf,       // <data>/web — downloaded files
     web_dl_open: bool,      // the "Download folder…" dialog is showing
     web_dl_mask: String,    // wildcard mask for that dialog (e.g. `*.zip;*.ans`)
     web_dl_recursive: bool, // recurse into sub-directories
@@ -2837,11 +2906,14 @@ pub struct Kaleidotron {
     colo_folder_diz: bool,
     colo_diz_rx: std::sync::mpsc::Receiver<(PathBuf, DizOutcome)>,
     #[allow(clippy::type_complexity)]
-    diz_queue: Arc<(std::sync::Mutex<Vec<(usize, PathBuf, String)>>, std::sync::Condvar)>,
+    diz_queue: Arc<(
+        std::sync::Mutex<Vec<(usize, PathBuf, String)>>,
+        std::sync::Condvar,
+    )>,
     diz_requested: HashSet<PathBuf>,
     diz_no_art: HashSet<PathBuf>, // pack folders resolved without a thumb (no art / failed → 📁)
     diz_target: Arc<std::sync::atomic::AtomicUsize>, // viewport-centre entry index (priority)
-    diz_view: (usize, usize),                        // visible entry-index range [first, last)
+    diz_view: (usize, usize),     // visible entry-index range [first, last)
 }
 
 /// The result of prepping one pack's FILE_ID thumbnail (see `colo_folder_diz`): a decoded
@@ -4230,8 +4302,17 @@ impl Kaleidotron {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| {
                     vec![
-                        [16, 16], [32, 32], [64, 64], [128, 128], [256, 256], [320, 200],
-                        [512, 512], [640, 400], [640, 480], [1024, 768], [1920, 1080],
+                        [16, 16],
+                        [32, 32],
+                        [64, 64],
+                        [128, 128],
+                        [256, 256],
+                        [320, 200],
+                        [512, 512],
+                        [640, 400],
+                        [640, 480],
+                        [1024, 768],
+                        [1920, 1080],
                     ]
                 }),
             ai_gen_save_prompt_name: String::new(),
@@ -4355,7 +4436,10 @@ impl Kaleidotron {
             grid_tile_border: get_bool(Self::TILE_BORDER_KEY).unwrap_or(true),
             open_on_double_click: get_bool(Self::OPEN_DBLCLICK_KEY).unwrap_or(true),
             caption_fields,
-            grid_hover_caption: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY)).unwrap_or(false),
+            grid_hover_caption: cc
+                .storage
+                .and_then(|st| eframe::get_value::<bool>(st, Self::GRID_HOVER_CAPTION_KEY))
+                .unwrap_or(false),
             tile_bg_enabled,
             tile_bg_folder,
             tile_bg_archive,
@@ -4607,23 +4691,65 @@ impl Kaleidotron {
                 .storage
                 .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_PREVIEW_H_KEY))
                 .unwrap_or(420.0),
-            font_3d_on: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_ON_KEY)).unwrap_or(false),
-            font_3d_depth: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY)).unwrap_or(0.2),
-            font_3d_bevel: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY)).unwrap_or(0.0),
-            font_3d_face: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY)).unwrap_or([220, 40, 40]),
-            font_3d_back: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_BACK_KEY)).unwrap_or([220, 40, 40]),
-            font_3d_side: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY)).unwrap_or([120, 20, 20]),
-            font_3d_light_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY)).unwrap_or(0.5),
-            font_3d_light_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY)).unwrap_or(0.7),
-            font_3d_light_rgb: cc.storage.and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_LIGHT_RGB_KEY)).unwrap_or([255, 255, 255]),
-            font_3d_yaw: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_YAW_KEY)).unwrap_or(0.5),
-            font_3d_pitch: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_PITCH_KEY)).unwrap_or(-0.45),
-            font_3d_zoom: cc.storage.and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_ZOOM_KEY)).unwrap_or(1.0),
+            font_3d_on: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_ON_KEY))
+                .unwrap_or(false),
+            font_3d_depth: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_DEPTH_KEY))
+                .unwrap_or(0.2),
+            font_3d_bevel: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_BEVEL_KEY))
+                .unwrap_or(0.0),
+            font_3d_face: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_FACE_KEY))
+                .unwrap_or([220, 40, 40]),
+            font_3d_back: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_BACK_KEY))
+                .unwrap_or([220, 40, 40]),
+            font_3d_side: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_SIDE_KEY))
+                .unwrap_or([120, 20, 20]),
+            font_3d_light_yaw: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_YAW_KEY))
+                .unwrap_or(0.5),
+            font_3d_light_pitch: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_LIGHT_PITCH_KEY))
+                .unwrap_or(0.7),
+            font_3d_light_rgb: cc
+                .storage
+                .and_then(|s| eframe::get_value::<[u8; 3]>(s, Self::FONT_3D_LIGHT_RGB_KEY))
+                .unwrap_or([255, 255, 255]),
+            font_3d_yaw: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_YAW_KEY))
+                .unwrap_or(0.5),
+            font_3d_pitch: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_PITCH_KEY))
+                .unwrap_or(-0.45),
+            font_3d_zoom: cc
+                .storage
+                .and_then(|s| eframe::get_value::<f32>(s, Self::FONT_3D_ZOOM_KEY))
+                .unwrap_or(1.0),
             font_3d_pan: [0.0, 0.0],
-            font_3d_spin: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_SPIN_KEY)).unwrap_or(false),
+            font_3d_spin: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::FONT_3D_SPIN_KEY))
+                .unwrap_or(false),
             font_3d_mesh: None,
             font_3d_tex: None,
-            svg_3d_on: cc.storage.and_then(|s| eframe::get_value::<bool>(s, Self::SVG_3D_ON_KEY)).unwrap_or(false),
+            svg_3d_on: cc
+                .storage
+                .and_then(|s| eframe::get_value::<bool>(s, Self::SVG_3D_ON_KEY))
+                .unwrap_or(false),
             svg_3d_mesh: None,
             font_preview_text: cc
                 .storage
@@ -4649,13 +4775,35 @@ impl Kaleidotron {
             amiga_path: None,
             amiga_sample_tex: None,
             amiga_grid_tex: None,
-            amiga_snap: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_SNAP_KEY)).unwrap_or(true),
-            amiga_crt: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_CRT_KEY)).unwrap_or(false),
-            amiga_cell: cc.storage.and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY)).unwrap_or(64).clamp(24, 160),
-            amiga_bg: cc.storage.and_then(|st| eframe::get_value::<[u8;3]>(st, Self::AMIGA_BG_KEY)).unwrap_or([0,0,0]),
-            amiga_bg_on: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_BG_ON_KEY)).unwrap_or(false),
-            amiga_top_down: cc.storage.and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_TOP_DOWN_KEY)).unwrap_or(true),
-            amiga_presets: cc.storage.and_then(|st| eframe::get_value::<Vec<AmigaPreset>>(st, Self::AMIGA_PRESETS_KEY)).unwrap_or_default(),
+            amiga_snap: cc
+                .storage
+                .and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_SNAP_KEY))
+                .unwrap_or(true),
+            amiga_crt: cc
+                .storage
+                .and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_CRT_KEY))
+                .unwrap_or(false),
+            amiga_cell: cc
+                .storage
+                .and_then(|st| eframe::get_value::<u32>(st, Self::AMIGA_CELL_KEY))
+                .unwrap_or(64)
+                .clamp(24, 160),
+            amiga_bg: cc
+                .storage
+                .and_then(|st| eframe::get_value::<[u8; 3]>(st, Self::AMIGA_BG_KEY))
+                .unwrap_or([0, 0, 0]),
+            amiga_bg_on: cc
+                .storage
+                .and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_BG_ON_KEY))
+                .unwrap_or(false),
+            amiga_top_down: cc
+                .storage
+                .and_then(|st| eframe::get_value::<bool>(st, Self::AMIGA_TOP_DOWN_KEY))
+                .unwrap_or(true),
+            amiga_presets: cc
+                .storage
+                .and_then(|st| eframe::get_value::<Vec<AmigaPreset>>(st, Self::AMIGA_PRESETS_KEY))
+                .unwrap_or_default(),
             amiga_preset_name: String::new(),
             amiga_spacing: cc
                 .storage
@@ -5037,7 +5185,14 @@ impl Kaleidotron {
                 .map(|v| {
                     v.into_iter()
                         .map(|(m, a)| {
-                            (m, PanelLayout { explorer: a[0], details: a[1], recolor: a[2] })
+                            (
+                                m,
+                                PanelLayout {
+                                    explorer: a[0],
+                                    details: a[1],
+                                    recolor: a[2],
+                                },
+                            )
                         })
                         .collect()
                 })
@@ -5121,7 +5276,11 @@ impl Kaleidotron {
 
         // Prime the font-thumbnail sample text (the decoder reads a process-global — see
         // `decode::font::set_thumb_sample`), so grid tiles render the user's preferred sample.
-        crate::decode::font::set_thumb_sample(if app.font_preview_on { &app.font_preview_text } else { "" });
+        crate::decode::font::set_thumb_sample(if app.font_preview_on {
+            &app.font_preview_text
+        } else {
+            ""
+        });
         // Install the persisted Unicode-ramp font into the converter's process-global.
         app.apply_ramp_src();
 
@@ -5466,13 +5625,22 @@ impl Kaleidotron {
         // Optional paths: an explicit `null` means "unset", which is different from the key being
         // absent (leave whatever we loaded alone) — so check for the key, not just a string value.
         if let Some(v) = m.get("midi_sf") {
-            self.midi_sf = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            self.midi_sf = v
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from);
         }
         if let Some(v) = m.get("yt_download_dir") {
-            self.yt_download_dir = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            self.yt_download_dir = v
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from);
         }
         if let Some(v) = m.get("dosbox_path") {
-            self.dosbox_path = v.as_str().filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            self.dosbox_path = v
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from);
         }
         if let Some(v) = st::get_bool(&m, "dosbox_keep_open") {
             self.dosbox_keep_open = v;
@@ -5553,7 +5721,10 @@ impl Kaleidotron {
         if include_secrets {
             let mut sec = Map::new();
             if !self.steam_api_key.trim().is_empty() {
-                sec.insert("steam_api_key".to_string(), Value::String(self.steam_api_key.clone()));
+                sec.insert(
+                    "steam_api_key".to_string(),
+                    Value::String(self.steam_api_key.clone()),
+                );
             }
             if !self.ma_key.trim().is_empty() {
                 sec.insert("ma_key".to_string(), Value::String(self.ma_key.clone()));
@@ -5576,7 +5747,11 @@ impl Kaleidotron {
                     self.status = format!(
                         "Exported settings → {}{}",
                         dest.display(),
-                        if include_secrets { "  ⚠ includes your API keys" } else { "" }
+                        if include_secrets {
+                            "  ⚠ includes your API keys"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -5620,9 +5795,10 @@ impl Kaleidotron {
         }
         if let Some(obj) = root.get("keybindings").and_then(|v| v.as_object()) {
             for (aid, v) in obj {
-                if let (Some(a), Some(k)) =
-                    (Action::from_id(aid), v.as_str().and_then(KeyBind::from_config))
-                {
+                if let (Some(a), Some(k)) = (
+                    Action::from_id(aid),
+                    v.as_str().and_then(KeyBind::from_config),
+                ) {
                     self.keymap.insert(a, k);
                 }
             }
@@ -5661,7 +5837,9 @@ impl Kaleidotron {
         const ZIP: &[u8] = include_bytes!("../assets/tdf/thedraw_fonts.zip");
         let dir = self.data_dir.join("bundled");
         let path = dir.join("TheDraw Fonts.zip");
-        let need = std::fs::metadata(&path).map(|m| m.len() != ZIP.len() as u64).unwrap_or(true);
+        let need = std::fs::metadata(&path)
+            .map(|m| m.len() != ZIP.len() as u64)
+            .unwrap_or(true);
         if need {
             std::fs::create_dir_all(&dir).ok()?;
             std::fs::write(&path, ZIP).ok()?;
@@ -5946,7 +6124,7 @@ impl Kaleidotron {
         // their message *after* calling refresh(), so theirs survives this).
         self.status.clear();
         self.lospec_detail = None; // leaving the palette detail view
-        // Navigating leaves any "Search results" view (and stops a running search).
+                                   // Navigating leaves any "Search results" view (and stops a running search).
         if self.search_results.is_some() || self.search_running {
             self.cancel_search();
             self.search_results = None;
@@ -5957,7 +6135,7 @@ impl Kaleidotron {
         self.colo_flat = false;
         self.colo_pieces.clear();
         self.cancel_img(); // stop a streaming image search so its late hits don't leak into `dir`
-        // Drop any Samples-pane / Pads-list focus + hot-swap session (out of context after nav).
+                           // Drop any Samples-pane / Pads-list focus + hot-swap session (out of context after nav).
         self.sample_focus = false;
         self.pad_list_focus = false;
         self.hotswap_pad = None;
@@ -6416,8 +6594,7 @@ impl Kaleidotron {
     /// `/pack/<name>` fetch would just 404).
     fn is_colo_pack_folder(path: &Path) -> bool {
         let parts = crate::sixteen::rel_parts(path);
-        parts.len() == 2
-            && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
+        parts.len() == 2 && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
     }
 
     /// Is `folder` a 16colo.rs *pack listing* — a year (`<year>`) or `latest`, whose tiles
@@ -6425,8 +6602,7 @@ impl Kaleidotron {
     /// tables, and the year *root* lists years, so neither qualifies.)
     fn is_colo_pack_listing(folder: &Path) -> bool {
         let parts = crate::sixteen::rel_parts(folder);
-        parts.len() == 1
-            && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
+        parts.len() == 1 && (parts[0].parse::<u32>().is_ok() || parts[0] == crate::sixteen::LATEST)
     }
 
     /// Lazily enqueue FILE_ID thumbnails for the pack folders **in view** (plus a small
@@ -6485,8 +6661,11 @@ impl Kaleidotron {
             match outcome {
                 DizOutcome::Art(w, h, rgba) => {
                     let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                    let tex =
-                        ctx.load_texture(path.to_string_lossy(), color, egui::TextureOptions::LINEAR);
+                    let tex = ctx.load_texture(
+                        path.to_string_lossy(),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
                     self.thumb_rgba.insert(path.clone(), (w, h, rgba));
                     self.thumb_tex.insert(path.clone(), tex);
                 }
@@ -6538,10 +6717,10 @@ impl Kaleidotron {
         {
             self.highlight_entry = Some(self.entries[idx].path.clone());
             self.highlight_born = -1.0; // stamp the fade start on first paint
-            // Scroll straight to the tile we came from (grid AND table). This beats the
-            // remembered scroll *offset*: if the listing changed shape — a `/` filter that's
-            // since cleared, a re-sort — the old offset points nowhere near the tile (it lands
-            // at the top), whereas its index always exposes it.
+                                        // Scroll straight to the tile we came from (grid AND table). This beats the
+                                        // remembered scroll *offset*: if the listing changed shape — a `/` filter that's
+                                        // since cleared, a re-sort — the old offset points nowhere near the tile (it lands
+                                        // at the top), whereas its index always exposes it.
             self.scroll_target = Some(idx);
             self.came_from = None;
             self.want_repaint = true;
@@ -6931,15 +7110,11 @@ impl Kaleidotron {
                 self.start_yt_open(dir);
             }
             // A channel's Playlists tab: `<youtube>/channel/<id>/playlists`.
-            [c, id, sub]
-                if c == crate::youtube::CHANNEL && sub == crate::youtube::PLAYLISTS =>
-            {
+            [c, id, sub] if c == crate::youtube::CHANNEL && sub == crate::youtube::PLAYLISTS => {
                 self.start_yt_list(dir, YtSource::ChannelPlaylists(id.clone()));
             }
             // A channel video leaf (a pinned video under a channel).
-            [c, _id, leaf]
-                if c == crate::youtube::CHANNEL && parse_yt_id(leaf).is_some() =>
-            {
+            [c, _id, leaf] if c == crate::youtube::CHANNEL && parse_yt_id(leaf).is_some() => {
                 self.start_yt_open(dir);
             }
             // A channel's videos: `<youtube>/channel/<id>`.
@@ -6947,9 +7122,7 @@ impl Kaleidotron {
                 self.start_yt_list(dir, YtSource::ChannelVideos(id.clone()));
             }
             // A playlist video leaf (a pinned video under a playlist).
-            [p, _leaf, vleaf]
-                if p == crate::youtube::PLAYLIST && parse_yt_id(vleaf).is_some() =>
-            {
+            [p, _leaf, vleaf] if p == crate::youtube::PLAYLIST && parse_yt_id(vleaf).is_some() => {
                 self.start_yt_open(dir);
             }
             // A playlist's videos: `<youtube>/playlist/<Title [plid]>` (the leaf carries the id).
@@ -7000,7 +7173,10 @@ impl Kaleidotron {
 
     /// Kick off an image search on a worker thread. Results stream into `all_entries` via `poll_img`.
     fn start_img_search(&mut self, dir: PathBuf) {
-        let query = crate::imgsearch::rel_parts_any(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::imgsearch::rel_parts_any(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         let gif = crate::imgsearch::is_gif_remote(&dir);
         self.show_folder(dir.clone(), Vec::new());
         self.img_results.clear();
@@ -7026,7 +7202,8 @@ impl Kaleidotron {
                 Ok(ImgMsg::Hit(mut entry, r)) => {
                     entry.rating = self.read_rating(&entry.path);
                     // Openverse thumbnails are rendered previews → LINEAR (via colo_thumbs pool).
-                    self.colo_thumbs.request(&entry.path, &r.thumb_url, THUMB_PX, false);
+                    self.colo_thumbs
+                        .request(&entry.path, &r.thumb_url, THUMB_PX, false);
                     self.img_results.insert(entry.path.clone(), *r);
                     self.all_entries.push(entry);
                     got = true;
@@ -7087,7 +7264,11 @@ impl Kaleidotron {
         match rx.try_recv() {
             Ok(Ok((vpath, local))) => {
                 let credit = self.img_results.get(&vpath).map(|r| {
-                    let who = if r.creator.is_empty() { r.provider.clone() } else { r.creator.clone() };
+                    let who = if r.creator.is_empty() {
+                        r.provider.clone()
+                    } else {
+                        r.creator.clone()
+                    };
                     let mut s = format!("{} — {who} · {}", r.title, r.license_label());
                     let dims = r.dims();
                     if !dims.is_empty() {
@@ -7147,7 +7328,10 @@ impl Kaleidotron {
         let Some(source) = crate::assetsearch::source_of(&dir) else {
             return;
         };
-        let query = crate::assetsearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::assetsearch::rel_parts(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.asset_results.clear();
         if let Some(c) = self.asset_cancel.take() {
@@ -7171,7 +7355,12 @@ impl Kaleidotron {
                 Ok(AssetMsg::Hit(mut entry, r)) => {
                     entry.rating = self.read_rating(&entry.path);
                     // Icons are SVG thumbnails (decode via the registry); Commons thumbs are PNG.
-                    self.colo_thumbs.request(&entry.path, &r.thumb_url, THUMB_PX, r.thumb_via_registry);
+                    self.colo_thumbs.request(
+                        &entry.path,
+                        &r.thumb_url,
+                        THUMB_PX,
+                        r.thumb_via_registry,
+                    );
                     self.asset_results.insert(entry.path.clone(), *r);
                     self.all_entries.push(entry);
                     got = true;
@@ -7179,7 +7368,8 @@ impl Kaleidotron {
                 Ok(AssetMsg::Done(n)) => {
                     self.status = format!("{n} result(s)");
                     if let Some(f) = self.folder.clone() {
-                        self.asset_search_cache = Some((f, self.all_entries.clone(), self.asset_results.clone()));
+                        self.asset_search_cache =
+                            Some((f, self.all_entries.clone(), self.asset_results.clone()));
                     }
                     done = true;
                     break;
@@ -7217,7 +7407,8 @@ impl Kaleidotron {
         self.asset_open_rx = Some(rx);
         self.status = format!("Fetching: {}", elide(&r.title, 40));
         std::thread::spawn(move || {
-            let res = crate::cache::get_file(&r.download_url, &r.filename()).map(|local| (vpath, local));
+            let res =
+                crate::cache::get_file(&r.download_url, &r.filename()).map(|local| (vpath, local));
             let _ = tx.send(res);
         });
     }
@@ -7225,7 +7416,9 @@ impl Kaleidotron {
     /// Finish an asset download each frame: map the virtual path → local SVG + open it, with a
     /// status line crediting the source (attribution + licence).
     fn poll_asset_open(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.asset_open_rx else { return };
+        let Some(rx) = &self.asset_open_rx else {
+            return;
+        };
         match rx.try_recv() {
             Ok(Ok((vpath, local))) => {
                 let credit = self.asset_results.get(&vpath).map(|r| {
@@ -7263,7 +7456,9 @@ impl Kaleidotron {
     fn gallery_browse_path(&self) -> PathBuf {
         use crate::lospec_gallery as g;
         let medium = g::MEDIUMS.get(self.gallery_medium).map_or("all", |m| m.0);
-        let sorting = g::SORTINGS.get(self.gallery_sorting).map_or("latest", |s| s.0);
+        let sorting = g::SORTINGS
+            .get(self.gallery_sorting)
+            .map_or("latest", |s| s.0);
         let time = g::TIMES.get(self.gallery_time).map_or("all", |t| t.0);
         g::browse_path(
             medium,
@@ -7296,7 +7491,11 @@ impl Kaleidotron {
         let category = parts.get(2).cloned().unwrap_or_else(|| "all".into());
         let sorting = parts.get(3).cloned().unwrap_or_else(|| "latest".into());
         let time = parts.get(4).cloned().unwrap_or_else(|| "all".into());
-        let tag = parts.get(5).filter(|t| *t != "-").cloned().unwrap_or_default();
+        let tag = parts
+            .get(5)
+            .filter(|t| *t != "-")
+            .cloned()
+            .unwrap_or_default();
         let masterpiece = parts.get(6).map(|m| m == "1").unwrap_or(false);
         let want = self.gallery_want;
         self.show_folder(dir.clone(), Vec::new());
@@ -7311,7 +7510,18 @@ impl Kaleidotron {
         self.status = "Browsing Lospec gallery…".into();
         self.want_repaint = true;
         std::thread::spawn(move || {
-            gallery_walk(medium, category, sorting, time, tag, masterpiece, want, &dir, cancel, tx)
+            gallery_walk(
+                medium,
+                category,
+                sorting,
+                time,
+                tag,
+                masterpiece,
+                want,
+                &dir,
+                cancel,
+                tx,
+            )
         });
     }
 
@@ -7374,7 +7584,9 @@ impl Kaleidotron {
     }
 
     fn poll_gallery_open(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.gallery_open_rx else { return };
+        let Some(rx) = &self.gallery_open_rx else {
+            return;
+        };
         match rx.try_recv() {
             Ok(Ok((vpath, local))) => {
                 let credit = self
@@ -7421,12 +7633,17 @@ impl Kaleidotron {
 
     /// The virtual browse path for the current facet + query.
     fn da_browse_path(&self) -> PathBuf {
-        let facet = crate::deviantart::FACETS.get(self.da_facet).map_or("dailydeviations", |f| f.0);
+        let facet = crate::deviantart::FACETS
+            .get(self.da_facet)
+            .map_or("dailydeviations", |f| f.0);
         crate::deviantart::browse_path(facet, &self.da_query)
     }
 
     fn open_da(&mut self, dir: PathBuf) {
-        match crate::deviantart::rel_parts(&dir).first().map(String::as_str) {
+        match crate::deviantart::rel_parts(&dir)
+            .first()
+            .map(String::as_str)
+        {
             None => {
                 let p = self.da_browse_path();
                 self.start_da_browse(p);
@@ -7445,8 +7662,15 @@ impl Kaleidotron {
             return;
         };
         let parts = crate::deviantart::rel_parts(&dir);
-        let facet = parts.get(1).cloned().unwrap_or_else(|| "dailydeviations".into());
-        let query = parts.get(2).filter(|q| *q != "-").cloned().unwrap_or_default();
+        let facet = parts
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "dailydeviations".into());
+        let query = parts
+            .get(2)
+            .filter(|q| *q != "-")
+            .cloned()
+            .unwrap_or_default();
         let want = self.da_want;
         self.show_folder(dir.clone(), Vec::new());
         self.da_devs.clear();
@@ -7520,7 +7744,8 @@ impl Kaleidotron {
         self.status = format!("Loading: {}", elide(&d.title, 40));
         let dir = self.da_dir.clone();
         std::thread::spawn(move || {
-            let res = download_to_dir(&d.content_url, &d.filename(), &dir).map(|local| (vpath, local));
+            let res =
+                download_to_dir(&d.content_url, &d.filename(), &dir).map(|local| (vpath, local));
             let _ = tx.send(res);
         });
     }
@@ -7557,7 +7782,8 @@ impl Kaleidotron {
         match parts.as_slice() {
             [] => {
                 self.show_folder(dir, Vec::new());
-                self.status = "Type a tag in the Places panel (or leave blank to browse all)".into();
+                self.status =
+                    "Type a tag in the Places panel (or leave blank to browse all)".into();
             }
             // `[search]` (blank query) or `[search, tag]` → browse. The worker reads the tag from the
             // path (missing = browse all).
@@ -7568,7 +7794,10 @@ impl Kaleidotron {
 
     /// Kick off a Lospec browse/search on a worker. Palettes stream in via `poll_lospec`.
     fn start_lospec_search(&mut self, dir: PathBuf) {
-        let query = crate::lospec::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::lospec::rel_parts(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.lospec_palettes.clear();
         if let Some(c) = self.lospec_cancel.take() {
@@ -7585,7 +7814,9 @@ impl Kaleidotron {
         let sorting = SORTS[self.lospec_sort.min(3)].to_string();
         let cfilter = CFILTERS[self.lospec_cfilter.min(3)].to_string();
         let (cn, want) = (self.lospec_cn, self.lospec_want);
-        std::thread::spawn(move || lospec_walk(query, sorting, cfilter, cn, want, &dir, cancel, tx));
+        std::thread::spawn(move || {
+            lospec_walk(query, sorting, cfilter, cn, want, &dir, cancel, tx)
+        });
     }
 
     /// Drain the Lospec worker each frame: generate a swatch thumbnail for each palette (colours are
@@ -7607,7 +7838,8 @@ impl Kaleidotron {
                     got = true;
                 }
                 Ok(LospecMsg::Done(n)) => {
-                    self.status = format!("{n} palette(s) — click one to add it to your library + Recolor");
+                    self.status =
+                        format!("{n} palette(s) — click one to add it to your library + Recolor");
                     done = true;
                     break;
                 }
@@ -7633,7 +7865,9 @@ impl Kaleidotron {
     /// The palette-detail view (author / colours / example art / description + download+apply). Shown
     /// in the central panel when `lospec_detail` is set.
     fn ui_lospec_detail(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        let Some(vpath) = self.lospec_detail.clone() else { return };
+        let Some(vpath) = self.lospec_detail.clone() else {
+            return;
+        };
         let Some(p) = self.lospec_palettes.get(&vpath).cloned() else {
             self.lospec_detail = None;
             return;
@@ -7684,8 +7918,10 @@ impl Kaleidotron {
             let h = (sw * 1.6).min(80.0);
             ui.horizontal_wrapped(|ui| {
                 for c in &p.colors {
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(sw, h), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(sw, h), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
                     resp.on_hover_text(format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]));
                 }
             });
@@ -7694,10 +7930,18 @@ impl Kaleidotron {
             // Actions.
             let mut open_page = false;
             ui.horizontal_wrapped(|ui| {
-                if ui.button("⬇ Download .GPL + apply").on_hover_text("Add to your palette library and apply it to Recolor").clicked() {
+                if ui
+                    .button("⬇ Download .GPL + apply")
+                    .on_hover_text("Add to your palette library and apply it to Recolor")
+                    .clicked()
+                {
                     download = true;
                 }
-                if ui.button("🎨 Apply to Recolor").on_hover_text("Use these colours now (without saving a file)").clicked() {
+                if ui
+                    .button("🎨 Apply to Recolor")
+                    .on_hover_text("Use these colours now (without saving a file)")
+                    .clicked()
+                {
                     apply = true;
                 }
                 if ui.button("💾 Export .GPL as…").clicked() {
@@ -7706,7 +7950,13 @@ impl Kaleidotron {
                 // Example art is served from Lospec's locked-down CDN (not fetchable), so link out to
                 // the palette page — it shows the example pixel art + more.
                 if !p.examples.is_empty()
-                    && ui.button(format!("{} View on Lospec", icons::GLOBE)).on_hover_text(format!("Open lospec.com — {} example artwork(s)", p.examples.len())).clicked()
+                    && ui
+                        .button(format!("{} View on Lospec", icons::GLOBE))
+                        .on_hover_text(format!(
+                            "Open lospec.com — {} example artwork(s)",
+                            p.examples.len()
+                        ))
+                        .clicked()
                 {
                     open_page = true;
                 }
@@ -7735,7 +7985,11 @@ impl Kaleidotron {
         }
         if export {
             let default = p.filename();
-            if let Some(dst) = rfd::FileDialog::new().set_file_name(default).add_filter("GIMP palette", &["gpl"]).save_file() {
+            if let Some(dst) = rfd::FileDialog::new()
+                .set_file_name(default)
+                .add_filter("GIMP palette", &["gpl"])
+                .save_file()
+            {
                 match crate::cache::get_file(&p.gpl_url(), &p.filename()) {
                     Ok(src) => match std::fs::copy(&src, &dst) {
                         Ok(_) => self.status = format!("Saved {}", short_name(&dst)),
@@ -7760,7 +8014,11 @@ impl Kaleidotron {
         };
         // Instant apply from the inline colours (no wait).
         self.custom_palette = Some(p.rgba());
-        self.status = format!("Applied “{}” ({} colors) — downloading .gpl…", p.title, p.colors.len());
+        self.status = format!(
+            "Applied “{}” ({} colors) — downloading .gpl…",
+            p.title,
+            p.colors.len()
+        );
         if self.lospec_open_rx.is_some() {
             return;
         }
@@ -7786,7 +8044,12 @@ impl Kaleidotron {
             return;
         };
         self.lospec_detail = Some(vpath.clone());
-        self.status = format!("{} · {} colors · {} downloads", p.title, p.colors.len(), p.downloads);
+        self.status = format!(
+            "{} · {} colors · {} downloads",
+            p.title,
+            p.colors.len(),
+            p.downloads
+        );
         // Fetch the author from the per-palette JSON (once).
         if !self.lospec_authors.contains_key(&vpath) && self.lospec_author_rx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -7803,7 +8066,9 @@ impl Kaleidotron {
     }
 
     fn poll_lospec_author(&mut self) {
-        let Some(rx) = &self.lospec_author_rx else { return };
+        let Some(rx) = &self.lospec_author_rx else {
+            return;
+        };
         match rx.try_recv() {
             Ok((path, author)) => {
                 self.lospec_authors.insert(path, author);
@@ -7818,7 +8083,9 @@ impl Kaleidotron {
     /// Finish a Lospec `.gpl` download: add it to the palette library list + select it (so Recolor
     /// uses the on-disk palette), clearing the transient inline apply.
     fn poll_lospec_open(&mut self) {
-        let Some(rx) = &self.lospec_open_rx else { return };
+        let Some(rx) = &self.lospec_open_rx else {
+            return;
+        };
         match rx.try_recv() {
             Ok(Ok((_vpath, saved, ncolors))) => {
                 if !self.palette_files.contains(&saved) {
@@ -7827,8 +8094,12 @@ impl Kaleidotron {
                 }
                 self.custom_palette = None; // hand off to the persistent on-disk palette
                 self.selected_palette = Some(saved.clone());
-                let name = saved.file_stem().and_then(|s| s.to_str()).unwrap_or("palette");
-                self.status = format!("Added “{name}” ({ncolors} colors) to your palette library + Recolor");
+                let name = saved
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("palette");
+                self.status =
+                    format!("Added “{name}” ({ncolors} colors) to your palette library + Recolor");
                 self.lospec_open_rx = None;
             }
             Ok(Err(e)) => {
@@ -7866,7 +8137,8 @@ impl Kaleidotron {
             // `<kind>` = browse all, `<kind>/search[/<q>]` = filtered.
             [k] if crate::polyhaven::Kind::from_slug(k).is_some() => self.start_ph_search(dir),
             [k, s] | [k, s, _]
-                if crate::polyhaven::Kind::from_slug(k).is_some() && s == crate::polyhaven::SEARCH =>
+                if crate::polyhaven::Kind::from_slug(k).is_some()
+                    && s == crate::polyhaven::SEARCH =>
             {
                 self.start_ph_search(dir)
             }
@@ -7875,7 +8147,8 @@ impl Kaleidotron {
             // mistaken for an asset.
             [k, _leaf] if crate::polyhaven::Kind::from_slug(k).is_some() => self.start_ph_open(dir),
             [k, s, _q, _leaf]
-                if crate::polyhaven::Kind::from_slug(k).is_some() && s == crate::polyhaven::SEARCH =>
+                if crate::polyhaven::Kind::from_slug(k).is_some()
+                    && s == crate::polyhaven::SEARCH =>
             {
                 self.start_ph_open(dir)
             }
@@ -7887,7 +8160,10 @@ impl Kaleidotron {
     /// is fast after the first call and the query filters locally.
     fn start_ph_search(&mut self, dir: PathBuf) {
         let parts = crate::polyhaven::rel_parts(&dir);
-        let Some(kind) = parts.first().and_then(|k| crate::polyhaven::Kind::from_slug(k)) else {
+        let Some(kind) = parts
+            .first()
+            .and_then(|k| crate::polyhaven::Kind::from_slug(k))
+        else {
             return;
         };
         let query = parts.get(2).cloned().unwrap_or_default();
@@ -7918,7 +8194,8 @@ impl Kaleidotron {
                 Ok(PhMsg::Hit(mut entry, a)) => {
                     entry.rating = self.read_rating(&entry.path);
                     if !a.thumb_url.is_empty() {
-                        self.colo_thumbs.request(&entry.path, &a.thumb_url, THUMB_PX, false);
+                        self.colo_thumbs
+                            .request(&entry.path, &a.thumb_url, THUMB_PX, false);
                     }
                     self.ph_assets.insert(entry.path.clone(), *a);
                     self.all_entries.push(entry);
@@ -7997,10 +8274,14 @@ impl Kaleidotron {
         let Some(rx) = &self.ph_open_rx else { return };
         match rx.try_recv() {
             Ok(Ok((vpath, local))) => {
-                let credit = self
-                    .ph_assets
-                    .get(&vpath)
-                    .map(|a| format!("{} — by {} · CC0 · {}", a.name, a.author_label(), a.page_url()));
+                let credit = self.ph_assets.get(&vpath).map(|a| {
+                    format!(
+                        "{} — by {} · CC0 · {}",
+                        a.name,
+                        a.author_label(),
+                        a.page_url()
+                    )
+                });
                 self.toast_file(format!("Downloaded {}", short_name(&local)), local.clone());
                 self.ph_files.insert(vpath.clone(), local);
                 self.ph_open_rx = None;
@@ -8060,7 +8341,9 @@ impl Kaleidotron {
     /// can't tell us — it's the virtual path's family segment that does.)
     fn is_ph_hdri(&self, path: &Path) -> bool {
         crate::polyhaven::is_remote(path)
-            && crate::polyhaven::rel_parts(path).first().map(|k| k.as_str())
+            && crate::polyhaven::rel_parts(path)
+                .first()
+                .map(|k| k.as_str())
                 == Some(crate::polyhaven::Kind::Hdris.slug())
     }
 
@@ -8125,7 +8408,10 @@ impl Kaleidotron {
             self.plugin_audio = true;
             self.registry.set_plugin("audio", true);
         }
-        let query = crate::audiosearch::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::audiosearch::rel_parts(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.snd_results.clear();
         if let Some(c) = self.snd_cancel.take() {
@@ -8196,7 +8482,8 @@ impl Kaleidotron {
         self.status = format!("Fetching: {}", elide(&r.title, 40));
         let dir = self.snd_dir.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(download_to_dir(&r.url, &r.filename(), &dir).map(|local| (vpath, local)));
+            let _ =
+                tx.send(download_to_dir(&r.url, &r.filename(), &dir).map(|local| (vpath, local)));
         });
     }
 
@@ -8247,7 +8534,10 @@ impl Kaleidotron {
     }
 
     fn start_gf_search(&mut self, dir: PathBuf) {
-        let query = crate::gfonts::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::gfonts::rel_parts(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.gf_fonts.clear();
         if let Some(c) = self.gf_cancel.take() {
@@ -8370,10 +8660,14 @@ impl Kaleidotron {
         let Some(rx) = &self.gf_open_rx else { return };
         match rx.try_recv() {
             Ok(Ok((vpath, local))) => {
-                let credit = self
-                    .gf_fonts
-                    .get(&vpath)
-                    .map(|f| format!("{} — by {} · {}", f.family, f.designer_label(), f.page_url()));
+                let credit = self.gf_fonts.get(&vpath).map(|f| {
+                    format!(
+                        "{} — by {} · {}",
+                        f.family,
+                        f.designer_label(),
+                        f.page_url()
+                    )
+                });
                 self.gf_files.insert(vpath.clone(), local);
                 self.gf_open_rx = None;
                 self.load_full(ctx, vpath);
@@ -8586,7 +8880,10 @@ impl Kaleidotron {
         let (tx, rx) = std::sync::mpsc::channel();
         self.web_rx = Some(rx);
         self.web_cancel = Some(cancel.clone());
-        self.status = format!("Listing {}…", crate::httpfs::url_for(&parts, prefer_http, true));
+        self.status = format!(
+            "Listing {}…",
+            crate::httpfs::url_for(&parts, prefer_http, true)
+        );
         self.want_repaint = true;
         std::thread::spawn(move || web_walk(parts, known, prefer_http, &dir, cancel, tx));
     }
@@ -8654,7 +8951,9 @@ impl Kaleidotron {
             return;
         }
         let parts = crate::httpfs::rel_parts(&vpath);
-        let Some(name) = parts.last().cloned() else { return };
+        let Some(name) = parts.last().cloned() else {
+            return;
+        };
         let host = parts.first().cloned().unwrap_or_default();
         let http = self.web_http.get(&host).copied().unwrap_or(false);
         let url = self
@@ -8669,7 +8968,9 @@ impl Kaleidotron {
         // can't collide.
         let dir = parts[..parts.len().saturating_sub(1)]
             .iter()
-            .fold(self.web_dir.clone(), |d, seg| d.join(sanitize_component(seg)));
+            .fold(self.web_dir.clone(), |d, seg| {
+                d.join(sanitize_component(seg))
+            });
         std::thread::spawn(move || {
             let _ = tx.send(download_to_dir(&url, &name, &dir).map(|local| (vpath, local)));
         });
@@ -8711,7 +9012,10 @@ impl Kaleidotron {
     }
 
     fn start_ma_search(&mut self, dir: PathBuf) {
-        let query = crate::modarchive::rel_parts(&dir).get(1).cloned().unwrap_or_default();
+        let query = crate::modarchive::rel_parts(&dir)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
         self.show_folder(dir.clone(), Vec::new());
         self.ma_modules.clear();
         if let Some(c) = self.ma_cancel.take() {
@@ -8805,7 +9109,8 @@ impl Kaleidotron {
             } else {
                 m.filename.clone()
             };
-            let _ = tx.send(download_to_dir(&m.download_url(), &name, &dir).map(|local| (vpath, local)));
+            let _ = tx
+                .send(download_to_dir(&m.download_url(), &name, &dir).map(|local| (vpath, local)));
         });
     }
 
@@ -8903,7 +9208,8 @@ impl Kaleidotron {
                 }
                 Ok(YtMsg::PlaylistHit(entry, p)) => {
                     if !p.thumb_url.is_empty() {
-                        self.colo_thumbs.request(&entry.path, &p.thumb_url, THUMB_PX, false);
+                        self.colo_thumbs
+                            .request(&entry.path, &p.thumb_url, THUMB_PX, false);
                     }
                     self.yt_playlists.insert(entry.path.clone(), *p);
                     self.all_entries.push(entry);
@@ -8993,8 +9299,9 @@ impl Kaleidotron {
                 let _ = tx_prog.send(YtOpenMsg::Progress(p));
             };
             let cookies = (!cookies.is_empty()).then_some(cookies.as_str());
-            let res = crate::youtube::download(&id, &dir, height, cookies, &cancel, &mut on_progress)
-                .map(|local| (vpath, local));
+            let res =
+                crate::youtube::download(&id, &dir, height, cookies, &cancel, &mut on_progress)
+                    .map(|local| (vpath, local));
             let _ = tx.send(YtOpenMsg::Done(res));
         });
     }
@@ -9143,7 +9450,11 @@ impl Kaleidotron {
                 self.yt_info_pending = None;
                 self.status = format!(
                     "Loaded {}{} comments",
-                    if has_t { "transcript · " } else { "no transcript · " },
+                    if has_t {
+                        "transcript · "
+                    } else {
+                        "no transcript · "
+                    },
                     n
                 );
             }
@@ -10176,12 +10487,12 @@ impl Kaleidotron {
             return;
         }
         // A full-file (or empty) selection → the whole sample.
-        let (s, e) = if (end - start).abs() < 0.001 || (start <= 0.001 && end >= ap.duration - 0.001)
-        {
-            (0.0, ap.duration)
-        } else {
-            (start, end)
-        };
+        let (s, e) =
+            if (end - start).abs() < 0.001 || (start <= 0.001 && end >= ap.duration - 0.001) {
+                (0.0, ap.duration)
+            } else {
+                (start, end)
+            };
         let buf = ap.region_buf(s, e);
         let (name, source) = if let Some(src) = &editor_source {
             (short_name(src), Some(src.to_string_lossy().into_owned()))
@@ -11342,7 +11653,9 @@ impl Kaleidotron {
         self.font_stroke_per_char = preset.stroke_per_char;
         self.font_apply_recolor = preset.apply_recolor;
         if !loaded {
-            self.fon_index = preset.face_index.min(self.fon_faces.len().saturating_sub(1));
+            self.fon_index = preset
+                .face_index
+                .min(self.fon_faces.len().saturating_sub(1));
         }
         if let Some(fx) = &preset.fx {
             let fx = fx.clone();
@@ -11357,38 +11670,74 @@ impl Kaleidotron {
     }
 
     /// The shared Preset row for the TTF/OTF (is_fon=false) and FON (is_fon=true) viewers.
-    fn font_preset_row(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, path: &Path, is_fon: bool) {
+    fn font_preset_row(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        path: &Path,
+        is_fon: bool,
+    ) {
         let mut recall: Option<FontPreset> = None;
         let mut save = false;
         let mut delete: Option<String> = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Preset");
-            let sel = if self.font_preset_name.is_empty() { "— pick —".to_string() } else { self.font_preset_name.clone() };
+            let sel = if self.font_preset_name.is_empty() {
+                "— pick —".to_string()
+            } else {
+                self.font_preset_name.clone()
+            };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("font_preset_pick")
-                .width(220.0)
-                .height(max_h)
-                .selected_text(sel)
-                .show_ui(ui, |ui| {
-                    for p in &self.font_presets {
-                        if ui.selectable_label(p.name == self.font_preset_name, &p.name).clicked() {
-                            recall = Some(p.clone());
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("font_preset_pick")
+                    .width(220.0)
+                    .height(max_h)
+                    .selected_text(sel)
+                    .show_ui(ui, |ui| {
+                        for p in &self.font_presets {
+                            if ui
+                                .selectable_label(p.name == self.font_preset_name, &p.name)
+                                .clicked()
+                            {
+                                recall = Some(p.clone());
+                            }
                         }
-                    }
-                }));
+                    }),
+            );
             let step = combo_scroll_step(ui, &cr);
             if step != 0 && !self.font_presets.is_empty() {
                 let n = self.font_presets.len() as isize;
-                let cur = self.font_presets.iter().position(|p| p.name == self.font_preset_name);
-                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                let cur = self
+                    .font_presets
+                    .iter()
+                    .position(|p| p.name == self.font_preset_name);
+                let ni = match cur {
+                    Some(c) => (c as isize + step).rem_euclid(n) as usize,
+                    None => 0,
+                };
                 recall = Some(self.font_presets[ni].clone());
             }
-            ui.add(egui::TextEdit::singleline(&mut self.font_preset_name).desired_width(140.0).hint_text("name…"));
-            if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.font_preset_name)
+                    .desired_width(140.0)
+                    .hint_text("name…"),
+            );
+            if ui
+                .button("💾 Save")
+                .on_hover_text("Save the current font + settings under this name")
+                .clicked()
+            {
                 save = true;
             }
-            let can_del = self.font_presets.iter().any(|p| p.name == self.font_preset_name.trim());
-            if ui.add_enabled(can_del, egui::Button::new("✕")).on_hover_text("Delete this preset").clicked() {
+            let can_del = self
+                .font_presets
+                .iter()
+                .any(|p| p.name == self.font_preset_name.trim());
+            if ui
+                .add_enabled(can_del, egui::Button::new("✕"))
+                .on_hover_text("Delete this preset")
+                .clicked()
+            {
                 delete = Some(self.font_preset_name.trim().to_string());
             }
         });
@@ -11425,9 +11774,14 @@ impl Kaleidotron {
     /// Render the current sample string in the open font. For a **colour font** (COLR/CPAL) whose
     /// sample includes colour glyphs, this renders the colour layers; otherwise the normal outline
     /// path (stroke / ink / merged silhouette).
-    fn render_font_sample_img(&self, opts: &crate::decode::font::TextOpts) -> Option<crate::image_types::PixImage> {
+    fn render_font_sample_img(
+        &self,
+        opts: &crate::decode::font::TextOpts,
+    ) -> Option<crate::image_types::PixImage> {
         if crate::decode::font::is_color_font(&self.font_bytes) {
-            if let Some(img) = crate::decode::font::render_color_text(&self.font_bytes, &self.font_sample, opts) {
+            if let Some(img) =
+                crate::decode::font::render_color_text(&self.font_bytes, &self.font_sample, opts)
+            {
                 return Some(img);
             }
         }
@@ -11438,7 +11792,11 @@ impl Kaleidotron {
     /// Recolor checkbox is on**. Off by default so the bitmap preview + PNG export match the clean
     /// vector SVG (which never runs recolor) — a stray persisted post-FX / palette no longer paints
     /// a surprise "shadow" on the font.
-    fn font_recolor(&mut self, path: &Path, img: crate::image_types::PixImage) -> crate::image_types::PixImage {
+    fn font_recolor(
+        &mut self,
+        path: &Path,
+        img: crate::image_types::PixImage,
+    ) -> crate::image_types::PixImage {
         if self.font_apply_recolor {
             self.recolor_sample(path, img)
         } else {
@@ -11455,13 +11813,31 @@ impl Kaleidotron {
             self.status = "Nothing to export.".into();
             return;
         };
-        let base = self.font_info.as_ref().map(|i| i.family.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "font".into());
+        let base = self
+            .font_info
+            .as_ref()
+            .map(|i| i.family.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "font".into());
         let clean = |s: &str, n: usize| -> String {
-            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .take(n)
+                .collect()
         };
         let default = format!("{}_{}.png", clean(&base, 24), clean(sample, 24));
-        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
-            match image::save_buffer(&p, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("PNG", &["png"])
+            .save_file()
+        {
+            match image::save_buffer(
+                &p,
+                &img.rgba_bytes(),
+                img.width,
+                img.height,
+                image::ColorType::Rgba8,
+            ) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
@@ -11470,16 +11846,29 @@ impl Kaleidotron {
 
     /// Save the whole composition as a **vector SVG** (crisp at any size) via a save dialog.
     fn export_font_svg(&mut self, sample: &str) {
-        let Some(svg) = crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts()) else {
+        let Some(svg) =
+            crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts())
+        else {
             self.status = "Nothing to export.".into();
             return;
         };
-        let base = self.font_info.as_ref().map(|i| i.family.clone()).unwrap_or_default();
+        let base = self
+            .font_info
+            .as_ref()
+            .map(|i| i.family.clone())
+            .unwrap_or_default();
         let clean = |s: &str, n: usize| -> String {
-            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .take(n)
+                .collect()
         };
         let default = format!("{}_{}.svg", clean(&base, 24), clean(sample, 24));
-        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("SVG", &["svg"])
+            .save_file()
+        {
             match std::fs::write(&p, svg) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -11489,11 +11878,17 @@ impl Kaleidotron {
 
     /// Write the composition to a temp SVG and open it in an external vector editor (Inkscape / …).
     fn open_font_svg_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
-        let Some(svg) = crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts()) else {
+        let Some(svg) =
+            crate::decode::font::text_svg(&self.font_bytes, sample, &self.font_text_opts())
+        else {
             self.status = "Nothing to render.".into();
             return;
         };
-        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let slug: String = sample
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(24)
+            .collect();
         let slug = if slug.is_empty() { "font".into() } else { slug };
         let out = std::env::temp_dir().join(format!("kaleidotron_{slug}.svg"));
         if let Err(e) = std::fs::write(&out, svg) {
@@ -11505,16 +11900,27 @@ impl Kaleidotron {
 
     /// Render the composition to a temp PNG and open it in an external image editor.
     fn open_font_png_in(&mut self, sample: &str, exec: &str, args: &str, env: &str) {
-        let Some(img) = crate::decode::font::render_text(&self.font_bytes, sample, &self.font_text_opts())
-            .map(|img| self.font_recolor(&self.font_path.clone().unwrap_or_default(), img))
+        let Some(img) =
+            crate::decode::font::render_text(&self.font_bytes, sample, &self.font_text_opts())
+                .map(|img| self.font_recolor(&self.font_path.clone().unwrap_or_default(), img))
         else {
             self.status = "Nothing to render.".into();
             return;
         };
-        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let slug: String = sample
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(24)
+            .collect();
         let slug = if slug.is_empty() { "font".into() } else { slug };
         let out = std::env::temp_dir().join(format!("kaleidotron_{slug}.png"));
-        if let Err(e) = image::save_buffer(&out, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+        if let Err(e) = image::save_buffer(
+            &out,
+            &img.rgba_bytes(),
+            img.width,
+            img.height,
+            image::ColorType::Rgba8,
+        ) {
             self.status = format!("Couldn't write temp PNG: {e}");
             return;
         }
@@ -11543,7 +11949,14 @@ impl Kaleidotron {
     /// Spin). Shared by the font 3D maker and the SVG 3D view — the camera/light state is the same
     /// `font_3d_*` fields, and `mesh_key` scopes the render-texture cache. The caller owns the mesh
     /// (so `self` isn't borrowed twice).
-    fn draw_3d_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2, mesh: Option<&crate::decode::mesh3d::Mesh3D>, mesh_key: &str) {
+    fn draw_3d_view(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        avail: egui::Vec2,
+        mesh: Option<&crate::decode::mesh3d::Mesh3D>,
+        mesh_key: &str,
+    ) {
         use crate::decode::mesh3d::{render, Camera, View};
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let space = ui.input(|i| i.key_down(egui::Key::Space));
@@ -11558,7 +11971,8 @@ impl Kaleidotron {
             self.font_3d_pitch = (self.font_3d_pitch + d.y * 0.01).clamp(-1.55, 1.55);
         }
         if resp.hovered() {
-            let sc = ctx.input(|i| i.smooth_scroll_delta.y) + ctx.input(|i| (i.zoom_delta() - 1.0) * 200.0);
+            let sc = ctx.input(|i| i.smooth_scroll_delta.y)
+                + ctx.input(|i| (i.zoom_delta() - 1.0) * 200.0);
             if sc.abs() > 0.01 {
                 self.font_3d_zoom = (self.font_3d_zoom * (1.0 + sc * 0.0015)).clamp(0.15, 8.0);
             }
@@ -11582,14 +11996,28 @@ impl Kaleidotron {
         let wpx = ((rect.width() * ppp).round() as usize).clamp(1, 8000);
         let hpx = ((rect.height() * ppp).round() as usize).clamp(1, 8000);
         if let Some(m) = mesh {
-            let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
+            let cam = Camera {
+                yaw: self.font_3d_yaw,
+                pitch: self.font_3d_pitch,
+                zoom: self.font_3d_zoom,
+                pan: self.font_3d_pan,
+            };
             let ro = self.font_3d_render_opts([22, 22, 26, 255]);
             let tkey = format!(
                 "{mesh_key}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}|{:?}|{wpx}x{hpx}",
-                self.font_3d_yaw, self.font_3d_pitch, self.font_3d_zoom, self.font_3d_light_yaw,
-                self.font_3d_light_pitch, self.font_3d_light_rgb
+                self.font_3d_yaw,
+                self.font_3d_pitch,
+                self.font_3d_zoom,
+                self.font_3d_light_yaw,
+                self.font_3d_light_pitch,
+                self.font_3d_light_rgb
             );
-            if self.font_3d_tex.as_ref().map(|(k, _)| k != &tkey).unwrap_or(true) {
+            if self
+                .font_3d_tex
+                .as_ref()
+                .map(|(k, _)| k != &tkey)
+                .unwrap_or(true)
+            {
                 let px = render(m, wpx, hpx, &View::Orbit(cam), &ro);
                 let mut flat = Vec::with_capacity(px.len() * 4);
                 for p in &px {
@@ -11618,8 +12046,14 @@ impl Kaleidotron {
         let opts = self.font_3d_opts();
         let mesh_key = format!(
             "font|{}|{:.4}|{:.4}|{:.4}|{:.4}|{:?}|{:?}|{:?}",
-            self.font_sample, opts.depth, opts.bevel, opts.letter_spacing, opts.line_gap,
-            opts.face_rgb, opts.back_rgb, opts.side_rgb
+            self.font_sample,
+            opts.depth,
+            opts.bevel,
+            opts.letter_spacing,
+            opts.line_gap,
+            opts.face_rgb,
+            opts.back_rgb,
+            opts.side_rgb
         );
         let mut mesh = self.font_3d_mesh.take();
         if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
@@ -11632,11 +12066,22 @@ impl Kaleidotron {
 
     /// The interactive 3D extrusion of an opened SVG (icon/vector) — reuses the font 3D controls
     /// (depth / face / back / body / bevel / light / spin) + the shared `draw_3d_view`.
-    fn draw_svg_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, avail: egui::Vec2, path: &Path) {
+    fn draw_svg_3d(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        avail: egui::Vec2,
+        path: &Path,
+    ) {
         let opts = self.font_3d_opts();
         let mesh_key = format!(
             "svg|{}|{:.4}|{:.4}|{:?}|{:?}|{:?}",
-            path.display(), opts.depth, opts.bevel, opts.face_rgb, opts.back_rgb, opts.side_rgb
+            path.display(),
+            opts.depth,
+            opts.bevel,
+            opts.face_rgb,
+            opts.back_rgb,
+            opts.side_rgb
         );
         let mut mesh = self.svg_3d_mesh.take();
         if mesh.as_ref().map(|(k, _)| k != &mesh_key).unwrap_or(true) {
@@ -11666,16 +12111,39 @@ impl Kaleidotron {
     /// Build the SVG vector snapshot of the current 3D view at `w`×`h` (transparent bg).
     fn font_3d_svg(&self, w: usize, h: usize) -> Option<String> {
         use crate::decode::mesh3d::{Camera, View};
-        let mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts())?;
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
-        Some(crate::decode::mesh3d::to_svg(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0])))
+        let mesh = crate::decode::font3d::extrude_text(
+            &self.font_bytes,
+            &self.font_sample,
+            &self.font_3d_opts(),
+        )?;
+        let cam = Camera {
+            yaw: self.font_3d_yaw,
+            pitch: self.font_3d_pitch,
+            zoom: self.font_3d_zoom,
+            pan: self.font_3d_pan,
+        };
+        Some(crate::decode::mesh3d::to_svg(
+            &mesh,
+            w,
+            h,
+            &View::Orbit(cam),
+            &self.font_3d_render_opts([0, 0, 0, 0]),
+        ))
     }
 
     /// Default export basename: `<family>_<sample>`.
     fn font_export_stem(&self) -> String {
-        let base = self.font_info.as_ref().map(|i| i.family.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "font".into());
+        let base = self
+            .font_info
+            .as_ref()
+            .map(|i| i.family.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "font".into());
         let clean = |s: &str, n: usize| -> String {
-            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(n).collect()
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .take(n)
+                .collect()
         };
         format!("{}_{}_3d", clean(&base, 24), clean(&self.font_sample, 24))
     }
@@ -11687,7 +12155,11 @@ impl Kaleidotron {
             return;
         };
         let default = format!("{}.svg", self.font_export_stem());
-        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("SVG", &["svg"])
+            .save_file()
+        {
             match std::fs::write(&p, svg) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -11698,16 +12170,35 @@ impl Kaleidotron {
     /// Save the current 3D view as a high-res PNG (transparent background).
     fn export_font_3d_png(&mut self) {
         use crate::decode::mesh3d::{render, Camera, View};
-        let Some(mesh) = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts()) else {
+        let Some(mesh) = crate::decode::font3d::extrude_text(
+            &self.font_bytes,
+            &self.font_sample,
+            &self.font_3d_opts(),
+        ) else {
             self.status = "Nothing to export.".into();
             return;
         };
         let (w, h) = (1600usize, 1200usize);
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
-        let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let cam = Camera {
+            yaw: self.font_3d_yaw,
+            pitch: self.font_3d_pitch,
+            zoom: self.font_3d_zoom,
+            pan: self.font_3d_pan,
+        };
+        let px = render(
+            &mesh,
+            w,
+            h,
+            &View::Orbit(cam),
+            &self.font_3d_render_opts([0, 0, 0, 0]),
+        );
         let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
         let default = format!("{}.png", self.font_export_stem());
-        if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("PNG", &["png"]).save_file() {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("PNG", &["png"])
+            .save_file()
+        {
             match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -11735,7 +12226,11 @@ impl Kaleidotron {
         else {
             return;
         };
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("icon").to_string();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("icon")
+            .to_string();
         let tmp = std::env::temp_dir();
         let three_d = self.svg_3d_on;
 
@@ -11760,13 +12255,17 @@ impl Kaleidotron {
             let opts = self.font_3d_render_opts([0, 0, 0, 0]);
             if as_svg {
                 let f = tmp.join(format!("{stem}_3d.svg"));
-                std::fs::write(&f, to_svg(&mesh, 1600, 1200, &View::Orbit(cam), &opts)).ok().map(|_| f)
+                std::fs::write(&f, to_svg(&mesh, 1600, 1200, &View::Orbit(cam), &opts))
+                    .ok()
+                    .map(|_| f)
             } else {
                 let (w, h) = (1600usize, 1200usize);
                 let px = render(&mesh, w, h, &View::Orbit(cam), &opts);
                 let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
                 let f = tmp.join(format!("{stem}_3d.png"));
-                image::save_buffer(&f, &flat, w as u32, h as u32, image::ColorType::Rgba8).ok().map(|_| f)
+                image::save_buffer(&f, &flat, w as u32, h as u32, image::ColorType::Rgba8)
+                    .ok()
+                    .map(|_| f)
             }
         } else {
             // 2D + a PNG-only program → rasterize the vector at a generous size.
@@ -11795,11 +12294,26 @@ impl Kaleidotron {
             return;
         };
         let (w, h) = (1600usize, 1200usize);
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
-        let px = render(&mesh, w, h, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let cam = Camera {
+            yaw: self.font_3d_yaw,
+            pitch: self.font_3d_pitch,
+            zoom: self.font_3d_zoom,
+            pan: self.font_3d_pan,
+        };
+        let px = render(
+            &mesh,
+            w,
+            h,
+            &View::Orbit(cam),
+            &self.font_3d_render_opts([0, 0, 0, 0]),
+        );
         let flat: Vec<u8> = px.iter().flat_map(|c| *c).collect();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("svg");
-        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{stem}_3d.png")).add_filter("PNG", &["png"]).save_file() {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_3d.png"))
+            .add_filter("PNG", &["png"])
+            .save_file()
+        {
             match image::save_buffer(&p, &flat, w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -11813,10 +12327,25 @@ impl Kaleidotron {
             self.status = "Nothing to export.".into();
             return;
         };
-        let cam = Camera { yaw: self.font_3d_yaw, pitch: self.font_3d_pitch, zoom: self.font_3d_zoom, pan: self.font_3d_pan };
-        let svg = to_svg(&mesh, 1600, 1200, &View::Orbit(cam), &self.font_3d_render_opts([0, 0, 0, 0]));
+        let cam = Camera {
+            yaw: self.font_3d_yaw,
+            pitch: self.font_3d_pitch,
+            zoom: self.font_3d_zoom,
+            pan: self.font_3d_pan,
+        };
+        let svg = to_svg(
+            &mesh,
+            1600,
+            1200,
+            &View::Orbit(cam),
+            &self.font_3d_render_opts([0, 0, 0, 0]),
+        );
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("svg");
-        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{stem}_3d.svg")).add_filter("SVG", &["svg"]).save_file() {
+        if let Some(p) = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_3d.svg"))
+            .add_filter("SVG", &["svg"])
+            .save_file()
+        {
             match std::fs::write(&p, svg) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -11847,7 +12376,11 @@ impl Kaleidotron {
                     ui.weak("· monospace");
                 }
                 ui.weak(format!("· {} upem", info.units_per_em));
-                if ui.small_button("📋 family").on_hover_text("Copy the family name").clicked() {
+                if ui
+                    .small_button("📋 family")
+                    .on_hover_text("Copy the family name")
+                    .clicked()
+                {
                     want_copy = Some(info.family.clone());
                 }
             } else {
@@ -11864,7 +12397,7 @@ impl Kaleidotron {
         let mut want_svg = false;
         let mut copy_svg = false;
         let mut open_in: Option<(usize, bool)> = None; // (opener index, is_svg) for "Open in…"
-        // Programs that handle PNG or SVG — each labelled by which format it'll receive.
+                                                       // Programs that handle PNG or SVG — each labelled by which format it'll receive.
         let img_openers: Vec<(OpenerItem, bool)> = self
             .opener_items()
             .into_iter()
@@ -11886,28 +12419,51 @@ impl Kaleidotron {
             let r = ui.add(egui::Slider::new(&mut self.font_size, 12.0..=400.0).suffix("px"));
             slider_extras(ui, &r, &mut self.font_size, 48.0, 1.0, 12.0, 400.0);
             ui.label("Ink");
-            ui.color_edit_button_srgb(&mut self.font_ink).on_hover_text("Glyph colour (the Recolor pane runs on top)");
+            ui.color_edit_button_srgb(&mut self.font_ink)
+                .on_hover_text("Glyph colour (the Recolor pane runs on top)");
             ui.checkbox(&mut self.font_bg_on, "BG");
             ui.add_enabled_ui(self.font_bg_on, |ui| {
-                ui.color_edit_button_srgb(&mut self.font_bg).on_hover_text("Background fill colour");
+                ui.color_edit_button_srgb(&mut self.font_bg)
+                    .on_hover_text("Background fill colour");
             });
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Letter spacing");
-            let r = ui.add(egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0).fixed_decimals(0));
-            slider_extras(ui, &r, &mut self.font_letter_spacing, 0.0, 1.0, -1000.0, 1000.0);
+            let r = ui.add(
+                egui::Slider::new(&mut self.font_letter_spacing, -1000.0..=1000.0)
+                    .fixed_decimals(0),
+            );
+            slider_extras(
+                ui,
+                &r,
+                &mut self.font_letter_spacing,
+                0.0,
+                1.0,
+                -1000.0,
+                1000.0,
+            );
             ui.separator();
             ui.label("Line height");
-            let r = ui.add(egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0));
+            let r = ui.add(
+                egui::Slider::new(&mut self.font_line_gap, -1000.0..=1000.0).fixed_decimals(0),
+            );
             slider_extras(ui, &r, &mut self.font_line_gap, 0.0, 1.0, -1000.0, 1000.0);
             if self.font_sample.contains('\n') {
                 ui.separator();
                 ui.label("Lines");
-                let cur = if self.font_top_down { "Top Down" } else { "Bottom Up" };
-                eat_scroll(egui::ComboBox::from_id_salt("font_zorder").selected_text(cur).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.font_top_down, true, "Top Down");
-                    ui.selectable_value(&mut self.font_top_down, false, "Bottom Up");
-                }));
+                let cur = if self.font_top_down {
+                    "Top Down"
+                } else {
+                    "Bottom Up"
+                };
+                eat_scroll(
+                    egui::ComboBox::from_id_salt("font_zorder")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.font_top_down, true, "Top Down");
+                            ui.selectable_value(&mut self.font_top_down, false, "Bottom Up");
+                        }),
+                );
             }
             if ui.small_button("Reset").clicked() {
                 self.font_letter_spacing = 0.0;
@@ -11957,31 +12513,43 @@ impl Kaleidotron {
         if self.font_3d_on {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Depth");
-                let r = ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
+                let r =
+                    ui.add(egui::Slider::new(&mut self.font_3d_depth, 0.0..=1.0).fixed_decimals(2));
                 slider_extras(ui, &r, &mut self.font_3d_depth, 0.2, 0.05, 0.0, 1.0);
                 ui.label("Bevel");
-                let r = ui.add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
+                let r = ui
+                    .add(egui::Slider::new(&mut self.font_3d_bevel, 0.0..=0.06).fixed_decimals(3))
                     .on_hover_text("Chamfered edge between the face and the body (0 = flat block)");
                 slider_extras(ui, &r, &mut self.font_3d_bevel, 0.0, 0.005, 0.0, 0.06);
                 ui.separator();
                 ui.label("Face");
-                ui.color_edit_button_srgb(&mut self.font_3d_face).on_hover_text("Front-face colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_face)
+                    .on_hover_text("Front-face colour");
                 ui.label("Back");
-                ui.color_edit_button_srgb(&mut self.font_3d_back).on_hover_text("Back-face colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_back)
+                    .on_hover_text("Back-face colour");
                 ui.label("Body");
-                ui.color_edit_button_srgb(&mut self.font_3d_side).on_hover_text("Extruded side (depth) colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_side)
+                    .on_hover_text("Extruded side (depth) colour");
                 ui.separator();
                 ui.label("Light");
                 let pi = std::f32::consts::PI;
-                let r = ui.add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2))
+                let r = ui
+                    .add(egui::Slider::new(&mut self.font_3d_light_yaw, -pi..=pi).fixed_decimals(2))
                     .on_hover_text("Light azimuth");
                 slider_extras(ui, &r, &mut self.font_3d_light_yaw, 0.5, 0.05, -pi, pi);
-                let r = ui.add(egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5).fixed_decimals(2))
+                let r = ui
+                    .add(
+                        egui::Slider::new(&mut self.font_3d_light_pitch, -1.5..=1.5)
+                            .fixed_decimals(2),
+                    )
                     .on_hover_text("Light elevation");
                 slider_extras(ui, &r, &mut self.font_3d_light_pitch, 0.7, 0.05, -1.5, 1.5);
-                ui.color_edit_button_srgb(&mut self.font_3d_light_rgb).on_hover_text("Light colour");
+                ui.color_edit_button_srgb(&mut self.font_3d_light_rgb)
+                    .on_hover_text("Light colour");
                 ui.separator();
-                ui.checkbox(&mut self.font_3d_spin, "Spin").on_hover_text("Auto-rotate the logo");
+                ui.checkbox(&mut self.font_3d_spin, "Spin")
+                    .on_hover_text("Auto-rotate the logo");
                 if ui.small_button("Reset view").clicked() {
                     self.font_3d_yaw = 0.5;
                     self.font_3d_pitch = -0.45;
@@ -12006,20 +12574,40 @@ impl Kaleidotron {
             });
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
+            if ui
+                .small_button("📋 text")
+                .on_hover_text("Copy the sample text")
+                .clicked()
+            {
                 want_copy = Some(self.font_sample.clone());
             }
-            if ui.small_button("📋 image").on_hover_text("Copy the rendered sample as a bitmap").clicked() {
+            if ui
+                .small_button("📋 image")
+                .on_hover_text("Copy the rendered sample as a bitmap")
+                .clicked()
+            {
                 copy_img = true;
             }
-            if ui.small_button("📋 SVG").on_hover_text("Copy the whole composition as vector SVG").clicked() {
+            if ui
+                .small_button("📋 SVG")
+                .on_hover_text("Copy the whole composition as vector SVG")
+                .clicked()
+            {
                 copy_svg = true;
             }
             ui.separator();
-            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG").clicked() {
+            if ui
+                .small_button("💾 PNG")
+                .on_hover_text("Save the rendered sample as a PNG")
+                .clicked()
+            {
                 want_png = true;
             }
-            if ui.small_button("💾 SVG").on_hover_text("Save the whole composition as a vector SVG (crisp at any size)").clicked() {
+            if ui
+                .small_button("💾 SVG")
+                .on_hover_text("Save the whole composition as a vector SVG (crisp at any size)")
+                .clicked()
+            {
                 want_svg = true;
             }
             // Open the composition in an external editor — as SVG (vector) for programs that handle
@@ -12038,7 +12626,9 @@ impl Kaleidotron {
                 }
             })
             .response
-            .on_hover_text("Open the composition in an image/vector editor (SVG or PNG per the program)");
+            .on_hover_text(
+                "Open the composition in an image/vector editor (SVG or PNG per the program)",
+            );
         });
         if copy_img {
             if let Some(img) = self.render_font_sample_img(&self.font_text_opts()) {
@@ -12053,7 +12643,11 @@ impl Kaleidotron {
             self.export_font_svg(&self.font_sample.clone());
         }
         if copy_svg {
-            match crate::decode::font::text_svg(&self.font_bytes, &self.font_sample, &self.font_text_opts()) {
+            match crate::decode::font::text_svg(
+                &self.font_bytes,
+                &self.font_sample,
+                &self.font_text_opts(),
+            ) {
                 Some(svg) => {
                     ctx.copy_text(svg);
                     self.status = "Copied composition SVG".into();
@@ -12062,7 +12656,10 @@ impl Kaleidotron {
             }
         }
         if let Some((oi, is_svg)) = open_in {
-            let prog = self.openers.get(oi).map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
+            let prog = self
+                .openers
+                .get(oi)
+                .map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
             if let Some((exec, args, env)) = prog {
                 let sample = self.font_sample.clone();
                 if is_svg {
@@ -12095,12 +12692,30 @@ impl Kaleidotron {
             let render_scale = (self.font_preview_zoom.max(0.1) * ppp).clamp(0.25, 8.0);
             let key = format!(
                 "{}|{:.0}|{:?}|{:?}|{}|{:.0}|{:.0}|{}|{:.0}|{:?}|{}|pc{}|rc{}|z{:.3}|{}|{}",
-                self.font_sample, self.font_size, self.font_ink, self.font_bg, self.font_bg_on,
-                self.font_letter_spacing, self.font_line_gap, self.font_top_down,
-                self.font_stroke_w, self.font_stroke_color, self.font_stroke_mode.to_u8(),
-                self.font_stroke_per_char, self.font_apply_recolor, render_scale, self.pipeline_key(), self.recolor_ident()
+                self.font_sample,
+                self.font_size,
+                self.font_ink,
+                self.font_bg,
+                self.font_bg_on,
+                self.font_letter_spacing,
+                self.font_line_gap,
+                self.font_top_down,
+                self.font_stroke_w,
+                self.font_stroke_color,
+                self.font_stroke_mode.to_u8(),
+                self.font_stroke_per_char,
+                self.font_apply_recolor,
+                render_scale,
+                self.pipeline_key(),
+                self.recolor_ident()
             );
-            if changed || self.font_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            if changed
+                || self
+                    .font_sample_tex
+                    .as_ref()
+                    .map(|(k, _)| k != &key)
+                    .unwrap_or(true)
+            {
                 // Supersample the whole logo (size + stroke + spacing) by render_scale.
                 let mut opts = self.font_text_opts();
                 opts.px *= render_scale;
@@ -12162,22 +12777,27 @@ impl Kaleidotron {
             ui.label(format!("Glyphs ({})", chars.len()));
             ui.separator();
             ui.label("Range");
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("font_block")
-                .selected_text(UNICODE_BLOCKS[self.font_block].0)
-                .show_ui(ui, |ui| {
-                    for (i, (name, _, _)) in UNICODE_BLOCKS.iter().enumerate() {
-                        if ui.selectable_label(i == self.font_block, *name).clicked() {
-                            self.font_block = i;
-                            self.font_page = 0;
-                            self.font_grid_tex = None;
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("font_block")
+                    .selected_text(UNICODE_BLOCKS[self.font_block].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _, _)) in UNICODE_BLOCKS.iter().enumerate() {
+                            if ui.selectable_label(i == self.font_block, *name).clicked() {
+                                self.font_block = i;
+                                self.font_page = 0;
+                                self.font_grid_tex = None;
+                            }
                         }
-                    }
-                }));
+                    }),
+            );
             if combo_wheel(ui, &cr, &mut self.font_block, UNICODE_BLOCKS.len()) {
                 self.font_page = 0;
                 self.font_grid_tex = None;
             }
-            if ui.add_enabled(self.font_page > 0, egui::Button::new("◀").small()).clicked() {
+            if ui
+                .add_enabled(self.font_page > 0, egui::Button::new("◀").small())
+                .clicked()
+            {
                 self.font_page -= 1;
                 self.font_grid_tex = None;
             }
@@ -12191,7 +12811,8 @@ impl Kaleidotron {
             }
             ui.separator();
             ui.label("Cell");
-            let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+            let r =
+                ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
             let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
             if r.changed() || ch {
                 self.font_grid_tex = None;
@@ -12209,7 +12830,14 @@ impl Kaleidotron {
         let end = (start + per_page).min(chars.len());
         let page_chars: Vec<char> = chars[start..end].to_vec();
         // Render the page grid (cached by page + cell + ink + recolor, so a colour change refreshes).
-        let gkey = format!("{}|{}|{:?}|{}|{}", self.font_page, cell, self.font_ink, self.pipeline_key(), self.recolor_ident());
+        let gkey = format!(
+            "{}|{}|{:?}|{}|{}",
+            self.font_page,
+            cell,
+            self.font_ink,
+            self.pipeline_key(),
+            self.recolor_ident()
+        );
         let need = self.font_grid_tex.is_none() || self.font_grid_key != gkey;
         if need {
             if let Some((img, rows)) = crate::decode::font::render_glyph_grid(
@@ -12295,7 +12923,10 @@ impl Kaleidotron {
                 });
         }
 
-        let hex = format!("#{:02X}{:02X}{:02X}", self.font_ink[0], self.font_ink[1], self.font_ink[2]);
+        let hex = format!(
+            "#{:02X}{:02X}{:02X}",
+            self.font_ink[0], self.font_ink[1], self.font_ink[2]
+        );
         if let Some(c) = svg_copy {
             match crate::decode::font::glyph_svg(&self.font_bytes, c, &hex) {
                 Some(svg) => {
@@ -12307,10 +12938,22 @@ impl Kaleidotron {
         }
         if let Some(c) = svg_export {
             if let Some(svg) = crate::decode::font::glyph_svg(&self.font_bytes, c, &hex) {
-                let base = self.font_info.as_ref().map(|i| i.family.clone()).unwrap_or_default();
-                let clean: String = base.chars().map(|x| if x.is_ascii_alphanumeric() { x } else { '_' }).take(20).collect();
+                let base = self
+                    .font_info
+                    .as_ref()
+                    .map(|i| i.family.clone())
+                    .unwrap_or_default();
+                let clean: String = base
+                    .chars()
+                    .map(|x| if x.is_ascii_alphanumeric() { x } else { '_' })
+                    .take(20)
+                    .collect();
                 let default = format!("{clean}_U{:04X}.svg", c as u32);
-                if let Some(p) = rfd::FileDialog::new().set_file_name(default).add_filter("SVG", &["svg"]).save_file() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(default)
+                    .add_filter("SVG", &["svg"])
+                    .save_file()
+                {
                     match std::fs::write(&p, svg) {
                         Ok(()) => self.status = format!("Saved {}", short_name(&p)),
                         Err(e) => self.status = format!("Export failed: {e}"),
@@ -12336,8 +12979,16 @@ impl Kaleidotron {
         }
         let preset = TdfPreset {
             name: name.to_string(),
-            font_path: self.tdf_path.as_ref().map(|p| self.to_display(p).display().to_string()).unwrap_or_default(),
-            font_real: self.tdf_path.as_ref().map(|p| self.resolve_local(p).display().to_string()).unwrap_or_default(),
+            font_path: self
+                .tdf_path
+                .as_ref()
+                .map(|p| self.to_display(p).display().to_string())
+                .unwrap_or_default(),
+            font_real: self
+                .tdf_path
+                .as_ref()
+                .map(|p| self.resolve_local(p).display().to_string())
+                .unwrap_or_default(),
             font_index: self.tdf_index,
             sample: self.font_sample.clone(),
             spacing: self.tdf_spacing,
@@ -12392,7 +13043,9 @@ impl Kaleidotron {
         self.font_sample = preset.sample.clone();
         // Same font already open → set the variant directly (the load path used the pending index).
         if !loaded {
-            self.tdf_index = preset.font_index.min(self.tdf_fonts.len().saturating_sub(1));
+            self.tdf_index = preset
+                .font_index
+                .min(self.tdf_fonts.len().saturating_sub(1));
         }
         self.tdf_spacing = preset.spacing;
         self.tdf_line_gap = preset.line_gap;
@@ -12433,7 +13086,12 @@ impl Kaleidotron {
             .filter(|p| is_fonty(p))
             .cloned()
             .collect();
-        fonts.extend(self.entries.iter().map(|e| e.path.clone()).filter(|p| is_fonty(p)));
+        fonts.extend(
+            self.entries
+                .iter()
+                .map(|e| e.path.clone())
+                .filter(|p| is_fonty(p)),
+        );
         for p in fonts {
             self.thumb_tex.remove(&p);
             self.thumb_rgba.remove(&p);
@@ -12499,7 +13157,9 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             ui.strong(
                 egui::RichText::new(
-                    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 )
                 .heading(),
             );
@@ -12507,23 +13167,28 @@ impl Kaleidotron {
             let n = self.tdf_fonts.len();
             if n > 1 {
                 let cur = self.tdf_fonts[self.tdf_index].0.clone();
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_font_pick")
-                    .width(300.0)
-                    .height(420.0)
-                    .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
-                    .show_ui(ui, |ui| {
-                        for (i, (name, ty, gc)) in self.tdf_fonts.iter().enumerate() {
-                            if ui
-                                .selectable_label(i == self.tdf_index, format!("{name}  ({ty}, {gc})"))
-                                .clicked()
-                            {
-                                self.tdf_index = i;
-                                self.tdf_sample_tex = None;
-                                self.tdf_grid_tex = None;
-                                self.tdf_page = 0;
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("tdf_font_pick")
+                        .width(300.0)
+                        .height(420.0)
+                        .selected_text(format!("{}/{}: {cur}", self.tdf_index + 1, n))
+                        .show_ui(ui, |ui| {
+                            for (i, (name, ty, gc)) in self.tdf_fonts.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        i == self.tdf_index,
+                                        format!("{name}  ({ty}, {gc})"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.tdf_index = i;
+                                    self.tdf_sample_tex = None;
+                                    self.tdf_grid_tex = None;
+                                    self.tdf_page = 0;
+                                }
                             }
-                        }
-                    }));
+                        }),
+                );
                 if combo_wheel(ui, &cr, &mut self.tdf_index, n) {
                     self.tdf_sample_tex = None;
                     self.tdf_grid_tex = None;
@@ -12545,27 +13210,42 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             ui.label("Preset");
             let names: Vec<String> = self.tdf_presets.iter().map(|p| p.name.clone()).collect();
-            let sel = if self.tdf_preset_name.is_empty() { "— pick —".to_string() } else { self.tdf_preset_name.clone() };
+            let sel = if self.tdf_preset_name.is_empty() {
+                "— pick —".to_string()
+            } else {
+                self.tdf_preset_name.clone()
+            };
             // Let the popup grow to (almost) the full screen height when there are many presets;
             // egui shrinks it to the content when there are few.
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_preset_pick")
-                .width(220.0)
-                .height(max_h)
-                .selected_text(sel)
-                .show_ui(ui, |ui| {
-                    for p in &self.tdf_presets {
-                        if ui.selectable_label(p.name == self.tdf_preset_name, &p.name).clicked() {
-                            recall_preset = Some(p.clone());
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("tdf_preset_pick")
+                    .width(220.0)
+                    .height(max_h)
+                    .selected_text(sel)
+                    .show_ui(ui, |ui| {
+                        for p in &self.tdf_presets {
+                            if ui
+                                .selectable_label(p.name == self.tdf_preset_name, &p.name)
+                                .clicked()
+                            {
+                                recall_preset = Some(p.clone());
+                            }
                         }
-                    }
-                    let _ = names;
-                }));
+                        let _ = names;
+                    }),
+            );
             let step = combo_scroll_step(ui, &cr);
             if step != 0 && !self.tdf_presets.is_empty() {
                 let n = self.tdf_presets.len() as isize;
-                let cur = self.tdf_presets.iter().position(|p| p.name == self.tdf_preset_name);
-                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                let cur = self
+                    .tdf_presets
+                    .iter()
+                    .position(|p| p.name == self.tdf_preset_name);
+                let ni = match cur {
+                    Some(c) => (c as isize + step).rem_euclid(n) as usize,
+                    None => 0,
+                };
                 recall_preset = Some(self.tdf_presets[ni].clone());
             }
             ui.add(
@@ -12573,11 +13253,22 @@ impl Kaleidotron {
                     .desired_width(140.0)
                     .hint_text("name…"),
             );
-            if ui.button("💾 Save").on_hover_text("Save the current font + settings under this name").clicked() {
+            if ui
+                .button("💾 Save")
+                .on_hover_text("Save the current font + settings under this name")
+                .clicked()
+            {
                 save_preset = true;
             }
-            let can_del = self.tdf_presets.iter().any(|p| p.name == self.tdf_preset_name.trim());
-            if ui.add_enabled(can_del, egui::Button::new("✕")).on_hover_text("Delete this preset").clicked() {
+            let can_del = self
+                .tdf_presets
+                .iter()
+                .any(|p| p.name == self.tdf_preset_name.trim());
+            if ui
+                .add_enabled(can_del, egui::Button::new("✕"))
+                .on_hover_text("Delete this preset")
+                .clicked()
+            {
                 delete_preset = Some(self.tdf_preset_name.trim().to_string());
             }
         });
@@ -12600,7 +13291,7 @@ impl Kaleidotron {
         let mut want_tdf = false;
         let mut ans_open: Option<usize> = None; // render → open in this .ans opener
         let mut ans_open_other = false; // render → open in a picked program
-        // The configured programs that handle `.ans` (so the ANS menu can open the render in them).
+                                        // The configured programs that handle `.ans` (so the ANS menu can open the render in them).
         let ans_openers: Vec<OpenerItem> = self
             .opener_items()
             .into_iter()
@@ -12608,7 +13299,11 @@ impl Kaleidotron {
             .collect();
         ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
-            if ui.small_button("📋 text").on_hover_text("Copy the sample text").clicked() {
+            if ui
+                .small_button("📋 text")
+                .on_hover_text("Copy the sample text")
+                .clicked()
+            {
                 want_copy = Some(self.font_sample.clone());
             }
             if ui
@@ -12619,7 +13314,11 @@ impl Kaleidotron {
                 copy_img = true;
             }
             ui.separator();
-            if ui.small_button("💾 PNG").on_hover_text("Save the rendered sample as a PNG beside the file").clicked() {
+            if ui
+                .small_button("💾 PNG")
+                .on_hover_text("Save the rendered sample as a PNG beside the file")
+                .clicked()
+            {
                 want_export = Some(());
             }
             // ANS is a menu: save to disk, or render + open in a configured .ans editor.
@@ -12651,7 +13350,11 @@ impl Kaleidotron {
             })
             .response
             .on_hover_text("Export the rendered text as ANSI art, or open it in an editor");
-            if ui.small_button("💾 TDF").on_hover_text("Export the selected font as a standalone TheDraw .tdf file").clicked() {
+            if ui
+                .small_button("💾 TDF")
+                .on_hover_text("Export the selected font as a standalone TheDraw .tdf file")
+                .clicked()
+            {
                 want_tdf = true;
             }
         });
@@ -12702,7 +13405,11 @@ impl Kaleidotron {
         });
         // Single-colour fg/bg (outline/block fonts only — colour fonts carry their own palette) +
         // the multi-line stacking order.
-        let is_color_font = self.tdf_fonts.get(self.tdf_index).map(|(_, t, _)| *t == "color").unwrap_or(false);
+        let is_color_font = self
+            .tdf_fonts
+            .get(self.tdf_index)
+            .map(|(_, t, _)| *t == "color")
+            .unwrap_or(false);
         let multiline = self.font_sample.contains('\n');
         if !is_color_font || multiline {
             ui.horizontal_wrapped(|ui| {
@@ -12721,19 +13428,31 @@ impl Kaleidotron {
                         ui.separator();
                     }
                     ui.label("Lines");
-                    let cur = if self.tdf_top_down { "Top Down" } else { "Bottom Up" };
-                    let cr = eat_scroll(egui::ComboBox::from_id_salt("tdf_zorder")
-                        .selected_text(cur)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_value(&mut self.tdf_top_down, true, "Top Down").clicked()
-                                || ui
-                                    .selectable_value(&mut self.tdf_top_down, false, "Bottom Up")
+                    let cur = if self.tdf_top_down {
+                        "Top Down"
+                    } else {
+                        "Bottom Up"
+                    };
+                    let cr = eat_scroll(
+                        egui::ComboBox::from_id_salt("tdf_zorder")
+                            .selected_text(cur)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_value(&mut self.tdf_top_down, true, "Top Down")
                                     .clicked()
-                            {
-                                self.tdf_sample_tex = None;
-                            }
-                        }))
-                        .on_hover_text("Which line wins where multi-line rows overlap");
+                                    || ui
+                                        .selectable_value(
+                                            &mut self.tdf_top_down,
+                                            false,
+                                            "Bottom Up",
+                                        )
+                                        .clicked()
+                                {
+                                    self.tdf_sample_tex = None;
+                                }
+                            }),
+                    )
+                    .on_hover_text("Which line wins where multi-line rows overlap");
                     if combo_wheel_list(ui, &cr, &mut self.tdf_top_down, &[true, false]) {
                         self.tdf_sample_tex = None;
                     }
@@ -12748,7 +13467,12 @@ impl Kaleidotron {
             self.font_sample.clone()
         };
         if copy_img {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, &self.tdf_opts()) {
+            if let Some(img) = crate::decode::tdf::render_tdf(
+                &self.tdf_bytes,
+                self.tdf_index,
+                &sample,
+                &self.tdf_opts(),
+            ) {
                 let img = self.recolor_sample(path, img);
                 self.copy_image_to_clipboard(&img);
             }
@@ -12757,13 +13481,19 @@ impl Kaleidotron {
             self.export_tdf_ans(&sample);
         }
         if let Some(oi) = ans_open {
-            let prog = self.openers.get(oi).map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
+            let prog = self
+                .openers
+                .get(oi)
+                .map(|o| (o.exec.clone(), o.args.clone(), o.env.clone()));
             if let Some((exec, args, env)) = prog {
                 self.open_tdf_ans_in(&sample, &exec, &args, &env);
             }
         }
         if ans_open_other {
-            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+            if let Some(exec) = rfd::FileDialog::new()
+                .set_title("Choose a program")
+                .pick_file()
+            {
                 let exec = exec.to_string_lossy().to_string();
                 self.open_tdf_ans_in(&sample, &exec, "", "");
             }
@@ -12771,9 +13501,32 @@ impl Kaleidotron {
         if want_tdf {
             self.export_tdf_file();
         }
-        let key = format!("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", self.tdf_index, sample, self.tdf_spacing, self.tdf_line_gap, self.tdf_font_9px, self.tdf_fg, self.tdf_bg, self.tdf_top_down, self.pipeline_key(), self.recolor_ident());
-        if changed || self.tdf_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            if let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, &sample, &self.tdf_opts()) {
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.tdf_index,
+            sample,
+            self.tdf_spacing,
+            self.tdf_line_gap,
+            self.tdf_font_9px,
+            self.tdf_fg,
+            self.tdf_bg,
+            self.tdf_top_down,
+            self.pipeline_key(),
+            self.recolor_ident()
+        );
+        if changed
+            || self
+                .tdf_sample_tex
+                .as_ref()
+                .map(|(k, _)| k != &key)
+                .unwrap_or(true)
+        {
+            if let Some(img) = crate::decode::tdf::render_tdf(
+                &self.tdf_bytes,
+                self.tdf_index,
+                &sample,
+                &self.tdf_opts(),
+            ) {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -12801,8 +13554,12 @@ impl Kaleidotron {
             if self.tdf_ruler {
                 let over = chars_w > self.tdf_ruler_cols;
                 let msg = if over {
-                    egui::RichText::new(format!("· ⚠ exceeds {} cols by {}", self.tdf_ruler_cols, chars_w - self.tdf_ruler_cols))
-                        .color(egui::Color32::from_rgb(230, 120, 90))
+                    egui::RichText::new(format!(
+                        "· ⚠ exceeds {} cols by {}",
+                        self.tdf_ruler_cols,
+                        chars_w - self.tdf_ruler_cols
+                    ))
+                    .color(egui::Color32::from_rgb(230, 120, 90))
                 } else {
                     egui::RichText::new(format!("· fits {} cols", self.tdf_ruler_cols)).weak()
                 };
@@ -12811,33 +13568,41 @@ impl Kaleidotron {
         });
         let crt_y = if self.tdf_crt { 1.2 } else { 1.0 };
         let (ruler_on, ruler_cols) = (self.tdf_ruler, self.tdf_ruler_cols);
-        egui::ScrollArea::both().id_salt("tdf_sample_scroll").show(ui, |ui| {
-            if let Some((_, tex)) = &self.tdf_sample_tex {
-                // Explicit zoom (user slider); CRT stretches Y ~1.2× (display only, texture unchanged).
-                // Snap rounds the scale to a whole number so NEAREST sampling is pixel-perfect.
-                let native = tex.size_vec2();
-                let scale = if self.tdf_snap {
-                    self.tdf_zoom.round().max(1.0)
+        egui::ScrollArea::both()
+            .id_salt("tdf_sample_scroll")
+            .show(ui, |ui| {
+                if let Some((_, tex)) = &self.tdf_sample_tex {
+                    // Explicit zoom (user slider); CRT stretches Y ~1.2× (display only, texture unchanged).
+                    // Snap rounds the scale to a whole number so NEAREST sampling is pixel-perfect.
+                    let native = tex.size_vec2();
+                    let scale = if self.tdf_snap {
+                        self.tdf_zoom.round().max(1.0)
+                    } else {
+                        self.tdf_zoom.max(0.25)
+                    };
+                    let size = egui::vec2(native.x * scale, native.y * scale * crt_y);
+                    let resp = ui.add(egui::Image::new((tex.id(), size)));
+                    // Column ruler: a vertical guide line at `ruler_cols` characters from the left of the
+                    // art, spanning the whole preview height, so a sysop sees if the logo overflows a
+                    // 40/80/132-column BBS screen.
+                    if ruler_on {
+                        let x = resp.rect.left() + ruler_cols as f32 * cell_w * scale;
+                        let (top, bot) = (
+                            resp.rect.top(),
+                            resp.rect.bottom().max(ui.clip_rect().bottom()),
+                        );
+                        ui.painter().line_segment(
+                            [egui::pos2(x, top), egui::pos2(x, bot)],
+                            egui::Stroke::new(
+                                1.5,
+                                egui::Color32::from_rgba_unmultiplied(255, 90, 90, 200),
+                            ),
+                        );
+                    }
                 } else {
-                    self.tdf_zoom.max(0.25)
-                };
-                let size = egui::vec2(native.x * scale, native.y * scale * crt_y);
-                let resp = ui.add(egui::Image::new((tex.id(), size)));
-                // Column ruler: a vertical guide line at `ruler_cols` characters from the left of the
-                // art, spanning the whole preview height, so a sysop sees if the logo overflows a
-                // 40/80/132-column BBS screen.
-                if ruler_on {
-                    let x = resp.rect.left() + ruler_cols as f32 * cell_w * scale;
-                    let (top, bot) = (resp.rect.top(), resp.rect.bottom().max(ui.clip_rect().bottom()));
-                    ui.painter().line_segment(
-                        [egui::pos2(x, top), egui::pos2(x, bot)],
-                        egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 90, 90, 200)),
-                    );
+                    ui.weak("(nothing to render — the font may lack these characters)");
                 }
-            } else {
-                ui.weak("(nothing to render — the font may lack these characters)");
-            }
-        });
+            });
         ui.separator();
 
         // Character grid — every TheDraw slot ('!'..='~'); defined glyphs render, gaps stay blank
@@ -12854,7 +13619,10 @@ impl Kaleidotron {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Glyphs ({defined}/{} defined)", cov.len()));
                 if pages > 1 {
-                    if ui.add_enabled(self.tdf_page > 0, egui::Button::new("◀").small()).clicked() {
+                    if ui
+                        .add_enabled(self.tdf_page > 0, egui::Button::new("◀").small())
+                        .clicked()
+                    {
                         self.tdf_page -= 1;
                         self.tdf_grid_tex = None;
                     }
@@ -12869,7 +13637,9 @@ impl Kaleidotron {
                 }
                 ui.separator();
                 ui.label("Cell");
-                let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+                let r = ui.add(
+                    egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false),
+                );
                 let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
                 if r.changed() || ch {
                     self.tdf_grid_tex = None;
@@ -12878,8 +13648,16 @@ impl Kaleidotron {
             let start = self.tdf_page * per_page;
             let end = (start + per_page).min(all_chars.len());
             let page_chars: Vec<char> = all_chars[start..end].to_vec();
-            let gkey = format!("{}|{}|{}|{}|{}", self.tdf_index, self.tdf_page, cell, self.tdf_font_9px, self.tdf_fg);
-            if self.tdf_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+            let gkey = format!(
+                "{}|{}|{}|{}|{}",
+                self.tdf_index, self.tdf_page, cell, self.tdf_font_9px, self.tdf_fg
+            );
+            if self
+                .tdf_grid_tex
+                .as_ref()
+                .map(|(k, ..)| k != &gkey)
+                .unwrap_or(true)
+            {
                 if let Some((img, _rows)) = crate::decode::tdf::render_glyph_grid(
                     &self.tdf_bytes,
                     self.tdf_index,
@@ -12899,50 +13677,70 @@ impl Kaleidotron {
             if let Some((_, tex, cols, chars)) = self.tdf_grid_tex.clone() {
                 let defined_set: std::collections::HashSet<char> =
                     cov.iter().filter(|(_, d)| *d).map(|(c, _)| *c).collect();
-                egui::ScrollArea::vertical().id_salt("tdf_grid_scroll").show(ui, |ui| {
-                    let size = tex.size_vec2();
-                    let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
-                    // Paint a faint char label in each *undefined* (gap) cell so it stands out.
-                    let painter = ui.painter_at(resp.rect);
-                    for (i, ch) in chars.iter().enumerate() {
-                        if defined_set.contains(ch) {
-                            continue;
+                egui::ScrollArea::vertical()
+                    .id_salt("tdf_grid_scroll")
+                    .show(ui, |ui| {
+                        let size = tex.size_vec2();
+                        let resp =
+                            ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+                        // Paint a faint char label in each *undefined* (gap) cell so it stands out.
+                        let painter = ui.painter_at(resp.rect);
+                        for (i, ch) in chars.iter().enumerate() {
+                            if defined_set.contains(ch) {
+                                continue;
+                            }
+                            let (c, r) = (i % cols, i / cols);
+                            let center = resp.rect.min
+                                + egui::vec2(
+                                    (c * cell) as f32 + cell as f32 / 2.0,
+                                    (r * cell) as f32 + cell as f32 / 2.0,
+                                );
+                            painter.text(
+                                center,
+                                egui::Align2::CENTER_CENTER,
+                                ch.to_string(),
+                                egui::FontId::monospace((cell as f32 * 0.4).clamp(9.0, 22.0)),
+                                egui::Color32::from_gray(70),
+                            );
                         }
-                        let (c, r) = (i % cols, i / cols);
-                        let center = resp.rect.min
-                            + egui::vec2((c * cell) as f32 + cell as f32 / 2.0, (r * cell) as f32 + cell as f32 / 2.0);
-                        painter.text(
-                            center,
-                            egui::Align2::CENTER_CENTER,
-                            ch.to_string(),
-                            egui::FontId::monospace((cell as f32 * 0.4).clamp(9.0, 22.0)),
-                            egui::Color32::from_gray(70),
-                        );
-                    }
-                    if let Some(pos) = resp.hover_pos() {
-                        let local = pos - resp.rect.min;
-                        let (c, r) = ((local.x / cell as f32) as usize, (local.y / cell as f32) as usize);
-                        if c < cols {
-                            if let Some(&ch) = chars.get(r * cols + c) {
-                                let cr = egui::Rect::from_min_size(
-                                    resp.rect.min + egui::vec2((c * cell) as f32, (r * cell) as f32),
-                                    egui::vec2(cell as f32, cell as f32),
-                                );
-                                ui.painter().rect_stroke(
-                                    cr,
-                                    2.0,
-                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
-                                    egui::StrokeKind::Inside,
-                                );
-                                let tag = if defined_set.contains(&ch) { "defined" } else { "— gap (undefined)" };
-                                resp.clone().on_hover_text(format!("{ch}   U+{:04X}   {tag}", ch as u32));
-                                if resp.clicked() {
-                                    want_copy = Some(ch.to_string());
+                        if let Some(pos) = resp.hover_pos() {
+                            let local = pos - resp.rect.min;
+                            let (c, r) = (
+                                (local.x / cell as f32) as usize,
+                                (local.y / cell as f32) as usize,
+                            );
+                            if c < cols {
+                                if let Some(&ch) = chars.get(r * cols + c) {
+                                    let cr = egui::Rect::from_min_size(
+                                        resp.rect.min
+                                            + egui::vec2((c * cell) as f32, (r * cell) as f32),
+                                        egui::vec2(cell as f32, cell as f32),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        cr,
+                                        2.0,
+                                        egui::Stroke::new(
+                                            1.5,
+                                            egui::Color32::from_rgb(90, 150, 235),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    let tag = if defined_set.contains(&ch) {
+                                        "defined"
+                                    } else {
+                                        "— gap (undefined)"
+                                    };
+                                    resp.clone().on_hover_text(format!(
+                                        "{ch}   U+{:04X}   {tag}",
+                                        ch as u32
+                                    ));
+                                    if resp.clicked() {
+                                        want_copy = Some(ch.to_string());
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
             }
         }
 
@@ -12958,9 +13756,13 @@ impl Kaleidotron {
 
     /// Save the current TDF sample render as a PNG beside the font file and report the path.
     fn export_tdf_png(&mut self, sample: &str) {
-        let Some(img) = crate::decode::tdf::render_tdf(&self.tdf_bytes, self.tdf_index, sample, &self.tdf_opts())
-            .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img))
-        else {
+        let Some(img) = crate::decode::tdf::render_tdf(
+            &self.tdf_bytes,
+            self.tdf_index,
+            sample,
+            &self.tdf_opts(),
+        )
+        .map(|img| self.recolor_sample(&self.tdf_path.clone().unwrap_or_default(), img)) else {
             self.status = "Nothing to export.".into();
             return;
         };
@@ -13003,8 +13805,18 @@ impl Kaleidotron {
     /// SAUCE metadata for an ANSI export: `(title, comment, date CCYYMMDD)`. Credits kaleidotron +
     /// names the source TheDraw font.
     fn tdf_ansi_sauce(&self, sample: &str) -> (String, String, String) {
-        let title: String = sample.lines().next().unwrap_or("").chars().take(35).collect();
-        let font = self.tdf_fonts.get(self.tdf_index).map(|(n, _, _)| n.clone()).unwrap_or_default();
+        let title: String = sample
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(35)
+            .collect();
+        let font = self
+            .tdf_fonts
+            .get(self.tdf_index)
+            .map(|(n, _, _)| n.clone())
+            .unwrap_or_default();
         let fname = self
             .tdf_path
             .as_ref()
@@ -13028,19 +13840,23 @@ impl Kaleidotron {
             date: &date,
         };
         let opts = self.tdf_opts();
-        let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
-            &self.tdf_bytes,
-            self.tdf_index,
-            sample,
-            &opts,
-            &sauce,
-        ) else {
+        let Some(bytes) =
+            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, &opts, &sauce)
+        else {
             self.status = "Nothing to export.".into();
             return;
         };
-        let slug: String = sample.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(24).collect();
+        let slug: String = sample
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(24)
+            .collect();
         let default = format!("{slug}.ans");
-        if let Some(path) = rfd::FileDialog::new().set_file_name(default).add_filter("ANSI art", &["ans"]).save_file() {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(default)
+            .add_filter("ANSI art", &["ans"])
+            .save_file()
+        {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&path)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -13061,13 +13877,9 @@ impl Kaleidotron {
             date: &date,
         };
         let opts = self.tdf_opts();
-        let Some(bytes) = crate::decode::tdf::tdf_to_ansi(
-            &self.tdf_bytes,
-            self.tdf_index,
-            sample,
-            &opts,
-            &sauce,
-        ) else {
+        let Some(bytes) =
+            crate::decode::tdf::tdf_to_ansi(&self.tdf_bytes, self.tdf_index, sample, &opts, &sauce)
+        else {
             self.status = "Nothing to render.".into();
             return;
         };
@@ -13097,8 +13909,15 @@ impl Kaleidotron {
             .map(|(n, _, _)| n.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "font".into());
-        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{slug}.tdf")).add_filter("TheDraw font", &["tdf"]).save_file() {
+        let slug: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{slug}.tdf"))
+            .add_filter("TheDraw font", &["tdf"])
+            .save_file()
+        {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&path)),
                 Err(e) => self.status = format!("Export failed: {e}"),
@@ -13138,11 +13957,19 @@ impl Kaleidotron {
             ui.strong(egui::RichText::new(&title).heading());
             ui.separator();
             let kind = if font.is_color {
-                format!("color · {}-plane · {} colours", font.depth, font.palette.len())
+                format!(
+                    "color · {}-plane · {} colours",
+                    font.depth,
+                    font.palette.len()
+                )
             } else {
                 "mono".to_string()
             };
-            ui.weak(format!("{}px · {} glyphs · {kind}", font.height, font.glyphs.len()));
+            ui.weak(format!(
+                "{}px · {} glyphs · {kind}",
+                font.height,
+                font.glyphs.len()
+            ));
             // Surface the internal name too when it adds something (differs from the filename).
             if !font.name.is_empty() && !title.eq_ignore_ascii_case(&font.name) {
                 ui.weak(format!("· “{}”", font.name));
@@ -13163,25 +13990,33 @@ impl Kaleidotron {
                 self.amiga_preset_name.clone()
             };
             let max_h = (ui.ctx().content_rect().height() - 120.0).clamp(200.0, 1400.0);
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("amiga_preset_pick")
-                .width(220.0)
-                .height(max_h)
-                .selected_text(sel)
-                .show_ui(ui, |ui| {
-                    for p in &self.amiga_presets {
-                        if ui
-                            .selectable_label(p.name == self.amiga_preset_name, &p.name)
-                            .clicked()
-                        {
-                            recall_amiga = Some(p.clone());
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("amiga_preset_pick")
+                    .width(220.0)
+                    .height(max_h)
+                    .selected_text(sel)
+                    .show_ui(ui, |ui| {
+                        for p in &self.amiga_presets {
+                            if ui
+                                .selectable_label(p.name == self.amiga_preset_name, &p.name)
+                                .clicked()
+                            {
+                                recall_amiga = Some(p.clone());
+                            }
                         }
-                    }
-                }));
+                    }),
+            );
             let step = combo_scroll_step(ui, &cr);
             if step != 0 && !self.amiga_presets.is_empty() {
                 let n = self.amiga_presets.len() as isize;
-                let cur = self.amiga_presets.iter().position(|p| p.name == self.amiga_preset_name);
-                let ni = match cur { Some(c) => (c as isize + step).rem_euclid(n) as usize, None => 0 };
+                let cur = self
+                    .amiga_presets
+                    .iter()
+                    .position(|p| p.name == self.amiga_preset_name);
+                let ni = match cur {
+                    Some(c) => (c as isize + step).rem_euclid(n) as usize,
+                    None => 0,
+                };
                 recall_amiga = Some(self.amiga_presets[ni].clone());
             }
             ui.add(
@@ -13224,15 +14059,25 @@ impl Kaleidotron {
         // ── Sample row: label + export buttons (mirrors the TDF viewer's) ───
         ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
-            if ui.button("📋 PNG").on_hover_text("Save the styled sample as a PNG").clicked() {
+            if ui
+                .button("📋 PNG")
+                .on_hover_text("Save the styled sample as a PNG")
+                .clicked()
+            {
                 want_png = true;
             }
-            if ui.button("📋 Copy").on_hover_text("Copy the styled sample to the clipboard as a bitmap").clicked() {
+            if ui
+                .button("📋 Copy")
+                .on_hover_text("Copy the styled sample to the clipboard as a bitmap")
+                .clicked()
+            {
                 want_copy = true;
             }
             if ui
                 .button("⬇ DRAW font")
-                .on_hover_text("Export as a DRAW Color Bitmap Font (.bmp) into ASSETS/FONTS/COLOR_BITMAP/")
+                .on_hover_text(
+                    "Export as a DRAW Color Bitmap Font (.bmp) into ASSETS/FONTS/COLOR_BITMAP/",
+                )
                 .clicked()
             {
                 want_cbf = true;
@@ -13257,37 +14102,61 @@ impl Kaleidotron {
             ui.label("Spacing");
             let r = ui
                 .add(egui::Slider::new(&mut self.amiga_spacing, -20..=20).show_value(false))
-                .on_hover_text("Per-glyph advance; negative kerns the overlap these fonts draw with");
-            changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_spacing, 0, 1.0, -20, 20);
+                .on_hover_text(
+                    "Per-glyph advance; negative kerns the overlap these fonts draw with",
+                );
+            changed |=
+                r.changed() | slider_extras(ui, &r, &mut self.amiga_spacing, 0, 1.0, -20, 20);
             let r = ui.add(egui::DragValue::new(&mut self.amiga_spacing).range(-40..=40));
             changed |= r.changed() | wheel_adjust(ui, &r, &mut self.amiga_spacing, 1.0, -40, 40);
             ui.separator();
             ui.label("Line height");
             let r = ui.add(egui::Slider::new(&mut self.amiga_line_gap, -20..=40).show_value(false));
-            changed |= r.changed() | slider_extras(ui, &r, &mut self.amiga_line_gap, 2, 1.0, -20, 40);
+            changed |=
+                r.changed() | slider_extras(ui, &r, &mut self.amiga_line_gap, 2, 1.0, -20, 40);
             let r = ui.add(egui::DragValue::new(&mut self.amiga_line_gap).range(-40..=80));
             changed |= r.changed() | wheel_adjust(ui, &r, &mut self.amiga_line_gap, 1.0, -40, 80);
             ui.separator();
             ui.label("Zoom");
-            let r = ui.add(egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0).step_by(0.25).show_value(false));
+            let r = ui.add(
+                egui::Slider::new(&mut self.amiga_zoom, 0.25..=8.0)
+                    .step_by(0.25)
+                    .show_value(false),
+            );
             slider_extras(ui, &r, &mut self.amiga_zoom, 2.0, 0.25, 0.25, 8.0);
             ui.label(format!("{:.1}×", self.amiga_zoom));
             ui.separator();
             // Snap = integer preview scale (crisp pixels); CRT = ~1.2x vertical stretch.
-            if ui.checkbox(&mut self.amiga_snap, "Snap").on_hover_text("Snap zoom to a whole-pixel scale").changed() {
+            if ui
+                .checkbox(&mut self.amiga_snap, "Snap")
+                .on_hover_text("Snap zoom to a whole-pixel scale")
+                .changed()
+            {
                 self.amiga_sample_tex = None;
             }
-            if ui.checkbox(&mut self.amiga_crt, "CRT").on_hover_text("~1.2× vertical stretch for the Amiga's non-square pixels").changed() {
+            if ui
+                .checkbox(&mut self.amiga_crt, "CRT")
+                .on_hover_text("~1.2× vertical stretch for the Amiga's non-square pixels")
+                .changed()
+            {
                 self.amiga_sample_tex = None;
             }
             ui.separator();
             // Background: a solid fill (baked into the preview + PNG/Copy) or the transparency
             // checkerboard when off — mirrors the TTF viewer's BG control.
-            if ui.checkbox(&mut self.amiga_bg_on, "BG").on_hover_text("Fill the background with a solid colour (baked into PNG/Copy)").changed() {
+            if ui
+                .checkbox(&mut self.amiga_bg_on, "BG")
+                .on_hover_text("Fill the background with a solid colour (baked into PNG/Copy)")
+                .changed()
+            {
                 self.amiga_sample_tex = None;
             }
             ui.add_enabled_ui(self.amiga_bg_on, |ui| {
-                if ui.color_edit_button_srgb(&mut self.amiga_bg).on_hover_text("Background colour").changed() {
+                if ui
+                    .color_edit_button_srgb(&mut self.amiga_bg)
+                    .on_hover_text("Background colour")
+                    .changed()
+                {
                     self.amiga_sample_tex = None;
                 }
             });
@@ -13295,17 +14164,23 @@ impl Kaleidotron {
             // Multi-line overlap z-order — which line wins where a tight (negative) line-height
             // makes rows touch. Mirrors the TTF/TDF viewer's "Lines" control.
             ui.label("Lines");
-            let cur = if self.amiga_top_down { "Top Down" } else { "Bottom Up" };
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("amiga_zorder")
-                .selected_text(cur)
-                .show_ui(ui, |ui| {
-                    let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
-                    let b = ui.selectable_value(&mut self.amiga_top_down, false, "Bottom Up");
-                    if a.changed() || b.changed() {
-                        self.amiga_sample_tex = None;
-                    }
-                }))
-                .on_hover_text("Which line draws on top where rows overlap");
+            let cur = if self.amiga_top_down {
+                "Top Down"
+            } else {
+                "Bottom Up"
+            };
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("amiga_zorder")
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        let a = ui.selectable_value(&mut self.amiga_top_down, true, "Top Down");
+                        let b = ui.selectable_value(&mut self.amiga_top_down, false, "Bottom Up");
+                        if a.changed() || b.changed() {
+                            self.amiga_sample_tex = None;
+                        }
+                    }),
+            )
+            .on_hover_text("Which line draws on top where rows overlap");
             if combo_wheel_list(ui, &cr, &mut self.amiga_top_down, &[true, false]) {
                 self.amiga_sample_tex = None;
             }
@@ -13317,8 +14192,17 @@ impl Kaleidotron {
         } else {
             self.font_sample.clone()
         };
-        let rendered = crate::decode::amiga_font::render_text(&font, &sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
-        ui.weak(format!("Design: {} × {} px", rendered.width, rendered.height));
+        let rendered = crate::decode::amiga_font::render_text(
+            &font,
+            &sample,
+            self.amiga_spacing,
+            self.amiga_line_gap,
+            self.amiga_top_down,
+        );
+        ui.weak(format!(
+            "Design: {} × {} px",
+            rendered.width, rendered.height
+        ));
         ui.separator();
 
         // Deferred exports (they need `&mut self`, so run after the UI closures above).
@@ -13336,9 +14220,17 @@ impl Kaleidotron {
 
         // ── The big preview ─────────────────────────────────────────────────
         // Snap rounds zoom to an integer so nearest-neighbour stays crisp; CRT stretches Y ~1.2×.
-        let eff_zoom = if self.amiga_snap { self.amiga_zoom.round().max(1.0) } else { self.amiga_zoom };
+        let eff_zoom = if self.amiga_snap {
+            self.amiga_zoom.round().max(1.0)
+        } else {
+            self.amiga_zoom
+        };
         let y_stretch = if self.amiga_crt { 1.2 } else { 1.0 };
-        let bgk = if self.amiga_bg_on { format!("bg{:?}", self.amiga_bg) } else { "nobg".into() };
+        let bgk = if self.amiga_bg_on {
+            format!("bg{:?}", self.amiga_bg)
+        } else {
+            "nobg".into()
+        };
         let key = format!(
             "{}|{}|{}|{}|{}|{}|{bgk}",
             path.display(),
@@ -13348,7 +14240,13 @@ impl Kaleidotron {
             self.pipeline_key(),
             self.recolor_ident()
         );
-        if changed || self.amiga_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+        if changed
+            || self
+                .amiga_sample_tex
+                .as_ref()
+                .map(|(k, _)| k != &key)
+                .unwrap_or(true)
+        {
             let recolored = self.recolor_sample(path, rendered);
             let img = self.amiga_with_bg(recolored);
             let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -13362,9 +14260,22 @@ impl Kaleidotron {
         // Build the glyph grid too, so it lands below the preview.
         let cell = self.amiga_cell as usize;
         let grid_cols = 16usize;
-        let gkey = format!("{}|{}|{}|{}", path.display(), cell, self.pipeline_key(), self.recolor_ident());
-        if self.amiga_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
-            if let Some((img, codes)) = crate::decode::amiga_font::render_glyph_grid(&font, grid_cols, cell) {
+        let gkey = format!(
+            "{}|{}|{}|{}",
+            path.display(),
+            cell,
+            self.pipeline_key(),
+            self.recolor_ident()
+        );
+        if self
+            .amiga_grid_tex
+            .as_ref()
+            .map(|(k, ..)| k != &gkey)
+            .unwrap_or(true)
+        {
+            if let Some((img, codes)) =
+                crate::decode::amiga_font::render_glyph_grid(&font, grid_cols, cell)
+            {
                 let img = self.recolor_sample(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
                     [img.width as usize, img.height as usize],
@@ -13375,49 +14286,58 @@ impl Kaleidotron {
             }
         }
 
-        let preview = self.amiga_sample_tex.as_ref().map(|(_, t)| (t.id(), t.size()));
-        let grid = self.amiga_grid_tex.as_ref().map(|(_, t, ..)| (t.id(), t.size()));
+        let preview = self
+            .amiga_sample_tex
+            .as_ref()
+            .map(|(_, t)| (t.id(), t.size()));
+        let grid = self
+            .amiga_grid_tex
+            .as_ref()
+            .map(|(_, t, ..)| (t.id(), t.size()));
         let bg_on = self.amiga_bg_on;
         let mut cell_edit = self.amiga_cell;
-        egui::ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
-            if let Some((id, [w, h])) = preview {
-                let size = egui::vec2(w as f32 * eff_zoom, h as f32 * eff_zoom * y_stretch);
-                ui.add_space(8.0);
-                ui.vertical_centered(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                    if !bg_on {
-                        let ppp = ui.ctx().pixels_per_point();
-                        self.paint_transparency_backdrop(ui.painter(), rect, ppp);
-                    }
+        egui::ScrollArea::both()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                if let Some((id, [w, h])) = preview {
+                    let size = egui::vec2(w as f32 * eff_zoom, h as f32 * eff_zoom * y_stretch);
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        if !bg_on {
+                            let ppp = ui.ctx().pixels_per_point();
+                            self.paint_transparency_backdrop(ui.painter(), rect, ppp);
+                        }
+                        ui.painter().image(
+                            id,
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    });
+                }
+                // ── Glyph browser, like TDF's "Glyphs (N) · Cell [slider]" ──────
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(format!("Glyphs ({})", font.glyphs.len()));
+                    ui.separator();
+                    ui.label("Cell");
+                    let r = ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
+                    slider_extras(ui, &r, &mut cell_edit, 64, 1.0, 24, 160);
+                });
+                if let Some((id, [w, h])) = grid {
+                    ui.add_space(4.0);
+                    let (rect, _) = ui
+                        .allocate_exact_size(egui::vec2(w as f32, h as f32), egui::Sense::hover());
                     ui.painter().image(
                         id,
                         rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
-                });
-            }
-            // ── Glyph browser, like TDF's "Glyphs (N) · Cell [slider]" ──────
-            ui.add_space(10.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(format!("Glyphs ({})", font.glyphs.len()));
-                ui.separator();
-                ui.label("Cell");
-                let r = ui.add(egui::Slider::new(&mut cell_edit, 24..=160).show_value(false));
-                slider_extras(ui, &r, &mut cell_edit, 64, 1.0, 24, 160);
+                }
             });
-            if let Some((id, [w, h])) = grid {
-                ui.add_space(4.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(w as f32, h as f32), egui::Sense::hover());
-                ui.painter().image(
-                    id,
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-        });
         if cell_edit != self.amiga_cell {
             self.amiga_cell = cell_edit;
             self.amiga_grid_tex = None;
@@ -13432,8 +14352,10 @@ impl Kaleidotron {
         }
         let real = self.resolve_local(path);
         self.amiga_font = std::fs::read(&real).ok().and_then(|bytes| {
-            let is_desc =
-                path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("font"));
+            let is_desc = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("font"));
             if is_desc {
                 // Follow the descriptor to a size file, then parse THAT for the glyph data.
                 let entries = crate::decode::amiga_font::parse_descriptor(&bytes).ok()?;
@@ -13569,12 +14491,32 @@ impl Kaleidotron {
 
     fn export_amiga_png(&mut self, font: &crate::decode::amiga_font::ColorFont, sample: &str) {
         let path = self.amiga_path.clone().unwrap_or_default();
-        let rendered = crate::decode::amiga_font::render_text(font, sample, self.amiga_spacing, self.amiga_line_gap, self.amiga_top_down);
+        let rendered = crate::decode::amiga_font::render_text(
+            font,
+            sample,
+            self.amiga_spacing,
+            self.amiga_line_gap,
+            self.amiga_top_down,
+        );
         let recolored = self.recolor_sample(&path, rendered);
         let img = self.amiga_with_bg(recolored);
-        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        if let Some(dst) = rfd::FileDialog::new().set_file_name(format!("{slug}.png")).add_filter("PNG", &["png"]).save_file() {
-            match image::save_buffer(&dst, &img.rgba_bytes(), img.width, img.height, image::ColorType::Rgba8) {
+        let slug: String = font
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if let Some(dst) = rfd::FileDialog::new()
+            .set_file_name(format!("{slug}.png"))
+            .add_filter("PNG", &["png"])
+            .save_file()
+        {
+            match image::save_buffer(
+                &dst,
+                &img.rgba_bytes(),
+                img.width,
+                img.height,
+                image::ColorType::Rgba8,
+            ) {
                 Ok(()) => self.status = format!("Saved {}", short_name(&dst)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
@@ -13594,8 +14536,14 @@ impl Kaleidotron {
                 return;
             }
         };
-        let slug: String = font.name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        let mut dlg = rfd::FileDialog::new().set_file_name(format!("{slug}.bmp")).add_filter("BMP", &["bmp"]);
+        let slug: String = font
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let mut dlg = rfd::FileDialog::new()
+            .set_file_name(format!("{slug}.bmp"))
+            .add_filter("BMP", &["bmp"]);
         if let Some(home) = std::env::var_os("HOME") {
             let draw = PathBuf::from(home).join("git/DRAW/ASSETS/FONTS/COLOR_BITMAP");
             if draw.is_dir() {
@@ -13604,7 +14552,13 @@ impl Kaleidotron {
         }
         if let Some(dst) = dlg.save_file() {
             // BMP through the image crate so DRAW's `_LOADIMAGE` reads it straight.
-            match image::save_buffer(&dst, &sheet.rgba_bytes(), sheet.width, sheet.height, image::ColorType::Rgba8) {
+            match image::save_buffer(
+                &dst,
+                &sheet.rgba_bytes(),
+                sheet.width,
+                sheet.height,
+                image::ColorType::Rgba8,
+            ) {
                 Ok(()) => self.status = format!("Exported CBF → {}", short_name(&dst)),
                 Err(e) => self.status = format!("Export failed: {e}"),
             }
@@ -13687,7 +14641,9 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             ui.strong(
                 egui::RichText::new(
-                    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 )
                 .heading(),
             );
@@ -13696,22 +14652,27 @@ impl Kaleidotron {
             ui.strong(name.clone());
             if self.fon_faces.len() > 1 {
                 let cur = &self.fon_faces[self.fon_index];
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("fon_face_pick")
-                    .width(200.0)
-                    .selected_text(format!("{} pt · {} px", cur.1, cur.2))
-                    .show_ui(ui, |ui| {
-                        for (i, (_, pts, h)) in self.fon_faces.iter().enumerate() {
-                            if ui
-                                .selectable_label(i == self.fon_index, format!("{pts} pt · {h} px"))
-                                .clicked()
-                            {
-                                self.fon_index = i;
-                                self.fon_sample_tex = None;
-                                self.fon_grid_tex = None;
-                                self.fon_page = 0;
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("fon_face_pick")
+                        .width(200.0)
+                        .selected_text(format!("{} pt · {} px", cur.1, cur.2))
+                        .show_ui(ui, |ui| {
+                            for (i, (_, pts, h)) in self.fon_faces.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        i == self.fon_index,
+                                        format!("{pts} pt · {h} px"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.fon_index = i;
+                                    self.fon_sample_tex = None;
+                                    self.fon_grid_tex = None;
+                                    self.fon_page = 0;
+                                }
                             }
-                        }
-                    }));
+                        }),
+                );
                 if combo_wheel(ui, &cr, &mut self.fon_index, self.fon_faces.len()) {
                     self.fon_sample_tex = None;
                     self.fon_grid_tex = None;
@@ -13786,11 +14747,23 @@ impl Kaleidotron {
         }
         let key = format!(
             "{}|{}|{:.0}|{:?}|{}|{}|rc{}|{}|{}",
-            self.fon_index, sample, self.font_stroke_w, self.font_stroke_color,
-            self.font_stroke_mode.to_u8(), self.font_bg_on, self.font_apply_recolor,
-            self.pipeline_key(), self.recolor_ident()
+            self.fon_index,
+            sample,
+            self.font_stroke_w,
+            self.font_stroke_color,
+            self.font_stroke_mode.to_u8(),
+            self.font_bg_on,
+            self.font_apply_recolor,
+            self.pipeline_key(),
+            self.recolor_ident()
         );
-        if changed || self.fon_sample_tex.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+        if changed
+            || self
+                .fon_sample_tex
+                .as_ref()
+                .map(|(k, _)| k != &key)
+                .unwrap_or(true)
+        {
             if let Some(img) = self.render_fon_sample(&sample) {
                 let img = self.font_recolor(path, img);
                 let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -13803,14 +14776,17 @@ impl Kaleidotron {
                 self.fon_sample_tex = None;
             }
         }
-        egui::ScrollArea::horizontal().id_salt("fon_sample_scroll").max_height(160.0).show(ui, |ui| {
-            if let Some((_, tex)) = &self.fon_sample_tex {
-                let native = tex.size_vec2();
-                let avail = ui.available_width().max(64.0);
-                let scale = (avail / native.x).clamp(1.0, 6.0).floor().max(1.0);
-                ui.add(egui::Image::new((tex.id(), native * scale)));
-            }
-        });
+        egui::ScrollArea::horizontal()
+            .id_salt("fon_sample_scroll")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                if let Some((_, tex)) = &self.fon_sample_tex {
+                    let native = tex.size_vec2();
+                    let avail = ui.available_width().max(64.0);
+                    let scale = (avail / native.x).clamp(1.0, 6.0).floor().max(1.0);
+                    ui.add(egui::Image::new((tex.id(), native * scale)));
+                }
+            });
         ui.separator();
 
         // Glyph grid (paged) with a cell-size slider.
@@ -13822,7 +14798,10 @@ impl Kaleidotron {
         self.fon_page = self.fon_page.min(pages - 1);
         ui.horizontal(|ui| {
             ui.label(format!("Glyphs ({glyphs})"));
-            if ui.add_enabled(self.fon_page > 0, egui::Button::new("◀").small()).clicked() {
+            if ui
+                .add_enabled(self.fon_page > 0, egui::Button::new("◀").small())
+                .clicked()
+            {
                 self.fon_page -= 1;
                 self.fon_grid_tex = None;
             }
@@ -13836,7 +14815,8 @@ impl Kaleidotron {
             }
             ui.separator();
             ui.label("Cell");
-            let r = ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
+            let r =
+                ui.add(egui::Slider::new(&mut self.font_grid_cell, 20.0..=200.0).show_value(false));
             let ch = slider_extras(ui, &r, &mut self.font_grid_cell, 40.0, 1.0, 20.0, 200.0);
             if r.changed() || ch {
                 self.fon_grid_tex = None;
@@ -13844,7 +14824,12 @@ impl Kaleidotron {
         });
         let start = self.fon_page * per_page;
         let gkey = format!("{}|{}|{}", self.fon_index, self.fon_page, cell);
-        if self.fon_grid_tex.as_ref().map(|(k, ..)| k != &gkey).unwrap_or(true) {
+        if self
+            .fon_grid_tex
+            .as_ref()
+            .map(|(k, ..)| k != &gkey)
+            .unwrap_or(true)
+        {
             if let Some((img, _rows, chars)) = crate::decode::fon::render_glyph_grid(
                 &self.fon_bytes,
                 self.fon_index,
@@ -13863,34 +14848,39 @@ impl Kaleidotron {
             }
         }
         if let Some((_, tex, cols, chars)) = self.fon_grid_tex.clone() {
-            egui::ScrollArea::vertical().id_salt("fon_grid_scroll").show(ui, |ui| {
-                let size = tex.size_vec2();
-                let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
-                if let Some(pos) = resp.hover_pos() {
-                    let local = pos - resp.rect.min;
-                    let c = (local.x / cell as f32) as usize;
-                    let r = (local.y / cell as f32) as usize;
-                    let idx = r * cols + c;
-                    if c < cols {
-                        if let Some(&ch) = chars.get(idx) {
-                            let cr = egui::Rect::from_min_size(
-                                resp.rect.min + egui::vec2((c * cell) as f32, (r * cell) as f32),
-                                egui::vec2(cell as f32, cell as f32),
-                            );
-                            ui.painter().rect_stroke(
-                                cr,
-                                2.0,
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
-                                egui::StrokeKind::Inside,
-                            );
-                            resp.clone().on_hover_text(format!("{ch}   U+{:04X}", ch as u32));
-                            if resp.clicked() {
-                                want_copy = Some(ch.to_string());
+            egui::ScrollArea::vertical()
+                .id_salt("fon_grid_scroll")
+                .show(ui, |ui| {
+                    let size = tex.size_vec2();
+                    let resp =
+                        ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+                    if let Some(pos) = resp.hover_pos() {
+                        let local = pos - resp.rect.min;
+                        let c = (local.x / cell as f32) as usize;
+                        let r = (local.y / cell as f32) as usize;
+                        let idx = r * cols + c;
+                        if c < cols {
+                            if let Some(&ch) = chars.get(idx) {
+                                let cr = egui::Rect::from_min_size(
+                                    resp.rect.min
+                                        + egui::vec2((c * cell) as f32, (r * cell) as f32),
+                                    egui::vec2(cell as f32, cell as f32),
+                                );
+                                ui.painter().rect_stroke(
+                                    cr,
+                                    2.0,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 150, 235)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                resp.clone()
+                                    .on_hover_text(format!("{ch}   U+{:04X}", ch as u32));
+                                if resp.clicked() {
+                                    want_copy = Some(ch.to_string());
+                                }
                             }
                         }
                     }
-                }
-            });
+                });
         }
 
         if let Some(s) = want_copy {
@@ -14497,7 +15487,11 @@ impl Kaleidotron {
         self.fps_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
         if self.show_fps {
             let r = ui.min_rect();
-            let src_fps = self.video_player.as_ref().map(|v| v.info.fps).unwrap_or(0.0);
+            let src_fps = self
+                .video_player
+                .as_ref()
+                .map(|v| v.info.fps)
+                .unwrap_or(0.0);
             let other = (self.fps_total_ms - self.fps_upload_ms - self.fps_blit_ms).max(0.0);
             let text = format!(
                 "UI {:.0} · video {:.0}/{:.0} fps · {}×{}\nvideo_ui {:.0}ms (upload {:.0} · blit {:.0} · rest {:.0})",
@@ -14518,8 +15512,7 @@ impl Kaleidotron {
                 egui::FontId::monospace(13.0),
                 egui::Color32::from_rgb(120, 255, 140),
             );
-            let bg = egui::Rect::from_min_size(pos, galley.size())
-                .expand2(egui::vec2(6.0, 4.0));
+            let bg = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(6.0, 4.0));
             painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(190));
             painter.galley(pos, galley, egui::Color32::WHITE);
         }
@@ -14691,7 +15684,8 @@ impl Kaleidotron {
     fn extract_video_audio_for_edit(&mut self) -> Option<PathBuf> {
         let src = self.video_player.as_ref().map(|vp| vp.path.clone())?;
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
-        let dest = std::env::temp_dir().join(format!("kaleidotron_{}.wav", sanitize_filename(stem)));
+        let dest =
+            std::env::temp_dir().join(format!("kaleidotron_{}.wav", sanitize_filename(stem)));
         let speed = self.video_player.as_ref().map(|vp| vp.speed).unwrap_or(1.0);
         if self.extract_video_audio_to(&src, &dest, speed) {
             self.status = format!("Editing audio from {}", short_name(&src));
@@ -14775,7 +15769,10 @@ impl Kaleidotron {
             return;
         };
         // Force an MP4 container so the AAC audio + h264 video are universally playable.
-        if dest.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase())
+        if dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
             != Some("mp4".into())
         {
             dest.set_extension("mp4");
@@ -14792,8 +15789,8 @@ impl Kaleidotron {
             match mode {
                 0 => cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
                 _ => cmd.args([
-                    "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-c:a", "aac",
-                    "-b:a", "192k",
+                    "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-c:a", "aac", "-b:a",
+                    "192k",
                 ]),
             };
             cmd.args(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
@@ -15663,15 +16660,17 @@ impl Kaleidotron {
                             self.pads[i].mono = mono;
                         }
                         let cur = (self.pads[i].loop_type as usize).min(2);
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("pad_loop_type")
-                            .selected_text(LOOP_TYPES[cur])
-                            .show_ui(ui, |ui| {
-                                for (t, name) in LOOP_TYPES.iter().enumerate() {
-                                    if ui.selectable_label(cur == t, *name).clicked() {
-                                        self.pads[i].loop_type = t as u8;
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("pad_loop_type")
+                                .selected_text(LOOP_TYPES[cur])
+                                .show_ui(ui, |ui| {
+                                    for (t, name) in LOOP_TYPES.iter().enumerate() {
+                                        if ui.selectable_label(cur == t, *name).clicked() {
+                                            self.pads[i].loop_type = t as u8;
+                                        }
                                     }
-                                }
-                            }));
+                                }),
+                        );
                         combo_wheel(ui, &cr, &mut self.pads[i].loop_type, LOOP_TYPES.len());
                         ui.separator();
                         ui.weak("Pitch");
@@ -16080,18 +17079,21 @@ impl Kaleidotron {
                     }
                     ui.weak("Type");
                     let cur = (ap_loop_type as usize).min(2);
-                    let cr = eat_scroll(egui::ComboBox::from_id_salt("editor_loop_type")
-                        .selected_text(LOOP_TYPES[cur])
-                        .show_ui(ui, |ui| {
-                            for (t, name) in LOOP_TYPES.iter().enumerate() {
-                                if ui.selectable_label(cur == t, *name).clicked() {
-                                    want_loop_type = Some(t as u8);
+                    let cr = eat_scroll(
+                        egui::ComboBox::from_id_salt("editor_loop_type")
+                            .selected_text(LOOP_TYPES[cur])
+                            .show_ui(ui, |ui| {
+                                for (t, name) in LOOP_TYPES.iter().enumerate() {
+                                    if ui.selectable_label(cur == t, *name).clicked() {
+                                        want_loop_type = Some(t as u8);
+                                    }
                                 }
-                            }
-                        }));
+                            }),
+                    );
                     let step = combo_scroll_step(ui, &cr);
                     if step != 0 {
-                        want_loop_type = Some((cur as isize + step).rem_euclid(LOOP_TYPES.len() as isize) as u8);
+                        want_loop_type =
+                            Some((cur as isize + step).rem_euclid(LOOP_TYPES.len() as isize) as u8);
                     }
                     ui.weak("· forward / reverse / ping-pong while looping");
                 });
@@ -17703,24 +18705,26 @@ impl Kaleidotron {
                     ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "✓");
                 }
                 let label = current.clone().unwrap_or_else(|| "None".to_string());
-                eat_scroll(egui::ComboBox::from_id_salt("midi_in_pick")
-                    .selected_text(elide(&label, 28))
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(current.is_none(), "None").clicked() {
-                            *want_midi = Some(None);
-                        }
-                        for p in &self.midi_ports {
-                            if ui
-                                .selectable_label(current.as_deref() == Some(p.as_str()), p)
-                                .clicked()
-                            {
-                                *want_midi = Some(Some(p.clone()));
+                eat_scroll(
+                    egui::ComboBox::from_id_salt("midi_in_pick")
+                        .selected_text(elide(&label, 28))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(current.is_none(), "None").clicked() {
+                                *want_midi = Some(None);
                             }
-                        }
-                        if self.midi_ports.is_empty() {
-                            ui.weak("(no controllers found)");
-                        }
-                    }));
+                            for p in &self.midi_ports {
+                                if ui
+                                    .selectable_label(current.as_deref() == Some(p.as_str()), p)
+                                    .clicked()
+                                {
+                                    *want_midi = Some(Some(p.clone()));
+                                }
+                            }
+                            if self.midi_ports.is_empty() {
+                                ui.weak("(no controllers found)");
+                            }
+                        }),
+                );
                 if ui
                     .small_button(icons::REFRESH)
                     .on_hover_text("Re-scan MIDI devices")
@@ -18562,8 +19566,10 @@ impl Kaleidotron {
         }
         if let Some((i, drop)) = want_drop {
             // A sample load drills into the pad afterwards (below); a pad move/swap/clone doesn't.
-            let sample_load =
-                matches!(drop, PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection(..));
+            let sample_load = matches!(
+                drop,
+                PadDrop::File(_) | PadDrop::Tracker(_) | PadDrop::Selection(..)
+            );
             match drop {
                 PadDrop::File(p) => self.load_pad_from_file(i, &p),
                 PadDrop::Tracker(idx) => self.load_pad_from_tracker(i, idx),
@@ -19321,7 +20327,9 @@ impl Kaleidotron {
                 r.label.clone(),
                 r.running,
                 r.ok,
-                r.finished.unwrap_or_else(|| self.egui_ctx.input(|i| i.time)) - r.started,
+                r.finished
+                    .unwrap_or_else(|| self.egui_ctx.input(|i| i.time))
+                    - r.started,
             ),
             None => (String::new(), false, None, 0.0),
         };
@@ -19336,7 +20344,9 @@ impl Kaleidotron {
                     ui.label(egui::RichText::new("running").weak());
                 }
                 (false, Some(true)) => {
-                    ui.label(egui::RichText::new("ok").color(egui::Color32::from_rgb(0x5c, 0xb8, 0x5c)));
+                    ui.label(
+                        egui::RichText::new("ok").color(egui::Color32::from_rgb(0x5c, 0xb8, 0x5c)),
+                    );
                 }
                 (false, Some(false)) => {
                     ui.label(egui::RichText::new("failed").color(ui.visuals().error_fg_color));
@@ -19347,7 +20357,11 @@ impl Kaleidotron {
                 ui.label(egui::RichText::new(format!("{elapsed:.1}s")).weak());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("\u{d7}").on_hover_text("Hide the output panel").clicked() {
+                if ui
+                    .small_button("\u{d7}")
+                    .on_hover_text("Hide the output panel")
+                    .clicked()
+                {
                     self.show_tasks_panel = false;
                 }
                 if ui.small_button("Clear").clicked() {
@@ -19411,7 +20425,12 @@ impl Kaleidotron {
             .as_ref()
             .map(|(p, _)| p.clone())
             .or_else(|| self.text_doc.as_ref().map(|(p, _)| p.clone()))
-            .or_else(|| self.entries.iter().find(|e| self.selection.contains(&e.path)).map(|e| e.path.clone()))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find(|e| self.selection.contains(&e.path))
+                    .map(|e| e.path.clone())
+            })
             .or_else(|| self.folder.clone())
             .unwrap_or_default()
     }
@@ -19444,14 +20463,24 @@ impl Kaleidotron {
             let group: Vec<&crate::tasks::Task> = self
                 .tasks
                 .iter()
-                .filter(|t| if want.is_empty() { t.group != "build" && t.group != "test" } else { t.group == want })
+                .filter(|t| {
+                    if want.is_empty() {
+                        t.group != "build" && t.group != "test"
+                    } else {
+                        t.group == want
+                    }
+                })
                 .collect();
             if group.is_empty() {
                 continue;
             }
             ui.label(egui::RichText::new(title).weak().small());
             for t in group {
-                let name = if t.is_default { format!("{}  \u{2605}", t.label) } else { t.label.clone() };
+                let name = if t.is_default {
+                    format!("{}  \u{2605}", t.label)
+                } else {
+                    t.label.clone()
+                };
                 let mut b = ui.button(name);
                 if !t.detail.is_empty() {
                     b = b.on_hover_text(&t.detail);
@@ -19517,7 +20546,9 @@ impl Kaleidotron {
     fn task_vars(&self, file: &Path) -> crate::tasks::Vars {
         crate::tasks::Vars {
             workspace: self.task_ws.clone().unwrap_or_else(|| {
-                file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+                file.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
             }),
             file: self.resolve_local(file),
             env: self.task_env.clone(),
@@ -19549,8 +20580,10 @@ impl Kaleidotron {
         }
         let chain = crate::tasks::plan(&self.tasks, label);
         let vars = self.task_vars(file);
-        let execs: Vec<crate::tasks::Exec> =
-            chain.iter().map(|t| crate::tasks::exec_for(t, &vars)).collect();
+        let execs: Vec<crate::tasks::Exec> = chain
+            .iter()
+            .map(|t| crate::tasks::exec_for(t, &vars))
+            .collect();
         let labels: Vec<String> = chain.iter().map(|t| t.label.clone()).collect();
         let (tx, rx) = std::sync::mpsc::channel::<TaskMsg>();
         self.task_rx = Some(rx);
@@ -19619,7 +20652,9 @@ impl Kaleidotron {
                 TaskMsg::End(code) => match code {
                     Some(0) => run.lines.push("· ok".into()),
                     Some(c) => run.lines.push(format!("· exit {c}")),
-                    None => run.lines.push("· could not start (is the program on PATH?)".into()),
+                    None => run
+                        .lines
+                        .push("· could not start (is the program on PATH?)".into()),
                 },
                 TaskMsg::Done(ok) => {
                     run.running = false;
@@ -19644,7 +20679,8 @@ impl Kaleidotron {
 
     /// Cancel the running task: kill the live child, then flag the chain so no later step starts.
     fn stop_task(&mut self) {
-        self.task_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.task_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut slot) = self.task_child.lock() {
             if let Some(child) = slot.as_mut() {
                 let _ = child.kill();
@@ -20149,8 +21185,14 @@ impl Kaleidotron {
         // Which viewer? An explicit "View as text" / "Preview as image" pick wins; otherwise a
         // source file defaults to the text editor as before.
         let want = self.force_open.take();
-        let is_code = crate::decode::CODE_EXTS
-            .contains(&path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase().as_str());
+        let is_code = crate::decode::CODE_EXTS.contains(
+            &path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+        );
         if is_code
             && self.plugin_code
             && want != Some(OpenAs::Image)
@@ -20158,7 +21200,9 @@ impl Kaleidotron {
         {
             let real = self.resolve_local(&path);
             const MAX_TEXT: u64 = 4 * 1024 * 1024;
-            let small = std::fs::metadata(&real).map(|m| m.len() <= MAX_TEXT).unwrap_or(false);
+            let small = std::fs::metadata(&real)
+                .map(|m| m.len() <= MAX_TEXT)
+                .unwrap_or(false);
             if small {
                 // Bytes, not `read_to_string`. A QB64 `.bas` with a box-drawing comment banner is
                 // CP437, not UTF-8, so `read_to_string` fails on exactly the files this program is
@@ -20171,7 +21215,11 @@ impl Kaleidotron {
                     // Normalise to LF so every offset (galley, cursor, find) refers to the same
                     // thing; `text_crlf` restores the file's own endings on save.
                     self.text_crlf = raw.contains("\r\n");
-                    let body = if self.text_crlf { raw.replace("\r\n", "\n") } else { raw };
+                    let body = if self.text_crlf {
+                        raw.replace("\r\n", "\n")
+                    } else {
+                        raw
+                    };
                     self.text_orig = body.clone();
                     self.text_doc = Some((path.clone(), body));
                     self.text_follow_len = std::fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
@@ -20295,7 +21343,11 @@ impl Kaleidotron {
             if let Ok(bytes) = std::fs::read(&src) {
                 let entries = crate::decode::ico::entries(&bytes);
                 if entries.len() > 1 {
-                    self.ico_view = Some(IcoView { path: path.clone(), entries, index: 0 });
+                    self.ico_view = Some(IcoView {
+                        path: path.clone(),
+                        entries,
+                        index: 0,
+                    });
                     self.render_ico_to_full(ctx);
                     return;
                 }
@@ -20564,7 +21616,8 @@ impl Kaleidotron {
         let size = [img.width as usize, img.height as usize];
         let rgba = img.rgba_bytes();
         // NEAREST — icons are pixel art; keep them crisp when zoomed.
-        let tex = TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
+        let tex =
+            TiledTexture::from_rgba(ctx, &path.to_string_lossy(), size, &rgba, view_tex_opts());
         self.full_src = Some((path.clone(), size, rgba));
         self.full_tex = Some((path, tex));
         self.full_reduced = None;
@@ -20643,11 +21696,13 @@ impl Kaleidotron {
             // A Lospec gallery piece not yet fetched → resolve its full image + view it.
             self.selected = idx;
             self.start_gallery_open(entry.path);
-        } else if self.da_devs.contains_key(&entry.path) && !self.da_files.contains_key(&entry.path) {
+        } else if self.da_devs.contains_key(&entry.path) && !self.da_files.contains_key(&entry.path)
+        {
             // A DeviantArt deviation not yet fetched → download its full-view image + view it.
             self.selected = idx;
             self.start_da_open(entry.path);
-        } else if self.ph_assets.contains_key(&entry.path) && !self.ph_files.contains_key(&entry.path)
+        } else if self.ph_assets.contains_key(&entry.path)
+            && !self.ph_files.contains_key(&entry.path)
         {
             // A Poly Haven asset not yet downloaded → fetch it (a model pulls its whole bundle),
             // then open — a model lands in the 3D viewer, a texture/HDRI in the image viewer.
@@ -20673,7 +21728,8 @@ impl Kaleidotron {
             // A remote file → download it, then open with the normal decoder path.
             self.selected = idx;
             self.start_web_open(entry.path);
-        } else if self.gf_fonts.contains_key(&entry.path) && !self.gf_files.contains_key(&entry.path)
+        } else if self.gf_fonts.contains_key(&entry.path)
+            && !self.gf_files.contains_key(&entry.path)
         {
             // A Google Fonts family not yet downloaded → fetch the .ttf, then open the font viewer.
             self.selected = idx;
@@ -21356,13 +22412,15 @@ impl Kaleidotron {
             } else {
                 SortKey::COMMON.to_vec()
             };
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("sort_key")
-                .selected_text(key.label())
-                .show_ui(ui, |ui| {
-                    for k in &keys {
-                        ui.selectable_value(&mut key, *k, k.label());
-                    }
-                }));
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("sort_key")
+                    .selected_text(key.label())
+                    .show_ui(ui, |ui| {
+                        for k in &keys {
+                            ui.selectable_value(&mut key, *k, k.label());
+                        }
+                    }),
+            );
             // Wheel-cycle within the offered keys; a key not in the list maps to its
             // position if present, else stays put.
             let mut ki = keys.iter().position(|&k| k == key).unwrap_or(0);
@@ -21384,18 +22442,20 @@ impl Kaleidotron {
             ui.checkbox(&mut dirs_first, "Dirs first");
             ui.separator();
             ui.label("Rating");
-            let cr = eat_scroll(egui::ComboBox::from_id_salt("min_rating")
-                .selected_text(if min_rating == 0 {
-                    "All".to_string()
-                } else {
-                    format!("≥ {min_rating}★")
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut min_rating, 0, "All");
-                    for r in 1..=5u8 {
-                        ui.selectable_value(&mut min_rating, r, format!("≥ {r}★"));
-                    }
-                }));
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("min_rating")
+                    .selected_text(if min_rating == 0 {
+                        "All".to_string()
+                    } else {
+                        format!("≥ {min_rating}★")
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut min_rating, 0, "All");
+                        for r in 1..=5u8 {
+                            ui.selectable_value(&mut min_rating, r, format!("≥ {r}★"));
+                        }
+                    }),
+            );
             let mut ri = min_rating as usize;
             if wheel_cycle(ui, &cr, &mut ri, 6) {
                 min_rating = ri as u8;
@@ -21639,19 +22699,18 @@ impl Kaleidotron {
     ) -> PipeAux<'a> {
         // Bit-font (ATASCII / Apple ][) spec — only used when the mode is one of them; a cheap
         // empty default otherwise so the pass is a no-op.
-        let (bf_font, bf_pool, bf_invert): (&'static [[u8; 8]], Vec<u16>, bool) =
-            if matches!(
-                self.dither_method,
-                crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
-            ) {
-                self.bitfont_spec()
-            } else if self.dither_method == crate::thumb::DITHER_REXFONT {
-                // REXPaint font reuses the bitfont slots: bitfont_pool = the enabled-glyph pool,
-                // bitfont_invert = its inverse toggle.
-                (&[], self.rexfont_pool(), self.rexfont_invert)
-            } else {
-                (&[], Vec::new(), false)
-            };
+        let (bf_font, bf_pool, bf_invert): (&'static [[u8; 8]], Vec<u16>, bool) = if matches!(
+            self.dither_method,
+            crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
+        ) {
+            self.bitfont_spec()
+        } else if self.dither_method == crate::thumb::DITHER_REXFONT {
+            // REXPaint font reuses the bitfont slots: bitfont_pool = the enabled-glyph pool,
+            // bitfont_invert = its inverse toggle.
+            (&[], self.rexfont_pool(), self.rexfont_invert)
+        } else {
+            (&[], Vec::new(), false)
+        };
         PipeAux {
             dither_method: self.dither_method,
             dither_amount: self.dither_amount,
@@ -21880,7 +22939,10 @@ impl Kaleidotron {
         // over the resize slider, and may UP-scale (aspect is intentionally not kept).
         if self.shade_fit_chars && self.is_ansi_grid_mode() {
             let (cw, ch) = self.textmode_cell_dims();
-            return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
+            return (
+                self.shade_fit_cols.max(1) * cw,
+                self.shade_fit_rows.max(1) * ch,
+            );
         }
         if !self.resize_on {
             return (w, h);
@@ -21897,7 +22959,10 @@ impl Kaleidotron {
     fn ansi_work_target(&self, w: usize, h: usize) -> (usize, usize) {
         if self.shade_fit_chars && self.is_ansi_grid_mode() {
             let (cw, ch) = self.textmode_cell_dims();
-            return (self.shade_fit_cols.max(1) * cw, self.shade_fit_rows.max(1) * ch);
+            return (
+                self.shade_fit_cols.max(1) * cw,
+                self.shade_fit_rows.max(1) * ch,
+            );
         }
         (w, h)
     }
@@ -21906,7 +22971,12 @@ impl Kaleidotron {
     /// (possibly enlarged) `(w, h, rgba)`. A no-op when the scaler is `None`. Runs
     /// *before* the recolor pipeline, so the whole stack (adjustments / dither /
     /// palette / post-FX) + Save operate on the enlarged art.
-    fn scale_source(&self, mut w: usize, mut h: usize, mut rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+    fn scale_source(
+        &self,
+        mut w: usize,
+        mut h: usize,
+        mut rgba: Vec<u8>,
+    ) -> (usize, usize, Vec<u8>) {
         // Bypass skips the geometry ops (JPEG clean + upscale) too — show the original.
         if self.recolor_bypass {
             return (w, h, rgba);
@@ -22516,7 +23586,10 @@ impl Kaleidotron {
         }
         if self.quantize_on {
             let reduced = self.reduce_palette(path)?;
-            return Some((format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8), reduced));
+            return Some((
+                format!("reduce:{}:{}", self.quantize_n, self.quantize_keep_bw as u8),
+                reduced,
+            ));
         }
         None
     }
@@ -22584,7 +23657,11 @@ impl Kaleidotron {
             // n-2, then append the extremes) so tiles get black+white without overwriting a
             // real cluster.
             let n = self.quantize_n.clamp(2, 256);
-            let median_n = if self.quantize_keep_bw { n.saturating_sub(2) } else { n };
+            let median_n = if self.quantize_keep_bw {
+                n.saturating_sub(2)
+            } else {
+                n
+            };
             let mut pal = if median_n == 0 {
                 Vec::new()
             } else {
@@ -22646,10 +23723,14 @@ impl Kaleidotron {
     /// same ergonomics as the video player's ⬇ PNG). Exports the **recoloured** pixels when the
     /// Recolor option is on, so what you save matches what you see.
     fn export_gif_frame(&mut self, idx: usize) {
-        let Some(anim) = self.anim.as_ref() else { return };
+        let Some(anim) = self.anim.as_ref() else {
+            return;
+        };
         let (w, h) = (anim.size[0], anim.size[1]);
         let src = anim.path.clone();
-        let Some(mut rgba) = anim.raw.get(idx).cloned() else { return };
+        let Some(mut rgba) = anim.raw.get(idx).cloned() else {
+            return;
+        };
         let (mut w, mut h) = (w, h);
         if self.gif_recolor && self.pipeline_active() {
             let palette = self.tile_palette(&src);
@@ -22667,7 +23748,11 @@ impl Kaleidotron {
         // Auto-name beside the GIF, never overwriting an existing export.
         let dir = self.resolve_local(&src);
         let dir = dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("frame").to_string();
+        let stem = src
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("frame")
+            .to_string();
         let mut out = dir.join(format!("{stem}_frame{}.png", idx + 1));
         let mut n = 2;
         while out.exists() {
@@ -22915,7 +24000,9 @@ impl Kaleidotron {
         crate::image_types::PixImage::from_rgba(
             w as u32,
             h as u32,
-            rgba.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+            rgba.chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect(),
         )
     }
 
@@ -23303,10 +24390,8 @@ impl Kaleidotron {
         if self.unicode_disabled.is_empty() {
             return Vec::new();
         }
-        let rf = crate::decode::uniart::ramp(
-            self.unicode_effective_ranges(),
-            &self.unicode_extra_cps(),
-        );
+        let rf =
+            crate::decode::uniart::ramp(self.unicode_effective_ranges(), &self.unicode_extra_cps());
         let (_, chars) = rf.as_ref();
         chars
             .iter()
@@ -23399,8 +24484,16 @@ impl Kaleidotron {
         let default = vec![true; 256];
         let mut open = self.petscii_picker;
         glyph_picker_window(
-            ctx, "PETSCII glyphs", "petscii_atlas", &font, 256, &mut self.petscii_mask, &default,
-            &mut open, &mut self.glyph_drag, None,
+            ctx,
+            "PETSCII glyphs",
+            "petscii_atlas",
+            &font,
+            256,
+            &mut self.petscii_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            None,
         );
         self.petscii_picker = open;
     }
@@ -23415,8 +24508,16 @@ impl Kaleidotron {
         let default = vec![true; n];
         let mut open = self.atascii_picker;
         glyph_picker_window(
-            ctx, "ATASCII glyphs", "atascii_atlas", &font, n, &mut self.atascii_mask, &default,
-            &mut open, &mut self.glyph_drag, None,
+            ctx,
+            "ATASCII glyphs",
+            "atascii_atlas",
+            &font,
+            n,
+            &mut self.atascii_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            None,
         );
         self.atascii_picker = open;
     }
@@ -23438,8 +24539,16 @@ impl Kaleidotron {
         let default: Vec<bool> = (0..n).map(|i| i < base || self.apple_mousetext).collect();
         let mut open = self.apple_picker;
         glyph_picker_window(
-            ctx, "Apple ][ glyphs", "apple_atlas", &font, n, &mut self.apple_mask, &default,
-            &mut open, &mut self.glyph_drag, None,
+            ctx,
+            "Apple ][ glyphs",
+            "apple_atlas",
+            &font,
+            n,
+            &mut self.apple_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            None,
         );
         self.apple_picker = open;
     }
@@ -23457,7 +24566,9 @@ impl Kaleidotron {
         let font: &crate::decode::rexfont::GlyphFont = match &resolved {
             Some(f) => f,
             None => {
-                fallback = crate::decode::rexfont::GlyphFont::from_8x16(&crate::decode::cp437_font::CP437_8X16);
+                fallback = crate::decode::rexfont::GlyphFont::from_8x16(
+                    &crate::decode::cp437_font::CP437_8X16,
+                );
                 &fallback
             }
         };
@@ -23465,8 +24576,16 @@ impl Kaleidotron {
         let default = vec![true; n];
         let mut open = self.ascii_picker;
         glyph_picker_window(
-            ctx, "ASCII glyphs", "ascii_atlas", font, n, &mut self.ascii_mask, &default,
-            &mut open, &mut self.glyph_drag, None,
+            ctx,
+            "ASCII glyphs",
+            "ascii_atlas",
+            font,
+            n,
+            &mut self.ascii_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            None,
         );
         self.ascii_picker = open;
     }
@@ -23480,10 +24599,8 @@ impl Kaleidotron {
         {
             return;
         }
-        let rf = crate::decode::uniart::ramp(
-            self.unicode_effective_ranges(),
-            &self.unicode_extra_cps(),
-        );
+        let rf =
+            crate::decode::uniart::ramp(self.unicode_effective_ranges(), &self.unicode_extra_cps());
         let (font, chars) = rf.as_ref();
         let n = font.glyphs.len();
         // Build the index mask for the current glyph set from the disabled-codepoint list.
@@ -23495,11 +24612,22 @@ impl Kaleidotron {
         let mut open = self.unicode_picker;
         // Hover tooltip: the glyph's char + U+codepoint.
         let label = |i: usize| -> String {
-            chars.get(i).map(|&c| format!("{c}  U+{:04X}", c as u32)).unwrap_or_default()
+            chars
+                .get(i)
+                .map(|&c| format!("{c}  U+{:04X}", c as u32))
+                .unwrap_or_default()
         };
         glyph_picker_window(
-            ctx, "Unicode glyphs", "unicode_atlas", font, n, &mut mask, &default, &mut open,
-            &mut self.glyph_drag, Some(&label),
+            ctx,
+            "Unicode glyphs",
+            "unicode_atlas",
+            font,
+            n,
+            &mut mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            Some(&label),
         );
         self.unicode_picker = open;
         // Sync the disabled-codepoint set back from the (possibly edited) mask.
@@ -23535,8 +24663,16 @@ impl Kaleidotron {
         };
         let mut open = self.ansi_picker;
         glyph_picker_window(
-            ctx, "ANSI Shade glyphs (block set)", "ansi_atlas", &font, 256, &mut self.ansi_mask,
-            &default, &mut open, &mut self.glyph_drag, None,
+            ctx,
+            "ANSI Shade glyphs (block set)",
+            "ansi_atlas",
+            &font,
+            256,
+            &mut self.ansi_mask,
+            &default,
+            &mut open,
+            &mut self.glyph_drag,
+            None,
         );
         self.ansi_picker = open;
     }
@@ -23580,14 +24716,19 @@ impl Kaleidotron {
         match &self.ascii_font {
             AsciiFont::Cp437 => "CP437 (built-in)".into(),
             AsciiFont::Rex(i) => crate::decode::rexfont::rexfont_name(*i).to_string(),
-            AsciiFont::File(p) => {
-                p.file_name().and_then(|s| s.to_str()).unwrap_or("(font)").to_string()
-            }
+            AsciiFont::File(p) => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("(font)")
+                .to_string(),
         }
     }
 
     /// Read + cache a user TTF/OTF as a CP437-ordered [`GlyphFont`] for the ASCII converter.
-    fn ascii_font_load(&mut self, path: &Path) -> Option<std::sync::Arc<crate::decode::rexfont::GlyphFont>> {
+    fn ascii_font_load(
+        &mut self,
+        path: &Path,
+    ) -> Option<std::sync::Arc<crate::decode::rexfont::GlyphFont>> {
         if let Some((p, f)) = &self.ascii_font_file {
             if p == path {
                 return Some(f.clone());
@@ -23606,13 +24747,22 @@ impl Kaleidotron {
     fn refresh_ascii_font(&mut self) {
         use crate::decode::rexfont::GlyphFont;
         let key = path_hash(Path::new(&self.ascii_font_tag()));
-        if self.ascii_font_cache.as_ref().is_some_and(|(k, _, _)| *k == key) {
+        if self
+            .ascii_font_cache
+            .as_ref()
+            .is_some_and(|(k, _, _)| *k == key)
+        {
             return;
         }
         let vga50 = self.shade_vga50;
-        let cp437 =
-            || (std::sync::Arc::new(crate::thumb::cp437_glyphfont(vga50).clone()), Some(vga50));
-        let (font, mode): (std::sync::Arc<GlyphFont>, Option<bool>) = match self.ascii_font.clone() {
+        let cp437 = || {
+            (
+                std::sync::Arc::new(crate::thumb::cp437_glyphfont(vga50).clone()),
+                Some(vga50),
+            )
+        };
+        let (font, mode): (std::sync::Arc<GlyphFont>, Option<bool>) = match self.ascii_font.clone()
+        {
             AsciiFont::Cp437 => cp437(),
             AsciiFont::Rex(i) => match crate::decode::rexfont::rexfont(i) {
                 Some(f) => (std::sync::Arc::new(f.clone()), None),
@@ -23627,8 +24777,15 @@ impl Kaleidotron {
     }
 
     /// The resolved ASCII render font + renderer flag for the pipeline (see [`Self::refresh_ascii_font`]).
-    fn ascii_render_font(&self) -> Option<(std::sync::Arc<crate::decode::rexfont::GlyphFont>, Option<bool>)> {
-        self.ascii_font_cache.as_ref().map(|(_, f, m)| (f.clone(), *m))
+    fn ascii_render_font(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::decode::rexfont::GlyphFont>,
+        Option<bool>,
+    )> {
+        self.ascii_font_cache
+            .as_ref()
+            .map(|(_, f, m)| (f.clone(), *m))
     }
 
     /// Point the quantize palette selection at the bundled `.GPL` matching the current PETSCII
@@ -23637,8 +24794,8 @@ impl Kaleidotron {
     /// gated on a palette being active — and (b) keeps the Colors swatches showing the same C64
     /// set. Called when switching TO PETSCII and whenever the PETSCII palette dropdown changes.
     fn petscii_sync_selected_palette(&mut self) {
-        let stem = crate::decode::PETSCII_PALETTES[(self.petscii_palette as usize)
-            .min(crate::decode::PETSCII_PALETTES.len() - 1)]
+        let stem = crate::decode::PETSCII_PALETTES
+            [(self.petscii_palette as usize).min(crate::decode::PETSCII_PALETTES.len() - 1)]
         .0;
         // "colodore" ships as COLODORE (16).GPL; the others as UPPERCASE (16).GPL.
         let file = format!("{} (16).GPL", stem.to_uppercase());
@@ -23715,20 +24872,44 @@ impl Kaleidotron {
         // ASCII and ANSI Shade both produce an AnsiGrid (so they share this build + the whole
         // render/export path); they differ only in the cell→glyph decision.
         let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
-            let font = self
-                .ascii_render_font()
-                .map(|(f, _)| f)
-                .unwrap_or_else(|| std::sync::Arc::new(crate::thumb::cp437_glyphfont(font_8x8).clone()));
+            let font = self.ascii_render_font().map(|(f, _)| f).unwrap_or_else(|| {
+                std::sync::Arc::new(crate::thumb::cp437_glyphfont(font_8x8).clone())
+            });
             crate::thumb::ascii_grid(
-                &work, tw, th, palette, cw, ch_, &self.ascii_charset(), self.ascii_color,
-                self.ascii_invert, &font, self.textmode_mono(),
+                &work,
+                tw,
+                th,
+                palette,
+                cw,
+                ch_,
+                &self.ascii_charset(),
+                self.ascii_color,
+                self.ascii_invert,
+                &font,
+                self.textmode_mono(),
             )
         } else {
             crate::thumb::ansi_shade_grid(
-                &work, tw, th, palette, cw, ch_, self.shade_f1, self.shade_f2, self.shade_f3,
-                self.shade_half, self.shade_f1_on, self.shade_f2_on, self.shade_f3_on,
-                self.shade_half_on, self.shade_half_use, self.shade_amount, self.shade_ice,
-                self.shade_smooth, self.shade_detail, self.ansi_allowed(),
+                &work,
+                tw,
+                th,
+                palette,
+                cw,
+                ch_,
+                self.shade_f1,
+                self.shade_f2,
+                self.shade_f3,
+                self.shade_half,
+                self.shade_f1_on,
+                self.shade_f2_on,
+                self.shade_f3_on,
+                self.shade_half_on,
+                self.shade_half_use,
+                self.shade_amount,
+                self.shade_ice,
+                self.shade_smooth,
+                self.shade_detail,
+                self.ansi_allowed(),
             )
         };
         let mut grid = grid;
@@ -23765,7 +24946,8 @@ impl Kaleidotron {
         let (cw, ch, rgba) = apply_crop_rgba(self.crop_of(path), size[0], size[1], &rgba);
         // Bypass: show the (cropped) ORIGINAL — skip every recolor branch below.
         if self.recolor_bypass {
-            let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [cw, ch], &rgba, view_tex_opts());
+            let tt =
+                TiledTexture::from_rgba(ctx, "pv_full_reduced", [cw, ch], &rgba, view_tex_opts());
             self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
             return Some(tt);
         }
@@ -23776,7 +24958,8 @@ impl Kaleidotron {
         if self.dither_method == crate::thumb::DITHER_PETSCII {
             let grid = self.build_petscii_grid(w, h, &rgba);
             let (pw, ph, px) = crate::thumb::petscii_render(&grid, &self.petscii_pal16);
-            let tt = TiledTexture::from_rgba(ctx, "pv_full_reduced", [pw, ph], &px, view_tex_opts());
+            let tt =
+                TiledTexture::from_rgba(ctx, "pv_full_reduced", [pw, ph], &px, view_tex_opts());
             self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
             return Some(tt);
         }
@@ -23810,8 +24993,13 @@ impl Kaleidotron {
                 // to do — a giant blocky mess). The character ruler reads this texture's
                 // size, so it also reports the real cols×rows.
                 let (disp, disp_size) = (work, [tw, th]);
-                let tt =
-                    TiledTexture::from_rgba(ctx, "pv_full_reduced", disp_size, &disp, view_tex_opts());
+                let tt = TiledTexture::from_rgba(
+                    ctx,
+                    "pv_full_reduced",
+                    disp_size,
+                    &disp,
+                    view_tex_opts(),
+                );
                 self.full_reduced = Some((path.to_path_buf(), key.to_string(), tt.clone()));
                 return Some(tt);
             }
@@ -23984,7 +25172,8 @@ impl Kaleidotron {
             self.handle_crop_view_input(ui, path, &resp, fit);
             let view = self.crop_view_rect();
             // Paint the (zoomed/panned) window of the image — the view rect is the UV.
-            ui.painter().image(tex.id(), fit, view, egui::Color32::WHITE);
+            ui.painter()
+                .image(tex.id(), fit, view, egui::Color32::WHITE);
             self.draw_crop_box(ui, path, fit, view, &resp, bw.max(1.0) / bh.max(1.0));
         } else {
             ui.painter().image(
@@ -24082,7 +25271,13 @@ impl Kaleidotron {
     /// (cursor-centred, scroll consumed so the panel doesn't also scroll) and shrinks the crop
     /// to fit the zoomed view; middle-drag pans (moving the crop with it); a middle-click with
     /// no drag resets zoom + pan.
-    fn handle_crop_view_input(&mut self, ui: &egui::Ui, path: &Path, resp: &egui::Response, fit: egui::Rect) {
+    fn handle_crop_view_input(
+        &mut self,
+        ui: &egui::Ui,
+        path: &Path,
+        resp: &egui::Response,
+        fit: egui::Rect,
+    ) {
         // Wheel zoom (only while hovering the image).
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -24160,9 +25355,12 @@ impl Kaleidotron {
                 view.min.y + (p.y - fit.min.y) / fit.height().max(1.0) * view.height(),
             )
         };
-        let bx = egui::Rect::from_min_max(to_screen(c[0], c[1]), to_screen(c[0] + c[2], c[1] + c[3]));
+        let bx =
+            egui::Rect::from_min_max(to_screen(c[0], c[1]), to_screen(c[0] + c[2], c[1] + c[3]));
         // Which handle is under the pointer (for hover light-up + cursor); the dragged one wins.
-        let hover_pos = resp.hover_pos().or_else(|| ui.input(|i| i.pointer.interact_pos()));
+        let hover_pos = resp
+            .hover_pos()
+            .or_else(|| ui.input(|i| i.pointer.interact_pos()));
         let active_handle = self
             .crop_drag
             .or_else(|| hover_pos.map(|p| pick_crop_handle(p, bx, fit)));
@@ -24181,17 +25379,45 @@ impl Kaleidotron {
             let r = |a: egui::Pos2, b: egui::Pos2| egui::Rect::from_min_max(a.min(b), a.max(b));
             painter.rect_filled(r(fit.min, egui::pos2(fit.max.x, bx.min.y)), 0.0, dim);
             painter.rect_filled(r(egui::pos2(fit.min.x, bx.max.y), fit.max), 0.0, dim);
-            painter.rect_filled(r(egui::pos2(fit.min.x, bx.min.y), egui::pos2(bx.min.x, bx.max.y)), 0.0, dim);
-            painter.rect_filled(r(egui::pos2(bx.max.x, bx.min.y), egui::pos2(fit.max.x, bx.max.y)), 0.0, dim);
-            draw_crop_guide(&painter, bx, guide_kind, egui::Stroke::new(0.7, ui.visuals().weak_text_color()));
-            painter.rect_stroke(bx, 0.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+            painter.rect_filled(
+                r(
+                    egui::pos2(fit.min.x, bx.min.y),
+                    egui::pos2(bx.min.x, bx.max.y),
+                ),
+                0.0,
+                dim,
+            );
+            painter.rect_filled(
+                r(
+                    egui::pos2(bx.max.x, bx.min.y),
+                    egui::pos2(fit.max.x, bx.max.y),
+                ),
+                0.0,
+                dim,
+            );
+            draw_crop_guide(
+                &painter,
+                bx,
+                guide_kind,
+                egui::Stroke::new(0.7, ui.visuals().weak_text_color()),
+            );
+            painter.rect_stroke(
+                bx,
+                0.0,
+                egui::Stroke::new(1.5, accent),
+                egui::StrokeKind::Inside,
+            );
             for (p, idx) in crop_handle_points(bx) {
                 let on = active_handle == Some(idx);
                 // Corners are drawn a touch larger than edge handles; the active one grows more.
                 let base = if idx < 4 { 13.0 } else { 11.0 };
                 let sz = if on { base + 4.0 } else { base };
                 let col = if on { hot } else { accent };
-                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(sz, sz)), 2.0, col);
+                painter.rect_filled(
+                    egui::Rect::from_center_size(p, egui::vec2(sz, sz)),
+                    2.0,
+                    col,
+                );
                 painter.rect_stroke(
                     egui::Rect::from_center_size(p, egui::vec2(sz, sz)),
                     2.0,
@@ -24281,7 +25507,10 @@ impl Kaleidotron {
         ui.horizontal(|ui| {
             ui.label("Crop");
             if ui
-                .add_enabled(cropped || self.crop_ratio.is_some(), egui::Button::new("Reset"))
+                .add_enabled(
+                    cropped || self.crop_ratio.is_some(),
+                    egui::Button::new("Reset"),
+                )
                 .on_hover_text("Clear the crop (full frame) and unlock the ratio")
                 .clicked()
             {
@@ -24320,7 +25549,10 @@ impl Kaleidotron {
         // stays on-screen and the zoom directly frames the crop); middle-drag pans it.
         if self.crop_zoom > 1.001 {
             ui.horizontal(|ui| {
-                ui.weak(format!("Zoom {:.1}× — crop follows the view", self.crop_zoom));
+                ui.weak(format!(
+                    "Zoom {:.1}× — crop follows the view",
+                    self.crop_zoom
+                ));
                 if ui.small_button("reset zoom").clicked() {
                     self.crop_zoom = 1.0;
                     self.crop_center = egui::vec2(0.5, 0.5);
@@ -24330,8 +25562,14 @@ impl Kaleidotron {
         // Composition overlay picker.
         ui.horizontal(|ui| {
             ui.label("Guide");
-            for (i, lbl) in ["Thirds", "Golden", "Grid", "Spiral", "None"].iter().enumerate() {
-                if ui.selectable_label(self.crop_guide == i as u8, *lbl).clicked() {
+            for (i, lbl) in ["Thirds", "Golden", "Grid", "Spiral", "None"]
+                .iter()
+                .enumerate()
+            {
+                if ui
+                    .selectable_label(self.crop_guide == i as u8, *lbl)
+                    .clicked()
+                {
                     self.crop_guide = i as u8;
                 }
             }
@@ -24440,7 +25678,12 @@ impl Kaleidotron {
                 }
             });
             if changed {
-                let nc = clamp_crop([v[0] / iw, v[1] / ih, (v[2] / iw).max(0.0), (v[3] / ih).max(0.0)]);
+                let nc = clamp_crop([
+                    v[0] / iw,
+                    v[1] / ih,
+                    (v[2] / iw).max(0.0),
+                    (v[3] / ih).max(0.0),
+                ]);
                 self.set_crop(path, nc);
             }
         }
@@ -24477,7 +25720,10 @@ impl Kaleidotron {
             return Err("nothing to crop".into());
         }
         let real = self.resolve_local(path);
-        let img = self.registry.decode_path(&real).map_err(|e| e.to_string())?;
+        let img = self
+            .registry
+            .decode_path(&real)
+            .map_err(|e| e.to_string())?;
         let (w, h) = (img.width as usize, img.height as usize);
         let (cw, ch, rgba) = apply_crop_rgba(rect, w, h, &img.rgba_bytes());
         if self.crop_backup {
@@ -24494,7 +25740,10 @@ impl Kaleidotron {
             .unwrap_or("")
             .to_ascii_lowercase();
         let res = if ext == "jpg" || ext == "jpeg" {
-            let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let rgb: Vec<u8> = rgba
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
             image::save_buffer(&real, &rgb, cw as u32, ch as u32, image::ColorType::Rgb8)
         } else {
             image::save_buffer(&real, &rgba, cw as u32, ch as u32, image::ColorType::Rgba8)
@@ -24510,7 +25759,11 @@ impl Kaleidotron {
         Ok(format!(
             "Applied crop → {} ({cw}×{ch}){}",
             short_name(&real),
-            if self.crop_backup { " · original backed up" } else { "" }
+            if self.crop_backup {
+                " · original backed up"
+            } else {
+                ""
+            }
         ))
     }
 
@@ -24649,7 +25902,10 @@ impl Kaleidotron {
             .map(|m| m.watch_url())
             .or_else(|| flat.as_ref().map(|f| f.watch_url()))
             .unwrap_or_default();
-        let description = meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+        let description = meta
+            .as_ref()
+            .map(|m| m.description.clone())
+            .unwrap_or_default();
         let info = self.yt_info.get(path).cloned();
         let info_pending = self.yt_info_pending.as_deref() == Some(path);
         // The channel id (for "Go to channel" — browse the channel inside kaleidotron).
@@ -24675,14 +25931,19 @@ impl Kaleidotron {
                 ui.label(egui::RichText::new(&title).heading());
                 if !channel.is_empty() {
                     ui.add_space(2.0);
-                    let ch_url = meta.as_ref().map(|m| m.channel_url.clone()).unwrap_or_default();
+                    let ch_url = meta
+                        .as_ref()
+                        .map(|m| m.channel_url.clone())
+                        .unwrap_or_default();
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("Channel");
                         ui.label(&channel);
                         if !channel_id.is_empty()
                             && ui
                                 .button("▸ Browse channel")
-                                .on_hover_text("Browse this channel's videos + playlists in kaleidotron")
+                                .on_hover_text(
+                                    "Browse this channel's videos + playlists in kaleidotron",
+                                )
                                 .clicked()
                         {
                             want_channel = Some(channel_id.clone());
@@ -24962,7 +26223,10 @@ impl Kaleidotron {
             }
             None => self.ai_gen_prompt.trim().to_string(),
         };
-        let extra_args = style.as_ref().map(|s| s.args_extra.clone()).unwrap_or_default();
+        let extra_args = style
+            .as_ref()
+            .map(|s| s.args_extra.clone())
+            .unwrap_or_default();
         let style_name = style.as_ref().map(|s| s.name.clone()).unwrap_or_default();
         // Seed: the dialog's, else wall-clock; a style may lock its own.
         let mut seed0 = if self.ai_gen_seed != 0 {
@@ -25097,8 +26361,14 @@ impl Kaleidotron {
         if !dir.is_dir() {
             return;
         }
-        let stem = produced.file_stem().and_then(|s| s.to_str()).unwrap_or("ai");
-        let ext = produced.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        let stem = produced
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ai");
+        let ext = produced
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("png");
         let mut dest = dir.join(format!("{stem}.{ext}"));
         let mut n = 1;
         while dest.exists() {
@@ -25143,11 +26413,21 @@ impl Kaleidotron {
         }
         // Snapshots so the combos don't borrow self fields we also mutate.
         let tool_names: Vec<String> = self.ai_tools.iter().map(|t| t.name.clone()).collect();
-        let cur_tool = self.ai_tools.get(self.ai_gen_tool).map(|t| t.name.clone()).unwrap_or_default();
-        let styles: Vec<(String, String)> =
-            self.ai_styles.iter().map(|s| (s.name.clone(), s.tool.clone())).collect();
-        let prompts: Vec<(String, String)> =
-            self.ai_prompts.iter().map(|p| (p.name.clone(), p.text.clone())).collect();
+        let cur_tool = self
+            .ai_tools
+            .get(self.ai_gen_tool)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let styles: Vec<(String, String)> = self
+            .ai_styles
+            .iter()
+            .map(|s| (s.name.clone(), s.tool.clone()))
+            .collect();
+        let prompts: Vec<(String, String)> = self
+            .ai_prompts
+            .iter()
+            .map(|p| (p.name.clone(), p.text.clone()))
+            .collect();
         let running = self.ai_job_rx.is_some();
         let sizes = self.ai_sizes.clone();
         let cmd_preview = self.ai_command_preview();
@@ -25169,31 +26449,42 @@ impl Kaleidotron {
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Tool");
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_tool")
-                            .selected_text(&cur_tool)
-                            .show_ui(ui, |ui| {
-                                for (i, n) in tool_names.iter().enumerate() {
-                                    ui.selectable_value(&mut self.ai_gen_tool, i, n);
-                                }
-                            }));
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("ai_gen_tool")
+                                .selected_text(&cur_tool)
+                                .show_ui(ui, |ui| {
+                                    for (i, n) in tool_names.iter().enumerate() {
+                                        ui.selectable_value(&mut self.ai_gen_tool, i, n);
+                                    }
+                                }),
+                        );
                         combo_wheel(ui, &cr, &mut self.ai_gen_tool, tool_names.len());
                         ui.end_row();
                         ui.label("Style");
                         let st = if self.ai_gen_style == 0 {
                             "(none)".to_string()
                         } else {
-                            styles.get(self.ai_gen_style - 1).map(|s| s.0.clone()).unwrap_or_default()
+                            styles
+                                .get(self.ai_gen_style - 1)
+                                .map(|s| s.0.clone())
+                                .unwrap_or_default()
                         };
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_style")
-                            .selected_text(st)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.ai_gen_style, 0, "(none)");
-                                for (i, (name, scope)) in styles.iter().enumerate() {
-                                    if scope.is_empty() || *scope == cur_tool {
-                                        ui.selectable_value(&mut self.ai_gen_style, i + 1, name);
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("ai_gen_style")
+                                .selected_text(st)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.ai_gen_style, 0, "(none)");
+                                    for (i, (name, scope)) in styles.iter().enumerate() {
+                                        if scope.is_empty() || *scope == cur_tool {
+                                            ui.selectable_value(
+                                                &mut self.ai_gen_style,
+                                                i + 1,
+                                                name,
+                                            );
+                                        }
                                     }
-                                }
-                            }));
+                                }),
+                        );
                         // Cycle only through the *in-scope* entries (the list is scope-filtered by tool).
                         let step = combo_scroll_step(ui, &cr);
                         if step != 0 {
@@ -25204,8 +26495,12 @@ impl Kaleidotron {
                                 }
                             }
                             if opts.len() > 1 {
-                                let c = opts.iter().position(|&o| o == self.ai_gen_style).unwrap_or(0);
-                                self.ai_gen_style = opts[(c as isize + step).rem_euclid(opts.len() as isize) as usize];
+                                let c = opts
+                                    .iter()
+                                    .position(|&o| o == self.ai_gen_style)
+                                    .unwrap_or(0);
+                                self.ai_gen_style = opts
+                                    [(c as isize + step).rem_euclid(opts.len() as isize) as usize];
                             }
                         }
                         ui.end_row();
@@ -25213,22 +26508,31 @@ impl Kaleidotron {
                         let pt = if self.ai_gen_prompt_sel == 0 {
                             "(none)".to_string()
                         } else {
-                            prompts.get(self.ai_gen_prompt_sel - 1).map(|p| p.0.clone()).unwrap_or_default()
+                            prompts
+                                .get(self.ai_gen_prompt_sel - 1)
+                                .map(|p| p.0.clone())
+                                .unwrap_or_default()
                         };
                         let mut load_preset: Option<String> = None;
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_preset")
-                            .selected_text(pt)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.ai_gen_prompt_sel, 0, "(none)");
-                                for (i, (name, text)) in prompts.iter().enumerate() {
-                                    if ui
-                                        .selectable_value(&mut self.ai_gen_prompt_sel, i + 1, name)
-                                        .clicked()
-                                    {
-                                        load_preset = Some(text.clone());
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("ai_gen_preset")
+                                .selected_text(pt)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.ai_gen_prompt_sel, 0, "(none)");
+                                    for (i, (name, text)) in prompts.iter().enumerate() {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.ai_gen_prompt_sel,
+                                                i + 1,
+                                                name,
+                                            )
+                                            .clicked()
+                                        {
+                                            load_preset = Some(text.clone());
+                                        }
                                     }
-                                }
-                            }));
+                                }),
+                        );
                         // Cycling a preset loads its prompt text too (landing on "(none)" leaves it).
                         if combo_wheel(ui, &cr, &mut self.ai_gen_prompt_sel, prompts.len() + 1)
                             && self.ai_gen_prompt_sel > 0
@@ -25279,29 +26583,32 @@ impl Kaleidotron {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Size");
                     // Preset dropdown (editable list) — pick to apply.
-                    let cr = eat_scroll(egui::ComboBox::from_id_salt("ai_gen_size")
-                        .selected_text(format!("{}×{}", self.ai_gen_w, self.ai_gen_h))
-                        .show_ui(ui, |ui| {
-                            for s in &sizes {
-                                if ui
-                                    .selectable_label(
-                                        [self.ai_gen_w, self.ai_gen_h] == *s,
-                                        format!("{}×{}", s[0], s[1]),
-                                    )
-                                    .clicked()
-                                {
-                                    self.ai_gen_w = s[0];
-                                    self.ai_gen_h = s[1];
+                    let cr = eat_scroll(
+                        egui::ComboBox::from_id_salt("ai_gen_size")
+                            .selected_text(format!("{}×{}", self.ai_gen_w, self.ai_gen_h))
+                            .show_ui(ui, |ui| {
+                                for s in &sizes {
+                                    if ui
+                                        .selectable_label(
+                                            [self.ai_gen_w, self.ai_gen_h] == *s,
+                                            format!("{}×{}", s[0], s[1]),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.ai_gen_w = s[0];
+                                        self.ai_gen_h = s[1];
+                                    }
                                 }
-                            }
-                        }));
+                            }),
+                    );
                     let step = combo_scroll_step(ui, &cr);
                     if step != 0 && !sizes.is_empty() {
                         let cur = sizes
                             .iter()
                             .position(|s| [self.ai_gen_w, self.ai_gen_h] == *s)
                             .unwrap_or(0);
-                        let ns = sizes[(cur as isize + step).rem_euclid(sizes.len() as isize) as usize];
+                        let ns =
+                            sizes[(cur as isize + step).rem_euclid(sizes.len() as isize) as usize];
                         self.ai_gen_w = ns[0];
                         self.ai_gen_h = ns[1];
                     }
@@ -25317,7 +26624,11 @@ impl Kaleidotron {
                     {
                         add_size = true;
                     }
-                    if ui.small_button("From image").on_hover_text("Use the open image's size").clicked() {
+                    if ui
+                        .small_button("From image")
+                        .on_hover_text("Use the open image's size")
+                        .clicked()
+                    {
                         if let Some((w, h)) = self.img_meta.values().next().map(|m| (m.w, m.h)) {
                             self.ai_gen_w = w;
                             self.ai_gen_h = h;
@@ -25332,7 +26643,11 @@ impl Kaleidotron {
                     ui.label("Seed");
                     let r = ui.add(egui::DragValue::new(&mut self.ai_gen_seed));
                     wheel_adjust(ui, &r, &mut self.ai_gen_seed, 1.0, 0, i64::MAX);
-                    if ui.small_button("🎲").on_hover_text("Random each run (seed 0)").clicked() {
+                    if ui
+                        .small_button("🎲")
+                        .on_hover_text("Random each run (seed 0)")
+                        .clicked()
+                    {
                         self.ai_gen_seed = 0;
                     }
                 });
@@ -25341,8 +26656,7 @@ impl Kaleidotron {
                     .id_salt("ai_cmd")
                     .show(ui, |ui| {
                         ui.add(
-                            egui::Label::new(egui::RichText::new(&cmd_preview).monospace())
-                                .wrap(),
+                            egui::Label::new(egui::RichText::new(&cmd_preview).monospace()).wrap(),
                         );
                     });
                 match self.ai_gen_pad {
@@ -25398,7 +26712,10 @@ impl Kaleidotron {
                 if let Some(p) = self.ai_prompts.iter_mut().find(|p| p.name == name) {
                     p.text = text;
                 } else {
-                    self.ai_prompts.push(crate::ai::AiPrompt { name: name.clone(), text });
+                    self.ai_prompts.push(crate::ai::AiPrompt {
+                        name: name.clone(),
+                        text,
+                    });
                 }
                 self.status = format!("Saved prompt “{name}”");
                 self.ai_gen_save_prompt_name.clear();
@@ -25407,7 +26724,11 @@ impl Kaleidotron {
         if save_style {
             let name = self.ai_gen_save_style_name.trim().to_string();
             if !name.is_empty() {
-                let tool = self.ai_tools.get(self.ai_gen_tool).map(|t| t.name.clone()).unwrap_or_default();
+                let tool = self
+                    .ai_tools
+                    .get(self.ai_gen_tool)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
                 let suffix = self.ai_gen_save_style_text.trim().to_string();
                 if let Some(s) = self.ai_styles.iter_mut().find(|s| s.name == name) {
                     s.suffix = suffix;
@@ -25440,7 +26761,10 @@ impl Kaleidotron {
         if self.ai_job_rx.is_some() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
-                ui.weak(format!("Generating {}/{}", self.ai_job_done, self.ai_job_total));
+                ui.weak(format!(
+                    "Generating {}/{}",
+                    self.ai_job_done, self.ai_job_total
+                ));
                 if ui.small_button("✕").clicked() {
                     self.cancel_ai_job();
                 }
@@ -25523,41 +26847,50 @@ impl Kaleidotron {
             });
 
         // Styles.
-        egui::CollapsingHeader::new(format!("Styles ({})", self.ai_styles.len()))
-            .show(ui, |ui| {
-                let mut remove = None;
-                for i in 0..self.ai_styles.len() {
-                    ui.horizontal(|ui| {
-                        let sel = self.ai_style_sel == i;
-                        let lbl = format!("{} [{}]", self.ai_styles[i].name,
-                            if self.ai_styles[i].tool.is_empty() { "any" } else { &self.ai_styles[i].tool });
-                        if ui.selectable_label(sel, lbl).clicked() {
-                            self.ai_style_sel = i;
+        egui::CollapsingHeader::new(format!("Styles ({})", self.ai_styles.len())).show(ui, |ui| {
+            let mut remove = None;
+            for i in 0..self.ai_styles.len() {
+                ui.horizontal(|ui| {
+                    let sel = self.ai_style_sel == i;
+                    let lbl = format!(
+                        "{} [{}]",
+                        self.ai_styles[i].name,
+                        if self.ai_styles[i].tool.is_empty() {
+                            "any"
+                        } else {
+                            &self.ai_styles[i].tool
                         }
-                        if ui.small_button("🗑").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    self.ai_styles.remove(i);
-                    self.ai_style_sel = self.ai_style_sel.saturating_sub(1);
-                }
-                if ui.small_button("＋ Add style").clicked() {
-                    self.ai_styles.push(crate::ai::AiStyle {
-                        name: "new style".into(),
-                        ..Default::default()
-                    });
-                    self.ai_style_sel = self.ai_styles.len() - 1;
-                }
-                if let Some(s) = self.ai_styles.get_mut(self.ai_style_sel) {
-                    ui.add_space(4.0);
-                    egui::Grid::new("ai_style_edit").num_columns(2).show(ui, |ui| {
+                    );
+                    if ui.selectable_label(sel, lbl).clicked() {
+                        self.ai_style_sel = i;
+                    }
+                    if ui.small_button("🗑").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.ai_styles.remove(i);
+                self.ai_style_sel = self.ai_style_sel.saturating_sub(1);
+            }
+            if ui.small_button("＋ Add style").clicked() {
+                self.ai_styles.push(crate::ai::AiStyle {
+                    name: "new style".into(),
+                    ..Default::default()
+                });
+                self.ai_style_sel = self.ai_styles.len() - 1;
+            }
+            if let Some(s) = self.ai_styles.get_mut(self.ai_style_sel) {
+                ui.add_space(4.0);
+                egui::Grid::new("ai_style_edit")
+                    .num_columns(2)
+                    .show(ui, |ui| {
                         ui.label("Name");
                         ui.text_edit_singleline(&mut s.name);
                         ui.end_row();
                         ui.label("Tool");
-                        ui.text_edit_singleline(&mut s.tool).on_hover_text("empty = any tool");
+                        ui.text_edit_singleline(&mut s.tool)
+                            .on_hover_text("empty = any tool");
                         ui.end_row();
                         ui.label("Prefix");
                         ui.text_edit_singleline(&mut s.prefix);
@@ -25566,19 +26899,23 @@ impl Kaleidotron {
                         ui.text_edit_singleline(&mut s.suffix);
                         ui.end_row();
                         ui.label("Args");
-                        ui.text_edit_singleline(&mut s.args_extra).on_hover_text("CLI flags (e.g. --style ega)");
+                        ui.text_edit_singleline(&mut s.args_extra)
+                            .on_hover_text("CLI flags (e.g. --style ega)");
                         ui.end_row();
                         ui.label("Seed lock");
-                        let r = ui.add(egui::DragValue::new(&mut s.seed)).on_hover_text("0 = don't force");
+                        let r = ui
+                            .add(egui::DragValue::new(&mut s.seed))
+                            .on_hover_text("0 = don't force");
                         wheel_adjust(ui, &r, &mut s.seed, 1.0, 0, i64::MAX);
                         ui.end_row();
                     });
-                }
-            });
+            }
+        });
 
         // Prompts.
-        egui::CollapsingHeader::new(format!("Prompts ({})", self.ai_prompts.len()))
-            .show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("Prompts ({})", self.ai_prompts.len())).show(
+            ui,
+            |ui| {
                 let mut remove = None;
                 for i in 0..self.ai_prompts.len() {
                     ui.horizontal(|ui| {
@@ -25605,9 +26942,14 @@ impl Kaleidotron {
                 if let Some(p) = self.ai_prompts.get_mut(self.ai_prompt_sel) {
                     ui.add_space(4.0);
                     ui.text_edit_singleline(&mut p.name);
-                    ui.add(egui::TextEdit::multiline(&mut p.text).desired_rows(2).desired_width(f32::INFINITY));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut p.text)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
                 }
-            });
+            },
+        );
     }
 
     /// Navigate to a YouTube channel's videos listing (`<youtube>/channel/<id>`). Pin it from the
@@ -25783,8 +27125,8 @@ impl Kaleidotron {
         let mut want_open_default = false; // "Open in default app" (PDF)
         let mut det_open_with: Option<usize> = None; // Details "Open in…" → this opener index
         let mut det_open_other = false; // Details "Open in… → Other program…"
-        // Snapshot the configured "Open in…" programs matching this file's extension (so the menu
-        // needn't borrow `self`). Built once per Details render.
+                                        // Snapshot the configured "Open in…" programs matching this file's extension (so the menu
+                                        // needn't borrow `self`). Built once per Details render.
         let det_ext = entry
             .path
             .extension()
@@ -25796,7 +27138,7 @@ impl Kaleidotron {
             .into_iter()
             .filter(|o| o.exts.is_empty() || o.exts.iter().any(|e| e == &det_ext))
             .collect();
-                                           // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
+        // Audio player actions are handled inside `draw_audio_controls`, not deferred here.
         let disp = self.to_display(&entry.path);
         // Inspecting a downloadable pack folder (it has a fetched zip URL). Keyed off
         // `remote_urls`, not path depth, so `groups/<g>` / `artists/<a>` listing folders
@@ -26369,7 +27711,10 @@ impl Kaleidotron {
             }
         }
         if det_open_other {
-            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+            if let Some(exec) = rfd::FileDialog::new()
+                .set_title("Choose a program")
+                .pick_file()
+            {
                 let exec = exec.to_string_lossy().to_string();
                 self.open_external_for(entry.path.clone(), exec, String::new(), String::new());
             }
@@ -26411,7 +27756,11 @@ impl Kaleidotron {
         let mut name = self
             .remote_result_url(path)
             .map(|(_, f)| f)
-            .or_else(|| real.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .or_else(|| {
+                real.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "download".to_string());
         // Not on disk yet → a remote result the user hasn't opened. Fetch it from its source URL
         // (synchronous + cached; the Save dialog blocks anyway, so a brief fetch is fine).
@@ -26605,8 +27954,11 @@ impl Kaleidotron {
                     if let Some(bg) = detected {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(rect, 2.0, egui::Color32::from_rgb(bg[0], bg[1], bg[2]));
+                        ui.painter().rect_filled(
+                            rect,
+                            2.0,
+                            egui::Color32::from_rgb(bg[0], bg[1], bg[2]),
+                        );
                         ui.painter().rect_stroke(
                             rect,
                             2.0,
@@ -26628,7 +27980,9 @@ impl Kaleidotron {
                 slider_extras(ui, &r, &mut self.jpeg_clean_tol, 24, 1.0, 0, 96);
             })
             .response
-            .on_hover_text("How close to the background a pixel must be to be removed (kills the speckle)");
+            .on_hover_text(
+                "How close to the background a pixel must be to be removed (kills the speckle)",
+            );
             // Output: Transparency vs BG colour (mutually exclusive).
             ui.horizontal(|ui| {
                 ui.label("Onto");
@@ -26650,7 +28004,9 @@ impl Kaleidotron {
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.jpeg_clean_snap, "Snap colors")
-                    .on_hover_text("Flatten JPEG gradient noise + harden edges (median-cut palette)");
+                    .on_hover_text(
+                        "Flatten JPEG gradient noise + harden edges (median-cut palette)",
+                    );
                 let on = self.jpeg_clean_snap;
                 ui.add_enabled_ui(on, |ui| {
                     let r = ui.add(
@@ -26664,8 +28020,9 @@ impl Kaleidotron {
                     .on_hover_text("Remove isolated foreground specks (leftover mosquito noise)");
                 let on = self.jpeg_clean_despeckle;
                 ui.add_enabled_ui(on, |ui| {
-                    let r =
-                        ui.add(egui::Slider::new(&mut self.jpeg_clean_min_island, 1..=16).suffix(" px"));
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.jpeg_clean_min_island, 1..=16).suffix(" px"),
+                    );
                     slider_extras(ui, &r, &mut self.jpeg_clean_min_island, 2, 1.0, 1, 16);
                 });
             });
@@ -26680,8 +28037,9 @@ impl Kaleidotron {
             ui.add_enabled_ui(merge_on, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("  Island ≤");
-                    let r = ui
-                        .add(egui::Slider::new(&mut self.jpeg_clean_merge_max, 1..=64).suffix(" px"));
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.jpeg_clean_merge_max, 1..=64).suffix(" px"),
+                    );
                     slider_extras(ui, &r, &mut self.jpeg_clean_merge_max, 8, 1.0, 1, 64);
                 })
                 .response
@@ -26712,8 +28070,9 @@ impl Kaleidotron {
             ui.add_enabled_ui(grid_on, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("  Pixel size");
-                    let r = ui
-                        .add(egui::Slider::new(&mut self.jpeg_clean_grid_size, 2..=16).suffix(" px"));
+                    let r = ui.add(
+                        egui::Slider::new(&mut self.jpeg_clean_grid_size, 2..=16).suffix(" px"),
+                    );
                     slider_extras(ui, &r, &mut self.jpeg_clean_grid_size, 4, 1.0, 2, 16);
                 })
                 .response
@@ -29338,7 +30697,17 @@ impl Kaleidotron {
             let (font, pool, invert) = self.bitfont_spec();
             let color = self.bitfont_color && self.dither_method != crate::thumb::DITHER_APPLE;
             let grid = crate::thumb::bitfont_grid(
-                &work, w, h, &palette, 8, 8, font, &pool, color, invert, self.textmode_mono(),
+                &work,
+                w,
+                h,
+                &palette,
+                8,
+                8,
+                font,
+                &pool,
+                color,
+                invert,
+                self.textmode_mono(),
             );
             let (c, r) = (grid.cols, grid.rows);
             crate::thumb::bitfont_render(&grid, font, &mut work, w, h, 8, 8);
@@ -29654,7 +31023,7 @@ impl Kaleidotron {
         let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
-        // A "Tasks ▸" pick, applied after the loop like every other tile action.
+                                                         // A "Tasks ▸" pick, applied after the loop like every other tile action.
         let mut run_task_on: Option<(usize, String)> = None;
         let task_items = self.task_items();
         // Ditto the explicit "open this as…" pick.
@@ -29716,10 +31085,15 @@ impl Kaleidotron {
             // the pack nearest what you're looking at first).
             let n = self.entries.len();
             self.grid_first_row = row_range.start; // for keyboard nav scroll-into-view
-            self.diz_view = ((row_range.start * per_row).min(n), (row_range.end * per_row).min(n));
+            self.diz_view = (
+                (row_range.start * per_row).min(n),
+                (row_range.end * per_row).min(n),
+            );
             let vis_center = (row_range.start + row_range.end) / 2 * per_row + per_row / 2;
-            self.diz_target
-                .store(vis_center.min(n.saturating_sub(1)), std::sync::atomic::Ordering::Relaxed);
+            self.diz_target.store(
+                vis_center.min(n.saturating_sub(1)),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             for row in row_range {
                 ui.horizontal(|ui| {
                     // Match the spacing the per_row math assumed (else the row's real
@@ -29822,8 +31196,7 @@ impl Kaleidotron {
                                         inner.min + egui::vec2(0.0, half.y),
                                         inner.min + half,
                                     ];
-                                    for (qi, ppath) in info.previews.iter().enumerate().take(4)
-                                    {
+                                    for (qi, ppath) in info.previews.iter().enumerate().take(4) {
                                         let cell = egui::Rect::from_min_size(origins[qi], half)
                                             .shrink(2.0);
                                         if let Some(tex) = self.thumb_tex.get(ppath) {
@@ -29873,7 +31246,8 @@ impl Kaleidotron {
                             // Archive = a virtual folder. Show a 2×2 montage of its contents once
                             // extracted in the background (clutch for font .zips); until then, the
                             // folder glyph. A format badge always marks it as an archive.
-                            let montage = self.archive_montage.get(path).map(|i| i.previews.clone());
+                            let montage =
+                                self.archive_montage.get(path).map(|i| i.previews.clone());
                             match montage {
                                 Some(previews) if !previews.is_empty() => {
                                     let inner = rect.shrink(7.0);
@@ -29885,13 +31259,17 @@ impl Kaleidotron {
                                         inner.min + half,
                                     ];
                                     for (qi, ppath) in previews.iter().enumerate().take(4) {
-                                        let cell = egui::Rect::from_min_size(origins[qi], half).shrink(2.0);
+                                        let cell = egui::Rect::from_min_size(origins[qi], half)
+                                            .shrink(2.0);
                                         if let Some(tex) = self.thumb_tex.get(ppath) {
                                             let fit = fit_centered(cell, tex.size_vec2());
                                             ui.painter().image(
                                                 tex.id(),
                                                 fit,
-                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
                                                 egui::Color32::WHITE,
                                             );
                                         } else {
@@ -29909,7 +31287,9 @@ impl Kaleidotron {
                                         ui.visuals().text_color(),
                                     );
                                     // Kick off the background extract + montage scan once per archive.
-                                    if montage.is_none() && self.archive_montage_pending.insert(path.clone()) {
+                                    if montage.is_none()
+                                        && self.archive_montage_pending.insert(path.clone())
+                                    {
                                         let tx = self.archive_montage_tx.clone();
                                         let ap = path.clone();
                                         std::thread::spawn(move || {
@@ -29981,11 +31361,8 @@ impl Kaleidotron {
                                 ui.visuals().weak_text_color(),
                             );
                             let font = egui::FontId::proportional((tile * 0.11).clamp(9.0, 15.0));
-                            let galley = p.layout_no_wrap(
-                                label,
-                                font,
-                                ui.visuals().strong_text_color(),
-                            );
+                            let galley =
+                                p.layout_no_wrap(label, font, ui.visuals().strong_text_color());
                             let at = egui::pos2(
                                 rect.center().x - galley.size().x * 0.5,
                                 rect.center().y + tile * 0.18,
@@ -30125,18 +31502,25 @@ impl Kaleidotron {
                                 } else if let Some(pl) = self.yt_playlists.get(path) {
                                     // A channel playlist tile → its cover thumbnail.
                                     if !pl.thumb_url.is_empty() {
-                                        self.colo_thumbs
-                                            .request(path, &pl.thumb_url, THUMB_PX, false);
+                                        self.colo_thumbs.request(
+                                            path,
+                                            &pl.thumb_url,
+                                            THUMB_PX,
+                                            false,
+                                        );
                                     }
                                 } else if let Some(r) = self.img_results.get(path) {
                                     // Openverse result → fetch its hosted thumbnail over HTTP.
-                                    self.colo_thumbs.request(path, &r.thumb_url, THUMB_PX, false);
+                                    self.colo_thumbs
+                                        .request(path, &r.thumb_url, THUMB_PX, false);
                                 } else if let Some(gp) = self.gallery_pieces.get(path) {
                                     // Lospec gallery piece → fetch its CDN preview thumbnail.
-                                    self.colo_thumbs.request(path, &gp.thumb_url, THUMB_PX, false);
+                                    self.colo_thumbs
+                                        .request(path, &gp.thumb_url, THUMB_PX, false);
                                 } else if let Some(d) = self.da_devs.get(path) {
                                     // DeviantArt deviation → fetch its hosted thumbnail.
-                                    self.colo_thumbs.request(path, &d.thumb_url, THUMB_PX, false);
+                                    self.colo_thumbs
+                                        .request(path, &d.thumb_url, THUMB_PX, false);
                                 } else if let Some(g) = self.steam_games.get(path) {
                                     // Steam game → fetch its CDN header image over HTTP.
                                     self.colo_thumbs.request(
@@ -30148,8 +31532,12 @@ impl Kaleidotron {
                                 } else if let Some(a) = self.ph_assets.get(path) {
                                     // Poly Haven asset → its CDN preview render.
                                     if !a.thumb_url.is_empty() {
-                                        self.colo_thumbs
-                                            .request(path, &a.thumb_url, THUMB_PX, false);
+                                        self.colo_thumbs.request(
+                                            path,
+                                            &a.thumb_url,
+                                            THUMB_PX,
+                                            false,
+                                        );
                                     }
                                 } else if let Some(m) = self.steam_media.get(path) {
                                     // A game's screenshot / trailer thumbnail.
@@ -30189,7 +31577,9 @@ impl Kaleidotron {
                                     // let the remote-thumb pool fetch the font + render its sample
                                     // through the registry (decode_as = the .ttf path → FontDecoder).
                                     match self.gf_ttf_urls.get(path).cloned() {
-                                        Some(u) => self.colo_thumbs.request(path, &u, THUMB_PX, true),
+                                        Some(u) => {
+                                            self.colo_thumbs.request(path, &u, THUMB_PX, true)
+                                        }
                                         None => self.request_gf_ttf_url(path),
                                     }
                                 } else {
@@ -30198,7 +31588,8 @@ impl Kaleidotron {
                                 // Spinner while the thumbnail decodes / downloads.
                                 if web_no_thumb {
                                     // Paint the format badge instead of an endless spinner.
-                                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                    let ext =
+                                        path.extension().and_then(|e| e.to_str()).unwrap_or("");
                                     paint_audio_tile(&ui.painter_at(rect), rect, ext);
                                 } else {
                                     let t = ui.input(|i| i.time);
@@ -30398,14 +31789,16 @@ impl Kaleidotron {
                                 let text_c = egui::Color32::from_white_alpha(ta);
                                 let max_chars = ((tile - 8.0) / 6.0).max(3.0) as usize;
                                 for (li, line) in lines.iter().enumerate() {
-                                    let y = rect.bottom() - panel_h * t
-                                        + pad
-                                        + li as f32 * line_h;
+                                    let y = rect.bottom() - panel_h * t + pad + li as f32 * line_h;
                                     p.text(
                                         egui::pos2(rect.center().x, y),
                                         egui::Align2::CENTER_TOP,
                                         elide(line, max_chars),
-                                        egui::FontId::proportional(if li == 0 { 11.5 } else { 10.5 }),
+                                        egui::FontId::proportional(if li == 0 {
+                                            11.5
+                                        } else {
+                                            10.5
+                                        }),
                                         text_c,
                                     );
                                 }
@@ -30488,11 +31881,15 @@ impl Kaleidotron {
                             let is_code_entry = !entry.is_dir
                                 && self.plugin_code
                                 && crate::decode::CODE_EXTS.contains(
-                                    &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
-                                        .to_ascii_lowercase().as_str(),
+                                    &entry
+                                        .path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or_default()
+                                        .to_ascii_lowercase()
+                                        .as_str(),
                                 );
-                            let is_dosbox_entry =
-                                is_dos_executable(&entry.path);
+                            let is_dosbox_entry = is_dos_executable(&entry.path);
                             let dosbox_folder = entry.is_dir && self.dosbox_path.is_some();
                             if let Some(pick) = entry_context_menu(
                                 ui,
@@ -31050,7 +32447,7 @@ impl Kaleidotron {
         let mut ph_hdr: Option<(usize, &'static str)> = None; // Poly Haven "Save .hdr"
         let mut steam_act: Option<(usize, SteamAct)> = None; // Steam game right-click action
         let mut yt_quality: Option<(usize, u32)> = None; // YouTube "Download quality" pick
-        // A "Tasks ▸" pick, applied after the loop like every other tile action.
+                                                         // A "Tasks ▸" pick, applied after the loop like every other tile action.
         let mut run_task_on: Option<(usize, String)> = None;
         let task_items = self.task_items();
         // Ditto the explicit "open this as…" pick.
@@ -31273,10 +32670,12 @@ impl Kaleidotron {
                             self.colo_thumbs.request(&path, &p.tn_url, THUMB_PX, false);
                         }
                     } else if let Some(r) = self.img_results.get(&path) {
-                        self.colo_thumbs.request(&path, &r.thumb_url, THUMB_PX, false);
+                        self.colo_thumbs
+                            .request(&path, &r.thumb_url, THUMB_PX, false);
                     } else if let Some(a) = self.ph_assets.get(&path) {
                         if !a.thumb_url.is_empty() {
-                            self.colo_thumbs.request(&path, &a.thumb_url, THUMB_PX, false);
+                            self.colo_thumbs
+                                .request(&path, &a.thumb_url, THUMB_PX, false);
                         }
                     } else if let Some(r) = self.snd_results.get(&path) {
                         if self.plugin_audio {
@@ -31303,7 +32702,10 @@ impl Kaleidotron {
                 // A non-renderable file (a mount's "show everything" data/binary) gets a type-id
                 // label in the thumb cell instead of an endless spinner. Computed here (row-level
                 // `&mut self`) so the deep cell closure needn't borrow the cache mutably.
-                let file_id = (!entry.is_dir && tex.is_none() && !colo_audio && !any_remote(&path)
+                let file_id = (!entry.is_dir
+                    && tex.is_none()
+                    && !colo_audio
+                    && !any_remote(&path)
                     && !self.is_renderable(&path))
                 .then(|| {
                     self.file_id_cache
@@ -31631,11 +33033,15 @@ impl Kaleidotron {
                         let is_code_entry = !entry.is_dir
                             && self.plugin_code
                             && crate::decode::CODE_EXTS.contains(
-                                &entry.path.extension().and_then(|e| e.to_str()).unwrap_or_default()
-                                    .to_ascii_lowercase().as_str(),
+                                &entry
+                                    .path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or_default()
+                                    .to_ascii_lowercase()
+                                    .as_str(),
                             );
-                        let is_dosbox_entry =
-                            is_dos_executable(&entry.path);
+                        let is_dosbox_entry = is_dos_executable(&entry.path);
                         let dosbox_folder = entry.is_dir && self.dosbox_path.is_some();
                         if let Some(pick) = entry_context_menu(
                             ui,
@@ -32184,7 +33590,9 @@ impl Kaleidotron {
                             anim.playing = !anim.playing;
                         }
                         let mut cur = anim.current;
-                        let r = ui.add(egui::Slider::new(&mut cur, 0..=n.saturating_sub(1)).text("frame"));
+                        let r = ui.add(
+                            egui::Slider::new(&mut cur, 0..=n.saturating_sub(1)).text("frame"),
+                        );
                         let ch = slider_extras(ui, &r, &mut cur, 0, 1.0, 0, n.saturating_sub(1));
                         if r.changed() || ch {
                             anim.current = cur;
@@ -32194,21 +33602,28 @@ impl Kaleidotron {
                         want_recolor = self.gif_recolor;
                         ui.checkbox(&mut want_recolor, "Recolor")
                             .on_hover_text("Run the Recolor / PixelFX stack on every frame");
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("gif_speed")
-                            .selected_text(format!("{speed}×"))
-                            .width(64.0)
-                            .show_ui(ui, |ui| {
-                                for v in [0.25f32, 0.5, 1.0, 1.5, 2.0, 4.0] {
-                                    if ui.selectable_label(speed == v, format!("{v}×")).clicked() {
-                                        want_speed = Some(v);
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("gif_speed")
+                                .selected_text(format!("{speed}×"))
+                                .width(64.0)
+                                .show_ui(ui, |ui| {
+                                    for v in [0.25f32, 0.5, 1.0, 1.5, 2.0, 4.0] {
+                                        if ui
+                                            .selectable_label(speed == v, format!("{v}×"))
+                                            .clicked()
+                                        {
+                                            want_speed = Some(v);
+                                        }
                                     }
-                                }
-                            }));
+                                }),
+                        );
                         let step = combo_scroll_step(ui, &cr);
                         if step != 0 {
                             const SP: [f32; 6] = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0];
                             let cur = SP.iter().position(|v| speed == *v).unwrap_or(2);
-                            want_speed = Some(SP[(cur as isize + step).rem_euclid(SP.len() as isize) as usize]);
+                            want_speed = Some(
+                                SP[(cur as isize + step).rem_euclid(SP.len() as isize) as usize],
+                            );
                         }
                         if ui
                             .button(format!("{} PNG", icons::DOWNLOAD))
@@ -32324,18 +33739,20 @@ impl Kaleidotron {
                     sheets,
                     names.get(sheet).map(String::as_str).unwrap_or("")
                 );
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("xmind_sheet_picker")
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            if ui
-                                .selectable_label(i == sheet, format!("{}. {}", i + 1, name))
-                                .clicked()
-                            {
-                                goto = Some(i);
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("xmind_sheet_picker")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                if ui
+                                    .selectable_label(i == sheet, format!("{}. {}", i + 1, name))
+                                    .clicked()
+                                {
+                                    goto = Some(i);
+                                }
                             }
-                        }
-                    }));
+                        }),
+                );
                 let step = combo_scroll_step(ui, &cr);
                 if step != 0 && sheets > 0 {
                     goto = Some((sheet as isize + step).rem_euclid(sheets as isize) as usize);
@@ -32360,27 +33777,47 @@ impl Kaleidotron {
         if self.ico_view.as_ref().is_some_and(|v| v.count() > 1) && !immersive {
             let (index, n, labels) = {
                 let v = self.ico_view.as_ref().unwrap();
-                (v.index, v.count(), (0..v.count()).map(|i| v.label(i)).collect::<Vec<_>>())
+                (
+                    v.index,
+                    v.count(),
+                    (0..v.count()).map(|i| v.label(i)).collect::<Vec<_>>(),
+                )
             };
             let mut goto: Option<usize> = None;
             ui.horizontal(|ui| {
-                if ui.add_enabled(index > 0, egui::Button::new("⬅ Prev")).clicked() {
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("⬅ Prev"))
+                    .clicked()
+                {
                     goto = Some(index.saturating_sub(1));
                 }
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("ico_image_picker")
-                    .selected_text(format!("Image {} / {}: {}", index + 1, n, labels.get(index).cloned().unwrap_or_default()))
-                    .show_ui(ui, |ui| {
-                        for (i, lab) in labels.iter().enumerate() {
-                            if ui.selectable_label(i == index, format!("{}. {lab}", i + 1)).clicked() {
-                                goto = Some(i);
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("ico_image_picker")
+                        .selected_text(format!(
+                            "Image {} / {}: {}",
+                            index + 1,
+                            n,
+                            labels.get(index).cloned().unwrap_or_default()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (i, lab) in labels.iter().enumerate() {
+                                if ui
+                                    .selectable_label(i == index, format!("{}. {lab}", i + 1))
+                                    .clicked()
+                                {
+                                    goto = Some(i);
+                                }
                             }
-                        }
-                    }));
+                        }),
+                );
                 let step = combo_scroll_step(ui, &cr);
                 if step != 0 && n > 0 {
                     goto = Some((index as isize + step).rem_euclid(n as isize) as usize);
                 }
-                if ui.add_enabled(index + 1 < n, egui::Button::new("Next ➡")).clicked() {
+                if ui
+                    .add_enabled(index + 1 < n, egui::Button::new("Next ➡"))
+                    .clicked()
+                {
                     goto = Some(index + 1);
                 }
                 ui.weak("· embedded icon images · ⬅/➡ turn");
@@ -32404,72 +33841,76 @@ impl Kaleidotron {
             // The combo mutates only this local (so it doesn't need `&mut self` while the
             // player is borrowed below); the change is applied after the borrow ends.
             let mut baud_choice = baud;
-            let (active, just_finished) =
-                {
-                    let p = self.player.as_mut().unwrap();
-                    let was_playing = p.playing;
-                    p.advance(baud, dt);
-                    let len = p.len;
-                    if !immersive {
-                        ui.horizontal(|ui| {
-                            let baud_lbl = |pl: bool| {
-                                if pl {
-                                    format!("{} Pause", icons::PAUSE)
-                                } else {
-                                    format!("{} Play", icons::PLAY)
-                                }
-                            };
-                            if ui
-                                .add(egui::Button::new(baud_lbl(p.playing)).min_size(
-                                    fixed_btn_size(ui, &[&baud_lbl(true), &baud_lbl(false)]),
-                                ))
-                                .clicked()
-                            {
-                                if p.pos >= p.len {
-                                    p.pos = 0; // at the end → replay from the start
-                                    p.acc = 0.0;
-                                }
-                                p.playing = !p.playing;
+            let (active, just_finished) = {
+                let p = self.player.as_mut().unwrap();
+                let was_playing = p.playing;
+                p.advance(baud, dt);
+                let len = p.len;
+                if !immersive {
+                    ui.horizontal(|ui| {
+                        let baud_lbl = |pl: bool| {
+                            if pl {
+                                format!("{} Pause", icons::PAUSE)
+                            } else {
+                                format!("{} Play", icons::PLAY)
                             }
-                            if ui.button(format!("{} Replay", icons::REPLAY)).clicked() {
-                                p.pos = 0;
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(baud_lbl(p.playing)).min_size(fixed_btn_size(
+                                    ui,
+                                    &[&baud_lbl(true), &baud_lbl(false)],
+                                )),
+                            )
+                            .clicked()
+                        {
+                            if p.pos >= p.len {
+                                p.pos = 0; // at the end → replay from the start
                                 p.acc = 0.0;
-                                p.playing = true;
                             }
-                            // Baud picker, right by the transport controls: simulate a modem
-                            // typing the art out. RIP and ANSI keep separate remembered speeds.
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("baud_pick")
+                            p.playing = !p.playing;
+                        }
+                        if ui.button(format!("{} Replay", icons::REPLAY)).clicked() {
+                            p.pos = 0;
+                            p.acc = 0.0;
+                            p.playing = true;
+                        }
+                        // Baud picker, right by the transport controls: simulate a modem
+                        // typing the art out. RIP and ANSI keep separate remembered speeds.
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("baud_pick")
                                 .selected_text(format!("{} {}", icons::BOLT, baud_choice.label()))
                                 .show_ui(ui, |ui| {
                                     for b in Baud::ALL {
                                         ui.selectable_value(&mut baud_choice, b, b.label());
                                     }
-                                }))
-                                .on_hover_text(
-                                    "Simulated modem baud rate — replay the art as it would have \
+                                }),
+                        )
+                        .on_hover_text(
+                            "Simulated modem baud rate — replay the art as it would have \
                                  typed out over a dial-up connection (None = instant). RIP and \
                                  ANSI keep separate speeds.",
-                                );
-                            combo_wheel_list(ui, &cr, &mut baud_choice, &Baud::ALL);
-                            let mut pos = p.pos;
-                            let r = ui.add(egui::Slider::new(&mut pos, 0..=len).text("byte"));
-                            let ch = slider_extras(ui, &r, &mut pos, 0, 1.0, 0, len);
-                            if r.changed() || ch {
-                                p.pos = pos;
-                                p.acc = 0.0;
-                                p.playing = false;
-                            }
-                            // The slider already shows the byte position, so don't repeat it:
-                            // just the percent and total size (baud is the picker to the left).
-                            let pct = (p.pos * 100).checked_div(len).unwrap_or(100);
-                            ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
-                        });
-                    }
-                    // Render one extra frame the moment it finishes, so the auto-scroll lands
-                    // exactly at the bottom (without it the last drawn frame is a tick short).
-                    let just_finished = was_playing && !p.playing;
-                    (p.playing || p.pos < p.len || just_finished, just_finished)
-                };
+                        );
+                        combo_wheel_list(ui, &cr, &mut baud_choice, &Baud::ALL);
+                        let mut pos = p.pos;
+                        let r = ui.add(egui::Slider::new(&mut pos, 0..=len).text("byte"));
+                        let ch = slider_extras(ui, &r, &mut pos, 0, 1.0, 0, len);
+                        if r.changed() || ch {
+                            p.pos = pos;
+                            p.acc = 0.0;
+                            p.playing = false;
+                        }
+                        // The slider already shows the byte position, so don't repeat it:
+                        // just the percent and total size (baud is the picker to the left).
+                        let pct = (p.pos * 100).checked_div(len).unwrap_or(100);
+                        ui.label(format!("{pct}%  ·  {}", human_size(len as u64)));
+                    });
+                }
+                // Render one extra frame the moment it finishes, so the auto-scroll lands
+                // exactly at the bottom (without it the last drawn frame is a tick short).
+                let just_finished = was_playing && !p.playing;
+                (p.playing || p.pos < p.len || just_finished, just_finished)
+            };
             // Apply a baud change now that the player borrow above has ended: remember the
             // per-kind speed and restart the transmission (or jump to the end for None).
             if baud_choice != baud {
@@ -33713,21 +35154,23 @@ impl Kaleidotron {
                 want_save = true;
             }
             if !self.saved_compares.is_empty() {
-                eat_scroll(egui::ComboBox::from_id_salt("compare_recall")
-                    .selected_text("Recall ▾")
-                    .show_ui(ui, |ui| {
-                        for i in 0..self.saved_compares.len() {
-                            let nm = self.saved_compares[i].name.clone();
-                            ui.horizontal(|ui| {
-                                if ui.selectable_label(false, &nm).clicked() {
-                                    recall = Some(i);
-                                }
-                                if ui.small_button("✕").on_hover_text("Delete").clicked() {
-                                    delete_saved = Some(i);
-                                }
-                            });
-                        }
-                    }));
+                eat_scroll(
+                    egui::ComboBox::from_id_salt("compare_recall")
+                        .selected_text("Recall ▾")
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.saved_compares.len() {
+                                let nm = self.saved_compares[i].name.clone();
+                                ui.horizontal(|ui| {
+                                    if ui.selectable_label(false, &nm).clicked() {
+                                        recall = Some(i);
+                                    }
+                                    if ui.small_button("✕").on_hover_text("Delete").clicked() {
+                                        delete_saved = Some(i);
+                                    }
+                                });
+                            }
+                        }),
+                );
             }
         });
         ui.separator();
@@ -34073,7 +35516,10 @@ impl Kaleidotron {
                 continue;
             }
             painter.line_segment(
-                [egui::pos2(x, top_base), egui::pos2(x, top_base - special_len)],
+                [
+                    egui::pos2(x, top_base),
+                    egui::pos2(x, top_base - special_len),
+                ],
                 egui::Stroke::new(1.5, accent),
             );
             painter.text(
@@ -34093,7 +35539,10 @@ impl Kaleidotron {
                 continue;
             }
             painter.line_segment(
-                [egui::pos2(left_base, y), egui::pos2(left_base - special_len, y)],
+                [
+                    egui::pos2(left_base, y),
+                    egui::pos2(left_base - special_len, y),
+                ],
                 egui::Stroke::new(1.5, accent),
             );
             painter.text(
@@ -34247,10 +35696,7 @@ impl Kaleidotron {
         // past ~1.5 device-px per source-px looks blurry — schedule a higher-res re-raster
         // (applied after this borrow of the texture ends) so it stays crisp like the real
         // app. `scale.x * ppp` is the true device-px/source-px factor.
-        let viewing_svg = self
-            .full_tex
-            .as_ref()
-            .is_some_and(|(p, _)| is_svg_path(p));
+        let viewing_svg = self.full_tex.as_ref().is_some_and(|(p, _)| is_svg_path(p));
         if (self.xmind_view.is_some() || self.pdf_view.is_some() || viewing_svg)
             && self.player.is_none()
             && self.anim.is_none()
@@ -34313,15 +35759,15 @@ impl Kaleidotron {
         // avoids any per-frame minimap work over live frames).
         let nav = (!self.immersive && self.video_player.is_none() && (overflow_x || overflow_y))
             .then(|| {
-            const M: f32 = 8.0;
-            const MAX_W: f32 = 120.0;
-            let max_h = (resp.rect.height() - 2.0 * M).max(16.0);
-            let sh_a = sh * aspect_y;
-            let s = (MAX_W / sw).min(max_h / sh_a);
-            let nsz = egui::vec2(sw * s, sh_a * s);
-            let ntl = egui::pos2(resp.rect.max.x - M - nsz.x, resp.rect.min.y + M);
-            egui::Rect::from_min_size(ntl, nsz)
-        });
+                const M: f32 = 8.0;
+                const MAX_W: f32 = 120.0;
+                let max_h = (resp.rect.height() - 2.0 * M).max(16.0);
+                let sh_a = sh * aspect_y;
+                let s = (MAX_W / sw).min(max_h / sh_a);
+                let nsz = egui::vec2(sw * s, sh_a * s);
+                let ntl = egui::pos2(resp.rect.max.x - M - nsz.x, resp.rect.min.y + M);
+                egui::Rect::from_min_size(ntl, nsz)
+            });
 
         // --- pan / scroll interaction ---
         let mut advance: Option<bool> = None;
@@ -34456,10 +35902,7 @@ impl Kaleidotron {
         // so the user can read off the cell grid (cols×rows). Only in ANSI-shade mode
         // with a live recolor, and never over an actual text-mode art file. `img_rect`
         // already encodes zoom+pan, so the ruler tracks the art as it moves. ---
-        if self.is_ansi_grid_mode()
-            && self.any_recolor_active()
-            && !self.viewing_textmode
-        {
+        if self.is_ansi_grid_mode() && self.any_recolor_active() && !self.viewing_textmode {
             self.draw_ansi_ruler(&painter, resp.rect, img_rect, sw, sh);
         }
 
@@ -35158,7 +36601,13 @@ impl Kaleidotron {
             .filter(|root| real.starts_with(root));
         // Quote a DOS path/name only when it has a space (LFN) — quoting a bare 8.3 command name can
         // make COMMAND.COM fail to find it, and DOS names almost never contain spaces.
-        let q = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };
+        let q = |s: &str| {
+            if s.contains(' ') {
+                format!("\"{s}\"")
+            } else {
+                s.to_string()
+            }
+        };
         let mut cmd = std::process::Command::new(&dosbox);
         cmd.arg("--noautoexec");
         // Hide the "Welcome to DOSBox Staging …" banner that otherwise prints in the emulated screen
@@ -35180,7 +36629,8 @@ impl Kaleidotron {
                 // Fix both the real- and protected-mode cycle budgets to the era's speed (the
                 // modern setting names; bare `cycles` is deprecated in DOSBox-Staging).
                 cmd.arg("--set").arg(format!("cpu_cycles={cycles}"));
-                cmd.arg("--set").arg(format!("cpu_cycles_protected={cycles}"));
+                cmd.arg("--set")
+                    .arg(format!("cpu_cycles_protected={cycles}"));
             }
         }
         // Either the pack-root explicit mount (dependencies reachable) or — for a plain local file
@@ -35188,7 +36638,9 @@ impl Kaleidotron {
         // followed by `pause`. A plain local file with keep-open OFF uses the simplest path-passing
         // form (DOSBox mounts the parent + resolves the runnable name itself).
         let explicit_root = mount_root.clone().or_else(|| {
-            (keep).then(|| real.parent().map(|p| p.to_path_buf())).flatten()
+            (keep)
+                .then(|| real.parent().map(|p| p.to_path_buf()))
+                .flatten()
         });
         if let Some(root) = &explicit_root {
             // `cd` only makes sense relative to the mount root; for the local keep-open case the
@@ -35200,11 +36652,21 @@ impl Kaleidotron {
                     .map(|p| p.to_string_lossy().replace('/', "\\"))
                     .filter(|s| !s.is_empty())
             });
-            let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            cmd.arg("-c").arg(format!("mount c \"{}\"", root.display())).arg("-c").arg("c:");
+            let name = real
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            cmd.arg("-c")
+                .arg(format!("mount c \"{}\"", root.display()))
+                .arg("-c")
+                .arg("c:");
             if let Some(sub) = subdir {
                 // The leading `\` must be INSIDE the quotes: `cd "\SUB DIR"`, not `cd \"SUB DIR"`.
-                let arg = if sub.contains(' ') { format!("cd \"\\{sub}\"") } else { format!("cd \\{sub}") };
+                let arg = if sub.contains(' ') {
+                    format!("cd \"\\{sub}\"")
+                } else {
+                    format!("cd \\{sub}")
+                };
                 cmd.arg("-c").arg(arg);
             }
             cmd.arg("-c").arg(q(&name));
@@ -35257,7 +36719,8 @@ impl Kaleidotron {
             }
             if *cycles > 0 {
                 cmd.arg("--set").arg(format!("cpu_cycles={cycles}"));
-                cmd.arg("--set").arg(format!("cpu_cycles_protected={cycles}"));
+                cmd.arg("--set")
+                    .arg(format!("cpu_cycles_protected={cycles}"));
             }
         }
         cmd.arg("-c")
@@ -35329,7 +36792,10 @@ impl Kaleidotron {
                 .or_else(|| self.video_player.as_ref().map(|v| v.path.clone()))
                 .or_else(|| self.audio_player.as_ref().map(|a| a.path.clone())),
             Mode::ThreeD => self.three_d.as_ref().map(|v| v.path.clone()),
-            Mode::Compare => self.compare_diff.clone().or_else(|| self.compare_source.clone()),
+            Mode::Compare => self
+                .compare_diff
+                .clone()
+                .or_else(|| self.compare_source.clone()),
             Mode::Grid => None,
         }
     }
@@ -35382,7 +36848,10 @@ impl Kaleidotron {
             self.open_in_default_app(path);
         }
         if other {
-            if let Some(exec) = rfd::FileDialog::new().set_title("Choose a program").pick_file() {
+            if let Some(exec) = rfd::FileDialog::new()
+                .set_title("Choose a program")
+                .pick_file()
+            {
                 let exec = exec.to_string_lossy().to_string();
                 self.open_external_for(path.to_path_buf(), exec, String::new(), String::new());
             }
@@ -35528,36 +36997,36 @@ impl Kaleidotron {
             // Inherit the themed window fill + global rounded corners; pad the content ourselves.
             .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(0)))
             .show(ctx, |ui| {
-              egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(20, 16))
-                .show(ui, |ui| {
-                // Header: a title + segmented tabs. Files = "Open in…" programs; Folders =
-                // "Open folder in…" actions. Both share one editor (folders hide Extensions).
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("File associations").size(19.0).strong(),
-                        )
-                        .selectable(false),
-                    );
-                    ui.add_space(16.0);
-                    ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
-                    if ui
-                        .add(egui::Button::selectable(self.assoc_tab == 0, "Files"))
-                        .clicked()
-                    {
-                        self.assoc_tab = 0;
-                    }
-                    if ui
-                        .add(egui::Button::selectable(self.assoc_tab == 1, "Folders"))
-                        .clicked()
-                    {
-                        self.assoc_tab = 1;
-                    }
-                });
-                ui.add_space(10.0);
-                if self.assoc_tab == 1 {
-                    openers_editor(
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(20, 16))
+                    .show(ui, |ui| {
+                        // Header: a title + segmented tabs. Files = "Open in…" programs; Folders =
+                        // "Open folder in…" actions. Both share one editor (folders hide Extensions).
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("File associations").size(19.0).strong(),
+                                )
+                                .selectable(false),
+                            );
+                            ui.add_space(16.0);
+                            ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
+                            if ui
+                                .add(egui::Button::selectable(self.assoc_tab == 0, "Files"))
+                                .clicked()
+                            {
+                                self.assoc_tab = 0;
+                            }
+                            if ui
+                                .add(egui::Button::selectable(self.assoc_tab == 1, "Folders"))
+                                .clicked()
+                            {
+                                self.assoc_tab = 1;
+                            }
+                        });
+                        ui.add_space(10.0);
+                        if self.assoc_tab == 1 {
+                            openers_editor(
                         ui,
                         &mut self.folder_actions,
                         &mut self.folder_act_selected,
@@ -35572,8 +37041,8 @@ impl Kaleidotron {
                         "optional; {} = folder path, else appended",
                         "assoc_folders",
                     );
-                } else {
-                    openers_editor(
+                        } else {
+                            openers_editor(
                         ui,
                         &mut self.openers,
                         &mut self.assoc_selected,
@@ -35587,8 +37056,8 @@ impl Kaleidotron {
                         "optional; {} = file path, else appended",
                         "assoc_files",
                     );
-                }
-              });
+                        }
+                    });
             });
         self.show_associations = open;
     }
@@ -35611,48 +37080,49 @@ impl Kaleidotron {
         // glyph must be centred in that cell (so the collapsed rail is a straight column), and the
         // highlight must be a flat filled box rather than a bordered button, VSCode-style.
         let icon_cell = sz + 16.0;
-        let row = |ui: &mut egui::Ui, glyph: &str, label: &str, on: bool, tip: &str| -> egui::Response {
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::click());
-            let vis = ui.visuals();
-            // Flat fill: selected wins, else a subtle hover wash. No stroke, no rounding.
-            let fill = if on {
-                Some(vis.selection.bg_fill)
-            } else if resp.hovered() {
-                Some(vis.widgets.hovered.weak_bg_fill)
-            } else {
-                None
-            };
-            if let Some(f) = fill {
-                ui.painter().rect_filled(rect, 0.0, f);
-            }
-            let col = if on {
-                vis.selection.stroke.color
-            } else if resp.hovered() {
-                vis.strong_text_color()
-            } else {
-                vis.text_color()
-            };
-            // Glyph centred inside its fixed cell — this is what squares up both layouts.
-            let cell = egui::Rect::from_min_size(rect.min, egui::vec2(icon_cell, btn_h));
-            ui.painter().text(
-                cell.center(),
-                egui::Align2::CENTER_CENTER,
-                glyph,
-                egui::FontId::proportional(sz),
-                col,
-            );
-            if expanded {
+        let row =
+            |ui: &mut egui::Ui, glyph: &str, label: &str, on: bool, tip: &str| -> egui::Response {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::click());
+                let vis = ui.visuals();
+                // Flat fill: selected wins, else a subtle hover wash. No stroke, no rounding.
+                let fill = if on {
+                    Some(vis.selection.bg_fill)
+                } else if resp.hovered() {
+                    Some(vis.widgets.hovered.weak_bg_fill)
+                } else {
+                    None
+                };
+                if let Some(f) = fill {
+                    ui.painter().rect_filled(rect, 0.0, f);
+                }
+                let col = if on {
+                    vis.selection.stroke.color
+                } else if resp.hovered() {
+                    vis.strong_text_color()
+                } else {
+                    vis.text_color()
+                };
+                // Glyph centred inside its fixed cell — this is what squares up both layouts.
+                let cell = egui::Rect::from_min_size(rect.min, egui::vec2(icon_cell, btn_h));
                 ui.painter().text(
-                    egui::pos2(rect.left() + icon_cell, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(14.0),
+                    cell.center(),
+                    egui::Align2::CENTER_CENTER,
+                    glyph,
+                    egui::FontId::proportional(sz),
                     col,
                 );
-            }
-            resp.on_hover_text(tip)
-        };
+                if expanded {
+                    ui.painter().text(
+                        egui::pos2(rect.left() + icon_cell, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(14.0),
+                        col,
+                    );
+                }
+                resp.on_hover_text(tip)
+            };
 
         // The gear is pinned to the bottom (where VSCode keeps settings), so the scrolling list is
         // measured against the space left over rather than the full height.
@@ -35674,7 +37144,10 @@ impl Kaleidotron {
             "Files \u{2014} folders, favorites, filters  ({})",
             self.bind_for(Action::PaneFiles).label()
         );
-        let fx_tip = format!("PixelFX presets  ({})", self.bind_for(Action::PanePixelFx).label());
+        let fx_tip = format!(
+            "PixelFX presets  ({})",
+            self.bind_for(Action::PanePixelFx).label()
+        );
         egui::ScrollArea::vertical()
             .max_height(list_h)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -35686,26 +37159,60 @@ impl Kaleidotron {
                     "Collapse",
                     false,
                     &collapse_tip,
-                ).clicked() {
+                )
+                .clicked()
+                {
                     self.rail_expanded = !self.rail_expanded;
                 }
                 ui.add_space(6.0);
 
-                if row(ui, "\u{1F5C1}", "Open\u{2026}", false, &format!("Open folder\u{2026}  ({open_key})")).clicked() {
+                if row(
+                    ui,
+                    "\u{1F5C1}",
+                    "Open\u{2026}",
+                    false,
+                    &format!("Open folder\u{2026}  ({open_key})"),
+                )
+                .clicked()
+                {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.open_folder(dir);
                     }
                 }
                 ui.add_space(8.0);
-                if row(ui, "\u{2630}", "Explorer", self.show_explorer, &format!("Explorer pane  ({exp_key})")).clicked() {
+                if row(
+                    ui,
+                    "\u{2630}",
+                    "Explorer",
+                    self.show_explorer,
+                    &format!("Explorer pane  ({exp_key})"),
+                )
+                .clicked()
+                {
                     self.show_explorer = !self.show_explorer;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{2139}", "Details", self.show_details, &format!("Details pane  ({det_key})")).clicked() {
+                if row(
+                    ui,
+                    "\u{2139}",
+                    "Details",
+                    self.show_details,
+                    &format!("Details pane  ({det_key})"),
+                )
+                .clicked()
+                {
                     self.show_details = !self.show_details;
                 }
                 ui.add_space(2.0);
-                if row(ui, "\u{1F3A8}", "Recolor", self.show_recolor, &format!("Recolor pane  ({rec_key})")).clicked() {
+                if row(
+                    ui,
+                    "\u{1F3A8}",
+                    "Recolor",
+                    self.show_recolor,
+                    &format!("Recolor pane  ({rec_key})"),
+                )
+                .clicked()
+                {
                     self.show_recolor = !self.show_recolor;
                 }
                 ui.add_space(12.0);
@@ -35715,7 +37222,12 @@ impl Kaleidotron {
                 // if hidden — otherwise the click would appear to do nothing).
                 for (sec, glyph, label, tip) in [
                     (RailSection::Files, "\u{1F4C1}", "Files", files_tip.as_str()),
-                    (RailSection::Audio, "\u{1F3B9}", "Audio", "Audio \u{2014} kits and samples"),
+                    (
+                        RailSection::Audio,
+                        "\u{1F3B9}",
+                        "Audio",
+                        "Audio \u{2014} kits and samples",
+                    ),
                     (RailSection::Fx, "\u{2728}", "PixelFX", fx_tip.as_str()),
                     (RailSection::Ai, icons::ROBOT, "AI", "AI generation"),
                 ] {
@@ -35791,7 +37303,9 @@ impl Kaleidotron {
         // attached to the panel's own response, not the gear's, which is why right-click did
         // nothing.
         if self.rail_settings_menu {
-            let anchor = gear_rect.map(|r| r.right_top()).unwrap_or(ui.max_rect().left_bottom());
+            let anchor = gear_rect
+                .map(|r| r.right_top())
+                .unwrap_or(ui.max_rect().left_bottom());
             let mut close = false;
             let mut open_path: Option<PathBuf> = None;
             let mut prefs = false;
@@ -35815,7 +37329,10 @@ impl Kaleidotron {
                             if let Some(p) = path {
                                 let exists = p.exists();
                                 if ui
-                                    .add_enabled(exists, egui::Button::new(format!("\u{1F4C4}  {label}")))
+                                    .add_enabled(
+                                        exists,
+                                        egui::Button::new(format!("\u{1F4C4}  {label}")),
+                                    )
                                     .on_hover_text(p.to_string_lossy())
                                     .clicked()
                                 {
@@ -35834,10 +37351,16 @@ impl Kaleidotron {
             // Click anywhere else dismisses it.
             if ui.ctx().input(|i| i.pointer.any_click())
                 && !area.response.rect.contains(
-                    ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or_default(),
+                    ui.ctx()
+                        .input(|i| i.pointer.interact_pos())
+                        .unwrap_or_default(),
                 )
                 && !gear_rect.is_some_and(|r| {
-                    r.contains(ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or_default())
+                    r.contains(
+                        ui.ctx()
+                            .input(|i| i.pointer.interact_pos())
+                            .unwrap_or_default(),
+                    )
                 })
             {
                 close = true;
@@ -35880,31 +37403,99 @@ impl Kaleidotron {
         use PaletteAct::Menu;
         let mut v: Vec<(String, String, PaletteAct)> = vec![
             ("Open folder…".into(), "File".into(), Menu(MenuAction::Open)),
-            ("Preferences…".into(), "File".into(), Menu(MenuAction::Prefs)),
+            (
+                "Preferences…".into(),
+                "File".into(),
+                Menu(MenuAction::Prefs),
+            ),
             ("Hotkeys…".into(), "Help".into(), Menu(MenuAction::Hotkeys)),
-            ("Associations…".into(), "View".into(), Menu(MenuAction::Associations)),
-            ("Select by pattern…".into(), "Edit  Ctrl+D".into(), Menu(MenuAction::SelectMask)),
-            ("Find…".into(), "Edit  Ctrl+F".into(), Menu(MenuAction::Search)),
+            (
+                "Associations…".into(),
+                "View".into(),
+                Menu(MenuAction::Associations),
+            ),
+            (
+                "Select by pattern…".into(),
+                "Edit  Ctrl+D".into(),
+                Menu(MenuAction::SelectMask),
+            ),
+            (
+                "Find…".into(),
+                "Edit  Ctrl+F".into(),
+                Menu(MenuAction::Search),
+            ),
             ("Undo".into(), "Edit  Ctrl+Z".into(), Menu(MenuAction::Undo)),
-            ("Refresh".into(), "View  F5".into(), Menu(MenuAction::Refresh)),
-            ("Force refresh".into(), "View  Shift+F5".into(), Menu(MenuAction::HardRefresh)),
-            ("Toggle Explorer pane".into(), "View".into(), Menu(MenuAction::ToggleExplorer)),
-            ("Toggle Details pane".into(), "View".into(), Menu(MenuAction::ToggleDetails)),
-            ("Toggle Recolor pane".into(), "View".into(), Menu(MenuAction::ToggleRecolor)),
-            ("Toggle task output".into(), "View".into(), Menu(MenuAction::ToggleTasksPanel)),
-            ("Reload project tasks".into(), "View".into(), Menu(MenuAction::ReloadTasks)),
-            ("Toggle grid / table view".into(), "View  T".into(), Menu(MenuAction::ToggleTable)),
-            ("Toggle hidden files".into(), "View".into(), Menu(MenuAction::ToggleHidden)),
-            ("Reset thumbnail size".into(), "View".into(), Menu(MenuAction::ResetThumb)),
-            ("Go to parent folder".into(), "Go  Backspace".into(), Menu(MenuAction::Up)),
+            (
+                "Refresh".into(),
+                "View  F5".into(),
+                Menu(MenuAction::Refresh),
+            ),
+            (
+                "Force refresh".into(),
+                "View  Shift+F5".into(),
+                Menu(MenuAction::HardRefresh),
+            ),
+            (
+                "Toggle Explorer pane".into(),
+                "View".into(),
+                Menu(MenuAction::ToggleExplorer),
+            ),
+            (
+                "Toggle Details pane".into(),
+                "View".into(),
+                Menu(MenuAction::ToggleDetails),
+            ),
+            (
+                "Toggle Recolor pane".into(),
+                "View".into(),
+                Menu(MenuAction::ToggleRecolor),
+            ),
+            (
+                "Toggle task output".into(),
+                "View".into(),
+                Menu(MenuAction::ToggleTasksPanel),
+            ),
+            (
+                "Reload project tasks".into(),
+                "View".into(),
+                Menu(MenuAction::ReloadTasks),
+            ),
+            (
+                "Toggle grid / table view".into(),
+                "View  T".into(),
+                Menu(MenuAction::ToggleTable),
+            ),
+            (
+                "Toggle hidden files".into(),
+                "View".into(),
+                Menu(MenuAction::ToggleHidden),
+            ),
+            (
+                "Reset thumbnail size".into(),
+                "View".into(),
+                Menu(MenuAction::ResetThumb),
+            ),
+            (
+                "Go to parent folder".into(),
+                "Go  Backspace".into(),
+                Menu(MenuAction::Up),
+            ),
             ("Go home".into(), "Go".into(), Menu(MenuAction::Home)),
-            ("Amiga ColorFonts".into(), "Go".into(), Menu(MenuAction::AmigaFonts)),
+            (
+                "Amiga ColorFonts".into(),
+                "Go".into(),
+                Menu(MenuAction::AmigaFonts),
+            ),
         ];
         // Navigating to a source is the commonest thing you'd want a palette for, and these come
         // straight from the rail's own table so the two can't drift.
         for (idx, _glyph, label, tip) in RailSection::source_buttons() {
             if self.places_tab_enabled(*idx) {
-                v.push((format!("Go to: {label}"), (*tip).into(), PaletteAct::Source(*idx)));
+                v.push((
+                    format!("Go to: {label}"),
+                    (*tip).into(),
+                    PaletteAct::Source(*idx),
+                ));
             }
         }
         v
@@ -35915,7 +37506,11 @@ impl Kaleidotron {
     fn ui_palette(&mut self, ctx: &egui::Context) {
         let Some(is_cmd) = self.palette else { return };
         // Build the candidate list.
-        let cmds = if is_cmd { self.palette_commands() } else { Vec::new() };
+        let cmds = if is_cmd {
+            self.palette_commands()
+        } else {
+            Vec::new()
+        };
         // Score every candidate, then take the best. Commands and entries share the
         // same shape so the list rendering below doesn't care which mode it's in.
         // Quick-open: the current view's entries, which are already in memory.
@@ -35928,17 +37523,27 @@ impl Kaleidotron {
             }
         } else {
             for (i, e) in self.entries.iter().enumerate() {
-                let name = e.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 if let Some(s) = Self::palette_score(&name, &self.palette_query) {
-                    let hint = if e.is_dir { "folder".to_string() } else { String::new() };
+                    let hint = if e.is_dir {
+                        "folder".to_string()
+                    } else {
+                        String::new()
+                    };
                     scored.push((s, name, hint, i));
                 }
             }
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.truncate(60);
-        let rows: Vec<(String, String, usize)> =
-            scored.iter().map(|(_, l, h, i)| (l.clone(), h.clone(), *i)).collect();
+        let rows: Vec<(String, String, usize)> = scored
+            .iter()
+            .map(|(_, l, h, i)| (l.clone(), h.clone(), *i))
+            .collect();
         self.palette_sel = self.palette_sel.min(rows.len().saturating_sub(1));
 
         // Keys: arrows move, Enter runs, Esc closes.
@@ -35967,48 +37572,57 @@ impl Kaleidotron {
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
             });
         egui::Area::new(egui::Id::new("palette"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(screen.center().x, screen.min.y + 90.0))
             .pivot(egui::Align2::CENTER_TOP)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                    ui.set_width(560.0);
-                    let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.palette_query)
-                            .hint_text(if is_cmd { "Run a command…" } else { "Go to file…" })
-                            .desired_width(f32::INFINITY),
-                    );
-                    te.request_focus();
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                        for (n, (label, hint, _)) in rows.iter().enumerate() {
-                            let on = n == self.palette_sel;
-                            let r = ui.add_sized(
-                                [ui.available_width(), 24.0],
-                                egui::Button::selectable(on, label.as_str()),
-                            );
-                            if !hint.is_empty() {
-                                let p = r.rect.right_center() - egui::vec2(8.0, 0.0);
-                                ui.painter().text(
-                                    p,
-                                    egui::Align2::RIGHT_CENTER,
-                                    hint,
-                                    egui::FontId::proportional(11.0),
-                                    ui.visuals().weak_text_color(),
-                                );
-                            }
-                            if r.clicked() {
-                                run = Some(n);
-                            }
-                        }
-                        if rows.is_empty() {
-                            ui.weak("No matches");
-                        }
+                egui::Frame::popup(ui.style())
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_width(560.0);
+                        let te = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette_query)
+                                .hint_text(if is_cmd {
+                                    "Run a command…"
+                                } else {
+                                    "Go to file…"
+                                })
+                                .desired_width(f32::INFINITY),
+                        );
+                        te.request_focus();
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(340.0)
+                            .show(ui, |ui| {
+                                for (n, (label, hint, _)) in rows.iter().enumerate() {
+                                    let on = n == self.palette_sel;
+                                    let r = ui.add_sized(
+                                        [ui.available_width(), 24.0],
+                                        egui::Button::selectable(on, label.as_str()),
+                                    );
+                                    if !hint.is_empty() {
+                                        let p = r.rect.right_center() - egui::vec2(8.0, 0.0);
+                                        ui.painter().text(
+                                            p,
+                                            egui::Align2::RIGHT_CENTER,
+                                            hint,
+                                            egui::FontId::proportional(11.0),
+                                            ui.visuals().weak_text_color(),
+                                        );
+                                    }
+                                    if r.clicked() {
+                                        run = Some(n);
+                                    }
+                                }
+                                if rows.is_empty() {
+                                    ui.weak("No matches");
+                                }
+                            });
                     });
-                });
             });
         if enter && !rows.is_empty() {
             run = Some(self.palette_sel);
@@ -36063,7 +37677,8 @@ impl Kaleidotron {
                 self.want_repaint = true;
             }
         }
-        self.panel_layouts.insert(mode_id(self.mode), self.current_layout());
+        self.panel_layouts
+            .insert(mode_id(self.mode), self.current_layout());
         self.mode = new;
         // A mode seen for the first time keeps whatever is currently open, so this never yanks
         // panels away on first use — it only restores a layout you actually chose before.
@@ -36171,9 +37786,16 @@ impl Kaleidotron {
     /// and egui silently kept the old set.
     fn code_font(&self, ctx: &egui::Context) -> egui::FontId {
         let named = egui::FontFamily::Name(CODE_FAMILY.into());
-        let bound = self.code_font_loaded.as_deref().is_some_and(|p| !p.is_empty())
+        let bound = self
+            .code_font_loaded
+            .as_deref()
+            .is_some_and(|p| !p.is_empty())
             && ctx.fonts(|f| f.families().contains(&named));
-        let family = if bound { named } else { egui::FontFamily::Monospace };
+        let family = if bound {
+            named
+        } else {
+            egui::FontFamily::Monospace
+        };
         egui::FontId::new(self.code_font_size, family)
     }
 
@@ -36229,7 +37851,8 @@ impl Kaleidotron {
                 }
                 r.request_focus();
             }
-            ui.checkbox(&mut self.text_find_case, "Aa").on_hover_text("Match case");
+            ui.checkbox(&mut self.text_find_case, "Aa")
+                .on_hover_text("Match case");
             if hits.is_empty() {
                 if self.text_find.is_empty() {
                     ui.weak("—");
@@ -36239,10 +37862,16 @@ impl Kaleidotron {
             } else {
                 ui.weak(format!("{} of {}", self.text_find_idx + 1, hits.len()));
             }
-            if ui.add_enabled(!hits.is_empty(), egui::Button::new("⬆")).clicked() {
+            if ui
+                .add_enabled(!hits.is_empty(), egui::Button::new("⬆"))
+                .clicked()
+            {
                 prev = true;
             }
-            if ui.add_enabled(!hits.is_empty(), egui::Button::new("⬇")).clicked() {
+            if ui
+                .add_enabled(!hits.is_empty(), egui::Button::new("⬇"))
+                .clicked()
+            {
                 next = true;
             }
             if editing {
@@ -36253,11 +37882,17 @@ impl Kaleidotron {
                         .desired_width(180.0)
                         .hint_text("replacement"),
                 );
-                if ui.add_enabled(!hits.is_empty(), egui::Button::new("Replace")).clicked() {
+                if ui
+                    .add_enabled(!hits.is_empty(), egui::Button::new("Replace"))
+                    .clicked()
+                {
                     replace_one = true;
                 }
                 if ui
-                    .add_enabled(!hits.is_empty(), egui::Button::new(format!("All ({})", hits.len())))
+                    .add_enabled(
+                        !hits.is_empty(),
+                        egui::Button::new(format!("All ({})", hits.len())),
+                    )
                     .clicked()
                 {
                     replace_all = true;
@@ -36293,7 +37928,10 @@ impl Kaleidotron {
                     body.replace_range(*a..*b, &rep);
                 }
             }
-            self.toast(ToastKind::Info, format!("Replaced {} occurrence(s)", hits.len()));
+            self.toast(
+                ToastKind::Info,
+                format!("Replaced {} occurrence(s)", hits.len()),
+            );
             self.text_find_idx = 0;
         }
         if close {
@@ -36331,7 +37969,11 @@ impl Kaleidotron {
         let Some((_, body)) = self.text_doc.clone() else {
             return Err("nothing open".into());
         };
-        let out = if self.text_crlf { body.replace('\n', "\r\n") } else { body.clone() };
+        let out = if self.text_crlf {
+            body.replace('\n', "\r\n")
+        } else {
+            body.clone()
+        };
         // Re-encode to whatever the file was, so a CP437 source isn't quietly rewritten as UTF-8
         // the first time it is saved — that would mangle every box-drawing character in it.
         let bytes = crate::decode::encode_text(&out, self.text_enc);
@@ -36342,7 +37984,9 @@ impl Kaleidotron {
 
     /// Save over the open file.
     fn save_text(&mut self) {
-        let Some((path, _)) = self.text_doc.clone() else { return };
+        let Some((path, _)) = self.text_doc.clone() else {
+            return;
+        };
         // A virtual path (inside an archive, or a downloaded 16colo/YouTube file) points at a
         // temp copy that is thrown away — writing there looks like it worked and silently loses
         // the edit, so refuse rather than lie.
@@ -36362,7 +38006,9 @@ impl Kaleidotron {
 
     /// Save to a new file chosen by the user, and follow the document there.
     fn save_text_as(&mut self) {
-        let Some((path, _)) = self.text_doc.clone() else { return };
+        let Some((path, _)) = self.text_doc.clone() else {
+            return;
+        };
         let mut dlg = rfd::FileDialog::new().set_file_name(short_name(&path));
         if let Some(dir) = self.resolve_local(&path).parent() {
             dlg = dlg.set_directory(dir);
@@ -36399,13 +38045,16 @@ impl Kaleidotron {
             .set_title("Unsaved changes")
             .set_description(format!("{name} has unsaved changes. Discard them?"))
             .set_buttons(rfd::MessageButtons::OkCancel)
-            .show() == rfd::MessageDialogResult::Ok
+            .show()
+            == rfd::MessageDialogResult::Ok
     }
 
     /// Byte ranges of every match of the find term, in order. Empty when the search is empty.
     fn text_matches(&self) -> Vec<(usize, usize)> {
         let needle = self.text_find.as_str();
-        let Some((_, body)) = self.text_doc.as_ref() else { return Vec::new() };
+        let Some((_, body)) = self.text_doc.as_ref() else {
+            return Vec::new();
+        };
         if needle.is_empty() {
             return Vec::new();
         }
@@ -36426,15 +38075,23 @@ impl Kaleidotron {
         }
         self.text_follow_t = now;
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
-        let Some((path, _)) = self.text_doc.clone() else { return };
+        let Some((path, _)) = self.text_doc.clone() else {
+            return;
+        };
         let real = self.resolve_local(&path);
-        let Ok(len) = std::fs::metadata(&real).map(|m| m.len()) else { return };
+        let Ok(len) = std::fs::metadata(&real).map(|m| m.len()) else {
+            return;
+        };
         if len == self.text_follow_len {
             return;
         }
         self.text_follow_len = len;
         if let Ok(raw) = std::fs::read_to_string(&real) {
-            let body = if self.text_crlf { raw.replace("\r\n", "\n") } else { raw };
+            let body = if self.text_crlf {
+                raw.replace("\r\n", "\n")
+            } else {
+                raw
+            };
             self.text_orig = body.clone();
             if let Some((_, b)) = self.text_doc.as_mut() {
                 *b = body;
@@ -36446,7 +38103,9 @@ impl Kaleidotron {
     /// Draw the open text document: a read-only but selectable `TextEdit`, syntax-coloured via a
     /// `LayoutJob` from the same lexer the raster tile uses, with a line-number gutter.
     fn draw_text_ui(&mut self, ui: &mut egui::Ui, immersive: bool) {
-        let Some((path, body)) = self.text_doc.clone() else { return };
+        let Some((path, body)) = self.text_doc.clone() else {
+            return;
+        };
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -36456,7 +38115,8 @@ impl Kaleidotron {
         let editing = self.text_edit;
         // Deferred intents: the toolbar runs inside egui closures that cannot borrow `self` twice.
         let mut back = false;
-        let (mut want_edit, mut want_revert, mut want_save, mut want_save_as) = (false, false, false, false);
+        let (mut want_edit, mut want_revert, mut want_save, mut want_save_as) =
+            (false, false, false, false);
         let mut want_follow: Option<bool> = None;
         let mut want_task: Option<String> = None;
         let mut want_enc: Option<crate::decode::Encoding> = None;
@@ -36485,12 +38145,18 @@ impl Kaleidotron {
                     }
                     if ui
                         .add_enabled(dirty, egui::Button::new("↶ Revert"))
-                        .on_hover_text("Throw away every change since the file was opened or last saved")
+                        .on_hover_text(
+                            "Throw away every change since the file was opened or last saved",
+                        )
                         .clicked()
                     {
                         want_revert = true;
                     }
-                    if ui.button("✕ Done").on_hover_text("Leave edit mode").clicked() {
+                    if ui
+                        .button("✕ Done")
+                        .on_hover_text("Leave edit mode")
+                        .clicked()
+                    {
                         want_edit = true;
                     }
                 } else {
@@ -36527,17 +38193,19 @@ impl Kaleidotron {
                 // was read AS is part of reading it, and a file that decodes cleanly as UTF-8 can
                 // still be a CP437 file that happens to contain only ASCII.
                 let enc = self.text_enc;
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("text_enc")
-                    .selected_text(enc.label())
-                    .width(84.0)
-                    .show_ui(ui, |ui| {
-                        for e in crate::decode::Encoding::ALL {
-                            if ui.selectable_label(enc == e, e.label()).clicked() && e != enc {
-                                want_enc = Some(e);
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("text_enc")
+                        .selected_text(enc.label())
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            for e in crate::decode::Encoding::ALL {
+                                if ui.selectable_label(enc == e, e.label()).clicked() && e != enc {
+                                    want_enc = Some(e);
+                                }
                             }
-                        }
-                    }))
-                    .on_hover_text("Re-read this file as a different code page");
+                        }),
+                )
+                .on_hover_text("Re-read this file as a different code page");
                 let step = combo_scroll_step(ui, &cr);
                 if step != 0 {
                     let all = crate::decode::Encoding::ALL;
@@ -36605,7 +38273,11 @@ impl Kaleidotron {
                 let raw = std::mem::take(&mut self.text_raw);
                 let text = crate::decode::decode_with(&raw, e);
                 self.text_crlf = text.contains("\r\n");
-                let body = if self.text_crlf { text.replace("\r\n", "\n") } else { text };
+                let body = if self.text_crlf {
+                    text.replace("\r\n", "\n")
+                } else {
+                    text
+                };
                 self.text_orig = body.clone();
                 self.text_doc = Some((path.clone(), body));
                 self.text_raw = raw;
@@ -36655,7 +38327,10 @@ impl Kaleidotron {
         let code_bg = active.and_then(|t| rgb(t.extreme_bg.or(t.window_bg)));
         let gutter_col = active.and_then(|t| rgb(t.weak_text));
         let kind_idx = |k: crate::decode::Tok| -> usize {
-            crate::decode::ALL_TOKS.iter().position(|t| *t == k).unwrap_or(0)
+            crate::decode::ALL_TOKS
+                .iter()
+                .position(|t| *t == k)
+                .unwrap_or(0)
         };
         // One `FontId` for the whole surface — the layouter, the TextEdit and the gutter must agree
         // exactly or the numbers drift from their lines.
@@ -36672,7 +38347,11 @@ impl Kaleidotron {
         // gutter — which must use the very same font — keep their own handle.
         let code_font = mono.clone();
         let line_hl = self.code_line_highlight;
-        let wrap_at = if wrap { ui.available_width() - gutter_w } else { f32::INFINITY };
+        let wrap_at = if wrap {
+            ui.available_width() - gutter_w
+        } else {
+            f32::INFINITY
+        };
         // Search hits are painted by the layouter, so highlighting is a property of the text rather
         // than an overlay that would have to be kept in step with scrolling and wrapping.
         let hits = self.text_matches();
@@ -36683,29 +38362,43 @@ impl Kaleidotron {
         let hit_range = cur_hit;
         let hit_bg = ui.visuals().selection.bg_fill.gamma_multiply(0.55);
         let cur_bg = ui.visuals().warn_fg_color.gamma_multiply(0.55);
-        let mut layouter = move |ui: &egui::Ui, _text: &dyn egui::TextBuffer, _w: f32| -> std::sync::Arc<egui::Galley> {
+        let mut layouter = move |ui: &egui::Ui,
+                                 _text: &dyn egui::TextBuffer,
+                                 _w: f32|
+              -> std::sync::Arc<egui::Galley> {
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = wrap_at;
             // Byte offset of the run being appended, tracked so a match can be located within it.
             let mut off = 0usize;
-            let push = |job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32, at: usize| {
-                let bg = match hits.binary_search_by(|(a, b)| {
-                    if *b <= at { std::cmp::Ordering::Less } else if *a > at { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
-                }) {
-                    Ok(i) => Some(if Some(hits[i]) == cur_hit { cur_bg } else { hit_bg }),
-                    Err(_) => None,
+            let push =
+                |job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32, at: usize| {
+                    let bg = match hits.binary_search_by(|(a, b)| {
+                        if *b <= at {
+                            std::cmp::Ordering::Less
+                        } else if *a > at {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    }) {
+                        Ok(i) => Some(if Some(hits[i]) == cur_hit {
+                            cur_bg
+                        } else {
+                            hit_bg
+                        }),
+                        Err(_) => None,
+                    };
+                    job.append(
+                        text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: mono.clone(),
+                            color,
+                            background: bg.unwrap_or(egui::Color32::TRANSPARENT),
+                            ..Default::default()
+                        },
+                    );
                 };
-                job.append(
-                    text,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: mono.clone(),
-                        color,
-                        background: bg.unwrap_or(egui::Color32::TRANSPARENT),
-                        ..Default::default()
-                    },
-                );
-            };
             for (i, runs) in spans.iter().enumerate() {
                 for (text, tok) in runs {
                     let c = kind_rgb[kind_idx(*tok)];
@@ -36748,7 +38441,8 @@ impl Kaleidotron {
         // still show a mismatched band under the last line. Setting `extreme_bg_color` as well
         // keeps the widget's own frame in step with it.
         if let Some(bg) = code_bg {
-            ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
+            ui.painter()
+                .rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
             ui.visuals_mut().extreme_bg_color = bg;
         }
         egui::ScrollArea::both()
@@ -36756,96 +38450,104 @@ impl Kaleidotron {
             // Following a growing file means staying at its end, which is the whole point of tail.
             .stick_to_bottom(self.text_follow)
             .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                // The gutter is *painted* after the text, at the y of each galley row.
-                //
-                // Every attempt to lay it out as its own column of widgets drifts: the row pitch
-                // there is the label height plus item spacing, which is not the pitch the galley
-                // uses, so the numbers and the lines they label slide apart — imperceptibly at the
-                // top of the file and by whole lines further down. Reserving the space now and
-                // reading the real row positions back afterwards is exact by construction.
-                let gutter_x = ui.cursor().min.x;
-                ui.add_space(gutter_w);
-                // In view mode the buffer is still handed in as mutable and the edit thrown away:
-                // `interactive(false)` would also kill selection, and read-only text you cannot
-                // select or copy is worse than useless. In edit mode the real buffer goes in.
-                let mut scratch = body.clone();
-                let target: &mut String = if editing {
-                    match self.text_doc.as_mut() {
-                        Some((_, b)) => b,
-                        None => &mut scratch,
-                    }
-                } else {
-                    &mut scratch
-                };
-                // Reserve the current-line shape BEFORE the text so the tint lands underneath it —
-                // the same pre-allocate-then-`set` idiom the recolor rows use for their zebra
-                // stripes. Painting it afterwards would wash out the glyphs it is meant to pick out.
-                let hl_slot = ui.painter().add(egui::Shape::Noop);
-                let out = egui::TextEdit::multiline(target)
-                    .id(text_id)
-                    .font(code_font.clone())
-                    .desired_width(f32::INFINITY)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                // Highlight the row the cursor sits on. Driven off the galley rather than a line
-                // count so it stays correct under wrapping, where one logical line owns several
-                // rows and only the one actually containing the cursor should light up.
-                if line_hl {
-                    if let Some(range) = out.cursor_range {
-                        let r = out.galley.pos_from_cursor(range.primary);
-                        let row = egui::Rect::from_min_max(
-                            egui::pos2(ui.clip_rect().min.x, out.galley_pos.y + r.min.y),
-                            egui::pos2(ui.clip_rect().max.x, out.galley_pos.y + r.max.y),
-                        );
-                        // A tint off the theme's own selection colour, so it tracks an imported
-                        // theme instead of being a fixed grey that clashes with half of them.
-                        let c = ui.visuals().selection.bg_fill.gamma_multiply(0.22);
-                        ui.painter().set(hl_slot, egui::Shape::rect_filled(row, 0.0, c));
-                    }
-                }
-                // Wrapping breaks the one-row-per-line assumption the numbering relies on, so the
-                // gutter is omitted there rather than shown wrong.
-                if !wrap {
-                    let color = gutter_col.unwrap_or_else(|| ui.visuals().weak_text_color());
-                    let font = code_font.clone();
-                    let clip = ui.clip_rect();
-                    for (i, row) in out.galley.rows.iter().enumerate() {
-                        let y = out.galley_pos.y + row.pos.y;
-                        // Skip rows scrolled out of view — a 100k-line log would otherwise queue
-                        // one text shape per line, every frame.
-                        if y + 20.0 < clip.min.y || y > clip.max.y {
-                            continue;
+                ui.horizontal_top(|ui| {
+                    // The gutter is *painted* after the text, at the y of each galley row.
+                    //
+                    // Every attempt to lay it out as its own column of widgets drifts: the row pitch
+                    // there is the label height plus item spacing, which is not the pitch the galley
+                    // uses, so the numbers and the lines they label slide apart — imperceptibly at the
+                    // top of the file and by whole lines further down. Reserving the space now and
+                    // reading the real row positions back afterwards is exact by construction.
+                    let gutter_x = ui.cursor().min.x;
+                    ui.add_space(gutter_w);
+                    // In view mode the buffer is still handed in as mutable and the edit thrown away:
+                    // `interactive(false)` would also kill selection, and read-only text you cannot
+                    // select or copy is worse than useless. In edit mode the real buffer goes in.
+                    let mut scratch = body.clone();
+                    let target: &mut String = if editing {
+                        match self.text_doc.as_mut() {
+                            Some((_, b)) => b,
+                            None => &mut scratch,
                         }
-                        ui.painter().text(
-                            egui::pos2(gutter_x + gutter_w - 6.0, y),
-                            egui::Align2::RIGHT_TOP,
-                            format!("{}", i + 1),
-                            font.clone(),
-                            color,
+                    } else {
+                        &mut scratch
+                    };
+                    // Reserve the current-line shape BEFORE the text so the tint lands underneath it —
+                    // the same pre-allocate-then-`set` idiom the recolor rows use for their zebra
+                    // stripes. Painting it afterwards would wash out the glyphs it is meant to pick out.
+                    let hl_slot = ui.painter().add(egui::Shape::Noop);
+                    let out = egui::TextEdit::multiline(target)
+                        .id(text_id)
+                        .font(code_font.clone())
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    // Highlight the row the cursor sits on. Driven off the galley rather than a line
+                    // count so it stays correct under wrapping, where one logical line owns several
+                    // rows and only the one actually containing the cursor should light up.
+                    if line_hl {
+                        if let Some(range) = out.cursor_range {
+                            let r = out.galley.pos_from_cursor(range.primary);
+                            let row = egui::Rect::from_min_max(
+                                egui::pos2(ui.clip_rect().min.x, out.galley_pos.y + r.min.y),
+                                egui::pos2(ui.clip_rect().max.x, out.galley_pos.y + r.max.y),
+                            );
+                            // A tint off the theme's own selection colour, so it tracks an imported
+                            // theme instead of being a fixed grey that clashes with half of them.
+                            let c = ui.visuals().selection.bg_fill.gamma_multiply(0.22);
+                            ui.painter()
+                                .set(hl_slot, egui::Shape::rect_filled(row, 0.0, c));
+                        }
+                    }
+                    // Wrapping breaks the one-row-per-line assumption the numbering relies on, so the
+                    // gutter is omitted there rather than shown wrong.
+                    if !wrap {
+                        let color = gutter_col.unwrap_or_else(|| ui.visuals().weak_text_color());
+                        let font = code_font.clone();
+                        let clip = ui.clip_rect();
+                        for (i, row) in out.galley.rows.iter().enumerate() {
+                            let y = out.galley_pos.y + row.pos.y;
+                            // Skip rows scrolled out of view — a 100k-line log would otherwise queue
+                            // one text shape per line, every frame.
+                            if y + 20.0 < clip.min.y || y > clip.max.y {
+                                continue;
+                            }
+                            ui.painter().text(
+                                egui::pos2(gutter_x + gutter_w - 6.0, y),
+                                egui::Align2::RIGHT_TOP,
+                                format!("{}", i + 1),
+                                font.clone(),
+                                color,
+                            );
+                        }
+                    }
+                    // Jumping to a match means moving the cursor there: egui scrolls to keep the
+                    // cursor visible, so selecting the range both reveals and marks the hit.
+                    if jump {
+                        let end = egui::Rect::from_min_size(
+                            egui::pos2(ui.min_rect().min.x, ui.min_rect().max.y),
+                            egui::Vec2::ZERO,
                         );
+                        ui.scroll_to_rect(end, Some(egui::Align::BOTTOM));
                     }
-                }
-                // Jumping to a match means moving the cursor there: egui scrolls to keep the
-                // cursor visible, so selecting the range both reveals and marks the hit.
-                if jump {
-                    let end = egui::Rect::from_min_size(
-                        egui::pos2(ui.min_rect().min.x, ui.min_rect().max.y),
-                        egui::Vec2::ZERO,
-                    );
-                    ui.scroll_to_rect(end, Some(egui::Align::BOTTOM));
-                }
-                if seek {
-                    if let Some((a, b)) = hit_range {
-                        let ccur = |byte: usize| egui::text::CCursor::new(body[..byte.min(body.len())].chars().count());
-                        let mut st = out.state.clone();
-                        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(ccur(a), ccur(b))));
-                        st.store(ui.ctx(), out.response.id);
-                        ui.ctx().memory_mut(|m| m.request_focus(out.response.id));
+                    if seek {
+                        if let Some((a, b)) = hit_range {
+                            let ccur = |byte: usize| {
+                                egui::text::CCursor::new(
+                                    body[..byte.min(body.len())].chars().count(),
+                                )
+                            };
+                            let mut st = out.state.clone();
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                ccur(a),
+                                ccur(b),
+                            )));
+                            st.store(ui.ctx(), out.response.id);
+                            ui.ctx().memory_mut(|m| m.request_focus(out.response.id));
+                        }
                     }
-                }
+                });
             });
-        });
     }
 
     /// Does the selected theme style the app chrome? (scope 0 = all, 2 = chrome only)
@@ -36911,9 +38613,18 @@ impl Kaleidotron {
             let age = now - t.born;
             let fade = ((Self::TOAST_SECS + 0.8 - age) / 0.8).clamp(0.0, 1.0) as f32;
             let (bg, fg) = match t.kind {
-                ToastKind::Success => (egui::Color32::from_rgb(24, 60, 32), egui::Color32::from_rgb(180, 240, 190)),
-                ToastKind::Error => (egui::Color32::from_rgb(70, 26, 26), egui::Color32::from_rgb(255, 190, 190)),
-                ToastKind::Info => (egui::Color32::from_rgb(30, 34, 42), egui::Color32::from_rgb(215, 220, 230)),
+                ToastKind::Success => (
+                    egui::Color32::from_rgb(24, 60, 32),
+                    egui::Color32::from_rgb(180, 240, 190),
+                ),
+                ToastKind::Error => (
+                    egui::Color32::from_rgb(70, 26, 26),
+                    egui::Color32::from_rgb(255, 190, 190),
+                ),
+                ToastKind::Info => (
+                    egui::Color32::from_rgb(30, 34, 42),
+                    egui::Color32::from_rgb(215, 220, 230),
+                ),
             };
             let area = egui::Area::new(egui::Id::new(("toast", idx)))
                 .order(egui::Order::Foreground)
@@ -36927,9 +38638,7 @@ impl Kaleidotron {
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
                             ui.set_max_width(420.0);
-                            ui.label(
-                                egui::RichText::new(&t.text).color(fg.gamma_multiply(fade)),
-                            );
+                            ui.label(egui::RichText::new(&t.text).color(fg.gamma_multiply(fade)));
                         });
                 });
             let r = area.response;
@@ -38105,7 +39814,7 @@ impl Kaleidotron {
         // Kits / Samples sub-tab actions (deferred — the closure can't borrow self twice).
         let mut load_kit: Option<PathBuf> = None;
         let mut open_editor = false; // enter the standalone pad editor (Kits tab / kit load)
-        // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
+                                     // "🎨 TheDraw Fonts" → mount the bundled library (None = all; Some(cat) = a type subfolder).
         let mut open_bundled_tdf: Option<Option<&'static str>> = None;
         let mut open_amiga_fonts = false;
         let mut recent_remove: Option<PathBuf> = None; // Recent → "Remove"
@@ -39866,7 +41575,9 @@ impl eframe::App for Kaleidotron {
         }
         // `--view`: Esc quits immediately (consumed, so it doesn't also fall through to the
         // back-to-grid handler — there's no grid to go back to in the bare viewer).
-        if self.view_only && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if self.view_only
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Track the live user zoom (changed by Ctrl +/-) so `save` can persist it. The effective
@@ -39939,7 +41650,9 @@ impl eframe::App for Kaleidotron {
         // they are wanted — so they are handled ahead of the `typing` gate and consumed, which also
         // stops Ctrl+F falling through to the grid's advanced search.
         if self.text_doc.is_some() {
-            if self.text_edit && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            if self.text_edit
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S))
+            {
                 self.save_text();
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
@@ -40242,11 +41955,11 @@ impl eframe::App for Kaleidotron {
             }
             hide_cursor = self.idle_t > CURSOR_HIDE_SECS;
             self.want_repaint = true; // keep polling the pointer for edge reveal + idle
-            // A menu/combo opened from an edge bar (e.g. the "Auto" popup) extends AWAY from the
-            // edge — moving the pointer onto it would leave the 48px reveal zone and hide the bar,
-            // closing the menu. So FREEZE the edge visibility while any popup is open (keep exactly
-            // the bar the menu opened from — don't reveal the others, which would relayout the whole
-            // view and flicker the menu shut), and never hide the cursor then.
+                                      // A menu/combo opened from an edge bar (e.g. the "Auto" popup) extends AWAY from the
+                                      // edge — moving the pointer onto it would leave the 48px reveal zone and hide the bar,
+                                      // closing the menu. So FREEZE the edge visibility while any popup is open (keep exactly
+                                      // the bar the menu opened from — don't reveal the others, which would relayout the whole
+                                      // view and flicker the menu shut), and never hide the cursor then.
             let popup_open = egui::Popup::is_any_open(&ctx);
             if popup_open {
                 hide_cursor = false;
@@ -40660,7 +42373,8 @@ impl eframe::App for Kaleidotron {
         }
         // Ctrl+Shift+P = command palette, Ctrl+P = quick-open. Consumed so neither leaks to a
         // grid/viewer binding, and skipped while another text field has focus.
-        if self.path_edit.is_none() && self.rebinding.is_none() && !ctx.egui_wants_keyboard_input() {
+        if self.path_edit.is_none() && self.rebinding.is_none() && !ctx.egui_wants_keyboard_input()
+        {
             let (cmd, quick) = ctx.input_mut(|i| {
                 (
                     i.consume_key(
@@ -41010,7 +42724,10 @@ impl eframe::App for Kaleidotron {
                                 (k(Action::LastItem), "Last item (grid)"),
                                 (k(Action::GoToRoot), "Go to filesystem root"),
                                 (k(Action::GoHome), "Go to home folder"),
-                                ("Mouse Back / Fwd".into(), "Folder history · prev / next image"),
+                                (
+                                    "Mouse Back / Fwd".into(),
+                                    "Folder history · prev / next image",
+                                ),
                             ],
                         ),
                         (
@@ -41241,46 +42958,46 @@ impl eframe::App for Kaleidotron {
                         egui::Frame::NONE
                             .inner_margin(egui::Margin::symmetric(22, 16))
                             .show(ui, |ui| {
-                              // The content Frame sits inside `ui.horizontal_top` (rail | content),
-                              // so its inner Ui INHERITS a left-to-right layout — which laid the
-                              // header and every section's widgets out sideways and shoved
-                              // `ui.columns` off to the right. Force top-down here; that's the one
-                              // fix behind all the "columns collapsed / sprawled" symptoms.
-                              ui.vertical(|ui| {
-                                // Section header (big title + subtitle), above the scroll area.
-                                let (title, subtitle, _) = PREF_SECTIONS[sec as usize];
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(title).size(21.0).strong(),
-                                        )
-                                        .selectable(false),
-                                    );
-                                    ui.add_space(10.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(subtitle)
-                                                .color(ui.visuals().weak_text_color())
-                                                .size(13.0),
-                                        )
-                                        .selectable(false),
-                                    );
-                                });
-                                ui.add_space(14.0);
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .max_height((avail_h - 46.0).max(120.0))
-                                    .show(ui, |ui| {
-                                        // HARD-bound the content width. Without this, an
-                                        // auto_shrink=false ScrollArea reports an unbounded
-                                        // available width, so long labels never wrap — which
-                                        // balloons the window AND collapses `ui.columns` into an
-                                        // overlapping strip. A fixed width makes labels wrap and
-                                        // every column compute a sane width.
-                                        ui.set_width(ui.available_width().min(864.0));
-                                        self.render_prefs_sections(ui, &ctx, &mut out);
+                                // The content Frame sits inside `ui.horizontal_top` (rail | content),
+                                // so its inner Ui INHERITS a left-to-right layout — which laid the
+                                // header and every section's widgets out sideways and shoved
+                                // `ui.columns` off to the right. Force top-down here; that's the one
+                                // fix behind all the "columns collapsed / sprawled" symptoms.
+                                ui.vertical(|ui| {
+                                    // Section header (big title + subtitle), above the scroll area.
+                                    let (title, subtitle, _) = PREF_SECTIONS[sec as usize];
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title).size(21.0).strong(),
+                                            )
+                                            .selectable(false),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(subtitle)
+                                                    .color(ui.visuals().weak_text_color())
+                                                    .size(13.0),
+                                            )
+                                            .selectable(false),
+                                        );
                                     });
-                              });
+                                    ui.add_space(14.0);
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .max_height((avail_h - 46.0).max(120.0))
+                                        .show(ui, |ui| {
+                                            // HARD-bound the content width. Without this, an
+                                            // auto_shrink=false ScrollArea reports an unbounded
+                                            // available width, so long labels never wrap — which
+                                            // balloons the window AND collapses `ui.columns` into an
+                                            // overlapping strip. A fixed width makes labels wrap and
+                                            // every column compute a sane width.
+                                            ui.set_width(ui.available_width().min(864.0));
+                                            self.render_prefs_sections(ui, &ctx, &mut out);
+                                        });
+                                });
                             });
                     });
                 });
@@ -41421,7 +43138,9 @@ impl eframe::App for Kaleidotron {
                             self.status = "Theme imported".into();
                             out.theme_apply = true;
                         }
-                        None => self.status = "Not a theme JSON (needs colors or native keys)".into(),
+                        None => {
+                            self.status = "Not a theme JSON (needs colors or native keys)".into()
+                        }
                     }
                 }
             }
@@ -41492,7 +43211,9 @@ impl eframe::App for Kaleidotron {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(&ctx, |ui| {
                     ui.label("Shown on every font thumbnail (TTF · OTF · FON · TDF) when enabled.");
-                    ui.label("One line per row; TDF tiles fall back to the font's own name when blank.");
+                    ui.label(
+                        "One line per row; TDF tiles fall back to the font's own name when blank.",
+                    );
                     ui.add_space(6.0);
                     // Re-render tiles when editing settles (focus lost), not per keystroke.
                     let resp = ui.add(
@@ -41503,19 +43224,27 @@ impl eframe::App for Kaleidotron {
                     );
                     changed |= resp.lost_focus() && resp.changed();
                     ui.horizontal(|ui| {
-                        changed |= ui.checkbox(&mut self.font_preview_on, "Use this text on font tiles").changed();
+                        changed |= ui
+                            .checkbox(&mut self.font_preview_on, "Use this text on font tiles")
+                            .changed();
                         if ui.button("↺ Default").clicked() {
-                            self.font_preview_text = crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
+                            self.font_preview_text =
+                                crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
                             changed = true;
                         }
-                        if ui.button("Apply").on_hover_text("Re-render the font thumbnails now").clicked() {
+                        if ui
+                            .button("Apply")
+                            .on_hover_text("Re-render the font thumbnails now")
+                            .clicked()
+                        {
                             changed = true;
                         }
                     });
                 });
             if changed {
                 // Editing implies "use it".
-                self.font_preview_on = self.font_preview_on || !self.font_preview_text.trim().is_empty();
+                self.font_preview_on =
+                    self.font_preview_on || !self.font_preview_text.trim().is_empty();
                 self.refresh_font_thumbs();
             }
             self.show_font_preview_edit = open;
@@ -41704,10 +43433,26 @@ impl eframe::App for Kaleidotron {
         if let Err(e) = crate::secrets::save(
             &self.secrets_file,
             &[
-                ("steam_api_key", &self.steam_api_key, "Steam Web API key — steamcommunity.com/dev/apikey"),
-                ("ma_key", &self.ma_key, "ModArchive API key (optional; browsing works without one)"),
-                ("da_client_id", &self.da_client_id, "DeviantArt app client_id — deviantart.com/developers"),
-                ("da_client_secret", &self.da_client_secret, "DeviantArt app client_secret (keep private)"),
+                (
+                    "steam_api_key",
+                    &self.steam_api_key,
+                    "Steam Web API key — steamcommunity.com/dev/apikey",
+                ),
+                (
+                    "ma_key",
+                    &self.ma_key,
+                    "ModArchive API key (optional; browsing works without one)",
+                ),
+                (
+                    "da_client_id",
+                    &self.da_client_id,
+                    "DeviantArt app client_id — deviantart.com/developers",
+                ),
+                (
+                    "da_client_secret",
+                    &self.da_client_secret,
+                    "DeviantArt app client_secret (keep private)",
+                ),
             ],
         ) {
             eprintln!("secrets.json: {e}");
@@ -41724,7 +43469,11 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_YOUTUBE_KEY, &self.plugin_youtube);
         eframe::set_value(storage, Self::PLUGIN_STEAM_KEY, &self.plugin_steam);
         eframe::set_value(storage, Self::PLUGIN_IMAGES_KEY, &self.plugin_images);
-        eframe::set_value(storage, Self::PLUGIN_AUDIOSEARCH_KEY, &self.plugin_audiosearch);
+        eframe::set_value(
+            storage,
+            Self::PLUGIN_AUDIOSEARCH_KEY,
+            &self.plugin_audiosearch,
+        );
         eframe::set_value(storage, Self::PLUGIN_DA_KEY, &self.plugin_deviantart);
         eframe::set_value(storage, Self::RAIL_SECTION_KEY, &self.rail_section.to_u8());
         eframe::set_value(storage, Self::RECENTS_KEY, &self.recent_dirs);
@@ -41805,11 +43554,27 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::FONT_LGAP_KEY, &self.font_line_gap);
         eframe::set_value(storage, Self::FONT_TOPDOWN_KEY, &self.font_top_down);
         eframe::set_value(storage, Self::FONT_STROKE_W_KEY, &self.font_stroke_w);
-        eframe::set_value(storage, Self::FONT_STROKE_COLOR_KEY, &self.font_stroke_color);
-        eframe::set_value(storage, Self::FONT_STROKE_MODE_KEY, &self.font_stroke_mode.to_u8());
-        eframe::set_value(storage, Self::FONT_STROKE_PER_CHAR_KEY, &self.font_stroke_per_char);
+        eframe::set_value(
+            storage,
+            Self::FONT_STROKE_COLOR_KEY,
+            &self.font_stroke_color,
+        );
+        eframe::set_value(
+            storage,
+            Self::FONT_STROKE_MODE_KEY,
+            &self.font_stroke_mode.to_u8(),
+        );
+        eframe::set_value(
+            storage,
+            Self::FONT_STROKE_PER_CHAR_KEY,
+            &self.font_stroke_per_char,
+        );
         eframe::set_value(storage, Self::FONT_RECOLOR_KEY, &self.font_apply_recolor);
-        eframe::set_value(storage, Self::FONT_PREVIEW_ZOOM_KEY, &self.font_preview_zoom);
+        eframe::set_value(
+            storage,
+            Self::FONT_PREVIEW_ZOOM_KEY,
+            &self.font_preview_zoom,
+        );
         eframe::set_value(storage, Self::FONT_PREVIEW_H_KEY, &self.font_preview_h);
         eframe::set_value(storage, Self::FONT_3D_ON_KEY, &self.font_3d_on);
         eframe::set_value(storage, Self::SVG_3D_ON_KEY, &self.svg_3d_on);
@@ -41818,9 +43583,21 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::FONT_3D_FACE_KEY, &self.font_3d_face);
         eframe::set_value(storage, Self::FONT_3D_BACK_KEY, &self.font_3d_back);
         eframe::set_value(storage, Self::FONT_3D_SIDE_KEY, &self.font_3d_side);
-        eframe::set_value(storage, Self::FONT_3D_LIGHT_YAW_KEY, &self.font_3d_light_yaw);
-        eframe::set_value(storage, Self::FONT_3D_LIGHT_PITCH_KEY, &self.font_3d_light_pitch);
-        eframe::set_value(storage, Self::FONT_3D_LIGHT_RGB_KEY, &self.font_3d_light_rgb);
+        eframe::set_value(
+            storage,
+            Self::FONT_3D_LIGHT_YAW_KEY,
+            &self.font_3d_light_yaw,
+        );
+        eframe::set_value(
+            storage,
+            Self::FONT_3D_LIGHT_PITCH_KEY,
+            &self.font_3d_light_pitch,
+        );
+        eframe::set_value(
+            storage,
+            Self::FONT_3D_LIGHT_RGB_KEY,
+            &self.font_3d_light_rgb,
+        );
         eframe::set_value(storage, Self::FONT_3D_YAW_KEY, &self.font_3d_yaw);
         eframe::set_value(storage, Self::FONT_3D_PITCH_KEY, &self.font_3d_pitch);
         eframe::set_value(storage, Self::FONT_3D_ZOOM_KEY, &self.font_3d_zoom);
@@ -41894,24 +43671,52 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::TRANSP_CHECKER_B_KEY, &self.transp_checker_b);
         eframe::set_value(storage, Self::TRANSP_COLOR_KEY, &self.transp_color);
         eframe::set_value(storage, Self::JPEG_CLEAN_KEY, &self.jpeg_clean_on);
-        eframe::set_value(storage, Self::JPEG_CLEAN_AUTO_KEY, &self.jpeg_clean_key_auto);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_AUTO_KEY,
+            &self.jpeg_clean_key_auto,
+        );
         eframe::set_value(storage, Self::JPEG_CLEAN_KEYCOL_KEY, &self.jpeg_clean_key);
         eframe::set_value(storage, Self::JPEG_CLEAN_TOL_KEY, &self.jpeg_clean_tol);
-        eframe::set_value(storage, Self::JPEG_CLEAN_TRANSP_KEY, &self.jpeg_clean_transparent);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_TRANSP_KEY,
+            &self.jpeg_clean_transparent,
+        );
         eframe::set_value(storage, Self::JPEG_CLEAN_BG_KEY, &self.jpeg_clean_bg);
         eframe::set_value(storage, Self::JPEG_CLEAN_SNAP_KEY, &self.jpeg_clean_snap);
-        eframe::set_value(storage, Self::JPEG_CLEAN_COLORS_KEY, &self.jpeg_clean_colors);
-        eframe::set_value(storage, Self::JPEG_CLEAN_DESPECKLE_KEY, &self.jpeg_clean_despeckle);
-        eframe::set_value(storage, Self::JPEG_CLEAN_ISLAND_KEY, &self.jpeg_clean_min_island);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_COLORS_KEY,
+            &self.jpeg_clean_colors,
+        );
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_DESPECKLE_KEY,
+            &self.jpeg_clean_despeckle,
+        );
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_ISLAND_KEY,
+            &self.jpeg_clean_min_island,
+        );
         eframe::set_value(storage, Self::JPEG_CLEAN_MERGE_KEY, &self.jpeg_clean_merge);
-        eframe::set_value(storage, Self::JPEG_CLEAN_MERGE_MAX_KEY, &self.jpeg_clean_merge_max);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_MERGE_MAX_KEY,
+            &self.jpeg_clean_merge_max,
+        );
         eframe::set_value(
             storage,
             Self::JPEG_CLEAN_MERGE_RADIUS_KEY,
             &self.jpeg_clean_merge_radius,
         );
         eframe::set_value(storage, Self::JPEG_CLEAN_GRID_KEY, &self.jpeg_clean_grid);
-        eframe::set_value(storage, Self::JPEG_CLEAN_GRID_SIZE_KEY, &self.jpeg_clean_grid_size);
+        eframe::set_value(
+            storage,
+            Self::JPEG_CLEAN_GRID_SIZE_KEY,
+            &self.jpeg_clean_grid_size,
+        );
         eframe::set_value(storage, Self::AUTO_CROP_KEY, &self.auto_crop_on);
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
@@ -41947,7 +43752,11 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::OPEN_DBLCLICK_KEY, &self.open_on_double_click);
         eframe::set_value(storage, Self::GAP_Y_KEY, &self.grid_gap_y);
         eframe::set_value(storage, Self::CAPTION_KEY, &self.caption_fields);
-        eframe::set_value(storage, Self::GRID_HOVER_CAPTION_KEY, &self.grid_hover_caption);
+        eframe::set_value(
+            storage,
+            Self::GRID_HOVER_CAPTION_KEY,
+            &self.grid_hover_caption,
+        );
         eframe::set_value(storage, Self::DETAILS_THUMB_H_KEY, &self.details_thumb_h);
         eframe::set_value(storage, Self::RECOLOR_THUMB_H_KEY, &self.recolor_thumb_h);
         eframe::set_value(
@@ -42014,7 +43823,11 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::REXMASK_KEY, &self.rexfont_mask);
         eframe::set_value(storage, Self::PETSCII_MASK_KEY, &self.petscii_mask);
-        eframe::set_value(storage, Self::PETSCII_USE_SEL_KEY, &self.petscii_use_selected);
+        eframe::set_value(
+            storage,
+            Self::PETSCII_USE_SEL_KEY,
+            &self.petscii_use_selected,
+        );
         eframe::set_value(storage, Self::ATASCII_MASK_KEY, &self.atascii_mask);
         eframe::set_value(storage, Self::APPLE_MASK_KEY, &self.apple_mask);
         eframe::set_value(
@@ -42058,7 +43871,11 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::SHADE_ICE_KEY, &self.shade_ice);
         eframe::set_value(storage, Self::SHADE_INVERT_KEY, &self.shade_invert);
         eframe::set_value(storage, Self::ANSI_MASK_KEY, &self.ansi_mask);
-        eframe::set_value(storage, Self::SHADE_EXPORT_FORMAT_KEY, &self.shade_export_format);
+        eframe::set_value(
+            storage,
+            Self::SHADE_EXPORT_FORMAT_KEY,
+            &self.shade_export_format,
+        );
         eframe::set_value(storage, Self::SHADE_FIT_CHARS_KEY, &self.shade_fit_chars);
         eframe::set_value(storage, Self::SHADE_FIT_COLS_KEY, &self.shade_fit_cols);
         eframe::set_value(storage, Self::SHADE_FIT_ROWS_KEY, &self.shade_fit_rows);
@@ -42085,7 +43902,11 @@ impl eframe::App for Kaleidotron {
         // stable, reviewable diff rather than HashMap iteration order.
         let entries: Vec<(String, String)> = Action::ALL
             .iter()
-            .filter_map(|a| self.keymap.get(a).map(|k| (a.id().to_string(), k.to_config())))
+            .filter_map(|a| {
+                self.keymap
+                    .get(a)
+                    .map(|k| (a.id().to_string(), k.to_config()))
+            })
             .collect();
         let labels = |id: &str| Action::from_id(id).map(|a| a.label().to_string());
         if let Err(e) = crate::keybindings::save(&self.keybindings_file, &entries, &labels) {
@@ -42658,8 +44479,16 @@ fn theme_from_base(light: bool) -> crate::theme::Theme {
 /// A raised card surface for the current theme: a step off the panel fill (lighter on dark,
 /// darker on light) so grouped controls read as cards. Returns (fill, border).
 fn card_colors(v: &egui::Visuals) -> (egui::Color32, egui::Color32) {
-    let toward = if v.dark_mode { [255, 255, 255] } else { [0, 0, 0] };
-    let (fill_t, border_t) = if v.dark_mode { (0.05, 0.14) } else { (0.04, 0.16) };
+    let toward = if v.dark_mode {
+        [255, 255, 255]
+    } else {
+        [0, 0, 0]
+    };
+    let (fill_t, border_t) = if v.dark_mode {
+        (0.05, 0.14)
+    } else {
+        (0.04, 0.16)
+    };
     (
         blend_toward(v.panel_fill, toward, fill_t),
         blend_toward(v.panel_fill, toward, border_t),
@@ -42711,12 +44540,17 @@ fn apply_fonts(ctx: &egui::Context, code: Option<Vec<u8>>) {
     // The code family keeps the same two fallbacks behind it, so a programming font with no arrows
     // or box-drawing glyphs still renders them rather than tofuing mid-listing.
     if let Some(bytes) = code {
-        fonts
-            .font_data
-            .insert("CodeFont".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.font_data.insert(
+            "CodeFont".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
         fonts.families.insert(
             egui::FontFamily::Name(CODE_FAMILY.into()),
-            vec!["CodeFont".to_owned(), "NerdFontSymbols".to_owned(), "DejaVuSans".to_owned()],
+            vec![
+                "CodeFont".to_owned(),
+                "NerdFontSymbols".to_owned(),
+                "DejaVuSans".to_owned(),
+            ],
         );
     }
     ctx.set_fonts(fonts);
@@ -43278,19 +45112,19 @@ struct PipeAux<'a> {
     shade_f2: f32,
     shade_f3: f32,
     shade_half: bool,
-    shade_f1_on: bool,  // include ░ as a shade candidate
-    shade_f2_on: bool,  // include ▒ as a shade candidate
-    shade_f3_on: bool,  // include ▓ as a shade candidate
+    shade_f1_on: bool,        // include ░ as a shade candidate
+    shade_f2_on: bool,        // include ▒ as a shade candidate
+    shade_f3_on: bool,        // include ▓ as a shade candidate
     shade_half_on: [bool; 4], // per half-block toggle (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐)
     shade_half_use: [f32; 4], // per half-block usage bias 0..1 (0.5 = neutral)
-    shade_amount: f32,  // 0..1: shading vs flat color
-    shade_smooth: f32,  // 0..1: contrast penalty on shade blocks (avoid garish dithers)
-    shade_detail: f32,  // 0..1: half-block detail weight (keep edges crisp when shrunk)
+    shade_amount: f32,        // 0..1: shading vs flat color
+    shade_smooth: f32,        // 0..1: contrast penalty on shade blocks (avoid garish dithers)
+    shade_detail: f32,        // 0..1: half-block detail weight (keep edges crisp when shrunk)
     shade_cw: usize,
     shade_ch: usize,
-    font_8x8: bool,     // render with the 8×8 VGA50 font (else 8×16)
-    shade_ice: bool,    // iCE color: unlock all 16 colors as backgrounds
-    shade_invert: bool, // ANSI Shade inverse video
+    font_8x8: bool,                   // render with the 8×8 VGA50 font (else 8×16)
+    shade_ice: bool,                  // iCE color: unlock all 16 colors as backgrounds
+    shade_invert: bool,               // ANSI Shade inverse video
     shade_allowed: Option<Vec<bool>>, // ANSI glyph-picker mask (None = all)
     // PETSCII pass params (only consulted when dither_method == DITHER_PETSCII). Lets
     // PETSCII apply through the pipeline — grid tiles, details preview, "Apply to grid".
@@ -43326,8 +45160,8 @@ struct PipeAux<'a> {
     unicode_ranges: u8,
     unicode_extra: Vec<u32>, // Ramp: user codepoints appended to the ranges' glyph set
     unicode_pool: Vec<u16>,
-    pixelate_h: f32,       // Pixelate block height (width = adjust.pixelate); <2 = square
-    fx: PostFx,            // CRT post-filter params (scanlines/glow/vignette/phosphor)
+    pixelate_h: f32, // Pixelate block height (width = adjust.pixelate); <2 = square
+    fx: PostFx,      // CRT post-filter params (scanlines/glow/vignette/phosphor)
     balance: [i16; 3],
     palette: Option<&'a [[u8; 4]]>,
     // When set, the `Dither` and `Palette` marker ops are SKIPPED — used by the ANSI
@@ -43412,9 +45246,10 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                     }
                 } else if aux.dither_method == crate::thumb::DITHER_REXFONT {
                     // REXPaint font — a generic glyph-font over the selected bundled font.
-                    if let (Some(p), Some(font)) =
-                        (aux.palette, crate::decode::rexfont::rexfont(aux.rexfont_sel))
-                    {
+                    if let (Some(p), Some(font)) = (
+                        aux.palette,
+                        crate::decode::rexfont::rexfont(aux.rexfont_sel),
+                    ) {
                         crate::thumb::glyphfont_pass(
                             rgba,
                             w,
@@ -43431,7 +45266,8 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                         // Ramp: density char-art over the enabled Unicode ranges, rendered from the
                         // user-chosen ramp font (see uniart::set_ramp_src). Colours from the active
                         // Reduce/palette, or the full xterm-256 set if none.
-                        let rf = crate::decode::uniart::ramp(aux.unicode_ranges, &aux.unicode_extra);
+                        let rf =
+                            crate::decode::uniart::ramp(aux.unicode_ranges, &aux.unicode_extra);
                         let (font, _) = rf.as_ref();
                         crate::thumb::unicode_ramp_pass(
                             rgba,
@@ -43733,27 +45569,29 @@ fn vga_swatch_menu(ui: &mut egui::Ui, label: &str, cur: &mut u8) -> bool {
     let (rgb, name) = VGA16[(*cur & 0x0f) as usize];
     let sw = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     ui.menu_button(format!("{label}: {name}"), |ui| {
-        egui::Grid::new(format!("{label}_vga_grid")).spacing([3.0, 3.0]).show(ui, |ui| {
-            for i in 0..16u8 {
-                let c = VGA16[i as usize].0;
-                let btn = egui::Button::new("")
-                    .fill(egui::Color32::from_rgb(c[0], c[1], c[2]))
-                    .min_size(egui::vec2(22.0, 22.0))
-                    .stroke(if i == *cur {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 235))
-                    } else {
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(60))
-                    });
-                if ui.add(btn).on_hover_text(VGA16[i as usize].1).clicked() {
-                    *cur = i;
-                    changed = true;
-                    ui.close();
+        egui::Grid::new(format!("{label}_vga_grid"))
+            .spacing([3.0, 3.0])
+            .show(ui, |ui| {
+                for i in 0..16u8 {
+                    let c = VGA16[i as usize].0;
+                    let btn = egui::Button::new("")
+                        .fill(egui::Color32::from_rgb(c[0], c[1], c[2]))
+                        .min_size(egui::vec2(22.0, 22.0))
+                        .stroke(if i == *cur {
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 235))
+                        } else {
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+                        });
+                    if ui.add(btn).on_hover_text(VGA16[i as usize].1).clicked() {
+                        *cur = i;
+                        changed = true;
+                        ui.close();
+                    }
+                    if (i + 1) % 8 == 0 {
+                        ui.end_row();
+                    }
                 }
-                if (i + 1) % 8 == 0 {
-                    ui.end_row();
-                }
-            }
-        });
+            });
     })
     .response
     .on_hover_text(format!("{label} colour (current: {name})"));
@@ -44263,14 +46101,14 @@ fn glow_contour_map(kind: u8, t: f32) -> f32 {
     use std::f32::consts::PI;
     let t = t.clamp(0.0, 1.0);
     match kind {
-        1 => t * t,                                   // Cone — sharp core, fast falloff
-        2 => t.sqrt(),                                // Cone inverted — soft, wide
+        1 => t * t,                                    // Cone — sharp core, fast falloff
+        2 => t.sqrt(),                                 // Cone inverted — soft, wide
         3 => (-((t - 0.5) * (t - 0.5)) / 0.045).exp(), // Gaussian — mid-weighted halo
-        4 => (1.0 - (1.0 - t) * (1.0 - t)).sqrt(),    // Half round — rounded rise
-        5 => (PI * t).sin(),                          // Ring — a single band
-        6 => (2.0 * PI * t).sin().abs(),              // Ring double — two bands
-        7 => (t * 4.0).fract(),                       // Sawtooth — concentric rings
-        _ => t,                                       // Linear
+        4 => (1.0 - (1.0 - t) * (1.0 - t)).sqrt(),     // Half round — rounded rise
+        5 => (PI * t).sin(),                           // Ring — a single band
+        6 => (2.0 * PI * t).sin().abs(),               // Ring double — two bands
+        7 => (t * 4.0).fract(),                        // Sawtooth — concentric rings
+        _ => t,                                        // Linear
     }
 }
 
@@ -45119,8 +46957,10 @@ fn crop_apply_ratio(c: [f32; 4], rw: u32, rh: u32, px_aspect: f32) -> [f32; 4] {
 /// Draw the composition overlay inside the crop box: 0 rule-of-thirds, 1 golden-ratio (φ)
 /// lines, 2 a 4×4 grid, 3 a golden spiral (+ φ lines), 4 none.
 fn draw_crop_guide(painter: &egui::Painter, bx: egui::Rect, guide: u8, stroke: egui::Stroke) {
-    let vline = |x: f32| painter.line_segment([egui::pos2(x, bx.min.y), egui::pos2(x, bx.max.y)], stroke);
-    let hline = |y: f32| painter.line_segment([egui::pos2(bx.min.x, y), egui::pos2(bx.max.x, y)], stroke);
+    let vline =
+        |x: f32| painter.line_segment([egui::pos2(x, bx.min.y), egui::pos2(x, bx.max.y)], stroke);
+    let hline =
+        |y: f32| painter.line_segment([egui::pos2(bx.min.x, y), egui::pos2(bx.max.x, y)], stroke);
     let at = |f: f32, lo: f32, span: f32| lo + span * f;
     match guide {
         0 => {
@@ -45155,7 +46995,10 @@ fn draw_golden_spiral(painter: &egui::Painter, bx: egui::Rect, stroke: egui::Str
     const K: f32 = 0.306_349; // ln(φ) / (π/2): radius ×φ per quarter turn
     let steps = 220;
     let t_max = 3.0 * 2.0 * PI;
-    let (cx, cy) = (bx.min.x + bx.width() * 0.618, bx.min.y + bx.height() * 0.618);
+    let (cx, cy) = (
+        bx.min.x + bx.width() * 0.618,
+        bx.min.y + bx.height() * 0.618,
+    );
     let (sx, sy) = (bx.width() * 0.618, bx.height() * 0.618);
     let pts: Vec<egui::Pos2> = (0..=steps)
         .map(|i| {
@@ -45334,7 +47177,11 @@ fn middle_reset<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, v
     // Double-click (primary) also resets — the discoverable gesture most people try. A `Slider`
     // senses drag, so `resp.double_clicked()` is unreliable; detect it from egui's per-frame
     // double-click flag while the pointer is over the slider instead.
-    let dbl = resp.contains_pointer() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+    let dbl = resp.contains_pointer()
+        && ui.input(|i| {
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+        });
     if hit || dbl {
         *v = def;
     }
@@ -45452,8 +47299,16 @@ fn combo_scroll_step(ui: &egui::Ui, resp: &egui::Response) -> isize {
     if notches == 0.0 {
         return 0;
     }
-    let mag = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
-    if notches < 0.0 { mag } else { -mag }
+    let mag = if ui.input(|i| i.modifiers.shift) {
+        10
+    } else {
+        1
+    };
+    if notches < 0.0 {
+        mag
+    } else {
+        -mag
+    }
 }
 
 /// Both slider affordances in one call for a plain `ui.add(Slider::new(..))`: double/middle-click
@@ -46265,7 +48120,11 @@ impl IcoView {
         self.entries
             .get(i)
             .map(|e| {
-                let bpp = if e.bpp == 0 { String::new() } else { format!(" · {}bpp", e.bpp) };
+                let bpp = if e.bpp == 0 {
+                    String::new()
+                } else {
+                    format!(" · {}bpp", e.bpp)
+                };
                 format!("{}×{}{bpp}", e.w, e.h)
             })
             .unwrap_or_default()
@@ -47153,9 +49012,9 @@ enum Edge {
 /// in egui's global `DragAndDrop` slot, so it survives crossing from the left dock to the pad grid.
 #[derive(Clone)]
 enum PadDrop {
-    File(PathBuf),  // a sample file (Samples explorer)
-    Tracker(usize), // a tracker/bank sample index in the current player
-    Pad(usize),     // another pad (drag one pad onto another to move/swap them)
+    File(PathBuf),       // a sample file (Samples explorer)
+    Tracker(usize),      // a tracker/bank sample index in the current player
+    Pad(usize),          // another pad (drag one pad onto another to move/swap them)
     Selection(f32, f32), // a waveform-editor selection (start, end) captured at drag-start
 }
 
@@ -49198,7 +51057,11 @@ fn lospec_walk(
     tx: std::sync::mpsc::Sender<LospecMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let f = crate::lospec::Filters { color_filter: &color_filter, color_n, sorting: &sorting };
+    let f = crate::lospec::Filters {
+        color_filter: &color_filter,
+        color_n,
+        sorting: &sorting,
+    };
     let palettes = crate::lospec::search(&query, want, &f).unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
@@ -49243,8 +51106,9 @@ fn gallery_walk(
     tx: std::sync::mpsc::Sender<GalleryMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let pieces = crate::lospec_gallery::browse(&medium, &category, &sorting, &time, &tag, masterpiece, want)
-        .unwrap_or_default();
+    let pieces =
+        crate::lospec_gallery::browse(&medium, &category, &sorting, &time, &tag, masterpiece, want)
+            .unwrap_or_default();
     let mut n = 0usize;
     let mut seen = std::collections::HashSet::new();
     for p in pieces {
@@ -49256,7 +51120,10 @@ fn gallery_walk(
             continue;
         }
         n += 1;
-        if tx.send(GalleryMsg::Hit(virtual_entry(path), Box::new(p))).is_err() {
+        if tx
+            .send(GalleryMsg::Hit(virtual_entry(path), Box::new(p)))
+            .is_err()
+        {
             return;
         }
     }
@@ -49313,12 +51180,17 @@ fn da_walk(
             }
             // Nest by artist + short id so same-title pieces don't collide.
             let short = d.id.split('-').next().unwrap_or("x").to_string();
-            let path = root.join(&d.artist).join(format!("{short}-{}", d.filename()));
+            let path = root
+                .join(&d.artist)
+                .join(format!("{short}-{}", d.filename()));
             if !seen.insert(path.clone()) {
                 continue;
             }
             n += 1;
-            if tx.send(DaMsg::Hit(virtual_entry(path), Box::new(d))).is_err() {
+            if tx
+                .send(DaMsg::Hit(virtual_entry(path), Box::new(d)))
+                .is_err()
+            {
                 return;
             }
         }
@@ -49443,7 +51315,10 @@ fn snd_walk(
             continue;
         }
         n += 1;
-        if tx.send(SndMsg::Hit(virtual_entry(path), Box::new(r))).is_err() {
+        if tx
+            .send(SndMsg::Hit(virtual_entry(path), Box::new(r)))
+            .is_err()
+        {
             return;
         }
     }
@@ -49470,7 +51345,10 @@ fn gf_walk(
             continue;
         }
         n += 1;
-        if tx.send(GfMsg::Hit(virtual_entry(path), Box::new(f))).is_err() {
+        if tx
+            .send(GfMsg::Hit(virtual_entry(path), Box::new(f)))
+            .is_err()
+        {
             return;
         }
     }
@@ -49480,7 +51358,13 @@ fn gf_walk(
 /// Make one remote path segment safe to use as a local directory name.
 fn sanitize_component(seg: &str) -> String {
     seg.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "-_. ".contains(c) { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_. ".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches(['.', ' '])
         .to_string()
@@ -49563,7 +51447,10 @@ fn ma_walk(
             continue;
         }
         n += 1;
-        if tx.send(MaMsg::Hit(virtual_entry(path), Box::new(m))).is_err() {
+        if tx
+            .send(MaMsg::Hit(virtual_entry(path), Box::new(m)))
+            .is_err()
+        {
             return;
         }
     }
@@ -49580,13 +51467,14 @@ fn web_walk(
     tx: std::sync::mpsc::Sender<WebMsg>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (items, http) = match crate::httpfs::fetch_listing_at(&parts, known_url.as_deref(), prefer_http) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = tx.send(WebMsg::Failed(e));
-            return;
-        }
-    };
+    let (items, http) =
+        match crate::httpfs::fetch_listing_at(&parts, known_url.as_deref(), prefer_http) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(WebMsg::Failed(e));
+                return;
+            }
+        };
     let mut n = 0usize;
     for it in items {
         if cancel.load(Relaxed) {
@@ -50656,7 +52544,9 @@ fn run_one_exec(
     if let Ok(mut slot) = child_slot.lock() {
         *slot = Some(child);
     }
-    let pump = |r: Option<Box<dyn std::io::Read + Send>>, tx: std::sync::mpsc::Sender<TaskMsg>, ctx: egui::Context| {
+    let pump = |r: Option<Box<dyn std::io::Read + Send>>,
+                tx: std::sync::mpsc::Sender<TaskMsg>,
+                ctx: egui::Context| {
         std::thread::spawn(move || {
             let Some(r) = r else { return };
             for line in std::io::BufReader::new(r).lines().map_while(Result::ok) {
@@ -50669,13 +52559,25 @@ fn run_one_exec(
             }
         })
     };
-    let h1 = pump(out.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), tx.clone(), ctx.clone());
-    let h2 = pump(err.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), tx.clone(), ctx.clone());
+    let h1 = pump(
+        out.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
+        tx.clone(),
+        ctx.clone(),
+    );
+    let h2 = pump(
+        err.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>),
+        tx.clone(),
+        ctx.clone(),
+    );
     let _ = h1.join();
     let _ = h2.join();
     // Take the child back out to wait on it: holding the lock across `wait` would block Stop for
     // exactly as long as the task runs, which is when Stop matters.
-    let status = child_slot.lock().ok().and_then(|mut s| s.take()).and_then(|mut c| c.wait().ok());
+    let status = child_slot
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take())
+        .and_then(|mut c| c.wait().ok());
     status.and_then(|s| s.code())
 }
 
@@ -51152,7 +53054,11 @@ fn openers_editor(
             {
                 pref_card(
                     ui,
-                    if show_exts { "Programs" } else { "Folder actions" },
+                    if show_exts {
+                        "Programs"
+                    } else {
+                        "Folder actions"
+                    },
                     accent,
                     |ui| {
                         egui::ScrollArea::vertical()
@@ -51165,18 +53071,21 @@ fn openers_editor(
                                     let w = ui.available_width();
                                     let resp = match icon {
                                         Some(id) => {
-                                            let img = egui::Image::new(egui::load::SizedTexture::new(
-                                                *id,
-                                                egui::vec2(16.0, 16.0),
-                                            ));
+                                            let img =
+                                                egui::Image::new(egui::load::SizedTexture::new(
+                                                    *id,
+                                                    egui::vec2(16.0, 16.0),
+                                                ));
                                             ui.add_sized(
                                                 [w, 26.0],
-                                                egui::Button::image_and_text(img, name).selected(sel),
+                                                egui::Button::image_and_text(img, name)
+                                                    .selected(sel),
                                             )
                                         }
-                                        None => {
-                                            ui.add_sized([w, 26.0], egui::Button::selectable(sel, name))
-                                        }
+                                        None => ui.add_sized(
+                                            [w, 26.0],
+                                            egui::Button::selectable(sel, name),
+                                        ),
                                     };
                                     if resp.clicked() {
                                         select = Some(i);
@@ -51202,7 +53111,8 @@ fn openers_editor(
                             .show(ui, |ui| {
                                 ui.label("Name");
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut o.name).desired_width(f32::INFINITY),
+                                    egui::TextEdit::singleline(&mut o.name)
+                                        .desired_width(f32::INFINITY),
                                 );
                                 ui.end_row();
 
@@ -51315,13 +53225,13 @@ fn entry_context_menu(
     local_dir: bool,                // this entry is a real on-disk folder (offer folder actions)
     bulk_dir: bool, // a 16colo artist/group/pack folder → offer "Download all pieces…"
     selected_videos: usize, // count of currently-selected local video files (≥2 → offer Join)
-    is_video: bool,         // a video (youtube or local) → offer "Add to list ▸"
+    is_video: bool, // a video (youtube or local) → offer "Add to list ▸"
     video_lists: &[String], // existing list names (for the "Add to list" submenu)
-    ph_hdri: bool,          // this entry is a Poly Haven HDRI (→ offer the real .hdr download)
-    tasks: &[TaskItem],     // the project's .vscode tasks (→ "Tasks ▸", run with ${file} = entry)
-    is_code: bool,          // a source/text file → offer Preview (image) / View / Edit as text
-    dosbox_run: bool,       // a DOS .com/.exe/.bat with DOSBox configured → offer "Run in DOSBox"
-    dosbox_folder: bool,    // a folder with DOSBox configured → offer "Open folder in DOSBox"
+    ph_hdri: bool,  // this entry is a Poly Haven HDRI (→ offer the real .hdr download)
+    tasks: &[TaskItem], // the project's .vscode tasks (→ "Tasks ▸", run with ${file} = entry)
+    is_code: bool,  // a source/text file → offer Preview (image) / View / Edit as text
+    dosbox_run: bool, // a DOS .com/.exe/.bat with DOSBox configured → offer "Run in DOSBox"
+    dosbox_folder: bool, // a folder with DOSBox configured → offer "Open folder in DOSBox"
 ) -> Option<TilePick> {
     let mut pick = None;
     // A DOS program → run it in DOSBox (top of the menu; it's the primary action for these).
@@ -51354,7 +53264,9 @@ fn entry_context_menu(
     if !entry.is_dir && !entry.is_archive {
         if ui
             .button("\u{25a4} Open as text art")
-            .on_hover_text("Force-decode this file as ANSI/CP437 art (for an unrecognised scene extension)")
+            .on_hover_text(
+                "Force-decode this file as ANSI/CP437 art (for an unrecognised scene extension)",
+            )
             .clicked()
         {
             pick = Some(TilePick::Open(OpenAs::TextArt));
@@ -51374,11 +53286,19 @@ fn entry_context_menu(
             pick = Some(TilePick::Open(OpenAs::Image));
             ui.close();
         }
-        if ui.button("\u{1f4c4} View (text)").on_hover_text("Selectable, searchable text").clicked() {
+        if ui
+            .button("\u{1f4c4} View (text)")
+            .on_hover_text("Selectable, searchable text")
+            .clicked()
+        {
             pick = Some(TilePick::Open(OpenAs::Text));
             ui.close();
         }
-        if ui.button("\u{270e} Edit (text)").on_hover_text("Open the text editor, editing enabled").clicked() {
+        if ui
+            .button("\u{270e} Edit (text)")
+            .on_hover_text("Open the text editor, editing enabled")
+            .clicked()
+        {
             pick = Some(TilePick::Open(OpenAs::TextEdit));
             ui.close();
         }
@@ -52363,7 +54283,10 @@ struct FolderInfo {
 /// large archives (a thumbnail isn't worth a huge extract) → an empty info (folder-glyph fallback).
 fn archive_montage_info(archive: &Path) -> FolderInfo {
     const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024; // don't extract >64 MiB just for a thumbnail
-    if std::fs::metadata(archive).map(|m| m.len() > MAX_ARCHIVE_BYTES).unwrap_or(true) {
+    if std::fs::metadata(archive)
+        .map(|m| m.len() > MAX_ARCHIVE_BYTES)
+        .unwrap_or(true)
+    {
         return FolderInfo::default();
     }
     match crate::archive::extract_to_cache(archive) {
@@ -52411,7 +54334,9 @@ const DOSBOX_MACHINES: &[(&str, &str, u32)] = &[
 fn identify_file(path: &Path) -> String {
     use std::io::Read;
     let mut buf = [0u8; 64];
-    let n = std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)).unwrap_or(0);
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .unwrap_or(0);
     let b = &buf[..n];
     let is = |sig: &[u8]| b.starts_with(sig);
     // Magic bytes for common container/binary types the viewer can't (or doesn't) render.
@@ -52470,7 +54395,12 @@ fn identify_file(path: &Path) -> String {
         .iter()
         .filter(|&&c| c < 0x20 && !matches!(c, b'\t' | b'\n' | b'\r' | 0x0c | 0x1a | 0x1b))
         .count();
-    if ctrl * 100 <= b.len() * 2 { "TEXT" } else { "BINARY" }.to_string()
+    if ctrl * 100 <= b.len() * 2 {
+        "TEXT"
+    } else {
+        "BINARY"
+    }
+    .to_string()
 }
 
 /// DOS programs we can hand to DOSBox: `.com`/`.exe`/`.bat`/`.cmd` (case-insensitive). A `.bat`
@@ -52479,7 +54409,10 @@ fn identify_file(path: &Path) -> String {
 /// are also in `CODE_EXTS`, so the right-click **View / Edit (text)** items still open their source.
 fn is_dos_executable(p: &std::path::Path) -> bool {
     matches!(
-        p.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()).as_deref(),
+        p.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.to_ascii_lowercase())
+            .as_deref(),
         Some("com" | "exe" | "bat" | "cmd")
     )
 }
@@ -52487,12 +54420,12 @@ fn is_dos_executable(p: &std::path::Path) -> bool {
 /// Does this path look like an image we can (or soon will) decode?
 fn is_image_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "bmp", "webp", "web", "tga", "tif", "tiff", "ppm", "pgm", "pbm",
-        "pnm", "qoi", "hdr", "dds", "exr", "ff", "bsv", "bsave", "pcx", "psd", "aseprite", "ase",
-        "xcf", "draw", "ico", "cur", "svg", "ans", "asc",
-        "nfo", "diz", "txt", "ace", "hyp", "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi",
-        "xb", "xbin", "bin", "ice", "cia", "tnd", "idf", "adf", "seq", "pet",
-        "petscii", "petmate", "rip", "pdf", "xmind", "iff", "ilbm", "lbm", "xp",
+        "png", "jpg", "jpeg", "gif", "bmp", "webp", "web", "tga", "tif", "tiff", "ppm", "pgm",
+        "pbm", "pnm", "qoi", "hdr", "dds", "exr", "ff", "bsv", "bsave", "pcx", "psd", "aseprite",
+        "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc", "nfo", "diz", "txt", "ace", "hyp",
+        "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin",
+        "ice", "cia", "tnd", "idf", "adf", "seq", "pet", "petscii", "petmate", "rip", "pdf",
+        "xmind", "iff", "ilbm", "lbm", "xp",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
@@ -52873,17 +54806,17 @@ pub struct CliArgs {
     // Headless TEXTMODE batch (`--batch`): apply a PixelFX preset to images and dump
     // .ans/.xb/.tnd, no window. Reuses `render_outdir` (--outdir) + `render_format`
     // (--format, mapped to a textmode code).
-    pub batch_inputs: Vec<PathBuf>,   // --batch: images/folders to convert
+    pub batch_inputs: Vec<PathBuf>, // --batch: images/folders to convert
     pub batch_preset: Option<String>, // --preset "NAME"
-    pub batch_list: bool,             // --list-presets: print preset names and exit
+    pub batch_list: bool,           // --list-presets: print preset names and exit
     // Per-run overrides of the preset's Fit-to-chars grid + cell (manifest-driven packs).
-    pub batch_cols: Option<usize>,        // --cols N: force the char grid width
-    pub batch_rows: Option<usize>,        // --rows N: force the char grid height
+    pub batch_cols: Option<usize>, // --cols N: force the char grid width
+    pub batch_rows: Option<usize>, // --rows N: force the char grid height
     pub batch_cell: Option<(usize, usize)>, // --cell WxH: 8x8 | 8x16 | 9x16
     // Profile / data-dir management (for testing a build from a clean slate).
     pub data_dir: Option<PathBuf>, // --data-dir DIR: use DIR for all settings/cache instead of the default
     pub reset: bool,               // --reset: back the current profile up (once) and start fresh
-    pub restore: bool,             // --restore: move the backup back over the current profile, then exit
+    pub restore: bool, // --restore: move the backup back over the current profile, then exit
 }
 
 const USAGE: &str = "\
@@ -53424,9 +55357,26 @@ fn build_ansi_grid_from_preset(
     }
     apply_pipeline(&mut work, tw, th, &adjust.order, &adjust, &aux);
     let grid = crate::thumb::ansi_shade_grid(
-        &work, tw, th, palette, cw, ch_, p.shade_f1, p.shade_f2, p.shade_f3, p.shade_half,
-        p.shade_f1_on, p.shade_f2_on, p.shade_f3_on, p.shade_half_on, p.shade_half_use,
-        p.shade_amount, p.shade_ice, p.shade_smooth, p.shade_detail, None,
+        &work,
+        tw,
+        th,
+        palette,
+        cw,
+        ch_,
+        p.shade_f1,
+        p.shade_f2,
+        p.shade_f3,
+        p.shade_half,
+        p.shade_f1_on,
+        p.shade_f2_on,
+        p.shade_f3_on,
+        p.shade_half_on,
+        p.shade_half_use,
+        p.shade_amount,
+        p.shade_ice,
+        p.shade_smooth,
+        p.shade_detail,
+        None,
     );
     (grid, work, tw, th, font_8x8)
 }
@@ -53500,7 +55450,9 @@ fn load_all_fx_presets() -> Vec<FxPreset> {
 /// `scan_render_dir` (flat, for `--render`) this descends into subfolders, so a batch of a
 /// pack folder mirrors its whole tree.
 fn scan_batch_dir(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     entries.sort();
     for p in entries {
@@ -53702,13 +55654,16 @@ pub fn run_batch(cli: &CliArgs) -> i32 {
     let crops = load_user_crops();
     let (mut ok, mut fail) = (0u32, 0u32);
     for (job, base) in &jobs {
-        let crop = crops
-            .get(&crop_canon(job))
-            .copied()
-            .unwrap_or(FULL_CROP);
-        match batch_one(&reg, job, base, preset, &palette, format, &date, outdir, crop) {
+        let crop = crops.get(&crop_canon(job)).copied().unwrap_or(FULL_CROP);
+        match batch_one(
+            &reg, job, base, preset, &palette, format, &date, outdir, crop,
+        ) {
             Ok((out, cols, rows)) => {
-                println!("{} → {} ({cols}×{rows} cells)", job.display(), out.display());
+                println!(
+                    "{} → {} ({cols}×{rows} cells)",
+                    job.display(),
+                    out.display()
+                );
                 ok += 1;
             }
             Err(e) => {
@@ -54748,18 +56703,28 @@ mod tests {
         let s = update_crop([0.2, 0.2, 0.6, 0.6], 2, -0.4, -0.4, None);
         assert!(s[2] < 0.6 && s[3] < 0.6, "BR drag inward shrinks");
         let tiny = update_crop([0.2, 0.2, 0.1, 0.1], 2, -1.0, -1.0, None);
-        assert!(tiny[2] >= CROP_MIN - 1e-6 && tiny[3] >= CROP_MIN - 1e-6, "min side held");
+        assert!(
+            tiny[2] >= CROP_MIN - 1e-6 && tiny[3] >= CROP_MIN - 1e-6,
+            "min side held"
+        );
     }
 
     #[test]
     fn crop_locked_aspect_holds_and_matches_pixels() {
         // update_crop keeps the normalized w/h at a_norm when a corner is dragged.
         let out = update_crop([0.1, 0.1, 0.4, 0.4], 2, 0.3, 0.0, Some(1.5));
-        assert!((out[2] / out[3] - 1.5).abs() < 0.05, "w/h {}", out[2] / out[3]);
+        assert!(
+            (out[2] / out[3] - 1.5).abs() < 0.05,
+            "w/h {}",
+            out[2] / out[3]
+        );
         // crop_apply_ratio yields a box whose PIXEL ratio matches (square image → px_aspect 1).
         let c = crop_apply_ratio([0.1, 0.1, 0.8, 0.8], 16, 9, 1.0);
         let pixel_ratio = (c[2] / c[3]) * 1.0;
-        assert!((pixel_ratio - 16.0 / 9.0).abs() < 0.02, "pixel ratio {pixel_ratio}");
+        assert!(
+            (pixel_ratio - 16.0 / 9.0).abs() < 0.02,
+            "pixel ratio {pixel_ratio}"
+        );
         // Flipping to 9:16 gives the reciprocal.
         let c2 = crop_apply_ratio(c, 9, 16, 1.0);
         let pr2 = (c2[2] / c2[3]) * 1.0;
@@ -54886,11 +56851,20 @@ mod tests {
             cell_h: 16,
             palette: vec![[220, 220, 220, 255], magenta], // ink 0, paper 1
             cells: vec![
-                AnsiCell { fg: 0, bg: 1, ch: b'A' },
-                AnsiCell { fg: 0, bg: 1, ch: b'B' },
+                AnsiCell {
+                    fg: 0,
+                    bg: 1,
+                    ch: b'A',
+                },
+                AnsiCell {
+                    fg: 0,
+                    bg: 1,
+                    ch: b'B',
+                },
             ],
         };
-        let (bytes, ext, _) = serialize_textmode(&grid, 0 /* Auto */, false, false, "t", "20260101");
+        let (bytes, ext, _) =
+            serialize_textmode(&grid, 0 /* Auto */, false, false, "t", "20260101");
         assert_eq!(ext, "xb", "custom-bg grid auto-exports as XBin");
         assert_eq!(&bytes[..5], b"XBIN\x1a", "XBin header");
         // The embedded palette (6-bit DAC, after the 11-byte header) contains the magenta paper.
@@ -54899,7 +56873,10 @@ mod tests {
             let (r, g, b) = ((c[0] as u32) << 2, (c[1] as u32) << 2, (c[2] as u32) << 2);
             r.abs_diff(200) < 12 && g.abs_diff(20) < 12 && b.abs_diff(180) < 12
         });
-        assert!(has_magenta, "the custom paper colour is embedded in the XBin palette");
+        assert!(
+            has_magenta,
+            "the custom paper colour is embedded in the XBin palette"
+        );
     }
 
     #[test]
@@ -54907,7 +56884,12 @@ mod tests {
         // ≥16 → first 16; fewer → cycle to fill; empty → black.
         let many: Vec<[u8; 4]> = (0..20).map(|i| [i as u8, 0, 0, 255]).collect();
         assert_eq!(coerce_palette_16(&many)[15], [15, 0, 0, 255]);
-        let four = [[10, 0, 0, 255], [20, 0, 0, 255], [30, 0, 0, 255], [40, 0, 0, 255]];
+        let four = [
+            [10, 0, 0, 255],
+            [20, 0, 0, 255],
+            [30, 0, 0, 255],
+            [40, 0, 0, 255],
+        ];
         let c = coerce_palette_16(&four);
         assert_eq!(c[0], four[0]);
         assert_eq!(c[4], four[0], "cycles after 4");
@@ -54918,16 +56900,31 @@ mod tests {
     #[test]
     fn compact_picker_mask_drops_trivial() {
         assert_eq!(compact_picker_mask(&[]), Vec::<bool>::new());
-        assert_eq!(compact_picker_mask(&[true, true, true]), Vec::<bool>::new(), "all-on → empty");
-        assert_eq!(compact_picker_mask(&[false, false]), Vec::<bool>::new(), "all-off → empty");
-        assert_eq!(compact_picker_mask(&[true, false, true]), vec![true, false, true], "subset kept");
+        assert_eq!(
+            compact_picker_mask(&[true, true, true]),
+            Vec::<bool>::new(),
+            "all-on → empty"
+        );
+        assert_eq!(
+            compact_picker_mask(&[false, false]),
+            Vec::<bool>::new(),
+            "all-off → empty"
+        );
+        assert_eq!(
+            compact_picker_mask(&[true, false, true]),
+            vec![true, false, true],
+            "subset kept"
+        );
     }
 
     #[test]
     fn preset_persists_char_selections() {
         // A preset captures the "Use only chars" string, the per-mode glyph masks, and the Unicode
         // codepoints, and survives the RON round-trip eframe uses to persist presets.
-        let mut p = FxPreset { name: "Chars".into(), ..Default::default() };
+        let mut p = FxPreset {
+            name: "Chars".into(),
+            ..Default::default()
+        };
         p.ascii_chars = " *".into();
         p.ascii_mask = compact_picker_mask(&{
             let mut m = vec![true; 256];
@@ -55408,7 +57405,12 @@ mod tests {
         // Persistence stores KeyBind::to_config() and reloads via KeyBind::from_config.
         for a in Action::ALL {
             let b = a.default_bind();
-            assert_eq!(KeyBind::from_config(&b.to_config()), Some(b), "{:?}", a.label());
+            assert_eq!(
+                KeyBind::from_config(&b.to_config()),
+                Some(b),
+                "{:?}",
+                a.label()
+            );
         }
     }
 
@@ -55416,7 +57418,10 @@ mod tests {
     fn keybind_parses_modifier_prefixes_and_bare_keys() {
         use egui::Key;
         // A bare key name (the pre-modifier config format) loads as a modifier-free bind.
-        assert_eq!(KeyBind::from_config("ArrowLeft"), Some(KeyBind::key(Key::ArrowLeft)));
+        assert_eq!(
+            KeyBind::from_config("ArrowLeft"),
+            Some(KeyBind::key(Key::ArrowLeft))
+        );
         // Modifier prefixes, any order/case, with Cmd/Ctrl treated as the same (portable) modifier.
         assert_eq!(KeyBind::from_config("Ctrl+X"), Some(KeyBind::ctrl(Key::X)));
         assert_eq!(KeyBind::from_config("alt+e"), Some(KeyBind::alt(Key::E)));
@@ -55857,9 +57862,15 @@ mod tests {
         // ASCII passes straight through; the full CP437 box/block/shade repertoire maps via the
         // round-trip table (this is the "Use only chars" pool for pasted box-drawing art).
         assert_eq!(resolve_ascii_chars(" .oOX$"), b" .oOX$".to_vec());
-        assert_eq!(resolve_ascii_chars("│─┌┐└┘┼"), vec![179, 196, 218, 191, 192, 217, 197]);
+        assert_eq!(
+            resolve_ascii_chars("│─┌┐└┘┼"),
+            vec![179, 196, 218, 191, 192, 217, 197]
+        );
         assert_eq!(resolve_ascii_chars("░▒▓█"), vec![176, 177, 178, 219]);
-        assert_eq!(resolve_ascii_chars("╔╗╚╝║═╬"), vec![201, 187, 200, 188, 186, 205, 206]);
+        assert_eq!(
+            resolve_ascii_chars("╔╗╚╝║═╬"),
+            vec![201, 187, 200, 188, 186, 205, 206]
+        );
         // An unmappable glyph is dropped, not turned into a solid block.
         assert!(resolve_ascii_chars("🍕").is_empty());
     }
@@ -56086,8 +58097,13 @@ mod tests {
         // The Resize MARKER's position moves the split: a spatial op (Sharpen) run before the
         // downscale (marker later) differs from running it after (marker first) — proving ops
         // above the marker are full-res and ops below are reduced-res.
-        let base = Adjust { sharpen: 4.0, ..Default::default() };
-        let src = [0u8, 0, 0, 255, 80, 80, 80, 255, 160, 160, 160, 255, 240, 240, 240, 255];
+        let base = Adjust {
+            sharpen: 4.0,
+            ..Default::default()
+        };
+        let src = [
+            0u8, 0, 0, 255, 80, 80, 80, 255, 160, 160, 160, 255, 240, 240, 240, 255,
+        ];
         // Marker first (default) → Sharpen runs at the reduced 2×1 res.
         let mut r_first = src.to_vec();
         apply_pipeline_resized(&mut r_first, 4, 1, 2, 1, &base, &aux);
@@ -56102,7 +58118,10 @@ mod tests {
         let sharp_full = base.with_order(&ops);
         let mut r_last = src.to_vec();
         apply_pipeline_resized(&mut r_last, 4, 1, 2, 1, &sharp_full, &aux);
-        assert_ne!(r_first, r_last, "the Resize marker's position changes the result");
+        assert_ne!(
+            r_first, r_last,
+            "the Resize marker's position changes the result"
+        );
     }
 
     #[test]
@@ -56116,10 +58135,17 @@ mod tests {
         assert_eq!(out[12], 255, "right edge clamps to white");
         // Monotonic non-decreasing red channel across the row.
         let reds: Vec<u8> = (0..4).map(|x| out[x * 4]).collect();
-        assert!(reds.windows(2).all(|w| w[0] <= w[1]), "ramp is monotonic: {reds:?}");
+        assert!(
+            reds.windows(2).all(|w| w[0] <= w[1]),
+            "ramp is monotonic: {reds:?}"
+        );
         assert!(out[3] == 255 && out[7] == 255, "alpha preserved");
         // A 1:1 "upscale" reproduces the source exactly.
-        assert_eq!(bilinear_up(&src, 2, 1, 2, 1), src, "identity size is a copy");
+        assert_eq!(
+            bilinear_up(&src, 2, 1, 2, 1),
+            src,
+            "identity size is a copy"
+        );
     }
 
     #[test]
@@ -56426,7 +58452,10 @@ mod text_editor_tests {
         // exact-match for that reason; this guards the invariant rather than the policy.
         let hay = "İstanbul ıstanbul";
         for (a, b) in find_ranges(hay, "stanbul", false) {
-            assert!(hay.get(a..b).is_some(), "offset {a}..{b} splits a character");
+            assert!(
+                hay.get(a..b).is_some(),
+                "offset {a}..{b} splits a character"
+            );
         }
     }
 
@@ -56446,7 +58475,11 @@ mod text_editor_tests {
         assert_eq!(body, "PRINT 1\nPRINT 2\n");
         // ...edit in LF space, then write back in the file's own endings.
         let edited = body.replace("PRINT 2", "PRINT 3");
-        let out = if crlf { edited.replace('\n', "\r\n") } else { edited };
+        let out = if crlf {
+            edited.replace('\n', "\r\n")
+        } else {
+            edited
+        };
         assert_eq!(out, "PRINT 1\r\nPRINT 3\r\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -56457,31 +58490,36 @@ mod text_editor_tests {
 /// them after the window closes (mirrors the `MenuAction` deferral pattern).
 #[derive(Default)]
 struct PrefsOut {
-    refresh: bool,                            // a plugin/DOSBox toggle → re-scan the folder
+    refresh: bool,                           // a plugin/DOSBox toggle → re-scan the folder
     color_change: Option<(String, [u8; 3])>, // a format-color edit
-    reset_colors: bool,                       // "Reset" the format colors
-    clear_blend_renders: bool,                // "Clear renders" → wipe the .blend render cache
-    export_setup: Option<bool>,               // Some(include_secrets) → export bundle
-    import_setup: bool,                       // "Import setup…" clicked
-    font_preview_changed: bool,               // font-tile sample text edited → refresh tiles
-    theme_apply: bool,                        // theme picked → re-install Visuals
-    open_config: Option<PathBuf>,             // Config-files tab → open this path
+    reset_colors: bool,                      // "Reset" the format colors
+    clear_blend_renders: bool,               // "Clear renders" → wipe the .blend render cache
+    export_setup: Option<bool>,              // Some(include_secrets) → export bundle
+    import_setup: bool,                      // "Import setup…" clicked
+    font_preview_changed: bool,              // font-tile sample text edited → refresh tiles
+    theme_apply: bool,                       // theme picked → re-install Visuals
+    open_config: Option<PathBuf>,            // Config-files tab → open this path
     // ── Theme editor (Theme section) ──
-    theme_base: Option<u8>,       // select a Default base: Some(0)=dark, Some(1)=light
+    theme_base: Option<u8>, // select a Default base: Some(0)=dark, Some(1)=light
     theme_select: Option<String>, // switch the active theme to this name ("" = Built-in)
-    theme_new: bool,              // create a fresh blank theme
-    theme_dup: bool,              // duplicate the active theme into an editable copy
-    theme_save: bool,             // write the active theme to disk
+    theme_new: bool,        // create a fresh blank theme
+    theme_dup: bool,        // duplicate the active theme into an editable copy
+    theme_save: bool,       // write the active theme to disk
     theme_delete: Option<String>, // delete this theme (file + list)
-    theme_import: bool,           // import a .json theme from a file
-    theme_export: bool,           // export the active theme to a file
-    theme_reload: bool,           // re-scan the themes folder from disk
+    theme_import: bool,     // import a .json theme from a file
+    theme_export: bool,     // export the active theme to a file
+    theme_reload: bool,     // re-scan the themes folder from disk
 }
 
 /// One titled Preferences card: a bordered group with a small uppercase accent heading,
 /// filling its column. The body writes into the inner `ui`. Cards flow across the
 /// section's `ui.columns(..)` so a section spreads sideways instead of stacking tall.
-fn pref_card(ui: &mut egui::Ui, title: &str, accent: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
+fn pref_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    accent: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     let (fill, border) = card_colors(ui.visuals());
     egui::Frame::new()
         .fill(fill)
@@ -56509,7 +58547,12 @@ impl Kaleidotron {
     /// The body of the Preferences dialog — the selected section's controls, grouped into
     /// titled cards laid out across two columns. Layout-only; every control, conditional
     /// group and deferred action matches the old single-column version (results in `out`).
-    fn render_prefs_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out: &mut PrefsOut) {
+    fn render_prefs_sections(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        out: &mut PrefsOut,
+    ) {
         // A cyan accent for the card titles — the scene-art cyan, darkened for light themes.
         // The active theme's accent (set app-wide as `hyperlink_color` in `apply_theme`).
         let accent = ui.visuals().hyperlink_color;
@@ -56525,29 +58568,38 @@ impl Kaleidotron {
                     // LEFT
                     pref_card(&mut c[0], "Theme", accent, |ui| {
                         let mut pick: Option<String> = None;
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("theme_pick")
-                            .selected_text(if self.theme_name.trim().is_empty() {
-                                "Built-in".to_string()
-                            } else {
-                                self.theme_name.clone()
-                            })
-                            .width(200.0)
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(self.theme_name.is_empty(), "Built-in").clicked() {
-                                    pick = Some(String::new());
-                                }
-                                for t in &self.themes {
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("theme_pick")
+                                .selected_text(if self.theme_name.trim().is_empty() {
+                                    "Built-in".to_string()
+                                } else {
+                                    self.theme_name.clone()
+                                })
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
                                     if ui
-                                        .selectable_label(
-                                            self.theme_name == t.name,
-                                            format!("{}{}", t.name, if t.dark { "" } else { "  (light)" }),
-                                        )
+                                        .selectable_label(self.theme_name.is_empty(), "Built-in")
                                         .clicked()
                                     {
-                                        pick = Some(t.name.clone());
+                                        pick = Some(String::new());
                                     }
-                                }
-                            }));
+                                    for t in &self.themes {
+                                        if ui
+                                            .selectable_label(
+                                                self.theme_name == t.name,
+                                                format!(
+                                                    "{}{}",
+                                                    t.name,
+                                                    if t.dark { "" } else { "  (light)" }
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            pick = Some(t.name.clone());
+                                        }
+                                    }
+                                }),
+                        );
                         // Cycle through [Built-in, theme0, theme1, …]; applied via `pick` below.
                         let step = combo_scroll_step(ui, &cr);
                         if step != 0 {
@@ -56578,12 +58630,18 @@ impl Kaleidotron {
                                 self.open_url(&d);
                             }
                         });
-                        ui.weak("Drop a VS Code theme .json in that folder — it's imported directly.");
+                        ui.weak(
+                            "Drop a VS Code theme .json in that folder — it's imported directly.",
+                        );
                         ui.horizontal(|ui| {
                             ui.label("Styles");
                             for (v, label, hover) in [
                                 (0u8, "Everything", "App chrome and code syntax"),
-                                (1, "Code only", "Syntax colours; app keeps the built-in look"),
+                                (
+                                    1,
+                                    "Code only",
+                                    "Syntax colours; app keeps the built-in look",
+                                ),
                                 (2, "App only", "Chrome; code keeps the built-in palette"),
                             ] {
                                 if ui
@@ -56613,7 +58671,10 @@ impl Kaleidotron {
                             let mut apply: Option<f32> = None;
                             for &(pct, scale) in FONT_SCALE_PRESETS {
                                 let on = (self.ui_font_scale - scale).abs() < 0.005;
-                                if ui.add(egui::Button::selectable(on, format!("{pct}"))).clicked() {
+                                if ui
+                                    .add(egui::Button::selectable(on, format!("{pct}")))
+                                    .clicked()
+                                {
                                     apply = Some(scale);
                                 }
                             }
@@ -56662,7 +58723,10 @@ impl Kaleidotron {
                                 }
                             }
                             if !self.code_font_path.is_empty()
-                                && ui.small_button("\u{d7}").on_hover_text("Back to the built-in monospace").clicked()
+                                && ui
+                                    .small_button("\u{d7}")
+                                    .on_hover_text("Back to the built-in monospace")
+                                    .clicked()
                             {
                                 self.code_font_path.clear();
                             }
@@ -56694,7 +58758,8 @@ impl Kaleidotron {
                         let resp = ui.add(egui::Slider::new(&mut gap_y, 0.0..=80.0).suffix(" pt"));
                         wheel_adjust(ui, &resp, &mut gap_y, 1.0, 0.0f32, 80.0f32);
                         self.grid_gap_y = gap_y;
-                        ui.checkbox(&mut self.grid_tile_border, "Tile borders").on_hover_text(
+                        ui.checkbox(&mut self.grid_tile_border, "Tile borders")
+                            .on_hover_text(
                             "Draw a border around each grid tile so they read as separate cards \
                              instead of one continuous row.",
                         );
@@ -56723,7 +58788,8 @@ impl Kaleidotron {
                              type-to-sample box.",
                         );
                         if ui.small_button("↺ Reset to default").clicked() {
-                            self.font_preview_text = crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
+                            self.font_preview_text =
+                                crate::decode::font::DEFAULT_THUMB_SAMPLE.to_string();
                             out.font_preview_changed = true;
                         }
                         ui.add_space(6.0);
@@ -56770,20 +58836,23 @@ impl Kaleidotron {
             1 => {
                 ui.columns(2, |c| {
                     pref_card(&mut c[0], "Window title bar", accent, |ui| {
-                        ui.checkbox(&mut self.title_show_path, "Show open path / file").on_hover_text(
-                            "Append the open folder or file to the title bar. The GUI zoom % \
+                        ui.checkbox(&mut self.title_show_path, "Show open path / file")
+                            .on_hover_text(
+                                "Append the open folder or file to the title bar. The GUI zoom % \
                              (Ctrl +/-) always shows in parens when it isn't 100%.",
-                        );
+                            );
                     });
                     pref_card(&mut c[0], "Text-mode (ANSI/scene) zoom", accent, |ui| {
                         let mut tz = self.textmode_zoom.round() as i32;
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("textmode_zoom")
-                            .selected_text(format!("{tz}×"))
-                            .show_ui(ui, |ui| {
-                                for n in [1, 2, 3, 4, 5, 6, 8] {
-                                    ui.selectable_value(&mut tz, n, format!("{n}×"));
-                                }
-                            }));
+                        let cr = eat_scroll(
+                            egui::ComboBox::from_id_salt("textmode_zoom")
+                                .selected_text(format!("{tz}×"))
+                                .show_ui(ui, |ui| {
+                                    for n in [1, 2, 3, 4, 5, 6, 8] {
+                                        ui.selectable_value(&mut tz, n, format!("{n}×"));
+                                    }
+                                }),
+                        );
                         combo_wheel_list(ui, &cr, &mut tz, &[1, 2, 3, 4, 5, 6, 8]);
                         if (tz as f32 - self.textmode_zoom).abs() > f32::EPSILON {
                             self.textmode_zoom = tz as f32;
@@ -56797,26 +58866,29 @@ impl Kaleidotron {
                             .on_hover_text("A fading panel with the piece's details");
                         ui.add_enabled_ui(self.osd_enabled, |ui| {
                             ui.label("Position");
-                            egui::Grid::new("osd_pos_grid").spacing([4.0, 4.0]).show(ui, |ui| {
-                                ui.selectable_value(&mut self.osd_position, 0, "Top L");
-                                ui.selectable_value(&mut self.osd_position, 1, "Top");
-                                ui.selectable_value(&mut self.osd_position, 2, "Top R");
-                                ui.end_row();
-                                ui.selectable_value(&mut self.osd_position, 3, "Left");
-                                ui.label("");
-                                ui.selectable_value(&mut self.osd_position, 4, "Right");
-                                ui.end_row();
-                                ui.selectable_value(&mut self.osd_position, 5, "Bot L");
-                                ui.selectable_value(&mut self.osd_position, 6, "Bot");
-                                ui.selectable_value(&mut self.osd_position, 7, "Bot R");
-                                ui.end_row();
-                            });
-                            let r = ui.add(
-                                egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
-                                    .suffix(" s")
-                                    .text("Hold"),
-                            )
-                            .on_hover_text("How long it stays before fading out");
+                            egui::Grid::new("osd_pos_grid")
+                                .spacing([4.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.selectable_value(&mut self.osd_position, 0, "Top L");
+                                    ui.selectable_value(&mut self.osd_position, 1, "Top");
+                                    ui.selectable_value(&mut self.osd_position, 2, "Top R");
+                                    ui.end_row();
+                                    ui.selectable_value(&mut self.osd_position, 3, "Left");
+                                    ui.label("");
+                                    ui.selectable_value(&mut self.osd_position, 4, "Right");
+                                    ui.end_row();
+                                    ui.selectable_value(&mut self.osd_position, 5, "Bot L");
+                                    ui.selectable_value(&mut self.osd_position, 6, "Bot");
+                                    ui.selectable_value(&mut self.osd_position, 7, "Bot R");
+                                    ui.end_row();
+                                });
+                            let r = ui
+                                .add(
+                                    egui::Slider::new(&mut self.osd_secs, 0.5..=15.0)
+                                        .suffix(" s")
+                                        .text("Hold"),
+                                )
+                                .on_hover_text("How long it stays before fading out");
                             slider_extras(ui, &r, &mut self.osd_secs, 3.0, 0.5, 0.5, 15.0);
                         });
                     });
@@ -56826,14 +58898,26 @@ impl Kaleidotron {
                             ui.radio_value(&mut self.transp_solid, false, "Checkerboard");
                             ui.add_enabled_ui(!self.transp_solid, |ui| {
                                 ui.label("Size");
-                                let size_label =
-                                    ["Small", "Medium", "Large"][self.transp_checker_size.min(2) as usize];
+                                let size_label = ["Small", "Medium", "Large"]
+                                    [self.transp_checker_size.min(2) as usize];
                                 let cr = egui::ComboBox::from_id_salt("transp_checker_size")
                                     .selected_text(size_label)
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.transp_checker_size, 0, "Small");
-                                        ui.selectable_value(&mut self.transp_checker_size, 1, "Medium");
-                                        ui.selectable_value(&mut self.transp_checker_size, 2, "Large");
+                                        ui.selectable_value(
+                                            &mut self.transp_checker_size,
+                                            0,
+                                            "Small",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.transp_checker_size,
+                                            1,
+                                            "Medium",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.transp_checker_size,
+                                            2,
+                                            "Large",
+                                        );
                                     })
                                     .response;
                                 combo_wheel(ui, &cr, &mut self.transp_checker_size, 3);
@@ -56864,17 +58948,30 @@ impl Kaleidotron {
                                 .num_columns(3)
                                 .spacing([10.0, 6.0])
                                 .show(ui, |ui| {
-                                    for a in Action::ALL.into_iter().filter(|a| a.scope() == *scope) {
+                                    for a in Action::ALL.into_iter().filter(|a| a.scope() == *scope)
+                                    {
                                         ui.label(a.label());
-                                        let cur =
-                                            self.keymap.get(&a).copied().unwrap_or_else(|| a.default_bind());
+                                        let cur = self
+                                            .keymap
+                                            .get(&a)
+                                            .copied()
+                                            .unwrap_or_else(|| a.default_bind());
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 let waiting = self.rebinding == Some(a);
-                                                let btn = if waiting { "press a key…" } else { "Rebind" };
-                                                if ui.button(btn).on_hover_text("Esc cancels").clicked() {
-                                                    new_rebind = Some(if waiting { None } else { Some(a) });
+                                                let btn = if waiting {
+                                                    "press a key…"
+                                                } else {
+                                                    "Rebind"
+                                                };
+                                                if ui
+                                                    .button(btn)
+                                                    .on_hover_text("Esc cancels")
+                                                    .clicked()
+                                                {
+                                                    new_rebind =
+                                                        Some(if waiting { None } else { Some(a) });
                                                 }
                                                 ui.add_space(6.0);
                                                 ui.strong(cur.label());
@@ -56897,19 +58994,67 @@ impl Kaleidotron {
                     ui.weak("Off by default — switch on the sources you browse.");
                     ui.add_space(4.0);
                     let items: [(&mut bool, &str, &str); 14] = [
-                        (&mut self.plugin_16c, "16colo.rs", "The 16colo.rs ANSI/ASCII art archive"),
-                        (&mut self.plugin_youtube, "YouTube", "Search + play YouTube videos (needs yt-dlp)"),
-                        (&mut self.plugin_steam, "Steam", "Your installed Steam games → video search"),
-                        (&mut self.plugin_images, "Image Search", "Creative-Commons images (Openverse)"),
-                        (&mut self.plugin_audiosearch, "Audio Search", "Creative-Commons audio (Openverse)"),
-                        (&mut self.plugin_deviantart, "DeviantArt", "Browse DeviantArt (set a client_id/secret in Plugins)"),
-                        (&mut self.plugin_gifs, "GIF Search", "Animated GIFs (Openverse)"),
-                        (&mut self.plugin_web, "Web Search", "Browse any auto-indexed URL like a folder tree"),
+                        (
+                            &mut self.plugin_16c,
+                            "16colo.rs",
+                            "The 16colo.rs ANSI/ASCII art archive",
+                        ),
+                        (
+                            &mut self.plugin_youtube,
+                            "YouTube",
+                            "Search + play YouTube videos (needs yt-dlp)",
+                        ),
+                        (
+                            &mut self.plugin_steam,
+                            "Steam",
+                            "Your installed Steam games → video search",
+                        ),
+                        (
+                            &mut self.plugin_images,
+                            "Image Search",
+                            "Creative-Commons images (Openverse)",
+                        ),
+                        (
+                            &mut self.plugin_audiosearch,
+                            "Audio Search",
+                            "Creative-Commons audio (Openverse)",
+                        ),
+                        (
+                            &mut self.plugin_deviantart,
+                            "DeviantArt",
+                            "Browse DeviantArt (set a client_id/secret in Plugins)",
+                        ),
+                        (
+                            &mut self.plugin_gifs,
+                            "GIF Search",
+                            "Animated GIFs (Openverse)",
+                        ),
+                        (
+                            &mut self.plugin_web,
+                            "Web Search",
+                            "Browse any auto-indexed URL like a folder tree",
+                        ),
                         (&mut self.plugin_icons, "Icon Search", "Icons (Iconify)"),
-                        (&mut self.plugin_vectors, "Vector Search", "Vector art (Wikimedia Commons)"),
-                        (&mut self.plugin_lospec, "Lospec", "Lospec palette browser + downloader"),
-                        (&mut self.plugin_ph, "3D Search", "Poly Haven CC0 models, textures and HDRIs"),
-                        (&mut self.plugin_gfonts, "Google Fonts", "Browse + download Google Fonts"),
+                        (
+                            &mut self.plugin_vectors,
+                            "Vector Search",
+                            "Vector art (Wikimedia Commons)",
+                        ),
+                        (
+                            &mut self.plugin_lospec,
+                            "Lospec",
+                            "Lospec palette browser + downloader",
+                        ),
+                        (
+                            &mut self.plugin_ph,
+                            "3D Search",
+                            "Poly Haven CC0 models, textures and HDRIs",
+                        ),
+                        (
+                            &mut self.plugin_gfonts,
+                            "Google Fonts",
+                            "Browse + download Google Fonts",
+                        ),
                         (&mut self.plugin_ma, "MOD Archive", "~170k tracker modules"),
                     ];
                     // A tight 2-column grid (adjacent, not split across the full card width) so
@@ -57678,7 +59823,6 @@ impl Kaleidotron {
     }
 }
 
-
 #[cfg(test)]
 mod gui_tests {
     use super::*;
@@ -57831,7 +59975,9 @@ mod gui_tests {
     fn shoot_view_only() {
         let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let file = std::env::current_dir().unwrap().join("assets/kaleidotron.png");
+        let file = std::env::current_dir()
+            .unwrap()
+            .join("assets/kaleidotron.png");
         let mut harness = Harness::builder()
             .with_size(egui::Vec2::new(1100.0, 760.0))
             .wgpu()
@@ -57873,7 +60019,10 @@ mod gui_tests {
         h.get_by_label("Default Dark").click();
         h.run_steps(3);
         let dark = fill(&h);
-        assert_ne!(mid, dark, "selecting Default Dark must reset off the saved theme");
+        assert_ne!(
+            mid, dark,
+            "selecting Default Dark must reset off the saved theme"
+        );
         // "Default Light" is a distinct base and is brighter than Default Dark.
         h.get_by_label("Default Light").click();
         h.run_steps(3);
@@ -57887,8 +60036,7 @@ mod gui_tests {
 
     #[test]
     fn esc_closes_dialogs() {
-        let mut h =
-            Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
+        let mut h = Harness::builder().build_eframe(|cc| Kaleidotron::new(cc, CliArgs::default()));
         for open in [
             |k: &mut Kaleidotron| k.show_prefs = true,
             |k: &mut Kaleidotron| k.show_associations = true,
@@ -57948,7 +60096,10 @@ mod gui_tests {
         let ctx = harness.ctx.clone();
         harness.state_mut().load_full(&ctx, src.clone());
         harness.run_steps(3);
-        assert!(harness.state().text_doc.is_some(), "a .bas must open in the text viewer");
+        assert!(
+            harness.state().text_doc.is_some(),
+            "a .bas must open in the text viewer"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -58142,13 +60293,15 @@ mod gui_tests {
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, s: &mut S| {
                 let names = ["a", "b", "c", "d"];
-                let cr = eat_scroll(egui::ComboBox::from_id_salt("t")
-                    .selected_text(names[s.idx])
-                    .show_ui(ui, |ui| {
-                        for (i, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut s.idx, i, *n);
-                        }
-                    }));
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("t")
+                        .selected_text(names[s.idx])
+                        .show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut s.idx, i, *n);
+                            }
+                        }),
+                );
                 s.rect = cr.rect;
                 wheel_cycle(ui, &cr, &mut s.idx, names.len());
             },
@@ -58598,12 +60751,21 @@ mod hold_test {
         }
         let b = super::auto_crop_box(&px, w, h).expect("flat border → croppable");
         // Bounding box is x=3..6, y=3..6 → normalized [0.3, 0.3, 0.4, 0.4].
-        assert!((b[0] - 0.3).abs() < 1e-4 && (b[1] - 0.3).abs() < 1e-4, "origin {b:?}");
-        assert!((b[2] - 0.4).abs() < 1e-4 && (b[3] - 0.4).abs() < 1e-4, "size {b:?}");
+        assert!(
+            (b[0] - 0.3).abs() < 1e-4 && (b[1] - 0.3).abs() < 1e-4,
+            "origin {b:?}"
+        );
+        assert!(
+            (b[2] - 0.4).abs() < 1e-4 && (b[3] - 0.4).abs() < 1e-4,
+            "size {b:?}"
+        );
 
         // A subject that fills the frame → nothing to crop → None.
         let full = vec![200u8; w * h * 4];
-        assert!(super::auto_crop_box(&full, w, h).is_none(), "no margin → None");
+        assert!(
+            super::auto_crop_box(&full, w, h).is_none(),
+            "no margin → None"
+        );
 
         // A busy (non-uniform) border → not auto-croppable → None.
         let mut noisy = px.clone();
@@ -58613,7 +60775,10 @@ mod hold_test {
             noisy[i + 1] = 255 - (x * 25) as u8;
             noisy[i + 2] = (x * 13) as u8;
         }
-        assert!(super::auto_crop_box(&noisy, w, h).is_none(), "busy border → None");
+        assert!(
+            super::auto_crop_box(&noisy, w, h).is_none(),
+            "busy border → None"
+        );
 
         // Transparent background → croppable via alpha, same bbox.
         let mut tpx = vec![0u8; w * h * 4]; // fully transparent
@@ -58627,7 +60792,10 @@ mod hold_test {
             }
         }
         let tb = super::auto_crop_box(&tpx, w, h).expect("transparent bg → croppable");
-        assert!((tb[2] - 0.4).abs() < 1e-4 && (tb[3] - 0.4).abs() < 1e-4, "alpha bbox {tb:?}");
+        assert!(
+            (tb[2] - 0.4).abs() < 1e-4 && (tb[3] - 0.4).abs() < 1e-4,
+            "alpha bbox {tb:?}"
+        );
     }
 
     #[test]
@@ -58710,4 +60878,3 @@ mod hold_test {
         assert_eq!(&merged[12..15], &[255, 255, 255]); // bottom-right untouched
     }
 }
-
