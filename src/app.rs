@@ -2052,13 +2052,27 @@ pub struct Kaleidotron {
     jpeg_clean_merge_radius: u32, // window radius (px) sampled to pick the absorbing colour
     jpeg_clean_grid: bool,        // snap to a native pixel grid by majority vote
     jpeg_clean_grid_size: u32,    // native pixel size (JPEG px per art px) for the grid
-    dither_method: u8,            // index into thumb::DITHER_NAMES (0 = none)
-    dither_amount: f32,           // 0..1 dither strength
-    dither_custom: Vec<u32>,      // custom ordered-dither threshold matrix (row-major)
-    dither_custom_n: usize,       // custom matrix dimension (n×n; 2/4/8)
-    dither_scale_x: usize,        // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
-    dither_scale_y: usize,        // ordered-dither cell HEIGHT in px (≥1)
-    dither_scale_lock: bool,      // lock the dither cell square (scale_x == scale_y)
+    // JPEG artifact removal — the continuous-tone kind (see `deblock.rs`). Complements
+    // jpeg_clean (which quantises to pixel art); this smooths 8×8 blocking + ringing.
+    deblock_on: bool,      // master toggle ("Remove JPEG artifacts")
+    deblock_block: u32,    // DCT block grid (JPEG = 8)
+    deblock_strength: f32, // 0..1 de-blocking seam smoothing
+    deblock_edge: u32,     // seam step below which a boundary is an artifact (0..255)
+    deblock_tv: f32,       // 0..1 edge-preserving diffusion (ringing/mosquito) amount
+    deblock_tv_iters: u32, // diffusion iterations
+    // Undither — reverse ordered/FS dithering back to smooth tone (see `undither.rs`).
+    undither_on: bool,       // master toggle ("Undither")
+    undither_edge: u32,      // Sobel gradient above which a pixel is a protected edge
+    undither_radius: u32,    // averaging window radius (px)
+    undither_strength: f32,  // 0..1 blend
+    undither_snap: bool,     // snap the smoothed field to the nearest source-palette colour
+    dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
+    dither_amount: f32,      // 0..1 dither strength
+    dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
+    dither_custom_n: usize,  // custom matrix dimension (n×n; 2/4/8)
+    dither_scale_x: usize,   // ordered-dither cell WIDTH in px (≥1; "zoom" the pattern)
+    dither_scale_y: usize,   // ordered-dither cell HEIGHT in px (≥1)
+    dither_scale_lock: bool, // lock the dither cell square (scale_x == scale_y)
     // ANSI Shade dither params (DITHER_ANSI): the fill fractions the ░▒▓ shade
     // blocks stand for, whether half-blocks are allowed, and whether to force the
     // authentic 9×16 VGA text cell (overriding Cell W/H).
@@ -3109,6 +3123,17 @@ impl Kaleidotron {
     const JPEG_CLEAN_MERGE_RADIUS_KEY: &'static str = "jpeg_clean_merge_radius";
     const JPEG_CLEAN_GRID_KEY: &'static str = "jpeg_clean_grid";
     const JPEG_CLEAN_GRID_SIZE_KEY: &'static str = "jpeg_clean_grid_size";
+    const DEBLOCK_ON_KEY: &'static str = "deblock_on";
+    const DEBLOCK_BLOCK_KEY: &'static str = "deblock_block";
+    const DEBLOCK_STRENGTH_KEY: &'static str = "deblock_strength";
+    const DEBLOCK_EDGE_KEY: &'static str = "deblock_edge";
+    const DEBLOCK_TV_KEY: &'static str = "deblock_tv";
+    const DEBLOCK_TV_ITERS_KEY: &'static str = "deblock_tv_iters";
+    const UNDITHER_ON_KEY: &'static str = "undither_on";
+    const UNDITHER_EDGE_KEY: &'static str = "undither_edge";
+    const UNDITHER_RADIUS_KEY: &'static str = "undither_radius";
+    const UNDITHER_STRENGTH_KEY: &'static str = "undither_strength";
+    const UNDITHER_SNAP_KEY: &'static str = "undither_snap";
     const CROPS_KEY: &'static str = "crops"; // per-image crops: RON HashMap<PathBuf,[f32;4]>
     const AUTO_CROP_KEY: &'static str = "auto_crop_on";
     const CROP_GUIDE_KEY: &'static str = "crop_guide"; // composition overlay choice (u8)
@@ -3661,6 +3686,51 @@ impl Kaleidotron {
             .storage
             .and_then(|s| eframe::get_value::<u32>(s, Self::JPEG_CLEAN_GRID_SIZE_KEY))
             .unwrap_or(4);
+        // JPEG artifact removal (continuous-tone deblock + diffusion) — defaults off.
+        let deblock_on = get_bool(Self::DEBLOCK_ON_KEY).unwrap_or(false);
+        let deblock_block = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::DEBLOCK_BLOCK_KEY))
+            .unwrap_or(8)
+            .clamp(2, 64);
+        let deblock_strength = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::DEBLOCK_STRENGTH_KEY))
+            .unwrap_or(0.6)
+            .clamp(0.0, 1.0);
+        let deblock_edge = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::DEBLOCK_EDGE_KEY))
+            .unwrap_or(24)
+            .clamp(1, 255);
+        let deblock_tv = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::DEBLOCK_TV_KEY))
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let deblock_tv_iters = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::DEBLOCK_TV_ITERS_KEY))
+            .unwrap_or(4)
+            .clamp(1, 30);
+        // Undither — defaults off.
+        let undither_on = get_bool(Self::UNDITHER_ON_KEY).unwrap_or(false);
+        let undither_edge = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::UNDITHER_EDGE_KEY))
+            .unwrap_or(220)
+            .clamp(1, 1020);
+        let undither_radius = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u32>(s, Self::UNDITHER_RADIUS_KEY))
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let undither_strength = cc
+            .storage
+            .and_then(|s| eframe::get_value::<f32>(s, Self::UNDITHER_STRENGTH_KEY))
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let undither_snap = get_bool(Self::UNDITHER_SNAP_KEY).unwrap_or(false);
         let auto_crop_on = get_bool(Self::AUTO_CROP_KEY).unwrap_or(false);
         // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
         let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
@@ -4464,6 +4534,17 @@ impl Kaleidotron {
             jpeg_clean_merge_radius,
             jpeg_clean_grid,
             jpeg_clean_grid_size,
+            deblock_on,
+            deblock_block,
+            deblock_strength,
+            deblock_edge,
+            deblock_tv,
+            deblock_tv_iters,
+            undither_on,
+            undither_edge,
+            undither_radius,
+            undither_strength,
+            undither_snap,
             auto_crop_on,
             auto_crop_possible: false,
             auto_crop_analyzed: None,
@@ -23006,10 +23087,66 @@ impl Kaleidotron {
                         h = oh;
                     }
                 }
+                OpKind::Deblock => {
+                    if let Some(o) = self.deblock_opts() {
+                        let out = crate::deblock::deblock(&rgba, w, h, &o);
+                        if out.len() == rgba.len() {
+                            rgba = out;
+                        }
+                    }
+                }
+                OpKind::Undither => {
+                    if let Some(o) = self.undither_opts() {
+                        // Snap uses the image's OWN colours as the palette (nearest-snap maps each
+                        // smoothed pixel onto the original palette = a de-dithered posterize). Only
+                        // build it when snap is on (and cap a photo's huge set via median-cut).
+                        let pal: Option<Vec<[u8; 4]>> = if o.snap {
+                            let mut distinct = crate::thumb::distinct_opaque_colors(&rgba);
+                            if distinct.len() > 256 {
+                                distinct = crate::thumb::median_cut(&distinct, 256);
+                            }
+                            Some(distinct)
+                        } else {
+                            None
+                        };
+                        let out = crate::undither::undither(&rgba, w, h, pal.as_deref(), &o);
+                        if out.len() == rgba.len() {
+                            rgba = out;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         (w, h, rgba)
+    }
+
+    /// Deblock (continuous-tone JPEG artifact removal) options for the `Deblock` marker, or `None`
+    /// when off. See `deblock.rs`.
+    fn deblock_opts(&self) -> Option<crate::deblock::DeblockOpts> {
+        if !self.deblock_on {
+            return None;
+        }
+        Some(crate::deblock::DeblockOpts {
+            block_size: self.deblock_block as usize,
+            strength: self.deblock_strength,
+            edge_threshold: self.deblock_edge,
+            tv_amount: self.deblock_tv,
+            tv_iters: self.deblock_tv_iters as usize,
+        })
+    }
+
+    /// Undither options for the `Undither` marker, or `None` when off. See `undither.rs`.
+    fn undither_opts(&self) -> Option<crate::undither::UnditherOpts> {
+        if !self.undither_on {
+            return None;
+        }
+        Some(crate::undither::UnditherOpts {
+            edge_threshold: self.undither_edge,
+            radius: self.undither_radius as usize,
+            strength: self.undither_strength,
+            snap: self.undither_snap,
+        })
     }
 
     /// Auto-crop: when a newly-viewed image appears, analyze it (from its cached thumbnail) and,
@@ -23176,6 +23313,17 @@ impl Kaleidotron {
             jpeg_clean_merge_radius: self.jpeg_clean_merge_radius,
             jpeg_clean_grid: self.jpeg_clean_grid,
             jpeg_clean_grid_size: self.jpeg_clean_grid_size,
+            deblock_on: self.deblock_on,
+            deblock_block: self.deblock_block,
+            deblock_strength: self.deblock_strength,
+            deblock_edge: self.deblock_edge,
+            deblock_tv: self.deblock_tv,
+            deblock_tv_iters: self.deblock_tv_iters,
+            undither_on: self.undither_on,
+            undither_edge: self.undither_edge,
+            undither_radius: self.undither_radius,
+            undither_strength: self.undither_strength,
+            undither_snap: self.undither_snap,
             folder: None, // the caller (fx_save) sets it from the folder field
         }
     }
@@ -23301,6 +23449,20 @@ impl Kaleidotron {
         self.jpeg_clean_merge_radius = p.jpeg_clean_merge_radius.clamp(1, 20);
         self.jpeg_clean_grid = p.jpeg_clean_grid;
         self.jpeg_clean_grid_size = p.jpeg_clean_grid_size.clamp(2, 16);
+        // JPEG artifact removal (Deblock) + Undither — restored with the preset, ranges clamped.
+        // A preset saved before these existed carries the serde defaults (all off), so applying it
+        // turns them off, matching every other new-op field.
+        self.deblock_on = p.deblock_on;
+        self.deblock_block = p.deblock_block.clamp(2, 64).max(2);
+        self.deblock_strength = p.deblock_strength.clamp(0.0, 1.0);
+        self.deblock_edge = p.deblock_edge.clamp(1, 255).max(1);
+        self.deblock_tv = p.deblock_tv.clamp(0.0, 1.0);
+        self.deblock_tv_iters = p.deblock_tv_iters.clamp(1, 30).max(1);
+        self.undither_on = p.undither_on;
+        self.undither_edge = p.undither_edge.clamp(1, 1020).max(1);
+        self.undither_radius = p.undither_radius.clamp(1, 8).max(1);
+        self.undither_strength = p.undither_strength.clamp(0.0, 1.0);
+        self.undither_snap = p.undither_snap;
         self.ascii_font_cache = None;
         self.apply_ramp_src();
         // Invalidate derived caches so the recalled look rebuilds.
@@ -23336,6 +23498,8 @@ impl Kaleidotron {
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
             || self.scale_algo != crate::scale::Scaler::None
             || self.jpeg_clean_on
+            || self.deblock_on
+            || self.undither_on
     }
 
     /// Is ANY recolor active — the value pipeline (`pipeline_active`) OR a **palette snap**
@@ -23561,6 +23725,31 @@ impl Kaleidotron {
                 ) + &format!(
                     ":{}:{}",
                     self.jpeg_clean_grid as u8, self.jpeg_clean_grid_size
+                )
+            } else {
+                String::new()
+            }
+            // Deblock (continuous-tone JPEG artifact removal) — any knob must re-render the preview.
+            + &if self.deblock_on {
+                format!(
+                    "|DB{}:{:.3}:{}:{:.3}:{}",
+                    self.deblock_block,
+                    self.deblock_strength,
+                    self.deblock_edge,
+                    self.deblock_tv,
+                    self.deblock_tv_iters,
+                )
+            } else {
+                String::new()
+            }
+            // Undither.
+            + &if self.undither_on {
+                format!(
+                    "|UD{}:{}:{:.3}:{}",
+                    self.undither_edge,
+                    self.undither_radius,
+                    self.undither_strength,
+                    self.undither_snap as u8,
                 )
             } else {
                 String::new()
@@ -27883,6 +28072,17 @@ impl Kaleidotron {
         self.jpeg_clean_merge_radius = 4;
         self.jpeg_clean_grid = false;
         self.jpeg_clean_grid_size = 4;
+        self.deblock_on = false;
+        self.deblock_block = 8;
+        self.deblock_strength = 0.6;
+        self.deblock_edge = 24;
+        self.deblock_tv = 0.0;
+        self.deblock_tv_iters = 4;
+        self.undither_on = false;
+        self.undither_edge = 220;
+        self.undither_radius = 1;
+        self.undither_strength = 1.0;
+        self.undither_snap = false;
         self.flash = None;
         self.editing_color = None;
     }
@@ -28078,6 +28278,124 @@ impl Kaleidotron {
                 .response
                 .on_hover_text("The JPEG's native pixel size (screen pixels per art pixel)");
             });
+        });
+    }
+
+    /// The "Remove JPEG artifacts" section — the *continuous-tone* deblock/denoise (see `deblock.rs`),
+    /// the complement of "Extract pixels from JPEG". Keeps the image photographic while smoothing the
+    /// 8×8 blocking seams (Strength/Edge/Block) and, optionally, ringing/mosquito noise (Smoothing).
+    /// A pre-pipeline source step (runs in `scale_source`); these controls just set the fields
+    /// `pipeline_key` folds in, so the live preview re-renders as you drag.
+    fn ui_deblock(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.deblock_on, "Remove JPEG artifacts")
+            .on_hover_text(
+                "De-block a lossy JPEG while keeping it continuous-tone (photos, scans, \
+                 gradient art): smooth the 8×8 blocking seams and, optionally, edge ringing — \
+                 WITHOUT palette-quantising. Use this instead of \u{201c}Extract pixels\u{201d} for \
+                 anything that isn\u{2019}t flat pixel art.",
+            );
+        if !self.deblock_on {
+            return;
+        }
+        ui.indent("deblock_opts", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("De-block");
+                let r = ui.add(egui::Slider::new(&mut self.deblock_strength, 0.0..=1.0));
+                slider_extras(ui, &r, &mut self.deblock_strength, 0.6, 0.05, 0.0, 1.0);
+            })
+            .response
+            .on_hover_text("How strongly to smooth the block-boundary seams (0 = off)");
+            ui.horizontal(|ui| {
+                ui.label("Edge keep");
+                let r = ui.add(egui::Slider::new(&mut self.deblock_edge, 1..=255));
+                slider_extras(ui, &r, &mut self.deblock_edge, 24, 1.0, 1, 255);
+            })
+            .response
+            .on_hover_text(
+                "A seam step at/above this is treated as a REAL edge and preserved; below it, \
+                 it\u{2019}s smoothed as an artifact. Lower = keep more edges, de-block less.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Block");
+                let r = ui.add(egui::Slider::new(&mut self.deblock_block, 2..=32).suffix(" px"));
+                slider_extras(ui, &r, &mut self.deblock_block, 8, 1.0, 2, 32);
+            })
+            .response
+            .on_hover_text(
+                "The DCT block grid to de-seam — JPEG is 8 (use 16 for a 2×-scaled JPEG)",
+            );
+            ui.separator();
+            // Ringing / mosquito-noise removal (edge-preserving diffusion).
+            ui.horizontal(|ui| {
+                ui.label("Smoothing");
+                let r = ui.add(egui::Slider::new(&mut self.deblock_tv, 0.0..=1.0));
+                slider_extras(ui, &r, &mut self.deblock_tv, 0.0, 0.05, 0.0, 1.0);
+            })
+            .response
+            .on_hover_text(
+                "Edge-preserving diffusion (a TV-family denoise) — melts ringing / mosquito \
+                 noise around edges and residual gradient noise in flats, while keeping real \
+                 edges crisp. 0 = off.",
+            );
+            let tv_on = self.deblock_tv > 0.0;
+            ui.add_enabled_ui(tv_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("  Iterations");
+                    let r = ui.add(egui::Slider::new(&mut self.deblock_tv_iters, 1..=30));
+                    slider_extras(ui, &r, &mut self.deblock_tv_iters, 4, 1.0, 1, 30);
+                })
+                .response
+                .on_hover_text("More iterations = smoother (edges stay, flats soften more)");
+            });
+        });
+    }
+
+    /// The "Undither" section — reverse ordered / Floyd–Steinberg dithering back to smooth tone
+    /// (see `undither.rs`). A pre-pipeline source step (runs in `scale_source`).
+    fn ui_undither(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.undither_on, "Undither")
+            .on_hover_text(
+                "Reverse ordered / Floyd\u{2013}Steinberg dithering: average each dithered flat \
+                 field back to the single tone it was faking, while keeping real edges crisp. \
+                 Great for old GIFs / paletted art with checkerboard shading.",
+            );
+        if !self.undither_on {
+            return;
+        }
+        ui.indent("undither_opts", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Strength");
+                let r = ui.add(egui::Slider::new(&mut self.undither_strength, 0.0..=1.0));
+                slider_extras(ui, &r, &mut self.undither_strength, 1.0, 0.05, 0.0, 1.0);
+            })
+            .response
+            .on_hover_text("Blend the undithered result over the original (0 = off, 1 = full)");
+            ui.horizontal(|ui| {
+                ui.label("Edge keep");
+                let r = ui.add(egui::Slider::new(&mut self.undither_edge, 1..=1020));
+                slider_extras(ui, &r, &mut self.undither_edge, 220, 4.0, 1, 1020);
+            })
+            .response
+            .on_hover_text(
+                "Sobel gradient above which a pixel is a protected edge (not averaged). Lower = \
+                 protect more detail / undither only very flat fields; higher = smooth more.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Radius");
+                let r = ui.add(egui::Slider::new(&mut self.undither_radius, 1..=8).suffix(" px"));
+                slider_extras(ui, &r, &mut self.undither_radius, 1, 1.0, 1, 8);
+            })
+            .response
+            .on_hover_text(
+                "Averaging window radius. 1\u{2013}2 suits fine ordered dither; larger recovers \
+                 coarser patterns but softens more.",
+            );
+            ui.checkbox(&mut self.undither_snap, "Snap to palette")
+                .on_hover_text(
+                    "After smoothing, snap each pixel to the nearest of the image\u{2019}s own \
+                     colours \u{2014} a clean de-dithered posterize in the original palette. Off = \
+                     keep the smooth (off-palette) intermediate tones.",
+                );
         });
     }
 
@@ -28316,6 +28634,15 @@ impl Kaleidotron {
                 // ----- JPEG cleanup (recover crisp pixel art from a lossy JPEG) — a
                 //       pre-pipeline source step, so it sits above Resize/Adjustments. -----
                 self.ui_jpeg_cleanup(ui, &entry.path);
+                ui.add_space(6.0);
+                ui.separator();
+
+                // ----- JPEG artifact removal (continuous-tone) + Undither — sibling
+                //       pre-pipeline source-repair steps. -----
+                self.ui_deblock(ui);
+                ui.add_space(6.0);
+                ui.separator();
+                self.ui_undither(ui);
                 ui.add_space(6.0);
                 ui.separator();
 
@@ -28699,6 +29026,22 @@ impl Kaleidotron {
                                                 },
                                                 "Pixel-art upscaler — pick it in the Resize section's Upscale dropdown. A geometry step; drag it above/below JPEG clean to upscale before or after the clean.",
                                             ),
+                                            OpKind::Deblock => (
+                                                if self.deblock_on {
+                                                    egui::RichText::new("Deblock").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Deblock (off)").weak()
+                                                },
+                                                "Remove JPEG blocking/ringing (continuous-tone) — set it up in the “Remove JPEG artifacts” section. A source-repair step; drag to reorder.",
+                                            ),
+                                            OpKind::Undither => (
+                                                if self.undither_on {
+                                                    egui::RichText::new("Undither").strong().color(active)
+                                                } else {
+                                                    egui::RichText::new("Undither (off)").weak()
+                                                },
+                                                "Reverse ordered/FS dithering back to smooth tone — set it up in the “Undither” section. A source-repair step; drag to reorder.",
+                                            ),
                                             _ => unreachable!("non-marker in marker branch"),
                                         };
                                         ui.add_sized(
@@ -28809,7 +29152,7 @@ impl Kaleidotron {
                                         let item = v.remove(from);
                                         let at = if from < to { to - 1 } else { to };
                                         v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 23]>::try_from(v) {
+                                        if let Ok(arr) = <[OpKind; 25]>::try_from(v) {
                                             a.order = arr;
                                         }
                                         self.adjust_drag = None;
@@ -43717,6 +44060,21 @@ impl eframe::App for Kaleidotron {
             Self::JPEG_CLEAN_GRID_SIZE_KEY,
             &self.jpeg_clean_grid_size,
         );
+        eframe::set_value(storage, Self::DEBLOCK_ON_KEY, &self.deblock_on);
+        eframe::set_value(storage, Self::DEBLOCK_BLOCK_KEY, &self.deblock_block);
+        eframe::set_value(storage, Self::DEBLOCK_STRENGTH_KEY, &self.deblock_strength);
+        eframe::set_value(storage, Self::DEBLOCK_EDGE_KEY, &self.deblock_edge);
+        eframe::set_value(storage, Self::DEBLOCK_TV_KEY, &self.deblock_tv);
+        eframe::set_value(storage, Self::DEBLOCK_TV_ITERS_KEY, &self.deblock_tv_iters);
+        eframe::set_value(storage, Self::UNDITHER_ON_KEY, &self.undither_on);
+        eframe::set_value(storage, Self::UNDITHER_EDGE_KEY, &self.undither_edge);
+        eframe::set_value(storage, Self::UNDITHER_RADIUS_KEY, &self.undither_radius);
+        eframe::set_value(
+            storage,
+            Self::UNDITHER_STRENGTH_KEY,
+            &self.undither_strength,
+        );
+        eframe::set_value(storage, Self::UNDITHER_SNAP_KEY, &self.undither_snap);
         eframe::set_value(storage, Self::AUTO_CROP_KEY, &self.auto_crop_on);
         eframe::set_value(storage, Self::TD_SHADE_KEY, &self.td_shade);
         eframe::set_value(storage, Self::TD_WIRE_COLOR_KEY, &self.td_wire_color);
@@ -44735,12 +45093,19 @@ enum OpKind {
     /// the two are reorderable relative to each other (drag to clean-then-upscale vs upscale-then-
     /// clean). The scaler itself is picked in the Resize section. Appended so indices stay valid.
     Upscale,
+    /// JPEG de-block / artifact removal — the *continuous-tone* complement of JpegClean: smooth the
+    /// 8×8 blocking seams + ringing without palette-quantising (see `deblock.rs`). A GEOMETRY-style
+    /// marker (same size), runs in `scale_source` before the pipeline. Appended so indices stay valid.
+    Deblock,
+    /// Undither — reverse ordered/Floyd–Steinberg dithering back to smooth tone (see `undither.rs`).
+    /// A source-repair marker, runs in `scale_source`. Appended so persisted indices stay valid.
+    Undither,
 }
 
 impl OpKind {
     /// Every op, in declaration order. `ALL[i] as u8 == i`. New ops are appended
     /// so persisted order indices stay valid across upgrades.
-    const ALL: [OpKind; 23] = [
+    const ALL: [OpKind; 25] = [
         OpKind::Brightness,
         OpKind::Contrast,
         OpKind::Gamma,
@@ -44764,6 +45129,8 @@ impl OpKind {
         OpKind::Resize,
         OpKind::JpegClean,
         OpKind::Upscale,
+        OpKind::Deblock,
+        OpKind::Undither,
     ];
 
     fn from_u8(b: u8) -> Option<OpKind> {
@@ -44786,6 +45153,8 @@ impl OpKind {
                 | OpKind::Resize
                 | OpKind::JpegClean
                 | OpKind::Upscale
+                | OpKind::Deblock
+                | OpKind::Undither
         )
     }
 
@@ -44817,6 +45186,8 @@ impl OpKind {
             OpKind::Resize => ("Resize", 0.0, 0.0, 0.0, 0.0),
             OpKind::JpegClean => ("JPEG clean", 0.0, 0.0, 0.0, 0.0),
             OpKind::Upscale => ("Upscale", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Deblock => ("Deblock", 0.0, 0.0, 0.0, 0.0),
+            OpKind::Undither => ("Undither", 0.0, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -44852,7 +45223,7 @@ struct Adjust {
     /// The order ops are applied in — a permutation of `OpKind::ALL`, and also the
     /// order the sliders are shown in. Not part of `is_identity` (it only matters
     /// when some op is active) but it *is* part of `key()` so the cache invalidates.
-    order: [OpKind; 23],
+    order: [OpKind; 25],
 }
 
 impl Default for Adjust {
@@ -44880,9 +45251,12 @@ impl Adjust {
     /// The default pipeline order: pixelate → tone curve → invert → color →
     /// balance → sharpen → dither → palette rematch. Dither sits right before the
     /// palette snap so the default behaves like the historical dithered reduce.
-    const DEFAULT_ORDER: [OpKind; 23] = [
-        // Geometry steps first (both run in scale_source, before the pipeline): clean the raw
-        // source, THEN pixel-art upscale it. Drag to swap (upscale-then-clean).
+    const DEFAULT_ORDER: [OpKind; 25] = [
+        // Source-repair steps first (all run in scale_source, before the pipeline): remove JPEG
+        // artifacts / undither the raw source, extract pixel art, THEN pixel-art upscale it. All
+        // reorderable — drag to swap (e.g. upscale-then-clean).
+        OpKind::Deblock,
+        OpKind::Undither,
         OpKind::JpegClean,
         OpKind::Upscale,
         // Resize next by default: the whole pipeline runs at the reduced resolution (the
@@ -44953,7 +45327,7 @@ impl Adjust {
         )
     }
     /// The apply order as op indices, for persistence.
-    fn order_to_u8(&self) -> [u8; 23] {
+    fn order_to_u8(&self) -> [u8; 25] {
         self.order.map(|o| o as u8)
     }
     /// Adopt a persisted order, ignoring unknown/duplicate entries and appending any
@@ -45018,7 +45392,19 @@ impl Adjust {
                 ops.insert(at, u);
             }
         }
-        if let Ok(order) = <[OpKind; 23]>::try_from(ops) {
+        // Deblock + Undither (new source-repair geometry ops) default to the very FRONT of the
+        // stack for an order saved before they existed — clean/undither the raw source first, the
+        // same as their default placement. Insert Undither first, then Deblock before it, so the
+        // final front order is Deblock, Undither, ….
+        for op in [OpKind::Undither, OpKind::Deblock] {
+            if !arr.iter().any(|&b| OpKind::from_u8(b) == Some(op)) {
+                if let Some(i) = ops.iter().position(|o| *o == op) {
+                    let g = ops.remove(i);
+                    ops.insert(0, g);
+                }
+            }
+        }
+        if let Ok(order) = <[OpKind; 25]>::try_from(ops) {
             self.order = order;
         }
         self
@@ -45037,7 +45423,9 @@ impl Adjust {
             | OpKind::Phosphor
             | OpKind::Resize
             | OpKind::JpegClean
-            | OpKind::Upscale => {
+            | OpKind::Upscale
+            | OpKind::Deblock
+            | OpKind::Undither => {
                 unreachable!("marker ops have no slider value")
             }
             OpKind::Invert => &mut self.invert,
@@ -45182,7 +45570,11 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
             // Resize is handled by the wrappers (they split the order around it); JpegClean +
             // Upscale are GEOMETRY ops handled in `scale_source` (they change/prepare the buffer
             // before the pipeline) — all no-ops here.
-            OpKind::Resize | OpKind::JpegClean | OpKind::Upscale => {}
+            OpKind::Resize
+            | OpKind::JpegClean
+            | OpKind::Upscale
+            | OpKind::Deblock
+            | OpKind::Undither => {}
             OpKind::Pixelate => {
                 // Mosaic: average each bw×bh block (alpha untouched, so the sprite's
                 // silhouette stays crisp). Width = a.pixelate, height = aux.pixelate_h,
@@ -45867,6 +46259,30 @@ struct FxPreset {
     jpeg_clean_grid: bool,
     #[serde(default)]
     jpeg_clean_grid_size: u32,
+    // JPEG artifact removal (Deblock) + Undither — captured with the preset. Struct-level
+    // `#[serde(default)]` fills these from the Default impl for presets saved before they existed.
+    #[serde(default)]
+    deblock_on: bool,
+    #[serde(default)]
+    deblock_block: u32,
+    #[serde(default)]
+    deblock_strength: f32,
+    #[serde(default)]
+    deblock_edge: u32,
+    #[serde(default)]
+    deblock_tv: f32,
+    #[serde(default)]
+    deblock_tv_iters: u32,
+    #[serde(default)]
+    undither_on: bool,
+    #[serde(default)]
+    undither_edge: u32,
+    #[serde(default)]
+    undither_radius: u32,
+    #[serde(default)]
+    undither_strength: f32,
+    #[serde(default)]
+    undither_snap: bool,
     // Collapsible group in the PixelFX tab: None = top level; the bundled presets are "Factory".
     folder: Option<String>,
 }
@@ -45973,6 +46389,17 @@ impl Default for FxPreset {
             jpeg_clean_merge_radius: 4,
             jpeg_clean_grid: false,
             jpeg_clean_grid_size: 4,
+            deblock_on: false,
+            deblock_block: 8,
+            deblock_strength: 0.6,
+            deblock_edge: 24,
+            deblock_tv: 0.0,
+            deblock_tv_iters: 4,
+            undither_on: false,
+            undither_edge: 220,
+            undither_radius: 1,
+            undither_strength: 1.0,
+            undither_snap: false,
             folder: None,
         }
     }
@@ -46487,7 +46914,9 @@ fn apply_op(rgba: &mut [u8], w: usize, h: usize, op: OpKind, a: &Adjust) {
         | OpKind::Phosphor
         | OpKind::Resize
         | OpKind::JpegClean
-        | OpKind::Upscale => {}
+        | OpKind::Upscale
+        | OpKind::Deblock
+        | OpKind::Undither => {}
     }
 }
 
@@ -56761,6 +57190,34 @@ mod tests {
     }
 
     #[test]
+    // Emit a byte-correct RON record for the "JPEG De-Artifact" bundled preset, to paste into
+    // assets/pixelfx_builtin.ron. Run: cargo test --release dump_deartifact_preset -- --ignored --nocapture
+    #[test]
+    #[ignore = "utility: prints a RON preset record to stdout"]
+    fn dump_deartifact_preset() {
+        // Neutral baseline (no adjustments / dither / palette / resize / upscale) + artifact removal:
+        // de-block the 8×8 seams and diffuse away ringing, tuned on real JPEGs to keep content intact.
+        let p = FxPreset {
+            name: "JPEG De-Artifact".to_string(),
+            color: Some([31, 120, 110]), // teal = "clean"
+            fg: None,
+            deblock_on: true,
+            deblock_block: 8,
+            deblock_strength: 0.9,
+            deblock_edge: 50,
+            deblock_tv: 0.65,
+            deblock_tv_iters: 4,
+            undither_on: false,
+            folder: None, // builtin_fx_presets() forces Factory
+            ..FxPreset::default()
+        };
+        let ron = ron::to_string(&vec![p]).unwrap();
+        // Strip the outer [ ] so it can be pasted between the existing records.
+        let inner = ron.trim().trim_start_matches('[').trim_end_matches(']');
+        eprintln!("\n--- paste this record into assets/pixelfx_builtin.ron ---\n{inner}\n---");
+    }
+
+    #[test]
     fn builtin_fx_presets_parse_and_reference_bundled_palettes() {
         let fx = builtin_fx_presets();
         assert!(
@@ -56771,6 +57228,25 @@ mod tests {
         assert!(
             fx.iter().any(|p| p.name == "Gameboy"),
             "a known preset is present"
+        );
+        // The JPEG artifact-removal preset ships, cleans (deblock + diffusion on) and keeps content
+        // (no palette snap / reduce / dither / upscale) — so it can't silently regress to a no-op.
+        let da = fx
+            .iter()
+            .find(|p| p.name == "JPEG De-Artifact")
+            .expect("JPEG De-Artifact preset is bundled");
+        assert!(
+            da.deblock_on && da.deblock_strength > 0.0 && da.deblock_tv > 0.0,
+            "it actually cleans"
+        );
+        assert!(
+            !da.quantize_on
+                && da.selected_palette.is_none()
+                && da.custom_palette.is_none()
+                && da.dither_method == 0
+                && da.scale_algo == 0
+                && !da.undither_on,
+            "it keeps original content (no quantize/palette/dither/upscale/undither)"
         );
         // Every referenced palette must resolve to embedded contents — else a fresh install would
         // recall a preset whose palette silently doesn't exist.
@@ -57704,6 +58180,8 @@ mod tests {
             OpKind::Resize,
             OpKind::JpegClean,
             OpKind::Upscale,
+            OpKind::Deblock,
+            OpKind::Undither,
         ];
         let mut bright_first = post_first;
         bright_first.order.swap(0, 1); // brightness now before posterize
@@ -57778,6 +58256,8 @@ mod tests {
                 OpKind::Resize,
                 OpKind::JpegClean,
                 OpKind::Upscale,
+                OpKind::Deblock,
+                OpKind::Undither,
             ],
             ..Default::default()
         };
