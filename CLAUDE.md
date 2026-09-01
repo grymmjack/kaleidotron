@@ -545,6 +545,34 @@ pack-view `raw_url` `enc()`s the built filename) so `#`→`%23` etc. survive
 The Recolor pane (`ui_recolor`) applies per-image **adjustments** then a **palette
 rematch**, and the *order* of all of it is user-controlled.
 
+- **Pane layout: 8 collapsible, drag-reorderable sections (`RecolorSection`).** Below the
+  always-visible preview + Export/Save row, the pane is a `for` loop over
+  `self.recolor_order` — `Palette · N colors` (the swatch grid) / `Cleaning` (the JPEG-clean
+  + de-block + undither checkboxes, grouped) / `Resize` / `Adjustments` / `Pixelate` /
+  `Color balance` / `Post FX` / `Recolor` (Reduce + the palette chooser + dither + the
+  textmode export). Each renders through the free fn **`recolor_section`** = a drag grip
+  (`drag_handle`) + a `CollapsingState` header + an indented body, and each section's body is
+  its own `ui_sec_*` method so the loop stays a `match`. A trailing `*` in the header (and a
+  value, e.g. `Resize *  · 320×200`) says a collapsed section is doing something.
+  - **The open state is OURS, not egui's** — a `[bool; COUNT]` indexed by discriminant. It
+    has to be: `persist_egui_memory()` is false (so egui's own collapsing state dies at
+    exit), and the header-row **⊞/⊟ All** button has to be able to force every section. So
+    `recolor_section` calls `state.set_open(open)` before drawing and hands the post-click
+    value back in `SectionHead::open`. NB forcing `open` means the header's own `clicked()`
+    no longer toggles anything (see `CollapsingHeader::open`), which is why the title label
+    is a `Sense::click()` `Label` that calls `state.toggle` itself.
+  - **Reordering** mirrors the Adjustments row drag: the grip sets `recolor_sec_drag`,
+    `recolor_section_drag` paints the insertion line and moves the section on release. The
+    drop targets are whole sections (header + body, measured with `ui.cursor().top()`), so
+    dragging over an expanded section lands where it looks like it should.
+  - **Persistence:** `RECOLOR_SECTIONS_KEY` (a `Vec<u8>` of discriminants) +
+    `RECOLOR_OPEN_KEY` (a `Vec<bool>`), restored by the pure `recolor_order_from` /
+    `recolor_open_from` (unit-tested). Variants are **appended, never reordered or removed** —
+    an unknown id is dropped and a section missing from a saved order is *appended*, so a
+    config written before a section existed gains it at the end rather than losing it. The
+    header button's right-click restores the default order; `⟲ Reset all` clears *settings*,
+    not the layout.
+
 - **`Adjust`** holds 12 value fields (brightness, contrast, gamma, shadows, highlights,
   posterize, hue, saturation, **vibrance**, pixelate, sharpen, **invert**) plus `order:
   [OpKind; 19]` — a permutation of `OpKind::ALL`. **8 of those 19 are marker ops** (no

@@ -2450,6 +2450,11 @@ pub struct Kaleidotron {
     textmode_zoom: f32,     // remembered viewer zoom for text-mode art (persisted)
     raster_zoom: f32,       // remembered viewer zoom for ordinary raster art (persisted)
     adjust_drag: Option<usize>, // colorizer: order index being drag-reordered
+    // Recolor pane layout: which sections are shown in what order, and which
+    // are expanded. Both persisted, so the arrangement survives a restart.
+    recolor_order: Vec<RecolorSection>,
+    recolor_open: [bool; RecolorSection::COUNT],
+    recolor_sec_drag: Option<usize>, // index in `recolor_order` being dragged
 
     // navigation (Phase 2 + round 4)
     favorites: Vec<PathBuf>,
@@ -3082,6 +3087,8 @@ impl Kaleidotron {
     const SHUFFLE_KEY: &'static str = "shuffle";
     const ADJUST_KEY: &'static str = "adjust";
     const ADJUST_ORDER_KEY: &'static str = "adjust_order";
+    const RECOLOR_SECTIONS_KEY: &'static str = "recolor_sections"; // pane section order
+    const RECOLOR_OPEN_KEY: &'static str = "recolor_open"; // per-section expanded state
     const BLUR_KEY: &'static str = "adjust_blur"; // separate: keeps the 12-wide adjust array
 
     const IMG_ZOOM_KEY: &'static str = "image_zoom";
@@ -3607,6 +3614,17 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<Vec<f32>>(s, Self::POSTFX_KEY))
             .map(|v| PostFx::from_record(&v))
             .unwrap_or_default();
+        // Recolor-pane section layout (order + which are expanded).
+        let recolor_order = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<u8>>(s, Self::RECOLOR_SECTIONS_KEY))
+            .map(|v| recolor_order_from(&v))
+            .unwrap_or_else(|| RecolorSection::ALL.to_vec());
+        let recolor_open = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<bool>>(s, Self::RECOLOR_OPEN_KEY))
+            .map(|v| recolor_open_from(&v))
+            .unwrap_or_else(default_recolor_open);
         let img_zoom = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::IMG_ZOOM_KEY))
@@ -5094,6 +5112,9 @@ impl Kaleidotron {
             textmode_zoom,
             raster_zoom: img_zoom,
             adjust_drag: None,
+            recolor_order,
+            recolor_open,
+            recolor_sec_drag: None,
             favorites,
             fav_colors,
             fav_names,
@@ -28415,6 +28436,31 @@ impl Kaleidotron {
             {
                 self.reset_recolor();
             }
+            // Collapse / expand every section at once. Kept to two characters: this
+            // row already carries Apply-to-grid / Reset all / Bypass, and a worded
+            // "Collapse all" pushed Bypass off the end of a docked pane. Pinned to a
+            // fixed width so the ⊞/⊟ swap can't shove the row (the jiggle rule).
+            let all_open = self.recolor_open.iter().all(|b| *b);
+            let sz = fixed_btn_size(ui, &["⊞ All", "⊟ All"]);
+            let btn = egui::Button::new(if all_open { "⊟ All" } else { "⊞ All" }).min_size(sz);
+            let resp = ui.add(btn).on_hover_text(if all_open {
+                "Collapse every section below · right-click to restore the default \
+                 section order"
+            } else {
+                "Expand every section below · right-click to restore the default \
+                 section order"
+            });
+            if resp.clicked() {
+                // All open -> collapse everything; anything closed -> open everything.
+                self.recolor_open = [!all_open; RecolorSection::COUNT];
+            }
+            resp.context_menu(|ui| {
+                if ui.button("↕ Reset section order").clicked() {
+                    self.recolor_order = RecolorSection::ALL.to_vec();
+                    ui.close();
+                }
+            });
+
             // Bypass (flush-right): keep every setting but show the ORIGINAL — for A/B
             // eyeballing colour touch-ups. Highlighted yellow while on so it's obviously off.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -28479,8 +28525,11 @@ impl Kaleidotron {
                     // Adjustments + (optional) palette map. Fold in the per-image crop so
                     // dragging the crop box rebuilds this preview.
                     let rkey = recolor.as_ref().map(|(k, _)| k.as_str()).unwrap_or("orig");
-                    let key =
-                        format!("{}|{rkey}{}", self.pipeline_key(), self.crop_sig(&entry.path));
+                    let key = format!(
+                        "{}|{rkey}{}",
+                        self.pipeline_key(),
+                        self.crop_sig(&entry.path)
+                    );
                     let pal = recolor.as_ref().map(|(_, p)| p.as_slice());
                     tex = self.make_preview(&ctx, &entry.path, &key, pal);
                 }
@@ -28497,2196 +28546,44 @@ impl Kaleidotron {
                     } else {
                         1.0
                     };
-                    self.recolor_thumb_h =
-                        self.draw_thumb_area(ui, &entry.path, &tex, ar_y, self.recolor_thumb_h, false);
+                    self.recolor_thumb_h = self.draw_thumb_area(
+                        ui,
+                        &entry.path,
+                        &tex,
+                        ar_y,
+                        self.recolor_thumb_h,
+                        false,
+                    );
                 } else {
                     self.thumbs.request(&entry.path, THUMB_PX);
                     self.want_repaint = true;
                 }
 
-                // ----- extracted palette swatches, kept directly under the preview so
-                //       they're always visible (Export/Save stay further down) -----
-                if let Some(d) = &display {
-                    ui.horizontal(|ui| {
-                        ui.strong("Palette");
-                        ui.weak(format!("· {} colors", d.len()));
-                    });
-                    ui.add_space(4.0);
-                    let prev = ui.spacing().item_spacing;
-                    ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                    let mut swatch_flash: Option<[u8; 4]> = None;
-                    let mut swatch_delete: Option<usize> = None;
-                    let mut swatch_edit: Option<usize> = None;
-                    let swatch_row = ui.horizontal_wrapped(|ui| {
-                        for (i, &c) in d.iter().enumerate() {
-                            let (r, resp) = ui
-                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                            let col =
-                                egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-                            ui.painter().rect_filled(r, 2.0, col);
-                            ui.painter().rect_stroke(
-                                r,
-                                2.0,
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
-                                egui::StrokeKind::Inside,
-                            );
-                            let resp = resp.on_hover_text(format!(
-                                "#{:02X}{:02X}{:02X}\nhold: flash where it's used · right-click: edit / delete",
-                                c[0], c[1], c[2]
-                            ));
-                            if resp.is_pointer_button_down_on() {
-                                swatch_flash = Some(c);
-                            }
-                            resp.context_menu(|ui| {
-                                if ui.button("✎ Edit color…").clicked() {
-                                    swatch_edit = Some(i);
-                                    ui.close();
-                                }
-                                if ui.button("🗑 Delete color").clicked() {
-                                    swatch_delete = Some(i);
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-                    // Remember where the swatch row sits (screen coords) so the
-                    // Edit-color dialog can default to just left of it.
-                    self.swatch_rect = Some(swatch_row.response.rect);
-                    // Apply swatch actions. Edits/deletes materialize the active palette
-                    // into a live `custom_palette` — the .gpl files on disk are never
-                    // touched. Flash is set only while a swatch is held.
-                    self.flash = swatch_flash;
-                    if swatch_flash.is_some() {
-                        self.want_repaint = true;
-                    }
-                    // Editing/deleting a swatch materializes the shown palette into
-                    // `custom_palette` (which wins in `active_recolor`), so the edit
-                    // shows live. We DON'T clear `quantize_on` here: editing a reduced
-                    // color should keep "Reduce" checked (the user's edit *is* the
-                    // reduced palette, hand-tweaked). Toggling Reduce or changing the
-                    // Colors count are the explicit resets that drop the edit.
-                    if let Some(i) = swatch_delete {
-                        if d.len() > 1 && i < d.len() {
-                            let mut pal = d.clone();
-                            pal.remove(i);
-                            self.custom_palette = Some(pal);
-                            self.selected_palette = None;
-                        }
-                    }
-                    if let Some(i) = swatch_edit {
-                        if let Some(&c) = d.get(i) {
-                            self.editing_color = Some((i, c));
-                            self.custom_palette = Some(d.clone());
-                            self.selected_palette = None;
-                        }
-                    }
-                    ui.spacing_mut().item_spacing = prev;
-                } else if matches!(pal_state, Some(None)) {
-                    ui.add_space(4.0);
-                    ui.weak(format!(
-                        "(image itself has > {} colors — Reduce or pick a palette below)",
-                        crate::thumb::SWATCH_CAP
-                    ));
-                }
-                // ----- export / save, kept directly under the swatches so they stay
-                //       reachable without scrolling on small screens -----
-                if let Some(d) = &display {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Export .GPL…").clicked() {
-                            do_export = Some((short_name(&entry.path), d.clone()));
-                        }
-                        // Save the processed image (recolor and/or adjustments).
-                        if recolor.is_some() || self.pipeline_active() {
-                            if ui
-                                .button("💾 Save recolored")
-                                .on_hover_text("Write to a 'recolored' subfolder next to the image")
-                                .clicked()
-                            {
-                                save_request = Some(false);
-                            }
-                            if ui.button("Save As…").clicked() {
-                                save_request = Some(true);
-                            }
-                        }
-                        // Export as textmode art. ANSI needs a palette; PETSCII brings its own
-                        // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
-                        if (recolor.is_some()
-                            || self.dither_method == crate::thumb::DITHER_PETSCII
-                            || self.dither_method == crate::thumb::DITHER_UNICODE)
-                            && ui
-                                .button("Export textmode")
-                                .on_hover_text(
-                                    "Write the recolored image as textmode art. Format follows \
-                                     the Colors selector: 16-color → .ans (EGA-16) or .xbin \
-                                     (embeds the palette); 256-color → .ans; RGB → .tnd \
-                                     (TundraDraw 24-bit). All carry a SAUCE record.",
-                                )
-                                .clicked()
-                        {
-                            ans_request = true;
-                        }
-                    });
-                }
-                ui.add_space(6.0);
-                ui.separator();
-
-                // ----- JPEG cleanup (recover crisp pixel art from a lossy JPEG) — a
-                //       pre-pipeline source step, so it sits above Resize/Adjustments. -----
-                self.ui_jpeg_cleanup(ui, &entry.path);
-                ui.add_space(6.0);
-                ui.separator();
-
-                // ----- JPEG artifact removal (continuous-tone) + Undither — sibling
-                //       pre-pipeline source-repair steps. -----
-                self.ui_deblock(ui);
-                ui.add_space(6.0);
-                ui.separator();
-                self.ui_undither(ui);
-                ui.add_space(6.0);
-                ui.separator();
-
-                // ----- Resize / resample (downsample the art, run the whole pipeline
-                //       at that lower resolution, then nearest-upscale back so it shows
-                //       at the SAME on-screen size — to judge low-res degradation and to
-                //       dither at single-pixel scale). Sits above Adjustments so the
-                //       resample happens first. -----
-                {
-                    // Native dims for the px labels: img_meta (local art), else the
-                    // decoded-thumb dims — which is all a 16colo piece has (no img_meta),
-                    // so the resize is enabled there too (it's factor-based regardless).
-                    let (nw, nh) = self
-                        .img_meta
-                        .get(&entry.path)
-                        .map(|m| (m.w as usize, m.h as usize))
-                        .filter(|&(w, h)| w > 0 && h > 0)
-                        .or_else(|| self.thumb_rgba.get(&entry.path).map(|(w, h, _)| (*w, *h)))
-                        .unwrap_or((0, 0));
-                    let (tw, th) = if nw > 0 {
-                        (
-                            ((nw as f32 * self.resize_fx).round() as usize).max(1),
-                            ((nh as f32 * self.resize_fy).round() as usize).max(1),
-                        )
-                    } else {
-                        (0, 0)
-                    };
-                    let header = if self.scale_algo != crate::scale::Scaler::None {
-                        format!("Resize *  · {}", self.scale_algo.label())
-                    } else if self.resize_active() {
-                        format!("Resize *  · {tw}×{th}")
-                    } else {
-                        "Resize".to_string()
-                    };
-                    egui::CollapsingHeader::new(header)
-                        .id_salt("resize")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            if nw == 0 {
-                                ui.weak("(load the image to resize it)");
-                                return;
-                            }
-                            // Pixel-art upscaler — enlarges the source with edge-aware
-                            // interpolation (runs before the whole pipeline). Independent
-                            // of the downsample sliders below; combine for any final size.
-                            ui.horizontal(|ui| {
-                                ui.label("Upscale").on_hover_text(
-                                    "Pixel-art scaler applied first (2×/3×). The enlarged art \
-                                     then flows through the whole recolor stack + Save.",
-                                );
-                                let mut si = self.scale_algo as usize;
-                                let cr = eat_scroll(egui::ComboBox::from_id_salt("scale_algo")
-                                    .selected_text(self.scale_algo.label())
-                                    .show_ui(ui, |ui| {
-                                        for (i, s) in crate::scale::Scaler::ALL.iter().enumerate() {
-                                            ui.selectable_value(&mut si, i, s.label());
-                                        }
-                                    }));
-                                wheel_cycle(ui, &cr, &mut si, crate::scale::Scaler::ALL.len());
-                                self.scale_algo = crate::scale::Scaler::from_u8(si as u8);
-                            });
-                            ui.separator();
-                            ui.checkbox(&mut self.resize_on, "Enable").on_hover_text(
-                                "Downsample then upscale back — the low-res look at the \
-                                 same on-screen size. Dither/adjustments below apply at \
-                                 the reduced resolution.",
-                            );
-                            let resize_on = self.resize_on;
-                            ui.add_enabled_ui(resize_on, |ui| {
-                                const PAD: f32 = 10.0;
-                                const VALUE_W: f32 = 64.0;
-                                let font = egui::TextStyle::Body.resolve(ui.style());
-                                let label_col = ui
-                                    .painter()
-                                    .layout_no_wrap(
-                                        "Height".to_string(),
-                                        font,
-                                        egui::Color32::WHITE,
-                                    )
-                                    .size()
-                                    .x;
-                                let slider_w = (ui.available_width()
-                                    - label_col
-                                    - VALUE_W
-                                    - PAD * 2.0)
-                                    .max(48.0);
-                                // Width (px) — editing sets the width factor; a locked
-                                // aspect mirrors it to the height factor.
-                                let mut w = tw;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = PAD;
-                                    value_slider(
-                                        ui, "Width", label_col, slider_w, VALUE_W, &mut w,
-                                        1usize, nw, nw, 1.0, 0,
-                                    );
-                                });
-                                if w != tw {
-                                    self.resize_fx = (w as f32 / nw as f32).clamp(0.005, 1.0);
-                                    if self.resize_lock {
-                                        self.resize_fy = self.resize_fx;
-                                    }
-                                }
-                                // Height (px).
-                                let mut h = th;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = PAD;
-                                    value_slider(
-                                        ui, "Height", label_col, slider_w, VALUE_W, &mut h,
-                                        1usize, nh, nh, 1.0, 0,
-                                    );
-                                });
-                                if h != th {
-                                    self.resize_fy = (h as f32 / nh as f32).clamp(0.005, 1.0);
-                                    if self.resize_lock {
-                                        self.resize_fx = self.resize_fy;
-                                    }
-                                }
-                                // Quick % of native (both axes) — snap to 100/75/50/25.
-                                ui.horizontal(|ui| {
-                                    ui.weak("Quick");
-                                    for pct in [100u32, 75, 50, 25] {
-                                        if ui
-                                            .button(format!("{pct}%"))
-                                            .on_hover_text("Set both axes to this % of native")
-                                            .clicked()
-                                        {
-                                            let f = pct as f32 / 100.0;
-                                            self.resize_fx = f;
-                                            self.resize_fy = f;
-                                        }
-                                    }
-                                });
-                                // Lock + relative shrink/grow steps (wrapped: 6 buttons).
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui
-                                        .selectable_label(self.resize_lock, "🔒 Lock aspect")
-                                        .clicked()
-                                    {
-                                        self.resize_lock = !self.resize_lock;
-                                        if self.resize_lock {
-                                            self.resize_fy = self.resize_fx; // unify on lock
-                                        }
-                                    }
-                                    if ui
-                                        .button("/2")
-                                        .on_hover_text("Halve the resolution (press again to keep halving)")
-                                        .clicked()
-                                    {
-                                        self.resize_fx = (self.resize_fx * 0.5).max(0.005);
-                                        self.resize_fy = (self.resize_fy * 0.5).max(0.005);
-                                    }
-                                    if ui.button("×2").on_hover_text("Double back up").clicked() {
-                                        self.resize_fx = (self.resize_fx * 2.0).min(1.0);
-                                        self.resize_fy = (self.resize_fy * 2.0).min(1.0);
-                                    }
-                                    if ui
-                                        .button("×¼")
-                                        .on_hover_text("Quarter the resolution (× ¼)")
-                                        .clicked()
-                                    {
-                                        self.resize_fx = (self.resize_fx * 0.25).max(0.005);
-                                        self.resize_fy = (self.resize_fy * 0.25).max(0.005);
-                                    }
-                                    if ui
-                                        .button("÷¼")
-                                        .on_hover_text("4× back up (÷ ¼)")
-                                        .clicked()
-                                    {
-                                        self.resize_fx = (self.resize_fx * 4.0).min(1.0);
-                                        self.resize_fy = (self.resize_fy * 4.0).min(1.0);
-                                    }
-                                    if ui.button("Reset").on_hover_text("Back to native resolution").clicked() {
-                                        self.resize_fx = 1.0;
-                                        self.resize_fy = 1.0;
-                                    }
-                                });
-                            });
-                        });
-                }
+                // ----- Export / save, kept directly under the preview so they stay
+                //       reachable without scrolling on a small screen, whatever the
+                //       sections below are collapsed to. -----
+                let req = self.ui_sec_export(ui, &entry.path, &display, recolor.is_some());
+                do_export = req.gpl;
+                save_request = req.save;
+                ans_request = req.textmode;
                 ui.add_space(4.0);
 
-                // ----- Adjustments (applied before the palette map) -----
-                {
-                    let header = if self.adjust.is_identity() {
-                        "Adjustments".to_string()
-                    } else {
-                        "Adjustments *".to_string() // * = active (font lacks ● U+25CF)
-                    };
-                    egui::CollapsingHeader::new(header)
-                        .id_salt("adjustments")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            let mut a = self.adjust;
-                            let n = a.order.len();
-                            // ⬆/⬇ rearrange the apply order; applied after the loop so
-                            // we don't mutate `order` mid-iteration.
-                            let mut mv: Option<(usize, usize)> = None;
-                            // Layout: [label column][pad][slider+value][pad][⟲ ⬆ ⬇].
-                            // The label column is sized to the widest label and the
-                            // right cluster is a fixed reserve, so every slider ends up
-                            // the *same* width and the columns line up.
-                            let font = egui::TextStyle::Body.resolve(ui.style());
-                            let label_col = a
-                                .order
-                                .iter()
-                                .map(|op| {
-                                    ui.painter()
-                                        .layout_no_wrap(
-                                            op.spec().0.to_string(),
-                                            font.clone(),
-                                            egui::Color32::WHITE,
-                                        )
-                                        .size()
-                                        .x
-                                })
-                                .fold(0.0_f32, f32::max);
-                            const PAD: f32 = 10.0; // gap between every item (the padding)
-                            const VALUE_W: f32 = 64.0; // slider's value box + its inner gap
-                            const BTN_W: f32 = 24.0; // each fixed-width button (⟲ ⬆ ⬇)
-                            const HANDLE_W: f32 = 16.0; // drag-reorder grip
-                            // Reserve handle + label + value + 3 buttons + the inter-item
-                            // gaps, so the leftover (the slider) is identical on every row.
-                            let avail = ui.available_width();
-                            let slider_w = (avail
-                                - HANDLE_W
-                                - label_col
-                                - VALUE_W
-                                - BTN_W * 3.0
-                                - PAD * 6.0)
-                                .max(48.0);
-                            // Marker rows have no slider — let their label span the whole
-                            // [label+slider+value] span so the ⬆/⬇ cluster still aligns.
-                            let marker_w = label_col + slider_w + VALUE_W + PAD * 2.0;
-                            let btn = |glyph: &str| {
-                                egui::Button::new(glyph).small().min_size(egui::vec2(BTN_W, 0.0))
-                            };
-                            let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(n);
-                            for i in 0..n {
-                                let op = a.order[i];
-                                let (label, lo, hi, def, step) = op.spec();
-                                let row_h = ui.spacing().interact_size.y;
-                                // Reserve a background shape *now* so it paints behind the
-                                // row content; filled in (zebra / hover) once we know the
-                                // row's rect below.
-                                let stripe = ui.painter().add(egui::Shape::Noop);
-                                let row = ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = PAD; // even padding
-                                    // Grip: drag to reorder (the ⬆/⬇ buttons still work too).
-                                    if drag_handle(ui, HANDLE_W, row_h).drag_started() {
-                                        self.adjust_drag = Some(i);
-                                    }
-                                    // Left: label (+ slider for value ops). The control
-                                    // cluster is added afterwards, right-anchored.
-                                    if op == OpKind::ColorBalance {
-                                        // Color balance is a marker (its R/G/B picker lives in the
-                                        // Color balance section below), but its STRENGTH is the
-                                        // master amount — surface it inline so the lane row has a
-                                        // real slider like every other op. An empty label row made
-                                        // the op look inert and hid that Strength was sitting at 0.
-                                        value_slider(
-                                            ui, label, label_col, slider_w, VALUE_W,
-                                            &mut self.balance_strength, 0.0f32, 1.0, 0.0, 0.0, 2,
-                                        );
-                                    } else if op.is_marker() {
-                                        // Marker ops (Palette / Dither) have no slider — the label
-                                        // shows active state; the real controls live in a section
-                                        // lower in the pane.
-                                        let active = ui.visuals().selection.bg_fill;
-                                        let (txt, hover) = match op {
-                                            OpKind::Pixelate => {
-                                                let bw = self.adjust.pixelate.round() as u32;
-                                                let bh = if self.pixelate_h >= 2.0 {
-                                                    self.pixelate_h.round() as u32
-                                                } else {
-                                                    bw
-                                                };
-                                                (
-                                                    if bw.max(bh) >= 2 {
-                                                        egui::RichText::new(format!("Pixelate · {bw}×{bh}")).strong().color(active)
-                                                    } else {
-                                                        egui::RichText::new("Pixelate (off)").weak()
-                                                    },
-                                                    "Mosaic block size — set width/height in the Pixelate section; drag to reorder",
-                                                )
-                                            }
-                                            OpKind::Palette => (
-                                                if recolor.is_some() {
-                                                    egui::RichText::new("Palette rematch").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Palette rematch (none active)").weak()
-                                                },
-                                                "Where the selected palette / Reduce is applied — drag to reorder",
-                                            ),
-                                            OpKind::Dither => (
-                                                if self.dither_method != 0 && self.dither_amount > 0.0 {
-                                                    egui::RichText::new(format!(
-                                                        "Dither · {}",
-                                                        crate::thumb::DITHER_NAMES
-                                                            .get(self.dither_method as usize)
-                                                            .copied()
-                                                            .unwrap_or("?")
-                                                    ))
-                                                    .strong()
-                                                    .color(active)
-                                                } else {
-                                                    egui::RichText::new("Dither (off)").weak()
-                                                },
-                                                "Ordered/custom dither pattern — set method & amount in the Dither section; drag to reorder",
-                                            ),
-                                            OpKind::ColorBalance => (
-                                                if self.balance_offset() != [0, 0, 0] {
-                                                    egui::RichText::new("Color balance").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Color balance (neutral)").weak()
-                                                },
-                                                "Per-channel R/G/B offset — set color & strength in the Color balance section; drag to reorder",
-                                            ),
-                                            OpKind::Scanlines => (
-                                                if self.postfx.scan_amt > 0.0 {
-                                                    egui::RichText::new("Scanlines").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Scanlines (off)").weak()
-                                                },
-                                                "CRT scanlines — set amount/spacing/direction/color in the Post FX section; drag to reorder",
-                                            ),
-                                            OpKind::Glow => (
-                                                if self.postfx.glow_amt > 0.0 {
-                                                    egui::RichText::new("Glow").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Glow (off)").weak()
-                                                },
-                                                "Phosphor bloom — set amount/radius in the Post FX section; drag to reorder",
-                                            ),
-                                            OpKind::Vignette => (
-                                                if self.postfx.vig_amt > 0.0 {
-                                                    egui::RichText::new("Vignette").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Vignette (off)").weak()
-                                                },
-                                                "Edge darkening — set amount/feather in the Post FX section; drag to reorder",
-                                            ),
-                                            OpKind::Phosphor => (
-                                                if self.postfx.phos_amt > 0.0 {
-                                                    egui::RichText::new("Phosphor").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Phosphor (off)").weak()
-                                                },
-                                                "RGB phosphor mask — set amount/size in the Post FX section; drag to reorder",
-                                            ),
-                                            OpKind::Resize => (
-                                                if self.resize_active() {
-                                                    egui::RichText::new(format!(
-                                                        "Resize · {:.0}%",
-                                                        self.resize_fx * 100.0
-                                                    ))
-                                                    .strong()
-                                                    .color(active)
-                                                } else {
-                                                    egui::RichText::new("Resize (off)").weak()
-                                                },
-                                                "Resample split point — set width/height in the Resize section. Ops ABOVE run full-res; ops BELOW run at the reduced size. Drag to reorder.",
-                                            ),
-                                            OpKind::JpegClean => (
-                                                if self.jpeg_clean_on {
-                                                    egui::RichText::new("JPEG clean").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("JPEG clean (off)").weak()
-                                                },
-                                                "Recover crisp pixel art from a lossy JPEG — set it up in the “Extract pixels from JPEG” section. A geometry step (runs before the pipeline); drag to swap its order with Upscale.",
-                                            ),
-                                            OpKind::Upscale => (
-                                                if self.scale_algo != crate::scale::Scaler::None {
-                                                    egui::RichText::new(format!(
-                                                        "Upscale · {}",
-                                                        self.scale_algo.label()
-                                                    ))
-                                                    .strong()
-                                                    .color(active)
-                                                } else {
-                                                    egui::RichText::new("Upscale (off)").weak()
-                                                },
-                                                "Pixel-art upscaler — pick it in the Resize section's Upscale dropdown. A geometry step; drag it above/below JPEG clean to upscale before or after the clean.",
-                                            ),
-                                            OpKind::Deblock => (
-                                                if self.deblock_on {
-                                                    egui::RichText::new("Deblock").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Deblock (off)").weak()
-                                                },
-                                                "Remove JPEG blocking/ringing (continuous-tone) — set it up in the “Remove JPEG artifacts” section. A source-repair step; drag to reorder.",
-                                            ),
-                                            OpKind::Undither => (
-                                                if self.undither_on {
-                                                    egui::RichText::new("Undither").strong().color(active)
-                                                } else {
-                                                    egui::RichText::new("Undither (off)").weak()
-                                                },
-                                                "Reverse ordered/FS dithering back to smooth tone — set it up in the “Undither” section. A source-repair step; drag to reorder.",
-                                            ),
-                                            _ => unreachable!("non-marker in marker branch"),
-                                        };
-                                        ui.add_sized(
-                                            egui::vec2(marker_w, row_h),
-                                            egui::Label::new(txt).truncate(),
-                                        )
-                                        .on_hover_text(hover);
-                                    } else {
-                                        let dec = if step > 0.0 { 0 } else { 2 };
-                                        value_slider(
-                                            ui, label, label_col, slider_w, VALUE_W,
-                                            a.field_mut(op), lo, hi, def, step, dec,
-                                        );
-                                    }
-                                    // Right-anchored cluster: ⟲ ⬆ ⬇. Right-to-left so the
-                                    // arrows sit at the row's right edge on *every* row
-                                    // (a Palette row keeps the ⟲ slot empty for alignment).
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.spacing_mut().item_spacing.x = PAD;
-                                            if ui
-                                                .add_enabled(i + 1 < n, btn("⬇"))
-                                                .on_hover_text("move later in the pipeline")
-                                                .clicked()
-                                            {
-                                                mv = Some((i, i + 1));
-                                            }
-                                            if ui
-                                                .add_enabled(i > 0, btn("⬆"))
-                                                .on_hover_text("move earlier in the pipeline")
-                                                .clicked()
-                                            {
-                                                mv = Some((i, i - 1));
-                                            }
-                                            if op == OpKind::ColorBalance {
-                                                // Reset the inline Strength (its R/G/B keep their
-                                                // own resets in the Color balance section).
-                                                if ui
-                                                    .add(btn("⟲"))
-                                                    .on_hover_text("reset strength to 0")
-                                                    .clicked()
-                                                {
-                                                    self.balance_strength = 0.0;
-                                                }
-                                            } else if op.is_marker() {
-                                                ui.add_space(BTN_W); // align with the ⟲ column
-                                            } else if ui
-                                                .add(btn("⟲"))
-                                                .on_hover_text("reset (or middle-click the slider)")
-                                                .clicked()
-                                            {
-                                                *a.field_mut(op) = def;
-                                            }
-                                        },
-                                    );
-                                });
-                                // Zebra stripe (odd rows) + hover highlight, painted behind
-                                // the row so it never covers the controls. Spans the full
-                                // pane width so the value→slider pairing reads clearly.
-                                let mut bg = row.response.rect;
-                                bg.min.x = ui.max_rect().min.x;
-                                bg.max.x = ui.max_rect().max.x;
-                                bg = bg.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y * 0.5));
-                                let hovered = ui.rect_contains_pointer(bg);
-                                let fill = if hovered {
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.30)
-                                } else if i % 2 == 1 {
-                                    ui.visuals().faint_bg_color
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                if fill != egui::Color32::TRANSPARENT {
-                                    ui.painter().set(stripe, egui::Shape::rect_filled(bg, 2.0, fill));
-                                }
-                                if hovered {
-                                    self.want_repaint = true;
-                                }
-                                row_rects.push(row.response.rect);
-                            }
-                            // Drag-reorder: while a grip is held, draw an insertion line
-                            // where it'll land; drop moves the op to that slot.
-                            if let Some(from) = self.adjust_drag {
-                                self.want_repaint = true;
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                                let ptr_y = ui.input(|i| i.pointer.interact_pos().map(|p| p.y));
-                                let released = ui.input(|i| i.pointer.any_released());
-                                if let (Some(py), Some(first), Some(last)) =
-                                    (ptr_y, row_rects.first(), row_rects.last())
-                                {
-                                    // Target = first row whose center sits below the pointer.
-                                    let mut to = n;
-                                    let mut line_y = last.bottom();
-                                    for (j, r) in row_rects.iter().enumerate() {
-                                        if py < r.center().y {
-                                            to = j;
-                                            line_y = r.top();
-                                            break;
-                                        }
-                                    }
-                                    ui.painter().hline(
-                                        first.x_range(),
-                                        line_y,
-                                        egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
-                                    );
-                                    if released {
-                                        let mut v: Vec<OpKind> = a.order.to_vec();
-                                        let item = v.remove(from);
-                                        let at = if from < to { to - 1 } else { to };
-                                        v.insert(at.min(v.len()), item);
-                                        if let Ok(arr) = <[OpKind; 25]>::try_from(v) {
-                                            a.order = arr;
-                                        }
-                                        self.adjust_drag = None;
-                                    }
-                                } else if released {
-                                    self.adjust_drag = None;
-                                }
-                            }
-                            if let Some((from, to)) = mv {
-                                a.order.swap(from, to);
-                            }
-                            if ui.button("Reset all").clicked() {
-                                a = Adjust::default();
-                                self.pixelate_h = 0.0;
-                            }
-                            self.adjust = a;
-                        });
-                }
-
-                // ----- Pixelate block size (its "Pixelate" marker row in Adjustments
-                //       positions where the mosaic applies). Per-axis Width×Height + a
-                //       Lock, like the dither cell — art isn't always square. -----
-                {
-                    let bw = self.adjust.pixelate;
-                    let bh = if self.pixelate_h >= 2.0 {
-                        self.pixelate_h
-                    } else {
-                        bw
-                    };
-                    let header = if bw.max(bh) >= 2.0 {
-                        format!("Pixelate *  · {}×{}", bw.round() as u32, bh.round() as u32)
-                    } else {
-                        "Pixelate".to_string()
-                    };
-                    egui::CollapsingHeader::new(header)
-                        .id_salt("pixelate")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let mut w = self.adjust.pixelate;
-                            ui.horizontal(|ui| {
-                                ui.label("Width")
-                                    .on_hover_text("Mosaic block WIDTH in px (0/1 = off)");
-                                let r = ui.add(egui::Slider::new(&mut w, 0.0..=32.0).step_by(1.0));
-                                middle_reset(ui, &r, &mut w, 0.0f32);
-                                wheel_adjust(ui, &r, &mut w, 1.0, 0.0f32, 32.0f32);
-                            });
-                            if w != self.adjust.pixelate {
-                                self.adjust.pixelate = w;
-                                if self.pixelate_lock {
-                                    self.pixelate_h = w;
-                                }
-                            }
-                            let mut hh = self.pixelate_h;
-                            ui.horizontal(|ui| {
-                                ui.label("Height")
-                                    .on_hover_text("Mosaic block HEIGHT in px (0/1 = square)");
-                                let r = ui.add(egui::Slider::new(&mut hh, 0.0..=32.0).step_by(1.0));
-                                middle_reset(ui, &r, &mut hh, 0.0f32);
-                                wheel_adjust(ui, &r, &mut hh, 1.0, 0.0f32, 32.0f32);
-                            });
-                            if hh != self.pixelate_h {
-                                self.pixelate_h = hh;
-                                if self.pixelate_lock {
-                                    self.adjust.pixelate = hh;
-                                }
-                            }
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .selectable_label(self.pixelate_lock, "🔒 Lock")
-                                    .on_hover_text("Keep the block square")
-                                    .clicked()
-                                {
-                                    self.pixelate_lock = !self.pixelate_lock;
-                                    if self.pixelate_lock {
-                                        self.pixelate_h = self.adjust.pixelate;
-                                    }
-                                }
-                                if ui.button("Reset").clicked() {
-                                    self.adjust.pixelate = 0.0;
-                                    self.pixelate_h = 0.0;
-                                }
-                            });
-                        });
-                }
-
-                // ----- Color balance (per-channel R/G/B offset; positioned by the
-                //       "Color balance" row in Adjustments above) -----
-                {
-                    let active = self.balance_offset() != [0, 0, 0];
-                    let header = if active {
-                        "Color balance *" // * = active (font lacks ● U+25CF)
-                    } else {
-                        "Color balance"
-                    };
-                    egui::CollapsingHeader::new(header)
-                        .id_salt("color_balance")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.weak(
-                                "Tints the image: 128 = neutral, >128 adds that channel, <128 removes it.",
-                            );
-                            // Same column geometry as Adjustments (label | wide slider |
-                            // right-justified value | ⟲), minus the grip and move arrows.
-                            const PAD: f32 = 10.0;
-                            const VALUE_W: f32 = 64.0;
-                            const BTN_W: f32 = 24.0;
-                            let font = egui::TextStyle::Body.resolve(ui.style());
-                            let label_col = ["Strength", "R", "G", "B"]
-                                .iter()
-                                .map(|s| {
-                                    ui.painter()
-                                        .layout_no_wrap(
-                                            (*s).to_string(),
-                                            font.clone(),
-                                            egui::Color32::WHITE,
-                                        )
-                                        .size()
-                                        .x
-                                })
-                                .fold(0.0_f32, f32::max);
-                            let slider_w = (ui.available_width()
-                                - label_col
-                                - VALUE_W
-                                - BTN_W
-                                - PAD * 3.0)
-                                .max(48.0);
-                            let btn = |g: &str| {
-                                egui::Button::new(g).small().min_size(egui::vec2(BTN_W, 0.0))
-                            };
-                            let reset_btn = |ui: &mut egui::Ui, tip: &str| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| ui.add(btn("⟲")).on_hover_text(tip).clicked(),
-                                )
-                                .inner
-                            };
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = PAD;
-                                value_slider(
-                                    ui, "Strength", label_col, slider_w, VALUE_W,
-                                    &mut self.balance_strength, 0.0f32, 1.0, 0.0, 0.0, 2,
-                                );
-                                if reset_btn(ui, "reset to 0") {
-                                    self.balance_strength = 0.0;
-                                }
-                            });
-                            // R/G/B as full 0–255 sliders, each with its own reset.
-                            let before = self.balance_color;
-                            for (lbl, k) in [("R", 0usize), ("G", 1), ("B", 2)] {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = PAD;
-                                    value_slider(
-                                        ui, lbl, label_col, slider_w, VALUE_W,
-                                        &mut self.balance_color[k], 0u8, 255, 128, 1.0, 0,
-                                    );
-                                    if reset_btn(ui, "reset to 128") {
-                                        self.balance_color[k] = 128;
-                                    }
-                                });
-                            }
-                            // Keep the hex buffer in step when the sliders move the color
-                            // (done *before* the hex field so typing there isn't clobbered).
-                            if self.balance_color != before {
-                                self.balance_hex = format!(
-                                    "{:02X}{:02X}{:02X}",
-                                    self.balance_color[0],
-                                    self.balance_color[1],
-                                    self.balance_color[2]
-                                );
-                            }
-                            // Swatch + hex paste (applies live on a valid 3/6-digit code).
-                            ui.horizontal(|ui| {
-                                let c = self.balance_color;
-                                let (r, _) = ui
-                                    .allocate_exact_size(egui::vec2(28.0, 18.0), egui::Sense::hover());
-                                ui.painter().rect_filled(
-                                    r,
-                                    2.0,
-                                    egui::Color32::from_rgb(c[0], c[1], c[2]),
-                                );
-                                ui.label("#");
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut self.balance_hex)
-                                        .desired_width(70.0)
-                                        .hint_text("RRGGBB"),
-                                );
-                                if resp.changed() {
-                                    if let Some(rgb) = parse_hex(&self.balance_hex) {
-                                        self.balance_color = rgb;
-                                    }
-                                }
-                            });
-                            if ui.button("Reset balance").clicked() {
-                                self.balance_color = [128, 128, 128];
-                                self.balance_strength = 0.0;
-                                self.balance_hex = "808080".into();
-                            }
-                        });
-                }
-
-                // ----- Post FX (CRT-style filters: scanlines / glow / vignette /
-                //       phosphor). Each is a marker op in the Adjustments list above —
-                //       drag it to position where it applies in the stack. -----
-                {
-                    let header = if self.postfx.active() {
-                        "Post FX *"
-                    } else {
-                        "Post FX"
-                    };
-                    egui::CollapsingHeader::new(header)
-                        .id_salt("postfx")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let fx = &mut self.postfx;
-                            ui.weak("Baked into the image (so they save). Reorder each in the Adjustments list above.");
-
-                            // --- Scanlines ---
-                            ui.add_space(2.0);
-                            ui.strong("Scanlines");
-                            ui.horizontal(|ui| {
-                                ui.label("Amount");
-                                let r = ui.add(egui::Slider::new(&mut fx.scan_amt, 0.0..=1.0));
-                                middle_reset(ui, &r, &mut fx.scan_amt, 0.0f32);
-                                wheel_adjust(ui, &r, &mut fx.scan_amt, 0.05, 0.0f32, 1.0f32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Spacing");
-                                let r = ui.add(egui::Slider::new(&mut fx.scan_period, 2..=16).suffix("px"));
-                                middle_reset(ui, &r, &mut fx.scan_period, 2u32);
-                                wheel_adjust(ui, &r, &mut fx.scan_period, 1.0, 2u32, 16u32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Thickness");
-                                // Cap at spacing−1 so at least one bright line always remains.
-                                let tmax = fx.scan_period.saturating_sub(1).max(1);
-                                let r = ui
-                                    .add(egui::Slider::new(&mut fx.scan_thick, 1..=tmax).suffix("px"))
-                                    .on_hover_text("How many px thick each scanline is (kept below the spacing)");
-                                middle_reset(ui, &r, &mut fx.scan_thick, 1u32);
-                                wheel_adjust(ui, &r, &mut fx.scan_thick, 1.0, 1u32, tmax);
-                                fx.scan_thick = fx.scan_thick.clamp(1, tmax);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Dir");
-                                for (d, sym, tip) in [
-                                    (0u8, "==", "Horizontal"),
-                                    (1u8, "||", "Vertical"),
-                                    (2u8, "\\\\", "Diagonal ＼"),
-                                    (3u8, "//", "Diagonal ／"),
-                                ] {
-                                    if ui
-                                        .selectable_label(fx.scan_dir == d, sym)
-                                        .on_hover_text(tip)
-                                        .clicked()
-                                    {
-                                        fx.scan_dir = d;
-                                    }
-                                }
-                                ui.separator();
-                                ui.label("Color");
-                                ui.color_edit_button_srgb(&mut fx.scan_color);
-                            });
-
-                            // --- Glow (phosphor bloom) ---
-                            ui.add_space(4.0);
-                            ui.strong("Glow");
-                            ui.horizontal(|ui| {
-                                ui.label("Amount");
-                                let r = ui.add(egui::Slider::new(&mut fx.glow_amt, 0.0..=2.0));
-                                middle_reset(ui, &r, &mut fx.glow_amt, 0.0f32);
-                                wheel_adjust(ui, &r, &mut fx.glow_amt, 0.05, 0.0f32, 2.0f32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Radius");
-                                let r = ui.add(egui::Slider::new(&mut fx.glow_radius, 1.0..=16.0).suffix("px"));
-                                middle_reset(ui, &r, &mut fx.glow_radius, 3.0f32);
-                                wheel_adjust(ui, &r, &mut fx.glow_radius, 1.0, 1.0f32, 16.0f32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Contour");
-                                const NAMES: [&str; 8] = [
-                                    "Linear", "Cone", "Cone inv", "Gaussian", "Half round",
-                                    "Ring", "Ring ×2", "Sawtooth",
-                                ];
-                                let cur = fx.glow_contour.min(7) as usize;
-                                let cr = eat_scroll(egui::ComboBox::from_id_salt("glow_contour")
-                                    .selected_text(NAMES[cur])
-                                    .show_ui(ui, |ui| {
-                                        for (i, n) in NAMES.iter().enumerate() {
-                                            ui.selectable_value(&mut fx.glow_contour, i as u8, *n);
-                                        }
-                                    }));
-                                combo_wheel(ui, &cr, &mut fx.glow_contour, NAMES.len());
-                            })
-                            .response
-                            .on_hover_text("Reshape the bloom falloff (Photoshop-style contour)");
-
-                            // --- Vignette ---
-                            ui.add_space(4.0);
-                            ui.strong("Vignette");
-                            ui.horizontal(|ui| {
-                                ui.label("Amount");
-                                let r = ui.add(egui::Slider::new(&mut fx.vig_amt, 0.0..=1.0));
-                                middle_reset(ui, &r, &mut fx.vig_amt, 0.0f32);
-                                wheel_adjust(ui, &r, &mut fx.vig_amt, 0.05, 0.0f32, 1.0f32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Feather");
-                                let r = ui.add(egui::Slider::new(&mut fx.vig_feather, 0.0..=1.0));
-                                middle_reset(ui, &r, &mut fx.vig_feather, 0.35f32);
-                                wheel_adjust(ui, &r, &mut fx.vig_feather, 0.05, 0.0f32, 1.0f32);
-                            });
-
-                            // --- Phosphor RGB mask ---
-                            ui.add_space(4.0);
-                            ui.strong("Phosphor");
-                            ui.horizontal(|ui| {
-                                ui.label("Amount");
-                                let r = ui.add(egui::Slider::new(&mut fx.phos_amt, 0.0..=1.0));
-                                middle_reset(ui, &r, &mut fx.phos_amt, 0.0f32);
-                                wheel_adjust(ui, &r, &mut fx.phos_amt, 0.05, 0.0f32, 1.0f32);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Size");
-                                let r = ui.add(egui::Slider::new(&mut fx.phos_size, 1..=8).suffix("px"));
-                                middle_reset(ui, &r, &mut fx.phos_size, 1u32);
-                                wheel_adjust(ui, &r, &mut fx.phos_size, 1.0, 1u32, 8u32);
-                            });
-                        });
-                }
-
-                {
-                    // ----- Recolor controls (palette-swap / reduce) -----
-                    ui.add_space(8.0);
-                    ui.separator();
-                    let has_own_palette = matches!(pal_state, Some(Some(_)));
-                    // Reduce works on ANY image: with an extractable palette it
-                    // median-cuts that; otherwise it synthesizes a palette from the
-                    // pixels (see `reduce_source`) and cuts *that*. So it's no longer
-                    // gated on `has_own_palette` — a >SWATCH_CAP photo can reduce too.
-                    // Deferred so the favorites/list loops can borrow self.palette_*
-                    // while we decide what to select. Some(None) = clear (Original).
-                    let mut pick: Option<Option<PathBuf>> = None;
-                    let mut toggle_fav: Option<PathBuf> = None; // star clicked in the list
-                    ui.horizontal(|ui| {
-                        ui.strong("Recolor");
-                        let is_orig = self.selected_palette.is_none()
-                            && !self.quantize_on
-                            && self.custom_palette.is_none();
-                        if ui.selectable_label(is_orig, "Original").clicked() {
-                            pick = Some(None);
-                        }
-                    });
-
+                // ----- The collapsible, drag-reorderable sections. Order + open state
+                //       are ours (persisted), not egui's — `persist_egui_memory()` is
+                //       false, and "Collapse all" has to stick. -----
+                let cx = RecolorCtx {
+                    entry: &entry,
+                    display: &display,
+                    pal_state: &pal_state,
+                    has_recolor: recolor.is_some(),
+                };
+                let order = self.recolor_order.clone();
+                let mut sec_rects: Vec<egui::Rect> = Vec::with_capacity(order.len());
+                for (i, &sec) in order.iter().enumerate() {
+                    sec_rects.push(self.ui_recolor_one_section(ui, sec, i, &cx));
                     ui.add_space(2.0);
-                    // ----- Reduce (median-cut the image's own colors to N) — above the
-                    //       palette chooser so it's always visible -----
-                    let active_reduce = self.quantize_on && self.selected_palette.is_none();
-                    {
-                        let mut on = active_reduce;
-                        if ui
-                            .checkbox(
-                                &mut on,
-                                format!("Reduce to {} colors", self.quantize_n),
-                            )
-                            .on_hover_text(if has_own_palette {
-                                "Median-cut this image's own palette down to N colors"
-                            } else {
-                                "Build a palette from the image's pixels, then reduce to N colors"
-                            })
-                            .changed()
-                        {
-                            self.quantize_on = on;
-                            // Toggling Reduce is the explicit reset: drop any swatch
-                            // hand-edit so checking re-reduces fresh and unchecking
-                            // reverts to Original (custom_palette wins otherwise).
-                            self.custom_palette = None;
-                            if on {
-                                self.selected_palette = None;
-                            }
-                        }
-                    }
-                    // Full-width slider, geometry matching the other sliders.
-                    {
-                        const PAD: f32 = 10.0;
-                        const VALUE_W: f32 = 64.0;
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        let label_col = ui
-                            .painter()
-                            .layout_no_wrap("Colors".to_string(), font, egui::Color32::WHITE)
-                            .size()
-                            .x;
-                        let slider_w =
-                            (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
-                        let n_before = self.quantize_n;
-                        ui.add_enabled_ui(active_reduce, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = PAD;
-                                value_slider(
-                                    ui, "Colors", label_col, slider_w, VALUE_W,
-                                    &mut self.quantize_n, 2usize, 256, 16, 1.0, 0,
-                                );
-                            });
-                        });
-                        // Changing the count re-quantizes to a fresh N-color median cut,
-                        // so a prior swatch hand-edit (kept in custom_palette) is dropped.
-                        if self.quantize_n != n_before {
-                            self.custom_palette = None;
-                        }
-                    }
-                    // Quick reduction presets.
-                    ui.horizontal(|ui| {
-                        ui.weak("Quick");
-                        for nq in [2usize, 3, 4, 6, 8, 10, 16, 32, 48] {
-                            if ui.button(nq.to_string()).clicked() {
-                                self.quantize_n = nq;
-                                self.quantize_on = true;
-                                self.selected_palette = None;
-                                self.custom_palette = None;
-                            }
-                        }
-                        ui.checkbox(&mut self.quantize_keep_bw, "Keep black/white")
-                            .on_hover_text(
-                                "Force pure black + white into the reduced palette — snaps the \
-                                 darkest color to black and the brightest to white (uses the \
-                                 palette's own extremes when it has no true black/white). Keeps \
-                                 the color count; great for readable ANSI contrast.",
-                            );
-                    });
-                    self.quantize_n = self.quantize_n.clamp(2, 256);
-
-                    ui.add_space(4.0);
-                    // ----- Dither (a movable pipeline op — the "Dither" row in
-                    //       Adjustments picks *where* it applies). Above the palette
-                    //       chooser, always visible. -----
-                    ui.horizontal(|ui| {
-                        ui.label("Dither");
-                        let mut m = self.dither_method as usize;
-                        let cr = eat_scroll(egui::ComboBox::from_id_salt("dither_method")
-                            .selected_text(
-                                crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"),
-                            )
-                            .show_ui(ui, |ui| {
-                                for (i, name) in crate::thumb::DITHER_NAMES.iter().enumerate() {
-                                    ui.selectable_value(&mut m, i, *name);
-                                }
-                            }));
-                        wheel_cycle(ui, &cr, &mut m, crate::thumb::DITHER_NAMES.len());
-                        let prev = self.dither_method;
-                        self.dither_method = m as u8;
-                        // Usability: ANSI Shade draws in PALETTE colours, so with nothing
-                        // providing any it silently does nothing. When the user switches TO
-                        // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
-                        // (an ANSI-appropriate default) so it works on the spot — they can then
-                        // pick a palette or change N from there.
-                        // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple) auto-enable
-                        // Reduce → 16 when switched to with nothing providing colours.
-                        if matches!(
-                            self.dither_method,
-                            crate::thumb::DITHER_ANSI
-                                | crate::thumb::DITHER_ASCII
-                                | crate::thumb::DITHER_ATASCII
-                                | crate::thumb::DITHER_APPLE
-                                | crate::thumb::DITHER_REXFONT
-                        ) && prev != self.dither_method
-                            && self.custom_palette.is_none()
-                            && self.selected_palette.is_none()
-                            && !self.quantize_on
-                        {
-                            self.quantize_on = true;
-                            self.quantize_n = 16;
-                            self.quantize_cache = None;
-                            self.reduce_src = None;
-                        }
-                        // Switching TO PETSCII: auto-select the matching C64 palette so the
-                        // export/save buttons appear (they need an active palette) and the
-                        // Colors swatches match the converter's colours.
-                        if self.dither_method == crate::thumb::DITHER_PETSCII
-                            && prev != crate::thumb::DITHER_PETSCII
-                            && !self.petscii_use_selected
-                        {
-                            self.petscii_sync_selected_palette();
-                        }
-                    });
-                    // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
-                    // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
-                    if matches!(self.dither_method, 1..=6) {
-                        ui.horizontal(|ui| {
-                            ui.label("Amount");
-                            let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
-                            middle_reset(ui, &resp, &mut self.dither_amount, 1.0f32);
-                            wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
-                        });
-                    }
-                    // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
-                    // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
-                    // Resize panel, since art isn't always square; enlarges each cell so a
-                    // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
-                    // Cell W/H apply to the ordered methods, and to ANSI Shade only
-                    // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
-                    if matches!(self.dither_method, 1..=3)
-                        || self.dither_method == crate::thumb::DITHER_CUSTOM
-                        || (self.is_ansi_grid_mode()
-                            && !self.shade_snap916
-                            && !self.shade_vga50)
-                    {
-                        // Width (cell X); a locked cell mirrors it to height.
-                        let mut sx = self.dither_scale_x;
-                        ui.horizontal(|ui| {
-                            ui.label("Cell W")
-                                .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
-                            let resp =
-                                ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
-                            middle_reset(ui, &resp, &mut sx, 1usize);
-                            wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
-                        });
-                        if sx != self.dither_scale_x {
-                            self.dither_scale_x = sx;
-                            if self.dither_scale_lock {
-                                self.dither_scale_y = sx;
-                            }
-                        }
-                        // Height (cell Y).
-                        let mut sy = self.dither_scale_y;
-                        ui.horizontal(|ui| {
-                            ui.label("Cell H")
-                                .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
-                            let resp =
-                                ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
-                            middle_reset(ui, &resp, &mut sy, 1usize);
-                            wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
-                        });
-                        if sy != self.dither_scale_y {
-                            self.dither_scale_y = sy;
-                            if self.dither_scale_lock {
-                                self.dither_scale_x = sy;
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(self.dither_scale_lock, "🔒 Lock")
-                                .on_hover_text("Keep the dither cell square")
-                                .clicked()
-                            {
-                                self.dither_scale_lock = !self.dither_scale_lock;
-                                if self.dither_scale_lock {
-                                    self.dither_scale_y = self.dither_scale_x; // unify on lock
-                                }
-                            }
-                            // Detect the art's native pixel size (per-axis) + match the cell.
-                            if ui
-                                .button("Auto")
-                                .on_hover_text(
-                                    "Pick a dither cell for this art: its pixel grid (per axis) \
-                                     if it's upscaled pixel art, else scaled to the resolution \
-                                     so the pattern reads on hi-res art.",
-                                )
-                                .clicked()
-                            {
-                                if let Some((ax, ay)) = self.detect_dither_scale(&entry.path) {
-                                    // Locked → keep it square (the coarser of the two).
-                                    let (ax, ay) = if self.dither_scale_lock {
-                                        let s = ax.max(ay);
-                                        (s, s)
-                                    } else {
-                                        (ax, ay)
-                                    };
-                                    self.dither_scale_x = ax;
-                                    self.dither_scale_y = ay;
-                                    self.status = format!("Auto dither cell: {ax}×{ay}px");
-                                }
-                            }
-                        });
-                    }
-                    // ----- ANSI Shade controls (textmode shade-block rendering) -----
-                    if self.dither_method == crate::thumb::DITHER_ANSI {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("ANSI Shade").strong());
-                            if ui
-                                .small_button("↺ Reset")
-                                .on_hover_text(
-                                    "Reset the ANSI-shade tuning (F1–F8, Shading, Smoothness, \
-                                     Half-blocks) to defaults. Leaves cell/VGA50/iCE/format/Fit \
-                                     as they are.",
-                                )
-                                .clicked()
-                            {
-                                self.reset_ansi_shade();
-                            }
-                        });
-                        // Named presets for JUST this panel (below PixelFX): pick to apply, [s]
-                        // saves the current settings as a new one, [x] deletes, Rename renames.
-                        ui.horizontal(|ui| {
-                            ui.label("Preset");
-                            let sel_name = self
-                                .ansi_preset_sel
-                                .and_then(|i| self.ansi_presets.get(i))
-                                .map(|p| p.name.clone());
-                            let mut to_apply: Option<usize> = None;
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("ansi_preset")
-                                .selected_text(sel_name.as_deref().unwrap_or("—"))
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(self.ansi_preset_sel.is_none(), "—")
-                                        .clicked()
-                                    {
-                                        self.ansi_preset_sel = None;
-                                    }
-                                    for i in 0..self.ansi_presets.len() {
-                                        if ui
-                                            .selectable_label(
-                                                self.ansi_preset_sel == Some(i),
-                                                &self.ansi_presets[i].name,
-                                            )
-                                            .clicked()
-                                        {
-                                            to_apply = Some(i);
-                                        }
-                                    }
-                                }));
-                            // Cycle through [— , preset0, preset1, …]; landing on a preset applies it.
-                            let step = combo_scroll_step(ui, &cr);
-                            if step != 0 {
-                                let n = self.ansi_presets.len() as isize + 1;
-                                let cur = match self.ansi_preset_sel {
-                                    None => 0isize,
-                                    Some(i) => i as isize + 1,
-                                };
-                                let ni = (cur + step).rem_euclid(n);
-                                if ni == 0 {
-                                    self.ansi_preset_sel = None;
-                                } else {
-                                    to_apply = Some((ni - 1) as usize);
-                                }
-                            }
-                            if let Some(i) = to_apply {
-                                self.ansi_preset_sel = Some(i);
-                                let p = self.ansi_presets[i].clone();
-                                self.apply_ansi_preset(&p);
-                            }
-                            if ui
-                                .small_button("s")
-                                .on_hover_text("Save the current ANSI-shade settings as a preset")
-                                .clicked()
-                            {
-                                let name = format!("Style {}", self.ansi_presets.len() + 1);
-                                let p = self.capture_ansi_preset(name);
-                                self.ansi_presets.push(p);
-                                self.ansi_preset_sel = Some(self.ansi_presets.len() - 1);
-                                self.ansi_preset_rename = self.ansi_preset_sel; // name it now
-                            }
-                            let has_sel = self.ansi_preset_sel.is_some();
-                            if ui
-                                .add_enabled(has_sel, egui::Button::new("x").small())
-                                .on_hover_text("Delete the selected preset")
-                                .clicked()
-                            {
-                                if let Some(i) = self.ansi_preset_sel.take() {
-                                    if i < self.ansi_presets.len() {
-                                        self.ansi_presets.remove(i);
-                                    }
-                                    self.ansi_preset_rename = None;
-                                }
-                            }
-                            if ui
-                                .add_enabled(has_sel, egui::Button::new("Rename").small())
-                                .clicked()
-                            {
-                                self.ansi_preset_rename = self.ansi_preset_sel;
-                            }
-                        });
-                        if let Some(i) = self.ansi_preset_rename {
-                            if i < self.ansi_presets.len() {
-                                ui.horizontal(|ui| {
-                                    ui.label("Name");
-                                    let r = ui.add(
-                                        egui::TextEdit::singleline(&mut self.ansi_presets[i].name)
-                                            .desired_width(150.0),
-                                    );
-                                    if ui.button("✓").clicked()
-                                        || (r.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                    {
-                                        self.ansi_preset_rename = None;
-                                    }
-                                });
-                            } else {
-                                self.ansi_preset_rename = None;
-                            }
-                        }
-                        // Snap 9×16 and Snap 8×8 (VGA50) are mutually exclusive — the
-                        // cell can only be one authentic text size at a time.
-                        if ui
-                            .checkbox(&mut self.shade_snap916, "Snap 9×16 (VGA cell)")
-                            .on_hover_text(
-                                "Force the authentic 9×16 VGA text cell (overrides Cell W/H)",
-                            )
-                            .clicked()
-                            && self.shade_snap916
-                        {
-                            self.shade_vga50 = false;
-                        }
-                        if ui
-                            .checkbox(&mut self.shade_vga50, "Snap 8×8 (VGA50)")
-                            .on_hover_text(
-                                "Force the 8×8 VGA50 text cell + 8×8 font (overrides Cell W/H)",
-                            )
-                            .clicked()
-                            && self.shade_vga50
-                        {
-                            self.shade_snap916 = false;
-                        }
-                        ui.checkbox(&mut self.shade_half, "Half-blocks (▀▄▌▐)")
-                            .on_hover_text(
-                                "Master toggle for the half-block glyphs (sharper cell edges). \
-                                 Tune each one's usage with the F5–F8 sliders below.",
-                            );
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
-                                .on_hover_text(
-                                    "iCE color: allow all 16 colors as backgrounds (else 8). \
-                                     Affects both the preview and the exported file.",
-                                );
-                            ui.checkbox(&mut self.shade_invert, "Invert")
-                                .on_hover_text("Inverse video — swap fg/bg per cell (default off)");
-                            if ui.button("Chars…").on_hover_text("Pick which block glyphs the shade matcher may use").clicked() {
-                                self.ansi_picker = !self.ansi_picker;
-                            }
-                        });
-                        // Explicit EXPORT format (export only — does not affect the preview).
-                        // Each entry names the actual output file `export_textmode` writes.
-                        ui.horizontal(|ui| {
-                            ui.label("Format").on_hover_text(
-                                "Textmode export file:\n\
-                                 • Auto — EGA→ANSI 16-color .ans, else truecolor .ans\n\
-                                 • ANSI 16-color (.ans) — nearest-ANSI16 SGR\n\
-                                 • ANSI 256-color (.ans) — xterm-256 SGR\n\
-                                 • ANSI truecolor (.ans) — 24-bit SGR\n\
-                                 • XBin 16-color (.xb) — embeds palette + font (Moebius)\n\
-                                 • Tundra 24-bit (.tnd) — binary truecolor\n\
-                                 • REXPaint (.xp) — gzipped CP437 + 24-bit fg/bg",
-                            );
-                            let mut f = self.shade_export_format as usize;
-                            const FORMATS: [&str; 7] = [
-                                "Auto",
-                                "ANSI 16-color (.ans)",
-                                "ANSI 256-color (.ans)",
-                                "ANSI truecolor (.ans)",
-                                "XBin 16-color (.xb)",
-                                "Tundra 24-bit (.tnd)",
-                                "REXPaint (.xp)",
-                            ];
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("shade_export_format")
-                                .selected_text(FORMATS[f.min(6)])
-                                .show_ui(ui, |ui| {
-                                    for (i, name) in FORMATS.iter().enumerate() {
-                                        ui.selectable_value(&mut f, i, *name);
-                                    }
-                                }));
-                            wheel_cycle(ui, &cr, &mut f, FORMATS.len());
-                            self.shade_export_format = f as u8;
-                        });
-                        // Fit-to-character-grid: force the working image to an exact
-                        // cols×rows cell grid (aspect NOT preserved). Feeds preview + export.
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
-                                .on_hover_text(
-                                    "Force the image to exactly cols×rows character cells \
-                                     (cols·cell_w × rows·cell_h px). The source aspect ratio \
-                                     is NOT preserved — it's stretched to the char grid.",
-                                );
-                            let r = ui.add(
-                                egui::DragValue::new(&mut self.shade_fit_cols)
-                                    .range(1..=1000)
-                                    .prefix("cols "),
-                            );
-                            wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 1000);
-                            let r = ui.add(
-                                egui::DragValue::new(&mut self.shade_fit_rows)
-                                    .range(1..=1000)
-                                    .prefix("rows "),
-                            );
-                            wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 1000);
-                        });
-                        ui.horizontal(|ui| {
-                            for (label, c, r) in
-                                [
-                                    ("40×25", 40, 25),
-                                    ("50×15", 50, 15),
-                                    ("60×20", 60, 20),
-                                    ("80×25", 80, 25),
-                                    ("80×50", 80, 50),
-                                    ("132×50", 132, 50),
-                                    ("160×80", 160, 80),
-                                ]
-                            {
-                                if ui.small_button(label).clicked() {
-                                    self.shade_fit_cols = c;
-                                    self.shade_fit_rows = r;
-                                    self.shade_fit_chars = true;
-                                }
-                            }
-                            // Resulting pixel size at the current cell dims.
-                            let (cw, ch) = self.textmode_cell_dims();
-                            ui.weak(format!(
-                                "→ {}×{} px",
-                                self.shade_fit_cols.max(1) * cw,
-                                self.shade_fit_rows.max(1) * ch
-                            ));
-                        });
-                        // Shading amount: how much shade/half-blocks vs flat color.
-                        ui.horizontal(|ui| {
-                            ui.label("Shading");
-                            let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_amount, 0.0..=2.0))
-                                .on_hover_text(
-                                    "How much shading vs. flat color. 0..1: low = flats stay \
-                                     solid, shade only in transitions. 1..2: FORCE dithering — \
-                                     solids get penalized so even flats go textured.",
-                                );
-                            middle_reset(ui, &resp, &mut self.shade_amount, 1.0f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_amount, 0.05, 0.0f32, 2.0f32);
-                        });
-                        // Smoothness: contrast penalty on the shade blocks so the search
-                        // avoids garish high-contrast dithers.
-                        ui.horizontal(|ui| {
-                            ui.label("Smoothness");
-                            let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_smooth, 0.0..=3.0))
-                                .on_hover_text(
-                                    "False-color avoidance — higher penalizes dithering two \
-                                     different HUES (yellow▒blue), keeping shade blocks between \
-                                     similar colors; push past 1 for a hard clamp. Lower allows \
-                                     any pair.",
-                                );
-                            middle_reset(ui, &resp, &mut self.shade_smooth, 0.5f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 3.0f32);
-                        });
-                        // Detail: how hard a cell's internal contrast pulls the search toward
-                        // half-blocks. Higher = crisper edges when shrunk (more ▀▄▌▐, less
-                        // shade blur); 0 = half-blocks only via their own F5–F8 usage.
-                        ui.horizontal(|ui| {
-                            ui.label("Detail");
-                            let resp = ui
-                                .add(egui::Slider::new(&mut self.shade_detail, 0.0..=5.0))
-                                .on_hover_text(
-                                    "Edge detail retention when shrinking — higher makes cells \
-                                     with a strong internal contrast render as crisp half-blocks \
-                                     (▀▄▌▐) instead of averaged shades. Scales the F5–F8 usage; \
-                                     crank it for aggressive edge-preservation.",
-                                );
-                            middle_reset(ui, &resp, &mut self.shade_detail, 0.30f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_detail, 0.05, 0.0f32, 5.0f32);
-                        });
-                        // The fill fractions the ░▒▓ shade blocks stand for; the leading
-                        // checkbox toggles whether that shade level is a candidate at all.
-                        // Each shade's slider is bounded to its own interior band (light
-                        // ░ ≤ mid ▒ ≤ dark ▓, never 0 or 1) so the ramp can't be inverted
-                        // or degenerate into a fake solid.
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_f1_on, "");
-                            self.paint_shade_swatch(ui, 176); // ░
-                            ui.label("F1");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
-                            middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.10f32, 0.40f32);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_f2_on, "");
-                            self.paint_shade_swatch(ui, 177); // ▒
-                            ui.label("F2");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
-                            middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.40f32, 0.60f32);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_f3_on, "");
-                            self.paint_shade_swatch(ui, 178); // ▓
-                            ui.label("F3");
-                            let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
-                            middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
-                            wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.60f32, 0.90f32);
-                        });
-                        // Half-block usage (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐). The leading checkbox
-                        // includes that glyph as a candidate; the slider biases how often the
-                        // search picks it (0.5 = neutral, right = more, left = less). All are
-                        // gated by the master "Half-blocks" toggle above. ▀/▄ (and ▌/▐) are
-                        // the same split with fg/bg swapped, so dialing one up favours that
-                        // character for horizontal (or vertical) edges.
-                        ui.add_enabled_ui(self.shade_half, |ui| {
-                            const HALF: [(u8, &str); 4] =
-                                [(223, "F5"), (220, "F6"), (221, "F7"), (222, "F8")];
-                            for (i, (glyph, label)) in HALF.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut self.shade_half_on[i], "");
-                                    self.paint_shade_swatch(ui, *glyph);
-                                    ui.label(*label);
-                                    let resp = ui
-                                        .add(egui::Slider::new(&mut self.shade_half_use[i], 0.0..=1.0))
-                                        .on_hover_text(
-                                            "How often this half-block is used — right = more, \
-                                             left = less, middle = neutral.",
-                                        );
-                                    middle_reset(ui, &resp, &mut self.shade_half_use[i], 0.5f32);
-                                    wheel_adjust(
-                                        ui, &resp, &mut self.shade_half_use[i], 0.05, 0.0f32, 1.0f32,
-                                    );
-                                });
-                            }
-                        });
-                        if recolor.is_none() {
-                            ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
-                        }
-                    }
-                    // ----- PETSCII controls (image → C64 hi-res char art) -----
-                    if self.dither_method == crate::thumb::DITHER_PETSCII {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("PETSCII").strong());
-                            ui.weak("C64 hi-res char art");
-                        });
-                        // Palette: petmate / colodore / pepto / vice. Picking one sets the
-                        // converter colours AND the matching quantize palette so exported art
-                        // matches whatever palette petmate is set to (Preferences → C64 palette).
-                        ui.horizontal(|ui| {
-                            ui.label("Palette")
-                                .on_hover_text("Match this to petmate's Preferences → “Select C64 color palette”");
-                            let names = crate::decode::PETSCII_PALETTES;
-                            let cur = (self.petscii_palette as usize).min(names.len() - 1);
-                            let mut changed = false;
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("petscii_pal")
-                                .selected_text(names[cur].0)
-                                .show_ui(ui, |ui| {
-                                    for (i, (n, _)) in names.iter().enumerate() {
-                                        if ui
-                                            .selectable_value(&mut self.petscii_palette, i as u8, *n)
-                                            .clicked()
-                                        {
-                                            changed = true;
-                                        }
-                                    }
-                                }));
-                            changed |= combo_wheel(ui, &cr, &mut self.petscii_palette, names.len());
-                            // Only re-sync the C64 palette to the quantize selection when NOT using
-                            // the selected palette (else it would fight the user's chosen palette).
-                            if changed && !self.petscii_use_selected {
-                                self.petscii_sync_selected_palette();
-                            }
-                        });
-                        // Render with any palette (like ANSI): when on, PETSCII colours come from the
-                        // palette selected in the Palettes list (or a Reduce/custom palette), coerced
-                        // to 16 — not the C64 VIC-II set above.
-                        ui.checkbox(&mut self.petscii_use_selected, "Use selected palette")
-                            .on_hover_text(
-                                "Render in the palette chosen in the Palettes list below (EGA, CGA, \
-                                 custom…), coerced to 16 colours — the same way ANSI honours it. \
-                                 Off = the authentic C64 palette above. (petmate/.seq export still \
-                                 assumes C64 colours.)",
-                            );
-                        ui.horizontal(|ui| {
-                            ui.label("Cols");
-                            let r = ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
-                            wheel_adjust(ui, &r, &mut self.petscii_cols, 1.0, 1, 120);
-                            ui.label("Rows");
-                            let r = ui.add(egui::DragValue::new(&mut self.petscii_rows).range(1..=120));
-                            wheel_adjust(ui, &r, &mut self.petscii_rows, 1.0, 1, 120);
-                            if ui.small_button("40×25").on_hover_text("C64 screen").clicked() {
-                                self.petscii_cols = 40;
-                                self.petscii_rows = 25;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Purity");
-                            let r = ui
-                                .add(egui::Slider::new(&mut self.petscii_purity, 0.0..=1.0))
-                                .on_hover_text(
-                                    "0 = clean block / quadrant art · 1 = full charset (photographic)",
-                                );
-                            middle_reset(ui, &r, &mut self.petscii_purity, 1.0f32);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Charset");
-                            ui.selectable_value(&mut self.petscii_page, 0, "Upper/graphics");
-                            ui.selectable_value(&mut self.petscii_page, 1, "Lower");
-                            if ui.button("Chars…").on_hover_text("Pick which C64 glyphs the matcher may use").clicked() {
-                                self.petscii_picker = !self.petscii_picker;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Export");
-                            const F: [&str; 4] = [".petmate", ".seq", ".json", ".png"];
-                            let cur = self.petscii_export_format.min(3) as usize;
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("petscii_fmt")
-                                .selected_text(F[cur])
-                                .show_ui(ui, |ui| {
-                                    for (i, n) in F.iter().enumerate() {
-                                        ui.selectable_value(
-                                            &mut self.petscii_export_format,
-                                            i as u8,
-                                            *n,
-                                        );
-                                    }
-                                }));
-                            combo_wheel(ui, &cr, &mut self.petscii_export_format, F.len());
-                            ui.weak("(use “Export textmode”)");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.petscii_bg_auto, "Auto background");
-                            if !self.petscii_bg_auto {
-                                let pal = self.petscii_pal16;
-                                for c in 0u8..16 {
-                                    let col = pal[c as usize];
-                                    let (rect, resp) = ui.allocate_exact_size(
-                                        egui::vec2(15.0, 15.0),
-                                        egui::Sense::click(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        2.0,
-                                        egui::Color32::from_rgb(col[0], col[1], col[2]),
-                                    );
-                                    if self.petscii_bg == c {
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            2.0,
-                                            egui::Stroke::new(2.0, egui::Color32::WHITE),
-                                            egui::StrokeKind::Middle,
-                                        );
-                                    }
-                                    if resp.clicked() {
-                                        self.petscii_bg = c;
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    // ----- ASCII controls (image → character-density art) -----
-                    if self.dither_method == crate::thumb::DITHER_ASCII {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("ASCII").strong());
-                            ui.weak("brightness → character density");
-                        });
-                        // Render font: built-in CP437, any bundled REXPaint font, or a TTF/OTF.
-                        ui.horizontal(|ui| {
-                            ui.label("Font");
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("ascii_font")
-                                .selected_text(self.ascii_font_name())
-                                .width(180.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.ascii_font, AsciiFont::Cp437, "CP437 (built-in)")
-                                        .on_hover_text("The VGA ROM — authentic 9-dot cell.");
-                                    ui.separator();
-                                    for i in 0..crate::decode::rexfont::rexfont_count() {
-                                        let sel = matches!(self.ascii_font, AsciiFont::Rex(j) if j == i);
-                                        if ui
-                                            .selectable_label(sel, crate::decode::rexfont::rexfont_name(i))
-                                            .clicked()
-                                        {
-                                            self.ascii_font = AsciiFont::Rex(i);
-                                        }
-                                    }
-                                }));
-                            // Cycle CP437 + the bundled REXPaint fonts (a File font is set via TTF…, not cycled).
-                            let step = combo_scroll_step(ui, &cr);
-                            if step != 0 {
-                                let n = crate::decode::rexfont::rexfont_count() as isize + 1;
-                                let cur = match self.ascii_font {
-                                    AsciiFont::Rex(j) => (j as isize + 1).min(n - 1),
-                                    _ => 0,
-                                };
-                                let ni = (cur + step).rem_euclid(n);
-                                self.ascii_font = if ni == 0 {
-                                    AsciiFont::Cp437
-                                } else {
-                                    AsciiFont::Rex((ni - 1) as usize)
-                                };
-                            }
-                            if ui.button("TTF…").on_hover_text("Render with any .ttf/.otf font (rasterized CP437-ordered)").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("Font", &["ttf", "otf", "ttc"])
-                                    .pick_file()
-                                {
-                                    self.ascii_font = AsciiFont::File(p);
-                                }
-                            }
-                            if !matches!(self.ascii_font, AsciiFont::Cp437)
-                                && ui.small_button("✖").on_hover_text("Back to CP437").clicked()
-                            {
-                                self.ascii_font = AsciiFont::Cp437;
-                            }
-                        });
-                        // "Use only chars": type an exact glyph set (e.g. " .oOX$") — when it has
-                        // any resolvable glyphs it OVERRIDES the category toggles below.
-                        let only_active = !resolve_ascii_chars(&self.ascii_chars).is_empty();
-                        ui.horizontal(|ui| {
-                            ui.label("Use only chars")
-                                .on_hover_text("Build the ramp from exactly these characters (light→dark by ink). Overrides the ranges. Leave empty to use the categories.");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.ascii_chars)
-                                    .hint_text(" .:oO0X$#@")
-                                    .desired_width(150.0),
-                            );
-                            if !self.ascii_chars.is_empty() && ui.small_button("✖").clicked() {
-                                self.ascii_chars.clear();
-                            }
-                        });
-                        // Character categories (ignored while "Use only chars" is active). Printable
-                        // 32–126 is always in the pool; the toggles union in more glyphs.
-                        ui.add_enabled_ui(!only_active, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Chars");
-                                ui.weak("32–126");
-                                ui.checkbox(&mut self.ascii_high, "High")
-                                    .on_hover_text("Include 128–255 (all CP437 extended)");
-                                ui.checkbox(&mut self.ascii_control, "Control")
-                                    .on_hover_text("Include control chars 0–31 (their CP437 glyphs)");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("     ");
-                                ui.checkbox(&mut self.ascii_blocks, "Blocks")
-                                    .on_hover_text("Include the ░▒▓█ shade + half/quarter block glyphs");
-                                ui.checkbox(&mut self.ascii_box, "Box Drawing")
-                                    .on_hover_text("Include the ─│┌┐└┘├┤┬┴┼ box-drawing glyphs");
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.ascii_color, "Color")
-                                .on_hover_text(
-                                    "Per-cell colour from the active palette (off = monochrome ink on paper)",
-                                );
-                            ui.checkbox(&mut self.ascii_invert, "Invert")
-                                .on_hover_text("Inverse video — draw the glyph in paper on an ink-coloured cell");
-                            if ui.button("Chars…").on_hover_text("Pick usable CP437 glyphs (intersects the ranges)").clicked() {
-                                self.ascii_picker = !self.ascii_picker;
-                            }
-                            ui.weak("·");
-                            ui.checkbox(&mut self.shade_vga50, "8×8 cell")
-                                .on_hover_text("Render in the 8×8 VGA50 font (off = 8×16)");
-                        });
-                        // Fit-to-chars: force an exact cols×rows canvas (shared with ANSI Shade).
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
-                                .on_hover_text("Force an exact cols×rows character canvas");
-                            if self.shade_fit_chars {
-                                ui.label("Cols");
-                                let r = ui.add(egui::DragValue::new(&mut self.shade_fit_cols).range(1..=300));
-                                wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 300);
-                                ui.label("Rows");
-                                let r = ui.add(egui::DragValue::new(&mut self.shade_fit_rows).range(1..=300));
-                                wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 300);
-                                if ui.small_button("80×25").clicked() {
-                                    self.shade_fit_cols = 80;
-                                    self.shade_fit_rows = 25;
-                                }
-                            }
-                        });
-                        if recolor.is_none() {
-                            ui.weak("(needs a palette / Reduce for its colors)");
-                        }
-                    }
-                    // ----- ATASCII controls (image → Atari 8-bit character art) -----
-                    if self.dither_method == crate::thumb::DITHER_ATASCII {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("ATASCII").strong());
-                            ui.weak("Atari 8-bit character art");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.bitfont_color, "Color")
-                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
-                            ui.checkbox(&mut self.atascii_invert, "Invert")
-                                .on_hover_text("Inverse video — swap ink and paper");
-                            if ui.button("Chars…").on_hover_text("Pick which glyphs to use").clicked() {
-                                self.atascii_picker = !self.atascii_picker;
-                            }
-                        });
-                        if recolor.is_none() {
-                            ui.weak("(needs a palette / Reduce for its colors)");
-                        }
-                    }
-                    // ----- Apple ][ controls (image → Apple II character art) -----
-                    if self.dither_method == crate::thumb::DITHER_APPLE {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Apple ][").strong());
-                            ui.weak("Apple II character art");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Font");
-                            ui.selectable_value(&mut self.apple_col80, false, "PR#0 (40 col)")
-                                .on_hover_text("The 40-column Apple II text font");
-                            ui.selectable_value(&mut self.apple_col80, true, "PR#3 (80 col)")
-                                .on_hover_text("The 80-column card font (narrower PRNumber3 style)");
-                        });
-                        // Apple II text was monochrome (no per-cell colour) — use the unified
-                        // fg/bg chips below instead.
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.apple_invert, "Invert")
-                                .on_hover_text("Inverse video — swap ink and paper");
-                            ui.checkbox(&mut self.apple_mousetext, "MouseText")
-                                .on_hover_text("Add the Apple //e MouseText glyphs to the pool");
-                            if ui.button("Chars…").on_hover_text("Pick which glyphs to use").clicked() {
-                                self.apple_picker = !self.apple_picker;
-                            }
-                        });
-                        if recolor.is_none() {
-                            ui.weak("(needs a palette / Reduce for its colors)");
-                        }
-                    }
-                    // ----- REXPaint-font controls (image → art in a bundled REXPaint font) -----
-                    if self.dither_method == crate::thumb::DITHER_REXFONT {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("REXPaint font").strong());
-                            let f = crate::decode::rexfont::rexfont(self.rexfont_sel);
-                            ui.weak(match f {
-                                Some(g) => format!("{}×{} cells", g.cell_w, g.cell_h),
-                                None => "—".into(),
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Font");
-                            let cur = self.rexfont_sel.min(crate::decode::rexfont::rexfont_count() - 1);
-                            let cr = eat_scroll(egui::ComboBox::from_id_salt("rexfont_sel")
-                                .selected_text(crate::decode::rexfont::rexfont_name(cur))
-                                .show_ui(ui, |ui| {
-                                    for i in 0..crate::decode::rexfont::rexfont_count() {
-                                        ui.selectable_value(
-                                            &mut self.rexfont_sel,
-                                            i,
-                                            crate::decode::rexfont::rexfont_name(i),
-                                        );
-                                    }
-                                }));
-                            combo_wheel(ui, &cr, &mut self.rexfont_sel, crate::decode::rexfont::rexfont_count());
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.bitfont_color, "Color")
-                                .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
-                            ui.checkbox(&mut self.rexfont_invert, "Invert")
-                                .on_hover_text("Inverse video — swap ink and paper");
-                            let on = self.rexfont_mask.iter().filter(|b| **b).count();
-                            let all = on == 0 || on >= 256;
-                            let label = if all { "Chars…".to_string() } else { format!("Chars ({on})…") };
-                            if ui
-                                .button(label)
-                                .on_hover_text("Pick which glyphs the converter may use (a clickable font grid)")
-                                .clicked()
-                            {
-                                self.rexfont_picker = !self.rexfont_picker;
-                            }
-                        });
-                        if recolor.is_none() {
-                            ui.weak("(needs a palette / Reduce for its colors)");
-                        }
-                    }
-                    // ----- Unicode controls (image → UTF-8 text art) -----
-                    if self.dither_method == crate::thumb::DITHER_UNICODE {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Unicode").strong());
-                            ui.weak("→ copy-pasteable UTF-8");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Style");
-                            ui.selectable_value(
-                                &mut self.unicode_style,
-                                crate::thumb::UNI_HALFBLOCK,
-                                "Half-block ▀",
-                            )
-                            .on_hover_text("Each character = 2 stacked colour pixels (full-colour)");
-                            ui.selectable_value(
-                                &mut self.unicode_style,
-                                crate::thumb::UNI_BRAILLE,
-                                "Braille ⠿",
-                            )
-                            .on_hover_text("2×4 dots per character — hi-res mono line/tone art");
-                            ui.selectable_value(
-                                &mut self.unicode_style,
-                                crate::thumb::UNI_RAMP,
-                                "Ramp ▒",
-                            )
-                            .on_hover_text("Density ramp over the enabled Unicode ranges below");
-                        });
-                        // Ramp style: the font to rasterize from + which ranges feed the glyph pool.
-                        if self.unicode_style == crate::thumb::UNI_RAMP {
-                            ui.horizontal(|ui| {
-                                ui.label("Font");
-                                let before = self.unicode_font.clone();
-                                let cr = eat_scroll(egui::ComboBox::from_id_salt("uni_font")
-                                    .selected_text(self.unicode_font_name())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.unicode_font, UniFont::Pdv, "Perfect DOS VGA (crisp)")
-                                            .on_hover_text("Pixel-perfect CP437 + Nerd Font icons. No Braille/Geometric.");
-                                        ui.selectable_value(&mut self.unicode_font, UniFont::DejaVu, "DejaVu Sans (+Braille)")
-                                            .on_hover_text("Wide Unicode coverage — Braille + Geometric Shapes.");
-                                    }));
-                                // Toggle the two built-ins (a Browse-picked File font isn't cycled); the
-                                // `!= before` block below then loads + installs it.
-                                if combo_scroll_step(ui, &cr) != 0 {
-                                    self.unicode_font = match self.unicode_font {
-                                        UniFont::DejaVu => UniFont::Pdv,
-                                        _ => UniFont::DejaVu,
-                                    };
-                                }
-                                if ui.button("Browse…").on_hover_text("Use any .ttf/.otf font on disk").clicked() {
-                                    if let Some(p) = rfd::FileDialog::new()
-                                        .add_filter("Font", &["ttf", "otf", "ttc"])
-                                        .pick_file()
-                                    {
-                                        self.unicode_font = UniFont::File(p);
-                                    }
-                                }
-                                if !matches!(self.unicode_font, UniFont::Pdv)
-                                    && ui.small_button("✖").on_hover_text("Back to the default font").clicked()
-                                {
-                                    self.unicode_font = UniFont::Pdv;
-                                }
-                                if self.unicode_font != before {
-                                    // Load + install the new font, and drop the stale file cache if
-                                    // we moved off a browsed file.
-                                    if !matches!(self.unicode_font, UniFont::File(_)) {
-                                        self.unicode_font_bytes = None;
-                                    }
-                                    self.apply_ramp_src();
-                                }
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Ranges");
-                                for (name, flag, _) in crate::decode::uniart::RANGES {
-                                    let mut on = self.unicode_ranges & flag != 0;
-                                    if ui.checkbox(&mut on, name).changed() {
-                                        if on {
-                                            self.unicode_ranges |= flag;
-                                        } else {
-                                            self.unicode_ranges &= !flag;
-                                        }
-                                    }
-                                }
-                                if ui.button("Chars…").on_hover_text("Pick which glyphs the ramp may use").clicked() {
-                                    self.unicode_picker = !self.unicode_picker;
-                                }
-                            });
-                            // Codepoint picker: add arbitrary glyphs beyond the ranges above.
-                            ui.horizontal(|ui| {
-                                ui.label("Codepoints").on_hover_text(
-                                    "Extra glyphs to add to the ramp. Type characters (★♥) or hex \
-                                     codepoints — single (2588 / U+2588), or ranges (2591-2593). \
-                                     Space- or comma-separated.",
-                                );
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut self.unicode_extra)
-                                        .hint_text("★♥ 2588 2591-2593")
-                                        .desired_width(200.0),
-                                );
-                                if resp.changed() {
-                                    // A codepoint the user removes from the field should no longer
-                                    // count as "disabled" (else re-adding it comes back off).
-                                    let live = self.unicode_extra_cps();
-                                    let ranges = self.unicode_effective_ranges();
-                                    self.unicode_disabled.retain(|cp| {
-                                        live.contains(cp)
-                                            || crate::decode::uniart::RANGES.iter().any(
-                                                |(_, flag, (a, b))| {
-                                                    ranges & flag != 0 && (*a..=*b).contains(cp)
-                                                },
-                                            )
-                                    });
-                                }
-                                let n = self.unicode_extra_cps().len();
-                                if n > 0 {
-                                    ui.weak(format!("+{n}"));
-                                }
-                            });
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("Cols");
-                            let r = ui.add(egui::Slider::new(&mut self.unicode_cols, 16..=300));
-                            slider_extras(ui, &r, &mut self.unicode_cols, 120, 1.0, 16, 300);
-                            ui.checkbox(&mut self.unicode_invert, "Invert")
-                                .on_hover_text("Flip the dot/tone on-off test");
-                        });
-                        ui.weak("Export writes .txt (xterm-256 colour for half-block / ramp).");
-                    }
-                    // Unified foreground / background for the mono char modes (ASCII/ATASCII/Apple).
-                    if self.textmode_mono().is_some() {
-                        ui.horizontal(|ui| {
-                            ui.label("Ink");
-                            ui.color_edit_button_srgb(&mut self.tm_fg)
-                                .on_hover_text("Foreground (glyph) colour");
-                            ui.label("Paper");
-                            ui.color_edit_button_srgb(&mut self.tm_bg)
-                                .on_hover_text("Background colour");
-                            if ui.small_button("↺").on_hover_text("White on black").clicked() {
-                                self.tm_fg = [235, 235, 235];
-                                self.tm_bg = [0, 0, 0];
-                            }
-                        });
-                    }
-                    if matches!(self.dither_method, 4 | 5) && recolor.is_none() {
-                        ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
-                    }
-                    if self.dither_method == crate::thumb::DITHER_CUSTOM {
-                        ui.horizontal(|ui| {
-                            ui.label("Matrix");
-                            for sz in [2usize, 4, 8] {
-                                if ui
-                                    .selectable_label(self.dither_custom_n == sz, format!("{sz}×{sz}"))
-                                    .clicked()
-                                {
-                                    self.dither_custom_n = sz;
-                                    self.dither_custom = crate::thumb::bayer_values(sz);
-                                }
-                            }
-                            if ui
-                                .button("Bayer")
-                                .on_hover_text("Reseed the cells with the Bayer pattern")
-                                .clicked()
-                            {
-                                self.dither_custom = crate::thumb::bayer_values(self.dither_custom_n);
-                            }
-                        });
-                        let n = self.dither_custom_n;
-                        let hi = (n * n - 1) as u32;
-                        ui.weak(format!("cell thresholds 0..={hi} — higher = brighter bias"));
-                        if self.dither_custom.len() != n * n {
-                            self.dither_custom = crate::thumb::bayer_values(n);
-                        }
-                        egui::Grid::new("dither_matrix")
-                            .spacing([3.0, 3.0])
-                            .show(ui, |ui| {
-                                for y in 0..n {
-                                    for x in 0..n {
-                                        let cell = &mut self.dither_custom[y * n + x];
-                                        ui.add(egui::DragValue::new(cell).range(0..=hi).speed(0.1));
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.weak("Palettes");
-                        if ui
-                            .button("🎲 Random")
-                            .on_hover_text("Pick a random palette from your library")
-                            .clicked()
-                            && !self.palette_files.is_empty()
-                        {
-                            let n = self.palette_files.len();
-                            let mut idx = random_index(n);
-                            // Avoid re-picking the one that's already selected.
-                            if n > 1
-                                && self.selected_palette.as_deref()
-                                    == Some(self.palette_files[idx].as_path())
-                            {
-                                idx = (idx + 1) % n;
-                            }
-                            let chosen = self.palette_files[idx].clone();
-                            self.status = format!("Random palette: {}", palette_label(&chosen));
-                            self.selected_palette = Some(chosen);
-                            self.custom_palette = None;
-                            self.quantize_on = false;
-                        }
-                        // Show the active palette's name (incl. whatever Random rolled).
-                        if let Some(pp) = &self.selected_palette {
-                            ui.weak(palette_label(pp));
-                        }
-                    });
-                    // Show the starred palettes alphabetically (by display name).
-                    let mut favs = self.palette_favorites.clone();
-                    favs.sort_by_key(|p| palette_label(p).to_lowercase());
-                    ui.horizontal_wrapped(|ui| {
-                        for fav in &favs {
-                            let sel = self.selected_palette.as_deref() == Some(fav.as_path());
-                            let resp = ui.selectable_label(sel, palette_label(fav));
-                            if resp.clicked() {
-                                pick = Some(Some(fav.clone()));
-                            }
-                            resp.context_menu(|ui| {
-                                if ui.button("★ Unfavorite").clicked() {
-                                    toggle_fav = Some(fav.clone());
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-
-                    egui::CollapsingHeader::new(format!(
-                        "All palettes ({})",
-                        self.palette_files.len()
-                    ))
-                    .show(ui, |ui| {
-                        for p in &self.palette_files {
-                            ui.horizontal(|ui| {
-                                // Star toggles favorite (gold = favorited, dim = not).
-                                let is_fav = self.palette_favorites.contains(p);
-                                let color = if is_fav {
-                                    egui::Color32::from_rgb(255, 200, 60)
-                                } else {
-                                    ui.visuals().weak_text_color()
-                                };
-                                let star = egui::Button::new(egui::RichText::new("★").color(color))
-                                    .frame(false);
-                                if ui
-                                    .add(star)
-                                    .on_hover_text(if is_fav {
-                                        "Unfavorite"
-                                    } else {
-                                        "Favorite (add a quick button)"
-                                    })
-                                    .clicked()
-                                {
-                                    toggle_fav = Some(p.clone());
-                                }
-                                let sel = self.selected_palette.as_deref() == Some(p.as_path());
-                                if ui.selectable_label(sel, palette_label(p)).clicked() {
-                                    pick = Some(Some(p.clone()));
-                                }
-                            });
-                        }
-                    });
-                    if let Some(sel) = pick {
-                        // Selecting a palette (or Original) clears Random + Reduce.
-                        self.selected_palette = sel;
-                        self.custom_palette = None;
-                        self.quantize_on = false;
-                    }
-                    if let Some(fp) = toggle_fav {
-                        if let Some(pos) = self.palette_favorites.iter().position(|x| x == &fp) {
-                            self.palette_favorites.remove(pos);
-                        } else {
-                            self.palette_favorites.push(fp);
-                        }
-                    }
                 }
+                self.recolor_section_drag(ui, &sec_rects);
             });
         if let Some((name, pal)) = do_export {
             if let Some(path) = rfd::FileDialog::new()
@@ -30752,6 +28649,2387 @@ impl Kaleidotron {
                 }
             }
             self.editing_color = if done || !open { None } else { Some((idx, c)) };
+        }
+    }
+
+    /// Native and target dimensions for the Resize section — shared by its body
+    /// and its header label so the two can't disagree. `(nw, nh, tw, th)`;
+    /// `nw == 0` means the image isn't decoded yet.
+    fn resize_dims(&self, path: &Path) -> (usize, usize, usize, usize) {
+        // img_meta (local art), else the decoded-thumb dims — which is all a
+        // 16colo piece has (no img_meta), so the resize works there too (it's
+        // factor-based regardless).
+        let (nw, nh) = self
+            .img_meta
+            .get(path)
+            .map(|m| (m.w as usize, m.h as usize))
+            .filter(|&(w, h)| w > 0 && h > 0)
+            .or_else(|| self.thumb_rgba.get(path).map(|(w, h, _)| (*w, *h)))
+            .unwrap_or((0, 0));
+        let (tw, th) = if nw > 0 {
+            (
+                ((nw as f32 * self.resize_fx).round() as usize).max(1),
+                ((nh as f32 * self.resize_fy).round() as usize).max(1),
+            )
+        } else {
+            (0, 0)
+        };
+        (nw, nh, tw, th)
+    }
+
+    /// The header label for one Recolor-pane section. A trailing `*` marks a
+    /// section that's doing something (the font lacks ● U+25CF), so a collapsed
+    /// section still says whether it's active.
+    fn recolor_section_title(
+        &self,
+        sec: RecolorSection,
+        path: &Path,
+        display: Option<&Vec<[u8; 4]>>,
+    ) -> String {
+        match sec {
+            RecolorSection::Palette => match display {
+                Some(d) => format!("Palette · {} colors", d.len()),
+                None => "Palette".to_string(),
+            },
+            RecolorSection::Cleaning => {
+                let n = [self.jpeg_clean_on, self.deblock_on, self.undither_on]
+                    .iter()
+                    .filter(|b| **b)
+                    .count();
+                if n > 0 {
+                    format!("Cleaning *  · {n} on")
+                } else {
+                    "Cleaning".to_string()
+                }
+            }
+            RecolorSection::Resize => {
+                let (_, _, tw, th) = self.resize_dims(path);
+                if self.scale_algo != crate::scale::Scaler::None {
+                    format!("Resize *  · {}", self.scale_algo.label())
+                } else if self.resize_active() {
+                    format!("Resize *  · {tw}×{th}")
+                } else {
+                    "Resize".to_string()
+                }
+            }
+            RecolorSection::Adjustments => if self.adjust.is_identity() {
+                "Adjustments"
+            } else {
+                "Adjustments *"
+            }
+            .to_string(),
+            RecolorSection::Pixelate => {
+                let bw = self.adjust.pixelate;
+                let bh = if self.pixelate_h >= 2.0 {
+                    self.pixelate_h
+                } else {
+                    bw
+                };
+                if bw.max(bh) >= 2.0 {
+                    format!("Pixelate *  · {}×{}", bw.round() as u32, bh.round() as u32)
+                } else {
+                    "Pixelate".to_string()
+                }
+            }
+            RecolorSection::Balance => if self.balance_offset() != [0, 0, 0] {
+                "Color balance *"
+            } else {
+                "Color balance"
+            }
+            .to_string(),
+            RecolorSection::PostFx => if self.postfx.active() {
+                "Post FX *"
+            } else {
+                "Post FX"
+            }
+            .to_string(),
+            RecolorSection::Recolor => {
+                if self.custom_palette.is_some() {
+                    "Recolor *  · edited".to_string()
+                } else if let Some(p) = &self.selected_palette {
+                    format!("Recolor *  · {}", palette_label(p))
+                } else if self.quantize_on {
+                    format!("Recolor *  · {} colors", self.quantize_n)
+                } else {
+                    "Recolor".to_string()
+                }
+            }
+        }
+    }
+
+    /// Draw one Recolor-pane section (header + body) and fold its click/drag
+    /// back into our own state. Split out of `ui_recolor` so the section loop
+    /// stays readable.
+    fn ui_recolor_one_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        sec: RecolorSection,
+        idx: usize,
+        cx: &RecolorCtx<'_>,
+    ) -> egui::Rect {
+        let (entry, display, pal_state, has_recolor) =
+            (cx.entry, cx.display, cx.pal_state, cx.has_recolor);
+        let title = self.recolor_section_title(sec, &entry.path, display.as_ref());
+        let open = self.recolor_open[sec as usize];
+        let top = ui.cursor().top();
+        let head = recolor_section(ui, sec.id(), &title, open, |ui| match sec {
+            RecolorSection::Palette => self.ui_sec_palette(ui, display, pal_state),
+            RecolorSection::Cleaning => {
+                // Three sibling source-repair steps, all pre-pipeline: recover
+                // crisp pixel art from a JPEG, de-block a continuous-tone JPEG,
+                // and undo an ordered/Floyd dither.
+                self.ui_jpeg_cleanup(ui, &entry.path);
+                ui.add_space(4.0);
+                self.ui_deblock(ui);
+                ui.add_space(4.0);
+                self.ui_undither(ui);
+            }
+            RecolorSection::Resize => self.ui_sec_resize(ui, &entry.path),
+            RecolorSection::Adjustments => self.ui_sec_adjustments(ui, has_recolor),
+            RecolorSection::Pixelate => self.ui_sec_pixelate(ui),
+            RecolorSection::Balance => self.ui_sec_balance(ui),
+            RecolorSection::PostFx => self.ui_sec_postfx(ui),
+            RecolorSection::Recolor => self.ui_sec_recolor(ui, &entry.path, pal_state, has_recolor),
+        });
+        self.recolor_open[sec as usize] = head.open;
+        if head.grabbed {
+            self.recolor_sec_drag = Some(idx);
+        }
+        // The drop target is the WHOLE section (header + body), so dragging over
+        // an expanded section lands where it looks like it should.
+        let bot = ui.cursor().top();
+        egui::Rect::from_x_y_ranges(head.rect.x_range(), top..=bot)
+    }
+
+    /// Reorder the Recolor pane's sections while a grip is held: draw the
+    /// insertion line, and move the section on release. Mirrors the
+    /// Adjustments row drag (`adjust_drag`).
+    fn recolor_section_drag(&mut self, ui: &egui::Ui, rects: &[egui::Rect]) {
+        let Some(from) = self.recolor_sec_drag else {
+            return;
+        };
+        self.want_repaint = true;
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let ptr_y = ui.input(|i| i.pointer.interact_pos().map(|p| p.y));
+        let released = ui.input(|i| i.pointer.any_released());
+        // A drag is orphaned if the pane stops drawing mid-grab (the dock is closed,
+        // the image is deselected) — we then never see the release. Drop it as soon
+        // as nothing is held, or the insertion line sticks around forever.
+        if !released && !ui.input(|i| i.pointer.any_down()) {
+            self.recolor_sec_drag = None;
+            return;
+        }
+        let (Some(py), Some(first), Some(last)) = (ptr_y, rects.first(), rects.last()) else {
+            if released {
+                self.recolor_sec_drag = None;
+            }
+            return;
+        };
+        // Target = the first section whose center sits below the pointer.
+        let mut to = rects.len();
+        let mut line_y = last.bottom();
+        for (j, r) in rects.iter().enumerate() {
+            if py < r.center().y {
+                to = j;
+                line_y = r.top();
+                break;
+            }
+        }
+        ui.painter().hline(
+            first.x_range(),
+            line_y,
+            egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+        );
+        if released {
+            if from < self.recolor_order.len() {
+                let item = self.recolor_order.remove(from);
+                let at = if from < to { to - 1 } else { to };
+                self.recolor_order
+                    .insert(at.min(self.recolor_order.len()), item);
+            }
+            self.recolor_sec_drag = None;
+        }
+    }
+
+    /// Recolor pane § Palette: the swatch grid of the active/extracted palette
+    /// (hold a swatch to flash where it's used, right-click to edit/delete).
+    fn ui_sec_palette(
+        &mut self,
+        ui: &mut egui::Ui,
+        display: &Option<Vec<[u8; 4]>>,
+        pal_state: &Option<Option<Vec<[u8; 4]>>>,
+    ) {
+        // The section header already reads "Palette · N colors", so this is just
+        // the swatch grid.
+        if let Some(d) = display {
+            let prev = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+            let mut swatch_flash: Option<[u8; 4]> = None;
+            let mut swatch_delete: Option<usize> = None;
+            let mut swatch_edit: Option<usize> = None;
+            let swatch_row = ui.horizontal_wrapped(|ui| {
+                for (i, &c) in d.iter().enumerate() {
+                    let (r, resp) = ui
+                        .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                    let col =
+                        egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                    ui.painter().rect_filled(r, 2.0, col);
+                    ui.painter().rect_stroke(
+                        r,
+                        2.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let resp = resp.on_hover_text(format!(
+                        "#{:02X}{:02X}{:02X}\nhold: flash where it's used · right-click: edit / delete",
+                        c[0], c[1], c[2]
+                    ));
+                    if resp.is_pointer_button_down_on() {
+                        swatch_flash = Some(c);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("✎ Edit color…").clicked() {
+                            swatch_edit = Some(i);
+                            ui.close();
+                        }
+                        if ui.button("🗑 Delete color").clicked() {
+                            swatch_delete = Some(i);
+                            ui.close();
+                        }
+                    });
+                }
+            });
+            // Remember where the swatch row sits (screen coords) so the
+            // Edit-color dialog can default to just left of it.
+            self.swatch_rect = Some(swatch_row.response.rect);
+            // Apply swatch actions. Edits/deletes materialize the active palette
+            // into a live `custom_palette` — the .gpl files on disk are never
+            // touched. Flash is set only while a swatch is held.
+            self.flash = swatch_flash;
+            if swatch_flash.is_some() {
+                self.want_repaint = true;
+            }
+            // Editing/deleting a swatch materializes the shown palette into
+            // `custom_palette` (which wins in `active_recolor`), so the edit
+            // shows live. We DON'T clear `quantize_on` here: editing a reduced
+            // color should keep "Reduce" checked (the user's edit *is* the
+            // reduced palette, hand-tweaked). Toggling Reduce or changing the
+            // Colors count are the explicit resets that drop the edit.
+            if let Some(i) = swatch_delete {
+                if d.len() > 1 && i < d.len() {
+                    let mut pal = d.clone();
+                    pal.remove(i);
+                    self.custom_palette = Some(pal);
+                    self.selected_palette = None;
+                }
+            }
+            if let Some(i) = swatch_edit {
+                if let Some(&c) = d.get(i) {
+                    self.editing_color = Some((i, c));
+                    self.custom_palette = Some(d.clone());
+                    self.selected_palette = None;
+                }
+            }
+            ui.spacing_mut().item_spacing = prev;
+        } else if matches!(pal_state, Some(None)) {
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "(image itself has > {} colors — Reduce or pick a palette below)",
+                crate::thumb::SWATCH_CAP
+            ));
+        }
+    }
+
+    /// The Export/Save row. Deliberately NOT a collapsible section: it sits
+    /// directly under the preview so Save stays reachable on a small screen
+    /// whatever the sections below are collapsed to. The clicks are deferred
+    /// (the dialogs need `&mut self` back).
+    fn ui_sec_export(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        display: &Option<Vec<[u8; 4]>>,
+        has_recolor: bool,
+    ) -> ExportReq {
+        let mut do_export: Option<(String, Vec<[u8; 4]>)> = None;
+        let mut save_request: Option<bool> = None;
+        let mut ans_request = false; // export the recolored image as ANSI art (.ans)
+        if let Some(d) = display {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Export .GPL…").clicked() {
+                    do_export = Some((short_name(path), d.clone()));
+                }
+                // Save the processed image (recolor and/or adjustments).
+                if has_recolor || self.pipeline_active() {
+                    if ui
+                        .button("💾 Save recolored")
+                        .on_hover_text("Write to a 'recolored' subfolder next to the image")
+                        .clicked()
+                    {
+                        save_request = Some(false);
+                    }
+                    if ui.button("Save As…").clicked() {
+                        save_request = Some(true);
+                    }
+                }
+                // Export as textmode art. ANSI needs a palette; PETSCII brings its own
+                // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
+                if (has_recolor
+                    || self.dither_method == crate::thumb::DITHER_PETSCII
+                    || self.dither_method == crate::thumb::DITHER_UNICODE)
+                    && ui
+                        .button("Export textmode")
+                        .on_hover_text(
+                            "Write the recolored image as textmode art. Format follows \
+                             the Colors selector: 16-color → .ans (EGA-16) or .xbin \
+                             (embeds the palette); 256-color → .ans; RGB → .tnd \
+                             (TundraDraw 24-bit). All carry a SAUCE record.",
+                        )
+                        .clicked()
+                {
+                    ans_request = true;
+                }
+            });
+        }
+        ExportReq {
+            gpl: do_export,
+            save: save_request,
+            textmode: ans_request,
+        }
+    }
+
+    /// Recolor pane § Resize: the pixel-art upscaler + the downsample factors.
+    fn ui_sec_resize(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let (nw, nh, tw, th) = self.resize_dims(path);
+        if nw == 0 {
+            ui.weak("(load the image to resize it)");
+            return;
+        }
+        // Pixel-art upscaler — enlarges the source with edge-aware
+        // interpolation (runs before the whole pipeline). Independent
+        // of the downsample sliders below; combine for any final size.
+        ui.horizontal(|ui| {
+            ui.label("Upscale").on_hover_text(
+                "Pixel-art scaler applied first (2×/3×). The enlarged art \
+                     then flows through the whole recolor stack + Save.",
+            );
+            let mut si = self.scale_algo as usize;
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("scale_algo")
+                    .selected_text(self.scale_algo.label())
+                    .show_ui(ui, |ui| {
+                        for (i, s) in crate::scale::Scaler::ALL.iter().enumerate() {
+                            ui.selectable_value(&mut si, i, s.label());
+                        }
+                    }),
+            );
+            wheel_cycle(ui, &cr, &mut si, crate::scale::Scaler::ALL.len());
+            self.scale_algo = crate::scale::Scaler::from_u8(si as u8);
+        });
+        ui.separator();
+        ui.checkbox(&mut self.resize_on, "Enable").on_hover_text(
+            "Downsample then upscale back — the low-res look at the \
+                 same on-screen size. Dither/adjustments below apply at \
+                 the reduced resolution.",
+        );
+        let resize_on = self.resize_on;
+        ui.add_enabled_ui(resize_on, |ui| {
+            const PAD: f32 = 10.0;
+            const VALUE_W: f32 = 64.0;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let label_col = ui
+                .painter()
+                .layout_no_wrap("Height".to_string(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let slider_w = (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
+            // Width (px) — editing sets the width factor; a locked
+            // aspect mirrors it to the height factor.
+            let mut w = tw;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = PAD;
+                value_slider(
+                    ui, "Width", label_col, slider_w, VALUE_W, &mut w, 1usize, nw, nw, 1.0, 0,
+                );
+            });
+            if w != tw {
+                self.resize_fx = (w as f32 / nw as f32).clamp(0.005, 1.0);
+                if self.resize_lock {
+                    self.resize_fy = self.resize_fx;
+                }
+            }
+            // Height (px).
+            let mut h = th;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = PAD;
+                value_slider(
+                    ui, "Height", label_col, slider_w, VALUE_W, &mut h, 1usize, nh, nh, 1.0, 0,
+                );
+            });
+            if h != th {
+                self.resize_fy = (h as f32 / nh as f32).clamp(0.005, 1.0);
+                if self.resize_lock {
+                    self.resize_fx = self.resize_fy;
+                }
+            }
+            // Quick % of native (both axes) — snap to 100/75/50/25.
+            ui.horizontal(|ui| {
+                ui.weak("Quick");
+                for pct in [100u32, 75, 50, 25] {
+                    if ui
+                        .button(format!("{pct}%"))
+                        .on_hover_text("Set both axes to this % of native")
+                        .clicked()
+                    {
+                        let f = pct as f32 / 100.0;
+                        self.resize_fx = f;
+                        self.resize_fy = f;
+                    }
+                }
+            });
+            // Lock + relative shrink/grow steps (wrapped: 6 buttons).
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(self.resize_lock, "🔒 Lock aspect")
+                    .clicked()
+                {
+                    self.resize_lock = !self.resize_lock;
+                    if self.resize_lock {
+                        self.resize_fy = self.resize_fx; // unify on lock
+                    }
+                }
+                if ui
+                    .button("/2")
+                    .on_hover_text("Halve the resolution (press again to keep halving)")
+                    .clicked()
+                {
+                    self.resize_fx = (self.resize_fx * 0.5).max(0.005);
+                    self.resize_fy = (self.resize_fy * 0.5).max(0.005);
+                }
+                if ui.button("×2").on_hover_text("Double back up").clicked() {
+                    self.resize_fx = (self.resize_fx * 2.0).min(1.0);
+                    self.resize_fy = (self.resize_fy * 2.0).min(1.0);
+                }
+                if ui
+                    .button("×¼")
+                    .on_hover_text("Quarter the resolution (× ¼)")
+                    .clicked()
+                {
+                    self.resize_fx = (self.resize_fx * 0.25).max(0.005);
+                    self.resize_fy = (self.resize_fy * 0.25).max(0.005);
+                }
+                if ui.button("÷¼").on_hover_text("4× back up (÷ ¼)").clicked() {
+                    self.resize_fx = (self.resize_fx * 4.0).min(1.0);
+                    self.resize_fy = (self.resize_fy * 4.0).min(1.0);
+                }
+                if ui
+                    .button("Reset")
+                    .on_hover_text("Back to native resolution")
+                    .clicked()
+                {
+                    self.resize_fx = 1.0;
+                    self.resize_fy = 1.0;
+                }
+            });
+        });
+    }
+
+    /// Recolor pane § Adjustments: the reorderable op stack.
+    fn ui_sec_adjustments(&mut self, ui: &mut egui::Ui, has_recolor: bool) {
+        let mut a = self.adjust;
+        let n = a.order.len();
+        // ⬆/⬇ rearrange the apply order; applied after the loop so
+        // we don't mutate `order` mid-iteration.
+        let mut mv: Option<(usize, usize)> = None;
+        // Layout: [label column][pad][slider+value][pad][⟲ ⬆ ⬇].
+        // The label column is sized to the widest label and the
+        // right cluster is a fixed reserve, so every slider ends up
+        // the *same* width and the columns line up.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let label_col = a
+            .order
+            .iter()
+            .map(|op| {
+                ui.painter()
+                    .layout_no_wrap(op.spec().0.to_string(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        const PAD: f32 = 10.0; // gap between every item (the padding)
+        const VALUE_W: f32 = 64.0; // slider's value box + its inner gap
+        const BTN_W: f32 = 24.0; // each fixed-width button (⟲ ⬆ ⬇)
+        const HANDLE_W: f32 = 16.0; // drag-reorder grip
+                                    // Reserve handle + label + value + 3 buttons + the inter-item
+                                    // gaps, so the leftover (the slider) is identical on every row.
+        let avail = ui.available_width();
+        let slider_w = (avail - HANDLE_W - label_col - VALUE_W - BTN_W * 3.0 - PAD * 6.0).max(48.0);
+        // Marker rows have no slider — let their label span the whole
+        // [label+slider+value] span so the ⬆/⬇ cluster still aligns.
+        let marker_w = label_col + slider_w + VALUE_W + PAD * 2.0;
+        let btn = |glyph: &str| {
+            egui::Button::new(glyph)
+                .small()
+                .min_size(egui::vec2(BTN_W, 0.0))
+        };
+        let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(n);
+        for i in 0..n {
+            let op = a.order[i];
+            let (label, lo, hi, def, step) = op.spec();
+            let row_h = ui.spacing().interact_size.y;
+            // Reserve a background shape *now* so it paints behind the
+            // row content; filled in (zebra / hover) once we know the
+            // row's rect below.
+            let stripe = ui.painter().add(egui::Shape::Noop);
+            let row = ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = PAD; // even padding
+                    // Grip: drag to reorder (the ⬆/⬇ buttons still work too).
+                    if drag_handle(ui, HANDLE_W, row_h).drag_started() {
+                        self.adjust_drag = Some(i);
+                    }
+                    // Left: label (+ slider for value ops). The control
+                    // cluster is added afterwards, right-anchored.
+                    if op == OpKind::ColorBalance {
+                        // Color balance is a marker (its R/G/B picker lives in the
+                        // Color balance section below), but its STRENGTH is the
+                        // master amount — surface it inline so the lane row has a
+                        // real slider like every other op. An empty label row made
+                        // the op look inert and hid that Strength was sitting at 0.
+                        value_slider(
+                            ui, label, label_col, slider_w, VALUE_W,
+                            &mut self.balance_strength, 0.0f32, 1.0, 0.0, 0.0, 2,
+                        );
+                    } else if op.is_marker() {
+                        // Marker ops (Palette / Dither) have no slider — the label
+                        // shows active state; the real controls live in a section
+                        // lower in the pane.
+                        let active = ui.visuals().selection.bg_fill;
+                        let (txt, hover) = match op {
+                            OpKind::Pixelate => {
+                                let bw = self.adjust.pixelate.round() as u32;
+                                let bh = if self.pixelate_h >= 2.0 {
+                                    self.pixelate_h.round() as u32
+                                } else {
+                                    bw
+                                };
+                                (
+                                    if bw.max(bh) >= 2 {
+                                        egui::RichText::new(format!("Pixelate · {bw}×{bh}")).strong().color(active)
+                                    } else {
+                                        egui::RichText::new("Pixelate (off)").weak()
+                                    },
+                                    "Mosaic block size — set width/height in the Pixelate section; drag to reorder",
+                                )
+                            }
+                            OpKind::Palette => (
+                                if has_recolor {
+                                    egui::RichText::new("Palette rematch").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Palette rematch (none active)").weak()
+                                },
+                                "Where the selected palette / Reduce is applied — drag to reorder",
+                            ),
+                            OpKind::Dither => (
+                                if self.dither_method != 0 && self.dither_amount > 0.0 {
+                                    egui::RichText::new(format!(
+                                        "Dither · {}",
+                                        crate::thumb::DITHER_NAMES
+                                            .get(self.dither_method as usize)
+                                            .copied()
+                                            .unwrap_or("?")
+                                    ))
+                                    .strong()
+                                    .color(active)
+                                } else {
+                                    egui::RichText::new("Dither (off)").weak()
+                                },
+                                "Ordered/custom dither pattern — set method & amount in the Dither section; drag to reorder",
+                            ),
+                            OpKind::ColorBalance => (
+                                if self.balance_offset() != [0, 0, 0] {
+                                    egui::RichText::new("Color balance").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Color balance (neutral)").weak()
+                                },
+                                "Per-channel R/G/B offset — set color & strength in the Color balance section; drag to reorder",
+                            ),
+                            OpKind::Scanlines => (
+                                if self.postfx.scan_amt > 0.0 {
+                                    egui::RichText::new("Scanlines").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Scanlines (off)").weak()
+                                },
+                                "CRT scanlines — set amount/spacing/direction/color in the Post FX section; drag to reorder",
+                            ),
+                            OpKind::Glow => (
+                                if self.postfx.glow_amt > 0.0 {
+                                    egui::RichText::new("Glow").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Glow (off)").weak()
+                                },
+                                "Phosphor bloom — set amount/radius in the Post FX section; drag to reorder",
+                            ),
+                            OpKind::Vignette => (
+                                if self.postfx.vig_amt > 0.0 {
+                                    egui::RichText::new("Vignette").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Vignette (off)").weak()
+                                },
+                                "Edge darkening — set amount/feather in the Post FX section; drag to reorder",
+                            ),
+                            OpKind::Phosphor => (
+                                if self.postfx.phos_amt > 0.0 {
+                                    egui::RichText::new("Phosphor").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Phosphor (off)").weak()
+                                },
+                                "RGB phosphor mask — set amount/size in the Post FX section; drag to reorder",
+                            ),
+                            OpKind::Resize => (
+                                if self.resize_active() {
+                                    egui::RichText::new(format!(
+                                        "Resize · {:.0}%",
+                                        self.resize_fx * 100.0
+                                    ))
+                                    .strong()
+                                    .color(active)
+                                } else {
+                                    egui::RichText::new("Resize (off)").weak()
+                                },
+                                "Resample split point — set width/height in the Resize section. Ops ABOVE run full-res; ops BELOW run at the reduced size. Drag to reorder.",
+                            ),
+                            OpKind::JpegClean => (
+                                if self.jpeg_clean_on {
+                                    egui::RichText::new("JPEG clean").strong().color(active)
+                                } else {
+                                    egui::RichText::new("JPEG clean (off)").weak()
+                                },
+                                "Recover crisp pixel art from a lossy JPEG — set it up in the “Extract pixels from JPEG” section. A geometry step (runs before the pipeline); drag to swap its order with Upscale.",
+                            ),
+                            OpKind::Upscale => (
+                                if self.scale_algo != crate::scale::Scaler::None {
+                                    egui::RichText::new(format!(
+                                        "Upscale · {}",
+                                        self.scale_algo.label()
+                                    ))
+                                    .strong()
+                                    .color(active)
+                                } else {
+                                    egui::RichText::new("Upscale (off)").weak()
+                                },
+                                "Pixel-art upscaler — pick it in the Resize section's Upscale dropdown. A geometry step; drag it above/below JPEG clean to upscale before or after the clean.",
+                            ),
+                            OpKind::Deblock => (
+                                if self.deblock_on {
+                                    egui::RichText::new("Deblock").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Deblock (off)").weak()
+                                },
+                                "Remove JPEG blocking/ringing (continuous-tone) — set it up in the “Remove JPEG artifacts” section. A source-repair step; drag to reorder.",
+                            ),
+                            OpKind::Undither => (
+                                if self.undither_on {
+                                    egui::RichText::new("Undither").strong().color(active)
+                                } else {
+                                    egui::RichText::new("Undither (off)").weak()
+                                },
+                                "Reverse ordered/FS dithering back to smooth tone — set it up in the “Undither” section. A source-repair step; drag to reorder.",
+                            ),
+                            _ => unreachable!("non-marker in marker branch"),
+                        };
+                        ui.add_sized(
+                            egui::vec2(marker_w, row_h),
+                            egui::Label::new(txt).truncate(),
+                        )
+                        .on_hover_text(hover);
+                    } else {
+                        let dec = if step > 0.0 { 0 } else { 2 };
+                        value_slider(
+                            ui, label, label_col, slider_w, VALUE_W,
+                            a.field_mut(op), lo, hi, def, step, dec,
+                        );
+                    }
+                    // Right-anchored cluster: ⟲ ⬆ ⬇. Right-to-left so the
+                    // arrows sit at the row's right edge on *every* row
+                    // (a Palette row keeps the ⟲ slot empty for alignment).
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = PAD;
+                            if ui
+                                .add_enabled(i + 1 < n, btn("⬇"))
+                                .on_hover_text("move later in the pipeline")
+                                .clicked()
+                            {
+                                mv = Some((i, i + 1));
+                            }
+                            if ui
+                                .add_enabled(i > 0, btn("⬆"))
+                                .on_hover_text("move earlier in the pipeline")
+                                .clicked()
+                            {
+                                mv = Some((i, i - 1));
+                            }
+                            if op == OpKind::ColorBalance {
+                                // Reset the inline Strength (its R/G/B keep their
+                                // own resets in the Color balance section).
+                                if ui
+                                    .add(btn("⟲"))
+                                    .on_hover_text("reset strength to 0")
+                                    .clicked()
+                                {
+                                    self.balance_strength = 0.0;
+                                }
+                            } else if op.is_marker() {
+                                ui.add_space(BTN_W); // align with the ⟲ column
+                            } else if ui
+                                .add(btn("⟲"))
+                                .on_hover_text("reset (or middle-click the slider)")
+                                .clicked()
+                            {
+                                *a.field_mut(op) = def;
+                            }
+                        },
+                    );
+                });
+            // Zebra stripe (odd rows) + hover highlight, painted behind
+            // the row so it never covers the controls. Spans the full
+            // pane width so the value→slider pairing reads clearly.
+            let mut bg = row.response.rect;
+            bg.min.x = ui.max_rect().min.x;
+            bg.max.x = ui.max_rect().max.x;
+            bg = bg.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y * 0.5));
+            let hovered = ui.rect_contains_pointer(bg);
+            let fill = if hovered {
+                ui.visuals().selection.bg_fill.gamma_multiply(0.30)
+            } else if i % 2 == 1 {
+                ui.visuals().faint_bg_color
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            if fill != egui::Color32::TRANSPARENT {
+                ui.painter()
+                    .set(stripe, egui::Shape::rect_filled(bg, 2.0, fill));
+            }
+            if hovered {
+                self.want_repaint = true;
+            }
+            row_rects.push(row.response.rect);
+        }
+        // Drag-reorder: while a grip is held, draw an insertion line
+        // where it'll land; drop moves the op to that slot.
+        if let Some(from) = self.adjust_drag {
+            self.want_repaint = true;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let ptr_y = ui.input(|i| i.pointer.interact_pos().map(|p| p.y));
+            let released = ui.input(|i| i.pointer.any_released());
+            if let (Some(py), Some(first), Some(last)) =
+                (ptr_y, row_rects.first(), row_rects.last())
+            {
+                // Target = first row whose center sits below the pointer.
+                let mut to = n;
+                let mut line_y = last.bottom();
+                for (j, r) in row_rects.iter().enumerate() {
+                    if py < r.center().y {
+                        to = j;
+                        line_y = r.top();
+                        break;
+                    }
+                }
+                ui.painter().hline(
+                    first.x_range(),
+                    line_y,
+                    egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                );
+                if released {
+                    let mut v: Vec<OpKind> = a.order.to_vec();
+                    let item = v.remove(from);
+                    let at = if from < to { to - 1 } else { to };
+                    v.insert(at.min(v.len()), item);
+                    if let Ok(arr) = <[OpKind; 25]>::try_from(v) {
+                        a.order = arr;
+                    }
+                    self.adjust_drag = None;
+                }
+            } else if released {
+                self.adjust_drag = None;
+            }
+        }
+        if let Some((from, to)) = mv {
+            a.order.swap(from, to);
+        }
+        if ui.button("Reset all").clicked() {
+            a = Adjust::default();
+            self.pixelate_h = 0.0;
+        }
+        self.adjust = a;
+    }
+
+    /// Recolor pane § Pixelate: the mosaic block size (its position in the
+    /// stack is the `Pixelate` marker row in Adjustments).
+    fn ui_sec_pixelate(&mut self, ui: &mut egui::Ui) {
+        let mut w = self.adjust.pixelate;
+        ui.horizontal(|ui| {
+            ui.label("Width")
+                .on_hover_text("Mosaic block WIDTH in px (0/1 = off)");
+            let r = ui.add(egui::Slider::new(&mut w, 0.0..=32.0).step_by(1.0));
+            middle_reset(ui, &r, &mut w, 0.0f32);
+            wheel_adjust(ui, &r, &mut w, 1.0, 0.0f32, 32.0f32);
+        });
+        if w != self.adjust.pixelate {
+            self.adjust.pixelate = w;
+            if self.pixelate_lock {
+                self.pixelate_h = w;
+            }
+        }
+        let mut hh = self.pixelate_h;
+        ui.horizontal(|ui| {
+            ui.label("Height")
+                .on_hover_text("Mosaic block HEIGHT in px (0/1 = square)");
+            let r = ui.add(egui::Slider::new(&mut hh, 0.0..=32.0).step_by(1.0));
+            middle_reset(ui, &r, &mut hh, 0.0f32);
+            wheel_adjust(ui, &r, &mut hh, 1.0, 0.0f32, 32.0f32);
+        });
+        if hh != self.pixelate_h {
+            self.pixelate_h = hh;
+            if self.pixelate_lock {
+                self.adjust.pixelate = hh;
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.pixelate_lock, "🔒 Lock")
+                .on_hover_text("Keep the block square")
+                .clicked()
+            {
+                self.pixelate_lock = !self.pixelate_lock;
+                if self.pixelate_lock {
+                    self.pixelate_h = self.adjust.pixelate;
+                }
+            }
+            if ui.button("Reset").clicked() {
+                self.adjust.pixelate = 0.0;
+                self.pixelate_h = 0.0;
+            }
+        });
+    }
+
+    /// Recolor pane § Color balance: the per-channel R/G/B offset.
+    fn ui_sec_balance(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Tints the image: 128 = neutral, >128 adds that channel, <128 removes it.");
+        // Same column geometry as Adjustments (label | wide slider |
+        // right-justified value | ⟲), minus the grip and move arrows.
+        const PAD: f32 = 10.0;
+        const VALUE_W: f32 = 64.0;
+        const BTN_W: f32 = 24.0;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let label_col = ["Strength", "R", "G", "B"]
+            .iter()
+            .map(|s| {
+                ui.painter()
+                    .layout_no_wrap((*s).to_string(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        let slider_w = (ui.available_width() - label_col - VALUE_W - BTN_W - PAD * 3.0).max(48.0);
+        let btn = |g: &str| {
+            egui::Button::new(g)
+                .small()
+                .min_size(egui::vec2(BTN_W, 0.0))
+        };
+        let reset_btn = |ui: &mut egui::Ui, tip: &str| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(btn("⟲")).on_hover_text(tip).clicked()
+            })
+            .inner
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = PAD;
+            value_slider(
+                ui,
+                "Strength",
+                label_col,
+                slider_w,
+                VALUE_W,
+                &mut self.balance_strength,
+                0.0f32,
+                1.0,
+                0.0,
+                0.0,
+                2,
+            );
+            if reset_btn(ui, "reset to 0") {
+                self.balance_strength = 0.0;
+            }
+        });
+        // R/G/B as full 0–255 sliders, each with its own reset.
+        let before = self.balance_color;
+        for (lbl, k) in [("R", 0usize), ("G", 1), ("B", 2)] {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = PAD;
+                value_slider(
+                    ui,
+                    lbl,
+                    label_col,
+                    slider_w,
+                    VALUE_W,
+                    &mut self.balance_color[k],
+                    0u8,
+                    255,
+                    128,
+                    1.0,
+                    0,
+                );
+                if reset_btn(ui, "reset to 128") {
+                    self.balance_color[k] = 128;
+                }
+            });
+        }
+        // Keep the hex buffer in step when the sliders move the color
+        // (done *before* the hex field so typing there isn't clobbered).
+        if self.balance_color != before {
+            self.balance_hex = format!(
+                "{:02X}{:02X}{:02X}",
+                self.balance_color[0], self.balance_color[1], self.balance_color[2]
+            );
+        }
+        // Swatch + hex paste (applies live on a valid 3/6-digit code).
+        ui.horizontal(|ui| {
+            let c = self.balance_color;
+            let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 18.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+            ui.label("#");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.balance_hex)
+                    .desired_width(70.0)
+                    .hint_text("RRGGBB"),
+            );
+            if resp.changed() {
+                if let Some(rgb) = parse_hex(&self.balance_hex) {
+                    self.balance_color = rgb;
+                }
+            }
+        });
+        if ui.button("Reset balance").clicked() {
+            self.balance_color = [128, 128, 128];
+            self.balance_strength = 0.0;
+            self.balance_hex = "808080".into();
+        }
+    }
+
+    /// Recolor pane § Post FX: the CRT filters (scanlines / glow / vignette /
+    /// phosphor), each positioned by its marker row in Adjustments.
+    fn ui_sec_postfx(&mut self, ui: &mut egui::Ui) {
+        let fx = &mut self.postfx;
+        ui.weak("Baked into the image (so they save). Reorder each in the Adjustments list above.");
+
+        // --- Scanlines ---
+        ui.add_space(2.0);
+        ui.strong("Scanlines");
+        ui.horizontal(|ui| {
+            ui.label("Amount");
+            let r = ui.add(egui::Slider::new(&mut fx.scan_amt, 0.0..=1.0));
+            middle_reset(ui, &r, &mut fx.scan_amt, 0.0f32);
+            wheel_adjust(ui, &r, &mut fx.scan_amt, 0.05, 0.0f32, 1.0f32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Spacing");
+            let r = ui.add(egui::Slider::new(&mut fx.scan_period, 2..=16).suffix("px"));
+            middle_reset(ui, &r, &mut fx.scan_period, 2u32);
+            wheel_adjust(ui, &r, &mut fx.scan_period, 1.0, 2u32, 16u32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Thickness");
+            // Cap at spacing−1 so at least one bright line always remains.
+            let tmax = fx.scan_period.saturating_sub(1).max(1);
+            let r = ui
+                .add(egui::Slider::new(&mut fx.scan_thick, 1..=tmax).suffix("px"))
+                .on_hover_text("How many px thick each scanline is (kept below the spacing)");
+            middle_reset(ui, &r, &mut fx.scan_thick, 1u32);
+            wheel_adjust(ui, &r, &mut fx.scan_thick, 1.0, 1u32, tmax);
+            fx.scan_thick = fx.scan_thick.clamp(1, tmax);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Dir");
+            for (d, sym, tip) in [
+                (0u8, "==", "Horizontal"),
+                (1u8, "||", "Vertical"),
+                (2u8, "\\\\", "Diagonal ＼"),
+                (3u8, "//", "Diagonal ／"),
+            ] {
+                if ui
+                    .selectable_label(fx.scan_dir == d, sym)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    fx.scan_dir = d;
+                }
+            }
+            ui.separator();
+            ui.label("Color");
+            ui.color_edit_button_srgb(&mut fx.scan_color);
+        });
+
+        // --- Glow (phosphor bloom) ---
+        ui.add_space(4.0);
+        ui.strong("Glow");
+        ui.horizontal(|ui| {
+            ui.label("Amount");
+            let r = ui.add(egui::Slider::new(&mut fx.glow_amt, 0.0..=2.0));
+            middle_reset(ui, &r, &mut fx.glow_amt, 0.0f32);
+            wheel_adjust(ui, &r, &mut fx.glow_amt, 0.05, 0.0f32, 2.0f32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Radius");
+            let r = ui.add(egui::Slider::new(&mut fx.glow_radius, 1.0..=16.0).suffix("px"));
+            middle_reset(ui, &r, &mut fx.glow_radius, 3.0f32);
+            wheel_adjust(ui, &r, &mut fx.glow_radius, 1.0, 1.0f32, 16.0f32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Contour");
+            const NAMES: [&str; 8] = [
+                "Linear",
+                "Cone",
+                "Cone inv",
+                "Gaussian",
+                "Half round",
+                "Ring",
+                "Ring ×2",
+                "Sawtooth",
+            ];
+            let cur = fx.glow_contour.min(7) as usize;
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("glow_contour")
+                    .selected_text(NAMES[cur])
+                    .show_ui(ui, |ui| {
+                        for (i, n) in NAMES.iter().enumerate() {
+                            ui.selectable_value(&mut fx.glow_contour, i as u8, *n);
+                        }
+                    }),
+            );
+            combo_wheel(ui, &cr, &mut fx.glow_contour, NAMES.len());
+        })
+        .response
+        .on_hover_text("Reshape the bloom falloff (Photoshop-style contour)");
+
+        // --- Vignette ---
+        ui.add_space(4.0);
+        ui.strong("Vignette");
+        ui.horizontal(|ui| {
+            ui.label("Amount");
+            let r = ui.add(egui::Slider::new(&mut fx.vig_amt, 0.0..=1.0));
+            middle_reset(ui, &r, &mut fx.vig_amt, 0.0f32);
+            wheel_adjust(ui, &r, &mut fx.vig_amt, 0.05, 0.0f32, 1.0f32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Feather");
+            let r = ui.add(egui::Slider::new(&mut fx.vig_feather, 0.0..=1.0));
+            middle_reset(ui, &r, &mut fx.vig_feather, 0.35f32);
+            wheel_adjust(ui, &r, &mut fx.vig_feather, 0.05, 0.0f32, 1.0f32);
+        });
+
+        // --- Phosphor RGB mask ---
+        ui.add_space(4.0);
+        ui.strong("Phosphor");
+        ui.horizontal(|ui| {
+            ui.label("Amount");
+            let r = ui.add(egui::Slider::new(&mut fx.phos_amt, 0.0..=1.0));
+            middle_reset(ui, &r, &mut fx.phos_amt, 0.0f32);
+            wheel_adjust(ui, &r, &mut fx.phos_amt, 0.05, 0.0f32, 1.0f32);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            let r = ui.add(egui::Slider::new(&mut fx.phos_size, 1..=8).suffix("px"));
+            middle_reset(ui, &r, &mut fx.phos_size, 1u32);
+            wheel_adjust(ui, &r, &mut fx.phos_size, 1.0, 1u32, 8u32);
+        });
+    }
+
+    /// Recolor pane § Recolor: Reduce, the palette chooser, dither and the
+    /// textmode/ASCII export options.
+    fn ui_sec_recolor(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        pal_state: &Option<Option<Vec<[u8; 4]>>>,
+        has_recolor: bool,
+    ) {
+        // ----- Recolor controls (palette-swap / reduce) -----
+        let has_own_palette = matches!(pal_state, Some(Some(_)));
+        // Reduce works on ANY image: with an extractable palette it
+        // median-cuts that; otherwise it synthesizes a palette from the
+        // pixels (see `reduce_source`) and cuts *that*. So it's no longer
+        // gated on `has_own_palette` — a >SWATCH_CAP photo can reduce too.
+        // Deferred so the favorites/list loops can borrow self.palette_*
+        // while we decide what to select. Some(None) = clear (Original).
+        let mut pick: Option<Option<PathBuf>> = None;
+        let mut toggle_fav: Option<PathBuf> = None; // star clicked in the list
+                                                    // The section header carries the "Recolor" title now, so this row is just
+                                                    // the reset-to-Original toggle. Kept non-wrapping but short, so it can't
+                                                    // widen the dock past its size_range (the compact-row gotcha).
+        ui.horizontal(|ui| {
+            let is_orig = self.selected_palette.is_none()
+                && !self.quantize_on
+                && self.custom_palette.is_none();
+            if ui
+                .selectable_label(is_orig, "Original")
+                .on_hover_text("No palette map: show the image's own colours")
+                .clicked()
+            {
+                pick = Some(None);
+            }
+        });
+
+        ui.add_space(2.0);
+        // ----- Reduce (median-cut the image's own colors to N) — above the
+        //       palette chooser so it's always visible -----
+        let active_reduce = self.quantize_on && self.selected_palette.is_none();
+        {
+            let mut on = active_reduce;
+            if ui
+                .checkbox(&mut on, format!("Reduce to {} colors", self.quantize_n))
+                .on_hover_text(if has_own_palette {
+                    "Median-cut this image's own palette down to N colors"
+                } else {
+                    "Build a palette from the image's pixels, then reduce to N colors"
+                })
+                .changed()
+            {
+                self.quantize_on = on;
+                // Toggling Reduce is the explicit reset: drop any swatch
+                // hand-edit so checking re-reduces fresh and unchecking
+                // reverts to Original (custom_palette wins otherwise).
+                self.custom_palette = None;
+                if on {
+                    self.selected_palette = None;
+                }
+            }
+        }
+        // Full-width slider, geometry matching the other sliders.
+        {
+            const PAD: f32 = 10.0;
+            const VALUE_W: f32 = 64.0;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let label_col = ui
+                .painter()
+                .layout_no_wrap("Colors".to_string(), font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let slider_w = (ui.available_width() - label_col - VALUE_W - PAD * 2.0).max(48.0);
+            let n_before = self.quantize_n;
+            ui.add_enabled_ui(active_reduce, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = PAD;
+                    value_slider(
+                        ui,
+                        "Colors",
+                        label_col,
+                        slider_w,
+                        VALUE_W,
+                        &mut self.quantize_n,
+                        2usize,
+                        256,
+                        16,
+                        1.0,
+                        0,
+                    );
+                });
+            });
+            // Changing the count re-quantizes to a fresh N-color median cut,
+            // so a prior swatch hand-edit (kept in custom_palette) is dropped.
+            if self.quantize_n != n_before {
+                self.custom_palette = None;
+            }
+        }
+        // Quick reduction presets.
+        ui.horizontal(|ui| {
+            ui.weak("Quick");
+            for nq in [2usize, 3, 4, 6, 8, 10, 16, 32, 48] {
+                if ui.button(nq.to_string()).clicked() {
+                    self.quantize_n = nq;
+                    self.quantize_on = true;
+                    self.selected_palette = None;
+                    self.custom_palette = None;
+                }
+            }
+            ui.checkbox(&mut self.quantize_keep_bw, "Keep black/white")
+                .on_hover_text(
+                    "Force pure black + white into the reduced palette — snaps the \
+                     darkest color to black and the brightest to white (uses the \
+                     palette's own extremes when it has no true black/white). Keeps \
+                     the color count; great for readable ANSI contrast.",
+                );
+        });
+        self.quantize_n = self.quantize_n.clamp(2, 256);
+
+        ui.add_space(4.0);
+        // ----- Dither (a movable pipeline op — the "Dither" row in
+        //       Adjustments picks *where* it applies). Above the palette
+        //       chooser, always visible. -----
+        ui.horizontal(|ui| {
+            ui.label("Dither");
+            let mut m = self.dither_method as usize;
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("dither_method")
+                    .selected_text(crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"))
+                    .show_ui(ui, |ui| {
+                        for (i, name) in crate::thumb::DITHER_NAMES.iter().enumerate() {
+                            ui.selectable_value(&mut m, i, *name);
+                        }
+                    }),
+            );
+            wheel_cycle(ui, &cr, &mut m, crate::thumb::DITHER_NAMES.len());
+            let prev = self.dither_method;
+            self.dither_method = m as u8;
+            // Usability: ANSI Shade draws in PALETTE colours, so with nothing
+            // providing any it silently does nothing. When the user switches TO
+            // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
+            // (an ANSI-appropriate default) so it works on the spot — they can then
+            // pick a palette or change N from there.
+            // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple) auto-enable
+            // Reduce → 16 when switched to with nothing providing colours.
+            if matches!(
+                self.dither_method,
+                crate::thumb::DITHER_ANSI
+                    | crate::thumb::DITHER_ASCII
+                    | crate::thumb::DITHER_ATASCII
+                    | crate::thumb::DITHER_APPLE
+                    | crate::thumb::DITHER_REXFONT
+            ) && prev != self.dither_method
+                && self.custom_palette.is_none()
+                && self.selected_palette.is_none()
+                && !self.quantize_on
+            {
+                self.quantize_on = true;
+                self.quantize_n = 16;
+                self.quantize_cache = None;
+                self.reduce_src = None;
+            }
+            // Switching TO PETSCII: auto-select the matching C64 palette so the
+            // export/save buttons appear (they need an active palette) and the
+            // Colors swatches match the converter's colours.
+            if self.dither_method == crate::thumb::DITHER_PETSCII
+                && prev != crate::thumb::DITHER_PETSCII
+                && !self.petscii_use_selected
+            {
+                self.petscii_sync_selected_palette();
+            }
+        });
+        // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
+        // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
+        if matches!(self.dither_method, 1..=6) {
+            ui.horizontal(|ui| {
+                ui.label("Amount");
+                let resp = ui.add(egui::Slider::new(&mut self.dither_amount, 0.0..=1.0));
+                middle_reset(ui, &resp, &mut self.dither_amount, 1.0f32);
+                wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
+            });
+        }
+        // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
+        // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
+        // Resize panel, since art isn't always square; enlarges each cell so a
+        // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
+        // Cell W/H apply to the ordered methods, and to ANSI Shade only
+        // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
+        if matches!(self.dither_method, 1..=3)
+            || self.dither_method == crate::thumb::DITHER_CUSTOM
+            || (self.is_ansi_grid_mode() && !self.shade_snap916 && !self.shade_vga50)
+        {
+            // Width (cell X); a locked cell mirrors it to height.
+            let mut sx = self.dither_scale_x;
+            ui.horizontal(|ui| {
+                ui.label("Cell W")
+                    .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
+                let resp = ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
+                middle_reset(ui, &resp, &mut sx, 1usize);
+                wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
+            });
+            if sx != self.dither_scale_x {
+                self.dither_scale_x = sx;
+                if self.dither_scale_lock {
+                    self.dither_scale_y = sx;
+                }
+            }
+            // Height (cell Y).
+            let mut sy = self.dither_scale_y;
+            ui.horizontal(|ui| {
+                ui.label("Cell H")
+                    .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
+                let resp = ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
+                middle_reset(ui, &resp, &mut sy, 1usize);
+                wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
+            });
+            if sy != self.dither_scale_y {
+                self.dither_scale_y = sy;
+                if self.dither_scale_lock {
+                    self.dither_scale_x = sy;
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.dither_scale_lock, "🔒 Lock")
+                    .on_hover_text("Keep the dither cell square")
+                    .clicked()
+                {
+                    self.dither_scale_lock = !self.dither_scale_lock;
+                    if self.dither_scale_lock {
+                        self.dither_scale_y = self.dither_scale_x; // unify on lock
+                    }
+                }
+                // Detect the art's native pixel size (per-axis) + match the cell.
+                if ui
+                    .button("Auto")
+                    .on_hover_text(
+                        "Pick a dither cell for this art: its pixel grid (per axis) \
+                         if it's upscaled pixel art, else scaled to the resolution \
+                         so the pattern reads on hi-res art.",
+                    )
+                    .clicked()
+                {
+                    if let Some((ax, ay)) = self.detect_dither_scale(path) {
+                        // Locked → keep it square (the coarser of the two).
+                        let (ax, ay) = if self.dither_scale_lock {
+                            let s = ax.max(ay);
+                            (s, s)
+                        } else {
+                            (ax, ay)
+                        };
+                        self.dither_scale_x = ax;
+                        self.dither_scale_y = ay;
+                        self.status = format!("Auto dither cell: {ax}×{ay}px");
+                    }
+                }
+            });
+        }
+        // ----- ANSI Shade controls (textmode shade-block rendering) -----
+        if self.dither_method == crate::thumb::DITHER_ANSI {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("ANSI Shade").strong());
+                if ui
+                    .small_button("↺ Reset")
+                    .on_hover_text(
+                        "Reset the ANSI-shade tuning (F1–F8, Shading, Smoothness, \
+                         Half-blocks) to defaults. Leaves cell/VGA50/iCE/format/Fit \
+                         as they are.",
+                    )
+                    .clicked()
+                {
+                    self.reset_ansi_shade();
+                }
+            });
+            // Named presets for JUST this panel (below PixelFX): pick to apply, [s]
+            // saves the current settings as a new one, [x] deletes, Rename renames.
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                let sel_name = self
+                    .ansi_preset_sel
+                    .and_then(|i| self.ansi_presets.get(i))
+                    .map(|p| p.name.clone());
+                let mut to_apply: Option<usize> = None;
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("ansi_preset")
+                        .selected_text(sel_name.as_deref().unwrap_or("—"))
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.ansi_preset_sel.is_none(), "—")
+                                .clicked()
+                            {
+                                self.ansi_preset_sel = None;
+                            }
+                            for i in 0..self.ansi_presets.len() {
+                                if ui
+                                    .selectable_label(
+                                        self.ansi_preset_sel == Some(i),
+                                        &self.ansi_presets[i].name,
+                                    )
+                                    .clicked()
+                                {
+                                    to_apply = Some(i);
+                                }
+                            }
+                        }),
+                );
+                // Cycle through [— , preset0, preset1, …]; landing on a preset applies it.
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 {
+                    let n = self.ansi_presets.len() as isize + 1;
+                    let cur = match self.ansi_preset_sel {
+                        None => 0isize,
+                        Some(i) => i as isize + 1,
+                    };
+                    let ni = (cur + step).rem_euclid(n);
+                    if ni == 0 {
+                        self.ansi_preset_sel = None;
+                    } else {
+                        to_apply = Some((ni - 1) as usize);
+                    }
+                }
+                if let Some(i) = to_apply {
+                    self.ansi_preset_sel = Some(i);
+                    let p = self.ansi_presets[i].clone();
+                    self.apply_ansi_preset(&p);
+                }
+                if ui
+                    .small_button("s")
+                    .on_hover_text("Save the current ANSI-shade settings as a preset")
+                    .clicked()
+                {
+                    let name = format!("Style {}", self.ansi_presets.len() + 1);
+                    let p = self.capture_ansi_preset(name);
+                    self.ansi_presets.push(p);
+                    self.ansi_preset_sel = Some(self.ansi_presets.len() - 1);
+                    self.ansi_preset_rename = self.ansi_preset_sel; // name it now
+                }
+                let has_sel = self.ansi_preset_sel.is_some();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("x").small())
+                    .on_hover_text("Delete the selected preset")
+                    .clicked()
+                {
+                    if let Some(i) = self.ansi_preset_sel.take() {
+                        if i < self.ansi_presets.len() {
+                            self.ansi_presets.remove(i);
+                        }
+                        self.ansi_preset_rename = None;
+                    }
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Rename").small())
+                    .clicked()
+                {
+                    self.ansi_preset_rename = self.ansi_preset_sel;
+                }
+            });
+            if let Some(i) = self.ansi_preset_rename {
+                if i < self.ansi_presets.len() {
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.ansi_presets[i].name)
+                                .desired_width(150.0),
+                        );
+                        if ui.button("✓").clicked()
+                            || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            self.ansi_preset_rename = None;
+                        }
+                    });
+                } else {
+                    self.ansi_preset_rename = None;
+                }
+            }
+            // Snap 9×16 and Snap 8×8 (VGA50) are mutually exclusive — the
+            // cell can only be one authentic text size at a time.
+            if ui
+                .checkbox(&mut self.shade_snap916, "Snap 9×16 (VGA cell)")
+                .on_hover_text("Force the authentic 9×16 VGA text cell (overrides Cell W/H)")
+                .clicked()
+                && self.shade_snap916
+            {
+                self.shade_vga50 = false;
+            }
+            if ui
+                .checkbox(&mut self.shade_vga50, "Snap 8×8 (VGA50)")
+                .on_hover_text("Force the 8×8 VGA50 text cell + 8×8 font (overrides Cell W/H)")
+                .clicked()
+                && self.shade_vga50
+            {
+                self.shade_snap916 = false;
+            }
+            ui.checkbox(&mut self.shade_half, "Half-blocks (▀▄▌▐)")
+                .on_hover_text(
+                    "Master toggle for the half-block glyphs (sharper cell edges). \
+                     Tune each one's usage with the F5–F8 sliders below.",
+                );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_ice, "iCE color (16 bg)")
+                    .on_hover_text(
+                        "iCE color: allow all 16 colors as backgrounds (else 8). \
+                         Affects both the preview and the exported file.",
+                    );
+                ui.checkbox(&mut self.shade_invert, "Invert")
+                    .on_hover_text("Inverse video — swap fg/bg per cell (default off)");
+                if ui
+                    .button("Chars…")
+                    .on_hover_text("Pick which block glyphs the shade matcher may use")
+                    .clicked()
+                {
+                    self.ansi_picker = !self.ansi_picker;
+                }
+            });
+            // Explicit EXPORT format (export only — does not affect the preview).
+            // Each entry names the actual output file `export_textmode` writes.
+            ui.horizontal(|ui| {
+                ui.label("Format").on_hover_text(
+                    "Textmode export file:\n\
+                     • Auto — EGA→ANSI 16-color .ans, else truecolor .ans\n\
+                     • ANSI 16-color (.ans) — nearest-ANSI16 SGR\n\
+                     • ANSI 256-color (.ans) — xterm-256 SGR\n\
+                     • ANSI truecolor (.ans) — 24-bit SGR\n\
+                     • XBin 16-color (.xb) — embeds palette + font (Moebius)\n\
+                     • Tundra 24-bit (.tnd) — binary truecolor\n\
+                     • REXPaint (.xp) — gzipped CP437 + 24-bit fg/bg",
+                );
+                let mut f = self.shade_export_format as usize;
+                const FORMATS: [&str; 7] = [
+                    "Auto",
+                    "ANSI 16-color (.ans)",
+                    "ANSI 256-color (.ans)",
+                    "ANSI truecolor (.ans)",
+                    "XBin 16-color (.xb)",
+                    "Tundra 24-bit (.tnd)",
+                    "REXPaint (.xp)",
+                ];
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("shade_export_format")
+                        .selected_text(FORMATS[f.min(6)])
+                        .show_ui(ui, |ui| {
+                            for (i, name) in FORMATS.iter().enumerate() {
+                                ui.selectable_value(&mut f, i, *name);
+                            }
+                        }),
+                );
+                wheel_cycle(ui, &cr, &mut f, FORMATS.len());
+                self.shade_export_format = f as u8;
+            });
+            // Fit-to-character-grid: force the working image to an exact
+            // cols×rows cell grid (aspect NOT preserved). Feeds preview + export.
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
+                    .on_hover_text(
+                        "Force the image to exactly cols×rows character cells \
+                         (cols·cell_w × rows·cell_h px). The source aspect ratio \
+                         is NOT preserved — it's stretched to the char grid.",
+                    );
+                let r = ui.add(
+                    egui::DragValue::new(&mut self.shade_fit_cols)
+                        .range(1..=1000)
+                        .prefix("cols "),
+                );
+                wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 1000);
+                let r = ui.add(
+                    egui::DragValue::new(&mut self.shade_fit_rows)
+                        .range(1..=1000)
+                        .prefix("rows "),
+                );
+                wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 1000);
+            });
+            ui.horizontal(|ui| {
+                for (label, c, r) in [
+                    ("40×25", 40, 25),
+                    ("50×15", 50, 15),
+                    ("60×20", 60, 20),
+                    ("80×25", 80, 25),
+                    ("80×50", 80, 50),
+                    ("132×50", 132, 50),
+                    ("160×80", 160, 80),
+                ] {
+                    if ui.small_button(label).clicked() {
+                        self.shade_fit_cols = c;
+                        self.shade_fit_rows = r;
+                        self.shade_fit_chars = true;
+                    }
+                }
+                // Resulting pixel size at the current cell dims.
+                let (cw, ch) = self.textmode_cell_dims();
+                ui.weak(format!(
+                    "→ {}×{} px",
+                    self.shade_fit_cols.max(1) * cw,
+                    self.shade_fit_rows.max(1) * ch
+                ));
+            });
+            // Shading amount: how much shade/half-blocks vs flat color.
+            ui.horizontal(|ui| {
+                ui.label("Shading");
+                let resp = ui
+                    .add(egui::Slider::new(&mut self.shade_amount, 0.0..=2.0))
+                    .on_hover_text(
+                        "How much shading vs. flat color. 0..1: low = flats stay \
+                         solid, shade only in transitions. 1..2: FORCE dithering — \
+                         solids get penalized so even flats go textured.",
+                    );
+                middle_reset(ui, &resp, &mut self.shade_amount, 1.0f32);
+                wheel_adjust(ui, &resp, &mut self.shade_amount, 0.05, 0.0f32, 2.0f32);
+            });
+            // Smoothness: contrast penalty on the shade blocks so the search
+            // avoids garish high-contrast dithers.
+            ui.horizontal(|ui| {
+                ui.label("Smoothness");
+                let resp = ui
+                    .add(egui::Slider::new(&mut self.shade_smooth, 0.0..=3.0))
+                    .on_hover_text(
+                        "False-color avoidance — higher penalizes dithering two \
+                         different HUES (yellow▒blue), keeping shade blocks between \
+                         similar colors; push past 1 for a hard clamp. Lower allows \
+                         any pair.",
+                    );
+                middle_reset(ui, &resp, &mut self.shade_smooth, 0.5f32);
+                wheel_adjust(ui, &resp, &mut self.shade_smooth, 0.05, 0.0f32, 3.0f32);
+            });
+            // Detail: how hard a cell's internal contrast pulls the search toward
+            // half-blocks. Higher = crisper edges when shrunk (more ▀▄▌▐, less
+            // shade blur); 0 = half-blocks only via their own F5–F8 usage.
+            ui.horizontal(|ui| {
+                ui.label("Detail");
+                let resp = ui
+                    .add(egui::Slider::new(&mut self.shade_detail, 0.0..=5.0))
+                    .on_hover_text(
+                        "Edge detail retention when shrinking — higher makes cells \
+                         with a strong internal contrast render as crisp half-blocks \
+                         (▀▄▌▐) instead of averaged shades. Scales the F5–F8 usage; \
+                         crank it for aggressive edge-preservation.",
+                    );
+                middle_reset(ui, &resp, &mut self.shade_detail, 0.30f32);
+                wheel_adjust(ui, &resp, &mut self.shade_detail, 0.05, 0.0f32, 5.0f32);
+            });
+            // The fill fractions the ░▒▓ shade blocks stand for; the leading
+            // checkbox toggles whether that shade level is a candidate at all.
+            // Each shade's slider is bounded to its own interior band (light
+            // ░ ≤ mid ▒ ≤ dark ▓, never 0 or 1) so the ramp can't be inverted
+            // or degenerate into a fake solid.
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_f1_on, "");
+                self.paint_shade_swatch(ui, 176); // ░
+                ui.label("F1");
+                let resp = ui.add(egui::Slider::new(&mut self.shade_f1, 0.10..=0.40));
+                middle_reset(ui, &resp, &mut self.shade_f1, 0.25f32);
+                wheel_adjust(ui, &resp, &mut self.shade_f1, 0.05, 0.10f32, 0.40f32);
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_f2_on, "");
+                self.paint_shade_swatch(ui, 177); // ▒
+                ui.label("F2");
+                let resp = ui.add(egui::Slider::new(&mut self.shade_f2, 0.40..=0.60));
+                middle_reset(ui, &resp, &mut self.shade_f2, 0.50f32);
+                wheel_adjust(ui, &resp, &mut self.shade_f2, 0.05, 0.40f32, 0.60f32);
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_f3_on, "");
+                self.paint_shade_swatch(ui, 178); // ▓
+                ui.label("F3");
+                let resp = ui.add(egui::Slider::new(&mut self.shade_f3, 0.60..=0.90));
+                middle_reset(ui, &resp, &mut self.shade_f3, 0.75f32);
+                wheel_adjust(ui, &resp, &mut self.shade_f3, 0.05, 0.60f32, 0.90f32);
+            });
+            // Half-block usage (F5 ▀ / F6 ▄ / F7 ▌ / F8 ▐). The leading checkbox
+            // includes that glyph as a candidate; the slider biases how often the
+            // search picks it (0.5 = neutral, right = more, left = less). All are
+            // gated by the master "Half-blocks" toggle above. ▀/▄ (and ▌/▐) are
+            // the same split with fg/bg swapped, so dialing one up favours that
+            // character for horizontal (or vertical) edges.
+            ui.add_enabled_ui(self.shade_half, |ui| {
+                const HALF: [(u8, &str); 4] = [(223, "F5"), (220, "F6"), (221, "F7"), (222, "F8")];
+                for (i, (glyph, label)) in HALF.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.shade_half_on[i], "");
+                        self.paint_shade_swatch(ui, *glyph);
+                        ui.label(*label);
+                        let resp = ui
+                            .add(egui::Slider::new(&mut self.shade_half_use[i], 0.0..=1.0))
+                            .on_hover_text(
+                                "How often this half-block is used — right = more, \
+                                 left = less, middle = neutral.",
+                            );
+                        middle_reset(ui, &resp, &mut self.shade_half_use[i], 0.5f32);
+                        wheel_adjust(ui, &resp, &mut self.shade_half_use[i], 0.05, 0.0f32, 1.0f32);
+                    });
+                }
+            });
+            if !has_recolor {
+                ui.weak("(needs a palette / Reduce — ANSI shade draws in palette colors)");
+            }
+        }
+        // ----- PETSCII controls (image → C64 hi-res char art) -----
+        if self.dither_method == crate::thumb::DITHER_PETSCII {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("PETSCII").strong());
+                ui.weak("C64 hi-res char art");
+            });
+            // Palette: petmate / colodore / pepto / vice. Picking one sets the
+            // converter colours AND the matching quantize palette so exported art
+            // matches whatever palette petmate is set to (Preferences → C64 palette).
+            ui.horizontal(|ui| {
+                ui.label("Palette").on_hover_text(
+                    "Match this to petmate's Preferences → “Select C64 color palette”",
+                );
+                let names = crate::decode::PETSCII_PALETTES;
+                let cur = (self.petscii_palette as usize).min(names.len() - 1);
+                let mut changed = false;
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("petscii_pal")
+                        .selected_text(names[cur].0)
+                        .show_ui(ui, |ui| {
+                            for (i, (n, _)) in names.iter().enumerate() {
+                                if ui
+                                    .selectable_value(&mut self.petscii_palette, i as u8, *n)
+                                    .clicked()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        }),
+                );
+                changed |= combo_wheel(ui, &cr, &mut self.petscii_palette, names.len());
+                // Only re-sync the C64 palette to the quantize selection when NOT using
+                // the selected palette (else it would fight the user's chosen palette).
+                if changed && !self.petscii_use_selected {
+                    self.petscii_sync_selected_palette();
+                }
+            });
+            // Render with any palette (like ANSI): when on, PETSCII colours come from the
+            // palette selected in the Palettes list (or a Reduce/custom palette), coerced
+            // to 16 — not the C64 VIC-II set above.
+            ui.checkbox(&mut self.petscii_use_selected, "Use selected palette")
+                .on_hover_text(
+                    "Render in the palette chosen in the Palettes list below (EGA, CGA, \
+                     custom…), coerced to 16 colours — the same way ANSI honours it. \
+                     Off = the authentic C64 palette above. (petmate/.seq export still \
+                     assumes C64 colours.)",
+                );
+            ui.horizontal(|ui| {
+                ui.label("Cols");
+                let r = ui.add(egui::DragValue::new(&mut self.petscii_cols).range(1..=120));
+                wheel_adjust(ui, &r, &mut self.petscii_cols, 1.0, 1, 120);
+                ui.label("Rows");
+                let r = ui.add(egui::DragValue::new(&mut self.petscii_rows).range(1..=120));
+                wheel_adjust(ui, &r, &mut self.petscii_rows, 1.0, 1, 120);
+                if ui
+                    .small_button("40×25")
+                    .on_hover_text("C64 screen")
+                    .clicked()
+                {
+                    self.petscii_cols = 40;
+                    self.petscii_rows = 25;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Purity");
+                let r = ui
+                    .add(egui::Slider::new(&mut self.petscii_purity, 0.0..=1.0))
+                    .on_hover_text(
+                        "0 = clean block / quadrant art · 1 = full charset (photographic)",
+                    );
+                middle_reset(ui, &r, &mut self.petscii_purity, 1.0f32);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Charset");
+                ui.selectable_value(&mut self.petscii_page, 0, "Upper/graphics");
+                ui.selectable_value(&mut self.petscii_page, 1, "Lower");
+                if ui
+                    .button("Chars…")
+                    .on_hover_text("Pick which C64 glyphs the matcher may use")
+                    .clicked()
+                {
+                    self.petscii_picker = !self.petscii_picker;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Export");
+                const F: [&str; 4] = [".petmate", ".seq", ".json", ".png"];
+                let cur = self.petscii_export_format.min(3) as usize;
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("petscii_fmt")
+                        .selected_text(F[cur])
+                        .show_ui(ui, |ui| {
+                            for (i, n) in F.iter().enumerate() {
+                                ui.selectable_value(&mut self.petscii_export_format, i as u8, *n);
+                            }
+                        }),
+                );
+                combo_wheel(ui, &cr, &mut self.petscii_export_format, F.len());
+                ui.weak("(use “Export textmode”)");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.petscii_bg_auto, "Auto background");
+                if !self.petscii_bg_auto {
+                    let pal = self.petscii_pal16;
+                    for c in 0u8..16 {
+                        let col = pal[c as usize];
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::click());
+                        ui.painter().rect_filled(
+                            rect,
+                            2.0,
+                            egui::Color32::from_rgb(col[0], col[1], col[2]),
+                        );
+                        if self.petscii_bg == c {
+                            ui.painter().rect_stroke(
+                                rect,
+                                2.0,
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                        if resp.clicked() {
+                            self.petscii_bg = c;
+                        }
+                    }
+                }
+            });
+        }
+        // ----- ASCII controls (image → character-density art) -----
+        if self.dither_method == crate::thumb::DITHER_ASCII {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("ASCII").strong());
+                ui.weak("brightness → character density");
+            });
+            // Render font: built-in CP437, any bundled REXPaint font, or a TTF/OTF.
+            ui.horizontal(|ui| {
+                ui.label("Font");
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("ascii_font")
+                        .selected_text(self.ascii_font_name())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.ascii_font,
+                                AsciiFont::Cp437,
+                                "CP437 (built-in)",
+                            )
+                            .on_hover_text("The VGA ROM — authentic 9-dot cell.");
+                            ui.separator();
+                            for i in 0..crate::decode::rexfont::rexfont_count() {
+                                let sel = matches!(self.ascii_font, AsciiFont::Rex(j) if j == i);
+                                if ui
+                                    .selectable_label(sel, crate::decode::rexfont::rexfont_name(i))
+                                    .clicked()
+                                {
+                                    self.ascii_font = AsciiFont::Rex(i);
+                                }
+                            }
+                        }),
+                );
+                // Cycle CP437 + the bundled REXPaint fonts (a File font is set via TTF…, not cycled).
+                let step = combo_scroll_step(ui, &cr);
+                if step != 0 {
+                    let n = crate::decode::rexfont::rexfont_count() as isize + 1;
+                    let cur = match self.ascii_font {
+                        AsciiFont::Rex(j) => (j as isize + 1).min(n - 1),
+                        _ => 0,
+                    };
+                    let ni = (cur + step).rem_euclid(n);
+                    self.ascii_font = if ni == 0 {
+                        AsciiFont::Cp437
+                    } else {
+                        AsciiFont::Rex((ni - 1) as usize)
+                    };
+                }
+                if ui
+                    .button("TTF…")
+                    .on_hover_text("Render with any .ttf/.otf font (rasterized CP437-ordered)")
+                    .clicked()
+                {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Font", &["ttf", "otf", "ttc"])
+                        .pick_file()
+                    {
+                        self.ascii_font = AsciiFont::File(p);
+                    }
+                }
+                if !matches!(self.ascii_font, AsciiFont::Cp437)
+                    && ui
+                        .small_button("✖")
+                        .on_hover_text("Back to CP437")
+                        .clicked()
+                {
+                    self.ascii_font = AsciiFont::Cp437;
+                }
+            });
+            // "Use only chars": type an exact glyph set (e.g. " .oOX$") — when it has
+            // any resolvable glyphs it OVERRIDES the category toggles below.
+            let only_active = !resolve_ascii_chars(&self.ascii_chars).is_empty();
+            ui.horizontal(|ui| {
+                ui.label("Use only chars")
+                    .on_hover_text("Build the ramp from exactly these characters (light→dark by ink). Overrides the ranges. Leave empty to use the categories.");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ascii_chars)
+                        .hint_text(" .:oO0X$#@")
+                        .desired_width(150.0),
+                );
+                if !self.ascii_chars.is_empty() && ui.small_button("✖").clicked() {
+                    self.ascii_chars.clear();
+                }
+            });
+            // Character categories (ignored while "Use only chars" is active). Printable
+            // 32–126 is always in the pool; the toggles union in more glyphs.
+            ui.add_enabled_ui(!only_active, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Chars");
+                    ui.weak("32–126");
+                    ui.checkbox(&mut self.ascii_high, "High")
+                        .on_hover_text("Include 128–255 (all CP437 extended)");
+                    ui.checkbox(&mut self.ascii_control, "Control")
+                        .on_hover_text("Include control chars 0–31 (their CP437 glyphs)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("     ");
+                    ui.checkbox(&mut self.ascii_blocks, "Blocks")
+                        .on_hover_text("Include the ░▒▓█ shade + half/quarter block glyphs");
+                    ui.checkbox(&mut self.ascii_box, "Box Drawing")
+                        .on_hover_text("Include the ─│┌┐└┘├┤┬┴┼ box-drawing glyphs");
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.ascii_color, "Color").on_hover_text(
+                    "Per-cell colour from the active palette (off = monochrome ink on paper)",
+                );
+                ui.checkbox(&mut self.ascii_invert, "Invert").on_hover_text(
+                    "Inverse video — draw the glyph in paper on an ink-coloured cell",
+                );
+                if ui
+                    .button("Chars…")
+                    .on_hover_text("Pick usable CP437 glyphs (intersects the ranges)")
+                    .clicked()
+                {
+                    self.ascii_picker = !self.ascii_picker;
+                }
+                ui.weak("·");
+                ui.checkbox(&mut self.shade_vga50, "8×8 cell")
+                    .on_hover_text("Render in the 8×8 VGA50 font (off = 8×16)");
+            });
+            // Fit-to-chars: force an exact cols×rows canvas (shared with ANSI Shade).
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.shade_fit_chars, "Fit to chars")
+                    .on_hover_text("Force an exact cols×rows character canvas");
+                if self.shade_fit_chars {
+                    ui.label("Cols");
+                    let r = ui.add(egui::DragValue::new(&mut self.shade_fit_cols).range(1..=300));
+                    wheel_adjust(ui, &r, &mut self.shade_fit_cols, 1.0, 1, 300);
+                    ui.label("Rows");
+                    let r = ui.add(egui::DragValue::new(&mut self.shade_fit_rows).range(1..=300));
+                    wheel_adjust(ui, &r, &mut self.shade_fit_rows, 1.0, 1, 300);
+                    if ui.small_button("80×25").clicked() {
+                        self.shade_fit_cols = 80;
+                        self.shade_fit_rows = 25;
+                    }
+                }
+            });
+            if !has_recolor {
+                ui.weak("(needs a palette / Reduce for its colors)");
+            }
+        }
+        // ----- ATASCII controls (image → Atari 8-bit character art) -----
+        if self.dither_method == crate::thumb::DITHER_ATASCII {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("ATASCII").strong());
+                ui.weak("Atari 8-bit character art");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.bitfont_color, "Color")
+                    .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
+                ui.checkbox(&mut self.atascii_invert, "Invert")
+                    .on_hover_text("Inverse video — swap ink and paper");
+                if ui
+                    .button("Chars…")
+                    .on_hover_text("Pick which glyphs to use")
+                    .clicked()
+                {
+                    self.atascii_picker = !self.atascii_picker;
+                }
+            });
+            if !has_recolor {
+                ui.weak("(needs a palette / Reduce for its colors)");
+            }
+        }
+        // ----- Apple ][ controls (image → Apple II character art) -----
+        if self.dither_method == crate::thumb::DITHER_APPLE {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Apple ][").strong());
+                ui.weak("Apple II character art");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Font");
+                ui.selectable_value(&mut self.apple_col80, false, "PR#0 (40 col)")
+                    .on_hover_text("The 40-column Apple II text font");
+                ui.selectable_value(&mut self.apple_col80, true, "PR#3 (80 col)")
+                    .on_hover_text("The 80-column card font (narrower PRNumber3 style)");
+            });
+            // Apple II text was monochrome (no per-cell colour) — use the unified
+            // fg/bg chips below instead.
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.apple_invert, "Invert")
+                    .on_hover_text("Inverse video — swap ink and paper");
+                ui.checkbox(&mut self.apple_mousetext, "MouseText")
+                    .on_hover_text("Add the Apple //e MouseText glyphs to the pool");
+                if ui
+                    .button("Chars…")
+                    .on_hover_text("Pick which glyphs to use")
+                    .clicked()
+                {
+                    self.apple_picker = !self.apple_picker;
+                }
+            });
+            if !has_recolor {
+                ui.weak("(needs a palette / Reduce for its colors)");
+            }
+        }
+        // ----- REXPaint-font controls (image → art in a bundled REXPaint font) -----
+        if self.dither_method == crate::thumb::DITHER_REXFONT {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("REXPaint font").strong());
+                let f = crate::decode::rexfont::rexfont(self.rexfont_sel);
+                ui.weak(match f {
+                    Some(g) => format!("{}×{} cells", g.cell_w, g.cell_h),
+                    None => "—".into(),
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Font");
+                let cur = self
+                    .rexfont_sel
+                    .min(crate::decode::rexfont::rexfont_count() - 1);
+                let cr = eat_scroll(
+                    egui::ComboBox::from_id_salt("rexfont_sel")
+                        .selected_text(crate::decode::rexfont::rexfont_name(cur))
+                        .show_ui(ui, |ui| {
+                            for i in 0..crate::decode::rexfont::rexfont_count() {
+                                ui.selectable_value(
+                                    &mut self.rexfont_sel,
+                                    i,
+                                    crate::decode::rexfont::rexfont_name(i),
+                                );
+                            }
+                        }),
+                );
+                combo_wheel(
+                    ui,
+                    &cr,
+                    &mut self.rexfont_sel,
+                    crate::decode::rexfont::rexfont_count(),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.bitfont_color, "Color")
+                    .on_hover_text("Per-cell colour from the active palette (off = monochrome)");
+                ui.checkbox(&mut self.rexfont_invert, "Invert")
+                    .on_hover_text("Inverse video — swap ink and paper");
+                let on = self.rexfont_mask.iter().filter(|b| **b).count();
+                let all = on == 0 || on >= 256;
+                let label = if all {
+                    "Chars…".to_string()
+                } else {
+                    format!("Chars ({on})…")
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(
+                        "Pick which glyphs the converter may use (a clickable font grid)",
+                    )
+                    .clicked()
+                {
+                    self.rexfont_picker = !self.rexfont_picker;
+                }
+            });
+            if !has_recolor {
+                ui.weak("(needs a palette / Reduce for its colors)");
+            }
+        }
+        // ----- Unicode controls (image → UTF-8 text art) -----
+        if self.dither_method == crate::thumb::DITHER_UNICODE {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Unicode").strong());
+                ui.weak("→ copy-pasteable UTF-8");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Style");
+                ui.selectable_value(
+                    &mut self.unicode_style,
+                    crate::thumb::UNI_HALFBLOCK,
+                    "Half-block ▀",
+                )
+                .on_hover_text("Each character = 2 stacked colour pixels (full-colour)");
+                ui.selectable_value(
+                    &mut self.unicode_style,
+                    crate::thumb::UNI_BRAILLE,
+                    "Braille ⠿",
+                )
+                .on_hover_text("2×4 dots per character — hi-res mono line/tone art");
+                ui.selectable_value(&mut self.unicode_style, crate::thumb::UNI_RAMP, "Ramp ▒")
+                    .on_hover_text("Density ramp over the enabled Unicode ranges below");
+            });
+            // Ramp style: the font to rasterize from + which ranges feed the glyph pool.
+            if self.unicode_style == crate::thumb::UNI_RAMP {
+                ui.horizontal(|ui| {
+                    ui.label("Font");
+                    let before = self.unicode_font.clone();
+                    let cr = eat_scroll(
+                        egui::ComboBox::from_id_salt("uni_font")
+                            .selected_text(self.unicode_font_name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.unicode_font,
+                                    UniFont::Pdv,
+                                    "Perfect DOS VGA (crisp)",
+                                )
+                                .on_hover_text(
+                                    "Pixel-perfect CP437 + Nerd Font icons. No Braille/Geometric.",
+                                );
+                                ui.selectable_value(
+                                    &mut self.unicode_font,
+                                    UniFont::DejaVu,
+                                    "DejaVu Sans (+Braille)",
+                                )
+                                .on_hover_text(
+                                    "Wide Unicode coverage — Braille + Geometric Shapes.",
+                                );
+                            }),
+                    );
+                    // Toggle the two built-ins (a Browse-picked File font isn't cycled); the
+                    // `!= before` block below then loads + installs it.
+                    if combo_scroll_step(ui, &cr) != 0 {
+                        self.unicode_font = match self.unicode_font {
+                            UniFont::DejaVu => UniFont::Pdv,
+                            _ => UniFont::DejaVu,
+                        };
+                    }
+                    if ui
+                        .button("Browse…")
+                        .on_hover_text("Use any .ttf/.otf font on disk")
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Font", &["ttf", "otf", "ttc"])
+                            .pick_file()
+                        {
+                            self.unicode_font = UniFont::File(p);
+                        }
+                    }
+                    if !matches!(self.unicode_font, UniFont::Pdv)
+                        && ui
+                            .small_button("✖")
+                            .on_hover_text("Back to the default font")
+                            .clicked()
+                    {
+                        self.unicode_font = UniFont::Pdv;
+                    }
+                    if self.unicode_font != before {
+                        // Load + install the new font, and drop the stale file cache if
+                        // we moved off a browsed file.
+                        if !matches!(self.unicode_font, UniFont::File(_)) {
+                            self.unicode_font_bytes = None;
+                        }
+                        self.apply_ramp_src();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Ranges");
+                    for (name, flag, _) in crate::decode::uniart::RANGES {
+                        let mut on = self.unicode_ranges & flag != 0;
+                        if ui.checkbox(&mut on, name).changed() {
+                            if on {
+                                self.unicode_ranges |= flag;
+                            } else {
+                                self.unicode_ranges &= !flag;
+                            }
+                        }
+                    }
+                    if ui
+                        .button("Chars…")
+                        .on_hover_text("Pick which glyphs the ramp may use")
+                        .clicked()
+                    {
+                        self.unicode_picker = !self.unicode_picker;
+                    }
+                });
+                // Codepoint picker: add arbitrary glyphs beyond the ranges above.
+                ui.horizontal(|ui| {
+                    ui.label("Codepoints").on_hover_text(
+                        "Extra glyphs to add to the ramp. Type characters (★♥) or hex \
+                         codepoints — single (2588 / U+2588), or ranges (2591-2593). \
+                         Space- or comma-separated.",
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.unicode_extra)
+                            .hint_text("★♥ 2588 2591-2593")
+                            .desired_width(200.0),
+                    );
+                    if resp.changed() {
+                        // A codepoint the user removes from the field should no longer
+                        // count as "disabled" (else re-adding it comes back off).
+                        let live = self.unicode_extra_cps();
+                        let ranges = self.unicode_effective_ranges();
+                        self.unicode_disabled.retain(|cp| {
+                            live.contains(cp)
+                                || crate::decode::uniart::RANGES
+                                    .iter()
+                                    .any(|(_, flag, (a, b))| {
+                                        ranges & flag != 0 && (*a..=*b).contains(cp)
+                                    })
+                        });
+                    }
+                    let n = self.unicode_extra_cps().len();
+                    if n > 0 {
+                        ui.weak(format!("+{n}"));
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Cols");
+                let r = ui.add(egui::Slider::new(&mut self.unicode_cols, 16..=300));
+                slider_extras(ui, &r, &mut self.unicode_cols, 120, 1.0, 16, 300);
+                ui.checkbox(&mut self.unicode_invert, "Invert")
+                    .on_hover_text("Flip the dot/tone on-off test");
+            });
+            ui.weak("Export writes .txt (xterm-256 colour for half-block / ramp).");
+        }
+        // Unified foreground / background for the mono char modes (ASCII/ATASCII/Apple).
+        if self.textmode_mono().is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Ink");
+                ui.color_edit_button_srgb(&mut self.tm_fg)
+                    .on_hover_text("Foreground (glyph) colour");
+                ui.label("Paper");
+                ui.color_edit_button_srgb(&mut self.tm_bg)
+                    .on_hover_text("Background colour");
+                if ui
+                    .small_button("↺")
+                    .on_hover_text("White on black")
+                    .clicked()
+                {
+                    self.tm_fg = [235, 235, 235];
+                    self.tm_bg = [0, 0, 0];
+                }
+            });
+        }
+        if matches!(self.dither_method, 4 | 5) && !has_recolor {
+            ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
+        }
+        if self.dither_method == crate::thumb::DITHER_CUSTOM {
+            ui.horizontal(|ui| {
+                ui.label("Matrix");
+                for sz in [2usize, 4, 8] {
+                    if ui
+                        .selectable_label(self.dither_custom_n == sz, format!("{sz}×{sz}"))
+                        .clicked()
+                    {
+                        self.dither_custom_n = sz;
+                        self.dither_custom = crate::thumb::bayer_values(sz);
+                    }
+                }
+                if ui
+                    .button("Bayer")
+                    .on_hover_text("Reseed the cells with the Bayer pattern")
+                    .clicked()
+                {
+                    self.dither_custom = crate::thumb::bayer_values(self.dither_custom_n);
+                }
+            });
+            let n = self.dither_custom_n;
+            let hi = (n * n - 1) as u32;
+            ui.weak(format!("cell thresholds 0..={hi} — higher = brighter bias"));
+            if self.dither_custom.len() != n * n {
+                self.dither_custom = crate::thumb::bayer_values(n);
+            }
+            egui::Grid::new("dither_matrix")
+                .spacing([3.0, 3.0])
+                .show(ui, |ui| {
+                    for y in 0..n {
+                        for x in 0..n {
+                            let cell = &mut self.dither_custom[y * n + x];
+                            ui.add(egui::DragValue::new(cell).range(0..=hi).speed(0.1));
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.weak("Palettes");
+            if ui
+                .button("🎲 Random")
+                .on_hover_text("Pick a random palette from your library")
+                .clicked()
+                && !self.palette_files.is_empty()
+            {
+                let n = self.palette_files.len();
+                let mut idx = random_index(n);
+                // Avoid re-picking the one that's already selected.
+                if n > 1
+                    && self.selected_palette.as_deref() == Some(self.palette_files[idx].as_path())
+                {
+                    idx = (idx + 1) % n;
+                }
+                let chosen = self.palette_files[idx].clone();
+                self.status = format!("Random palette: {}", palette_label(&chosen));
+                self.selected_palette = Some(chosen);
+                self.custom_palette = None;
+                self.quantize_on = false;
+            }
+            // Show the active palette's name (incl. whatever Random rolled).
+            if let Some(pp) = &self.selected_palette {
+                ui.weak(palette_label(pp));
+            }
+        });
+        // Show the starred palettes alphabetically (by display name).
+        let mut favs = self.palette_favorites.clone();
+        favs.sort_by_key(|p| palette_label(p).to_lowercase());
+        ui.horizontal_wrapped(|ui| {
+            for fav in &favs {
+                let sel = self.selected_palette.as_deref() == Some(fav.as_path());
+                let resp = ui.selectable_label(sel, palette_label(fav));
+                if resp.clicked() {
+                    pick = Some(Some(fav.clone()));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("★ Unfavorite").clicked() {
+                        toggle_fav = Some(fav.clone());
+                        ui.close();
+                    }
+                });
+            }
+        });
+
+        egui::CollapsingHeader::new(format!("All palettes ({})", self.palette_files.len())).show(
+            ui,
+            |ui| {
+                for p in &self.palette_files {
+                    ui.horizontal(|ui| {
+                        // Star toggles favorite (gold = favorited, dim = not).
+                        let is_fav = self.palette_favorites.contains(p);
+                        let color = if is_fav {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        let star =
+                            egui::Button::new(egui::RichText::new("★").color(color)).frame(false);
+                        if ui
+                            .add(star)
+                            .on_hover_text(if is_fav {
+                                "Unfavorite"
+                            } else {
+                                "Favorite (add a quick button)"
+                            })
+                            .clicked()
+                        {
+                            toggle_fav = Some(p.clone());
+                        }
+                        let sel = self.selected_palette.as_deref() == Some(p.as_path());
+                        if ui.selectable_label(sel, palette_label(p)).clicked() {
+                            pick = Some(Some(p.clone()));
+                        }
+                    });
+                }
+            },
+        );
+        if let Some(sel) = pick {
+            // Selecting a palette (or Original) clears Random + Reduce.
+            self.selected_palette = sel;
+            self.custom_palette = None;
+            self.quantize_on = false;
+        }
+        if let Some(fp) = toggle_fav {
+            if let Some(pos) = self.palette_favorites.iter().position(|x| x == &fp) {
+                self.palette_favorites.remove(pos);
+            } else {
+                self.palette_favorites.push(fp);
+            }
         }
     }
 
@@ -44101,6 +44379,16 @@ impl eframe::App for Kaleidotron {
         // (ratings persist to their own JSON sidecar, not eframe storage)
         eframe::set_value(storage, Self::ADJUST_KEY, &self.adjust.to_array());
         eframe::set_value(storage, Self::ADJUST_ORDER_KEY, &self.adjust.order_to_u8());
+        eframe::set_value(
+            storage,
+            Self::RECOLOR_SECTIONS_KEY,
+            &self
+                .recolor_order
+                .iter()
+                .map(|s| *s as u8)
+                .collect::<Vec<u8>>(),
+        );
+        eframe::set_value(storage, Self::RECOLOR_OPEN_KEY, &self.recolor_open.to_vec());
         eframe::set_value(storage, Self::BLUR_KEY, &self.adjust.blur);
         eframe::set_value(storage, Self::IMG_ZOOM_KEY, &self.raster_zoom);
         eframe::set_value(storage, Self::ZOOM_LOCK_KEY, &self.zoom_lock);
@@ -47890,6 +48178,211 @@ fn drag_handle(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Response {
         }
     }
     resp.on_hover_cursor(egui::CursorIcon::Grab)
+}
+
+/// One collapsible section of the Recolor pane. Sections are drag-reorderable
+/// and their order + open state persist (`RECOLOR_SECTIONS_KEY` /
+/// `RECOLOR_OPEN_KEY`), so the pane keeps the layout you arranged.
+///
+/// Variants are **appended**, never reordered or removed — a persisted order is
+/// a list of these discriminants, same rule as `OpKind::ALL`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecolorSection {
+    Palette,
+    Cleaning,
+    Resize,
+    Adjustments,
+    Pixelate,
+    Balance,
+    PostFx,
+    Recolor,
+}
+
+impl RecolorSection {
+    /// The default top-to-bottom order (also the order the pipeline reads in).
+    const ALL: [RecolorSection; 8] = [
+        Self::Palette,
+        Self::Cleaning,
+        Self::Resize,
+        Self::Adjustments,
+        Self::Pixelate,
+        Self::Balance,
+        Self::PostFx,
+        Self::Recolor,
+    ];
+    const COUNT: usize = Self::ALL.len();
+
+    /// Stable id for the egui collapsing state (never the display index — that
+    /// moves when the user reorders).
+    fn id(self) -> &'static str {
+        match self {
+            Self::Palette => "palette",
+            Self::Cleaning => "cleaning",
+            Self::Resize => "resize",
+            Self::Adjustments => "adjustments",
+            Self::Pixelate => "pixelate",
+            Self::Balance => "color_balance",
+            Self::PostFx => "postfx",
+            Self::Recolor => "recolor",
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        Self::ALL.iter().copied().find(|s| *s as u8 == v)
+    }
+
+    /// Whether a section starts open on a fresh install.
+    fn default_open(self) -> bool {
+        matches!(
+            self,
+            Self::Palette | Self::Adjustments | Self::Balance | Self::Recolor
+        )
+    }
+}
+
+/// Rebuild a persisted Recolor-pane section order. Unknown ids (a section this
+/// build doesn't have) and duplicates are dropped, and any section missing from
+/// the saved order is **appended** — so a config written before a section
+/// existed still gains it, at the end, rather than losing it entirely.
+fn recolor_order_from(saved: &[u8]) -> Vec<RecolorSection> {
+    let mut out: Vec<RecolorSection> = Vec::with_capacity(RecolorSection::COUNT);
+    for &id in saved {
+        if let Some(s) = RecolorSection::from_u8(id) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    for s in RecolorSection::ALL {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Which Recolor-pane sections start expanded on a fresh install.
+fn default_recolor_open() -> [bool; RecolorSection::COUNT] {
+    let mut open = [false; RecolorSection::COUNT];
+    for s in RecolorSection::ALL {
+        open[s as usize] = s.default_open();
+    }
+    open
+}
+
+/// Rebuild the per-section expanded flags, indexed by section discriminant. A
+/// short saved record (written before a section existed) leaves the newer
+/// sections at their default.
+fn recolor_open_from(saved: &[bool]) -> [bool; RecolorSection::COUNT] {
+    let mut open = default_recolor_open();
+    for (slot, v) in open.iter_mut().zip(saved) {
+        *slot = *v;
+    }
+    open
+}
+
+/// Everything a Recolor-pane section needs to know about the image being
+/// edited — bundled so the section dispatcher stays a short call.
+struct RecolorCtx<'a> {
+    entry: &'a Entry,
+    /// The palette drawn as swatches: the active recolor palette, else the
+    /// image's own extracted one.
+    display: &'a Option<Vec<[u8; 4]>>,
+    /// The image's own extracted palette. `Some(None)` = it has more colours
+    /// than we swatch (`thumb::SWATCH_CAP`).
+    pal_state: &'a Option<Option<Vec<[u8; 4]>>>,
+    /// A palette map is active (a picked palette, Reduce, or a hand-edited set).
+    has_recolor: bool,
+}
+
+/// The deferred clicks from the Export/Save row — applied after the pane's
+/// `ScrollArea` closure releases its borrow of `self`.
+#[derive(Default)]
+struct ExportReq {
+    /// Export the shown palette as a `.gpl`: `(suggested name, colours)`.
+    gpl: Option<(String, Vec<[u8; 4]>)>,
+    /// Save the processed image; `true` = through a Save-As dialog.
+    save: Option<bool>,
+    /// Export the recolored image as textmode art.
+    textmode: bool,
+}
+
+/// What one `recolor_section` header reported back this frame.
+struct SectionHead {
+    /// The header row alone (grip + arrow + title).
+    rect: egui::Rect,
+    /// The open state AFTER this frame's click, for the caller to store.
+    open: bool,
+    /// The grip was just grabbed — start a reorder drag.
+    grabbed: bool,
+}
+
+/// A collapsible Recolor-pane section: `[grip] [▸] Title` over an indented body.
+///
+/// The open state is the CALLER's (a persisted flag), not egui's — that's what
+/// makes "Collapse all" stick and survive a restart, since
+/// `persist_egui_memory()` is false. So egui's state is forced to `open` before
+/// the header draws, and the post-click value comes back in `SectionHead::open`.
+/// Note that this means the header's own `clicked()` no longer toggles anything
+/// (see `CollapsingHeader::open`), which is why the label click is handled here.
+fn recolor_section(
+    ui: &mut egui::Ui,
+    key: &str,
+    title: &str,
+    open: bool,
+    body: impl FnOnce(&mut egui::Ui),
+) -> SectionHead {
+    let id = ui.make_persistent_id(("recolor_sec", key));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open);
+    state.set_open(open);
+    let mut grabbed = false;
+    let mut clicked = false;
+    // Reserve the hover highlight now so it paints UNDER the row (the zebra-stripe
+    // idiom from the Adjustments list).
+    let stripe = ui.painter().add(egui::Shape::Noop);
+    let head = ui.horizontal(|ui| {
+        let h = ui.spacing().interact_size.y;
+        grabbed = drag_handle(ui, 14.0, h).drag_started();
+        state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        // The whole rest of the row toggles, not just the words — a header you can
+        // only hit on its text reads as broken. Allocated as a bare click target,
+        // with the label painted into it by a NON-advancing `new_child` so it can't
+        // shorten the row (the `ui.put` cursor-advance gotcha).
+        let w = ui.available_width().max(1.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+        let mut cui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        cui.add(egui::Label::new(egui::RichText::new(title).strong()).selectable(false));
+        clicked = resp.clicked();
+        resp.on_hover_text("Click to collapse / expand · drag the grip to reorder the sections");
+    });
+    if ui.rect_contains_pointer(head.response.rect) {
+        ui.painter().set(
+            stripe,
+            egui::Shape::rect_filled(
+                head.response.rect,
+                2.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.20),
+            ),
+        );
+    }
+    if clicked {
+        state.toggle(ui);
+    }
+    state.show_body_indented(&head.response, ui, body);
+    // Read the state AFTER the body: an `Esc` inside a collapsible body can close it
+    // too, and that has to reach the caller's persisted flag or it snaps back open.
+    let open = state.is_open();
+    state.store(ui.ctx());
+    SectionHead {
+        rect: head.response.rect,
+        open,
+        grabbed,
+    }
 }
 
 /// While `resp` (a ComboBox header) holds the pointer, the mouse wheel steps
@@ -56195,6 +56688,84 @@ pub fn run_render(cli: &CliArgs) -> i32 {
 mod tests {
     use super::*;
 
+    // ----- Recolor-pane section layout (order + expanded state) -----
+
+    #[test]
+    fn recolor_section_ids_are_stable_and_unique() {
+        // The persisted order is a list of these discriminants, and the egui
+        // collapsing state is keyed by `id()` — both have to stay 1:1 with the
+        // variant, so a reorder of `ALL` can never silently remap someone's
+        // saved layout.
+        let mut ids: Vec<&str> = RecolorSection::ALL.iter().map(|s| s.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), RecolorSection::COUNT);
+        for s in RecolorSection::ALL {
+            assert_eq!(RecolorSection::from_u8(s as u8), Some(s));
+        }
+        assert_eq!(RecolorSection::from_u8(RecolorSection::COUNT as u8), None);
+        assert_eq!(RecolorSection::from_u8(200), None);
+    }
+
+    #[test]
+    fn recolor_order_round_trips_and_repairs() {
+        // A saved order comes back exactly as saved.
+        let saved: Vec<u8> = vec![
+            RecolorSection::Recolor as u8,
+            RecolorSection::Palette as u8,
+            RecolorSection::Adjustments as u8,
+        ];
+        let got = recolor_order_from(&saved);
+        assert_eq!(
+            &got[..3],
+            &[
+                RecolorSection::Recolor,
+                RecolorSection::Palette,
+                RecolorSection::Adjustments
+            ]
+        );
+        // …and every section missing from it is appended rather than lost, so a
+        // config written before a section existed still shows it.
+        assert_eq!(got.len(), RecolorSection::COUNT);
+        for s in RecolorSection::ALL {
+            assert!(got.contains(&s), "{s:?} dropped");
+        }
+        // Junk ids and duplicates are discarded, not rendered twice.
+        let messy = vec![
+            200,
+            RecolorSection::Resize as u8,
+            RecolorSection::Resize as u8,
+            99,
+        ];
+        let got = recolor_order_from(&messy);
+        assert_eq!(got[0], RecolorSection::Resize);
+        assert_eq!(got.len(), RecolorSection::COUNT);
+        // An empty/absent record is just the default order.
+        assert_eq!(recolor_order_from(&[]), RecolorSection::ALL.to_vec());
+    }
+
+    #[test]
+    fn recolor_open_defaults_fill_a_short_record() {
+        let def = default_recolor_open();
+        assert!(def[RecolorSection::Palette as usize]);
+        assert!(!def[RecolorSection::Cleaning as usize]);
+        // A record saved before a section existed leaves the newer ones at their
+        // default instead of silently collapsing them.
+        let short = vec![false; 2];
+        let got = recolor_open_from(&short);
+        assert!(!got[RecolorSection::Palette as usize]); // saved
+        assert_eq!(
+            got[RecolorSection::Recolor as usize],
+            def[RecolorSection::Recolor as usize] // untouched by the short record
+        );
+        // A full record wins outright — that's what makes "Collapse all" stick.
+        let all_closed = vec![false; RecolorSection::COUNT];
+        assert_eq!(
+            recolor_open_from(&all_closed),
+            [false; RecolorSection::COUNT]
+        );
+    }
+
     #[test]
     fn safe_name_neutralizes_path_traps() {
         // Ordinary DOS-style scene filenames survive untouched (extension dispatch relies
@@ -60308,6 +60879,67 @@ mod gui_tests {
     use super::*;
     use egui_kittest::kittest::Queryable; // brings get_by_label onto Harness
     use egui_kittest::Harness;
+
+    // Dev-only: render the Recolor pane's collapsible sections to PNGs (expanded,
+    // all-collapsed, and reordered) so the section layout can be eyeballed headlessly.
+    //   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json WGPU_BACKEND=vulkan \
+    //   PV_SHOT_DIR=/tmp/pv_shots cargo test --features gui-screenshots shoot_recolor -- --nocapture
+    #[cfg(feature = "gui-screenshots")]
+    #[test]
+    fn shoot_recolor_sections() {
+        let dir = std::env::var("PV_SHOT_DIR").unwrap_or_else(|_| "/tmp/pv_shots".to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = std::env::current_dir().unwrap().join("assets");
+        let mut harness = Harness::builder()
+            .with_size(egui::Vec2::new(1500.0, 980.0))
+            .wgpu()
+            .build_eframe(|cc| {
+                Kaleidotron::new(
+                    cc,
+                    CliArgs {
+                        folder: Some(folder.clone()),
+                        ..CliArgs::default()
+                    },
+                )
+            });
+        {
+            let st = harness.state_mut();
+            st.show_recolor = true;
+            // The pane acts on the inspected tile; there's no pointer here, so
+            // point it at a real image directly.
+            st.last_inspected = Some(folder.join("kaleidotron.png"));
+        }
+        let shot = |h: &mut Harness<'_, Kaleidotron>, name: &str| {
+            h.run_steps(8);
+            match h.render() {
+                Ok(img) => {
+                    img.save(format!("{dir}/{name}.png")).unwrap();
+                    eprintln!("wrote {dir}/{name}.png");
+                }
+                Err(e) => eprintln!("render {name} failed: {e}"),
+            }
+        };
+        shot(&mut harness, "recolor_default");
+        harness.state_mut().recolor_open = [true; RecolorSection::COUNT];
+        shot(&mut harness, "recolor_expanded");
+        harness.state_mut().recolor_open = [false; RecolorSection::COUNT];
+        shot(&mut harness, "recolor_collapsed");
+        // Reordered: Recolor and Cleaning pulled to the top.
+        harness.state_mut().recolor_order = vec![
+            RecolorSection::Recolor,
+            RecolorSection::Cleaning,
+            RecolorSection::Palette,
+            RecolorSection::Resize,
+            RecolorSection::Adjustments,
+            RecolorSection::Pixelate,
+            RecolorSection::Balance,
+            RecolorSection::PostFx,
+        ];
+        shot(&mut harness, "recolor_reordered");
+        // …and with only that first section open, so its body is visible.
+        harness.state_mut().recolor_open[RecolorSection::Recolor as usize] = true;
+        shot(&mut harness, "recolor_recolor_open");
+    }
 
     // Dev-only: render every Preferences section to a PNG so layout/styling can be eyeballed
     // headlessly (lavapipe software Vulkan, no display). Run with:
