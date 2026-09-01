@@ -28436,31 +28436,6 @@ impl Kaleidotron {
             {
                 self.reset_recolor();
             }
-            // Collapse / expand every section at once. Kept to two characters: this
-            // row already carries Apply-to-grid / Reset all / Bypass, and a worded
-            // "Collapse all" pushed Bypass off the end of a docked pane. Pinned to a
-            // fixed width so the ⊞/⊟ swap can't shove the row (the jiggle rule).
-            let all_open = self.recolor_open.iter().all(|b| *b);
-            let sz = fixed_btn_size(ui, &["⊞ All", "⊟ All"]);
-            let btn = egui::Button::new(if all_open { "⊟ All" } else { "⊞ All" }).min_size(sz);
-            let resp = ui.add(btn).on_hover_text(if all_open {
-                "Collapse every section below · right-click to restore the default \
-                 section order"
-            } else {
-                "Expand every section below · right-click to restore the default \
-                 section order"
-            });
-            if resp.clicked() {
-                // All open -> collapse everything; anything closed -> open everything.
-                self.recolor_open = [!all_open; RecolorSection::COUNT];
-            }
-            resp.context_menu(|ui| {
-                if ui.button("↕ Reset section order").clicked() {
-                    self.recolor_order = RecolorSection::ALL.to_vec();
-                    ui.close();
-                }
-            });
-
             // Bypass (flush-right): keep every setting but show the ORIGINAL — for A/B
             // eyeballing colour touch-ups. Highlighted yellow while on so it's obviously off.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -28559,10 +28534,11 @@ impl Kaleidotron {
                     self.want_repaint = true;
                 }
 
-                // ----- Export / save, kept directly under the preview so they stay
-                //       reachable without scrolling on a small screen, whatever the
-                //       sections below are collapsed to. -----
-                let req = self.ui_sec_export(ui, &entry.path, &display, recolor.is_some());
+                // ----- The pane toolbar: Export/Save on the left (kept directly under
+                //       the preview so they stay reachable on a small screen, whatever
+                //       the sections are collapsed to) + collapse/expand-all flush
+                //       right, over the sections it acts on. -----
+                let req = self.ui_recolor_toolbar(ui, &entry.path, &display, recolor.is_some());
                 do_export = req.gpl;
                 save_request = req.save;
                 ans_request = req.textmode;
@@ -28940,11 +28916,15 @@ impl Kaleidotron {
         }
     }
 
-    /// The Export/Save row. Deliberately NOT a collapsible section: it sits
-    /// directly under the preview so Save stays reachable on a small screen
-    /// whatever the sections below are collapsed to. The clicks are deferred
-    /// (the dialogs need `&mut self` back).
-    fn ui_sec_export(
+    /// The Recolor pane's toolbar row, sitting between the preview and the
+    /// sections: Export/Save on the left, collapse/expand-all flush right.
+    ///
+    /// Deliberately NOT one of the collapsible sections — Save has to stay
+    /// reachable on a small screen whatever is collapsed, and the collapse-all
+    /// button obviously can't live inside the thing it collapses. The row always
+    /// draws, even with no palette to export, so the toggle is always there.
+    /// Export clicks are deferred (the dialogs need `&mut self` back).
+    fn ui_recolor_toolbar(
         &mut self,
         ui: &mut egui::Ui,
         path: &Path,
@@ -28954,9 +28934,9 @@ impl Kaleidotron {
         let mut do_export: Option<(String, Vec<[u8; 4]>)> = None;
         let mut save_request: Option<bool> = None;
         let mut ans_request = false; // export the recolored image as ANSI art (.ans)
-        if let Some(d) = display {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if let Some(d) = display {
                 if ui.button("Export .GPL…").clicked() {
                     do_export = Some((short_name(path), d.clone()));
                 }
@@ -28990,8 +28970,47 @@ impl Kaleidotron {
                 {
                     ans_request = true;
                 }
+            }
+            // Collapse / expand every section, flush right over the sections it
+            // acts on. Styled like VSCode's Explorer toolbar — icon-only, and
+            // frameless until hovered — so it reads as chrome for the list below
+            // rather than as a fourth peer of Apply-to-grid / Reset all / Bypass
+            // (where a worded label also pushed Bypass off a docked pane).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let all_open = self.recolor_open.iter().all(|b| *b);
+                let glyph = if all_open {
+                    icons::COLLAPSE_ALL
+                } else {
+                    icons::EXPAND_ALL
+                };
+                // Pinned width: the two codicons need not share an advance, and a
+                // flush-right button that resizes drags the whole row (jiggle rule).
+                let sz = fixed_btn_size(ui, &[icons::COLLAPSE_ALL, icons::EXPAND_ALL]);
+                let resp = ui
+                    .add(
+                        egui::Button::new(glyph)
+                            .frame_when_inactive(false)
+                            .min_size(sz),
+                    )
+                    .on_hover_text(if all_open {
+                        "Collapse all sections · right-click to restore the default \
+                         section order"
+                    } else {
+                        "Expand all sections · right-click to restore the default \
+                         section order"
+                    });
+                if resp.clicked() {
+                    // All open -> collapse everything; anything closed -> open all.
+                    self.recolor_open = [!all_open; RecolorSection::COUNT];
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("↕ Reset section order").clicked() {
+                        self.recolor_order = RecolorSection::ALL.to_vec();
+                        ui.close();
+                    }
+                });
             });
-        }
+        });
         ExportReq {
             gpl: do_export,
             save: save_request,
@@ -45231,6 +45250,15 @@ mod icons {
     pub const ROBOT: &str = "\u{f06a9}"; // nf-md-robot (AI)
     pub const LOCK: &str = "\u{f033e}"; // nf-md-lock (pad key-lock, engaged)
     pub const LOCK_OPEN: &str = "\u{f033f}"; // nf-md-lock_open (pad key-lock, free)
+                                             // The two exceptions to the plane-15 rule above: these are Nerd Font's
+                                             // **Codicons** — VSCode's own icon set — so a collapse/expand-all toolbar
+                                             // button reads exactly like the one in VSCode's Explorer. They sit at U+EAxx/
+                                             // U+EBxx, low enough to be worth checking for shadowing, so it was checked:
+                                             // none of Ubuntu-Light / NotoEmoji / emoji-icon-font / Hack / DejaVu Sans has
+                                             // a glyph at either codepoint, so the Nerd Font fallback wins. Verify the same
+                                             // way before adding another (fonttools: `TTFont(p)['cmap'].getBestCmap()`).
+    pub const COLLAPSE_ALL: &str = "\u{eac5}"; // cod-collapse_all
+    pub const EXPAND_ALL: &str = "\u{eb95}"; // cod-expand_all
 }
 
 /// A `min_size` that fits the **widest** of `labels` at the current button style, so a button

@@ -546,7 +546,8 @@ The Recolor pane (`ui_recolor`) applies per-image **adjustments** then a **palet
 rematch**, and the *order* of all of it is user-controlled.
 
 - **Pane layout: 8 collapsible, drag-reorderable sections (`RecolorSection`).** Below the
-  always-visible preview + Export/Save row, the pane is a `for` loop over
+  always-visible preview + toolbar row (`ui_recolor_toolbar`: Export/Save on the left,
+  collapse/expand-all flush right — see below), the pane is a `for` loop over
   `self.recolor_order` — `Palette · N colors` (the swatch grid) / `Cleaning` (the JPEG-clean
   + de-block + undither checkboxes, grouped) / `Resize` / `Adjustments` / `Pixelate` /
   `Color balance` / `Post FX` / `Recolor` (Reduce + the palette chooser + dither + the
@@ -556,7 +557,8 @@ rematch**, and the *order* of all of it is user-controlled.
   value, e.g. `Resize *  · 320×200`) says a collapsed section is doing something.
   - **The open state is OURS, not egui's** — a `[bool; COUNT]` indexed by discriminant. It
     has to be: `persist_egui_memory()` is false (so egui's own collapsing state dies at
-    exit), and the header-row **⊞/⊟ All** button has to be able to force every section. So
+    exit), and the toolbar's **collapse/expand-all** button has to be able to force every
+    section. So
     `recolor_section` calls `state.set_open(open)` before drawing and hands the post-click
     value back in `SectionHead::open`. NB forcing `open` means the header's own `clicked()`
     no longer toggles anything (see `CollapsingHeader::open`), which is why the title label
@@ -565,12 +567,20 @@ rematch**, and the *order* of all of it is user-controlled.
     `recolor_section_drag` paints the insertion line and moves the section on release. The
     drop targets are whole sections (header + body, measured with `ui.cursor().top()`), so
     dragging over an expanded section lands where it looks like it should.
+  - **The toolbar row (`ui_recolor_toolbar`) is NOT one of the sections** — Save has to stay
+    reachable on a small screen whatever is collapsed, and the collapse-all button obviously
+    can't live inside the thing it collapses. It always draws (even with no palette to
+    export) so the toggle is always there. The button is flush right in a
+    `Layout::right_to_left`, directly over the sections it acts on, and styled like VSCode's
+    Explorer toolbar: icon-only (`icons::COLLAPSE_ALL`/`EXPAND_ALL`, the Codicons) and
+    `frame_when_inactive(false)` so it's frameless until hovered. It lived in the pane's
+    header row first, where a worded label pushed **Bypass** off the end of a docked pane.
   - **Persistence:** `RECOLOR_SECTIONS_KEY` (a `Vec<u8>` of discriminants) +
     `RECOLOR_OPEN_KEY` (a `Vec<bool>`), restored by the pure `recolor_order_from` /
     `recolor_open_from` (unit-tested). Variants are **appended, never reordered or removed** —
     an unknown id is dropped and a section missing from a saved order is *appended*, so a
     config written before a section existed gains it at the end rather than losing it. The
-    header button's right-click restores the default order; `⟲ Reset all` clears *settings*,
+    toolbar button's right-click restores the default order; `⟲ Reset all` clears *settings*,
     not the layout.
 
 - **`Adjust`** holds 12 value fields (brightness, contrast, gamma, shadows, highlights,
@@ -1470,6 +1480,12 @@ unchanged. Between them, **nothing we draw tofus.**
   FontAwesome-based, so a low codepoint gets **shadowed** (music note → "fi"). Plane-15 is
   untouchable by any other stacked font. Verify a new codepoint is in the font's cmap first
   (fonttools: `TTFont(path)['cmap']`; a venv one-liner — see git log).
+  **The one sanctioned exception** is `COLLAPSE_ALL`/`EXPAND_ALL` (U+EAC5/U+EB95), Nerd Font's
+  **Codicons** — VSCode's own icon set, so a collapse/expand-all toolbar button reads exactly
+  like the one in VSCode's Explorer. Those sit *below* the FontAwesome range, so shadowing was
+  checked explicitly and none of Ubuntu-Light / NotoEmoji / emoji-icon-font / Hack / DejaVu Sans
+  has a glyph at either codepoint. Check the same way (across every font in `apply_fonts`, not
+  just Nerd Font) before reaching outside plane 15 again.
 - **For a plain symbol**, a normal Unicode char (`·`/`…`/`×`/`★`) still just works via DejaVu.
 - Only ASCII (`*`) or a *painted* shape (see `drag_handle`'s dots) if something tofus even with
   both fallbacks (very new emoji / CJK / niche pictographs). When in doubt, test in the real app.
