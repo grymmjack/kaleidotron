@@ -1,13 +1,14 @@
 name: Release
 
-# Build standalone binaries for Linux, Windows and macOS (Apple Silicon).
+# Build standalone binaries for Linux, Windows and macOS (Apple Silicon + Intel).
 #
 # - Push a tag like `v0.1.0` → builds every target AND publishes a GitHub Release with the
 #   archives attached.
 # - Run manually (Actions → Release → Run workflow) → builds them and uploads the archives
 #   as downloadable workflow artifacts, but publishes nothing. Handy for a dry run.
 #
-# macOS is arm64 only (Apple Silicon) — Intel Macs are intentionally not targeted.
+# macOS builds both arm64 (Apple Silicon, native on macos-latest) and x86_64 (Intel, native
+# on macos-13 — the last Intel runner image; macos-14+ are all Apple Silicon).
 #
 # Cross-platform is near-zero-config: TLS is pure-Rust (ureq → rustls/ring, no system
 # OpenSSL); file dialogs use rfd's XDG-portal backend (no GTK dep); the vendored libxmp
@@ -100,30 +101,44 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build macos-arm64
-    runs-on: macos-latest # Apple Silicon
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon — native build on the arm64 runner image.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          # Intel — native build on macos-13, the last Intel-based runner
+          # (macos-14/15/latest are all Apple Silicon). Native avoids
+          # cross-arch C linking of the vendored libxmp (built by build.rs).
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x86_64
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: aarch64-apple-darwin
+          key: ${{ matrix.target }}
 
       - name: Build (release)
-        run: cargo build --release --locked --target aarch64-apple-darwin
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           version="${GITHUB_REF_NAME}"
           [ "${GITHUB_REF_TYPE}" = "tag" ] || version="dev"
-          stage="kaleidotron-${version}-macos-arm64"
+          stage="kaleidotron-${version}-${{ matrix.name }}"
           mkdir -p "$stage"
-          cp target/aarch64-apple-darwin/release/kaleidotron "$stage/"
+          cp "target/${{ matrix.target }}/release/kaleidotron" "$stage/"
           cp README.md "$stage/" 2>/dev/null || true
           tar -czf "${stage}.tar.gz" "$stage"
           echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
@@ -131,7 +146,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v6
         with:
-          name: macos-arm64
+          name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
