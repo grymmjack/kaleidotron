@@ -2061,12 +2061,16 @@ pub struct Kaleidotron {
     deblock_tv: f32,       // 0..1 edge-preserving diffusion (ringing/mosquito) amount
     deblock_tv_iters: u32, // diffusion iterations
     // Undither — reverse ordered/FS dithering back to smooth tone (see `undither.rs`).
-    undither_on: bool,       // master toggle ("Undither")
-    undither_edge: u32,      // Sobel gradient above which a pixel is a protected edge
-    undither_radius: u32,    // averaging window radius (px)
-    undither_strength: f32,  // 0..1 blend
-    undither_snap: bool,     // snap the smoothed field to the nearest source-palette colour
-    dither_method: u8,       // index into thumb::DITHER_NAMES (0 = none)
+    undither_on: bool,      // master toggle ("Undither")
+    undither_edge: u32,     // Sobel gradient above which a pixel is a protected edge
+    undither_radius: u32,   // averaging window radius (px)
+    undither_strength: f32, // 0..1 blend
+    undither_snap: bool,    // snap the smoothed field to the nearest source-palette colour
+    dither_method: u8,      // TRUE dither only: 0=None, 1..3 Bayer, 4 FS, 5 Atkinson, 6 Custom
+    // Terminal char-art CONVERTER, independent of `dither_method` (they compose: dither
+    // THEN convert). 0 = none; else one of thumb::DITHER_{ANSI,PETSCII,ASCII,ATASCII,
+    // APPLE,REXFONT,UNICODE} (7..=13, reusing those constants as the convert values).
+    convert_method: u8,
     dither_amount: f32,      // 0..1 dither strength
     dither_custom: Vec<u32>, // custom ordered-dither threshold matrix (row-major)
     dither_custom_n: usize,  // custom matrix dimension (n×n; 2/4/8)
@@ -3164,6 +3168,7 @@ impl Kaleidotron {
     const UNI_EXTRA_KEY: &'static str = "unicode_extra"; // String of extra ramp codepoints
     const UNI_FONT_KEY: &'static str = "unicode_font"; // UniFont: which font the ramp uses
     const DITHER_METHOD_KEY: &'static str = "dither_method";
+    const CONVERT_METHOD_KEY: &'static str = "convert_method";
     const DITHER_AMOUNT_KEY: &'static str = "dither_amount";
     const DITHER_CUSTOM_KEY: &'static str = "dither_custom";
     const DITHER_CUSTOM_N_KEY: &'static str = "dither_custom_n";
@@ -3885,10 +3890,22 @@ impl Kaleidotron {
             .and_then(|s| eframe::get_value::<usize>(s, Self::QUANT_N_KEY))
             .unwrap_or(16)
             .clamp(2, 256);
-        let dither_method = cc
+        let stored_dither = cc
             .storage
             .and_then(|s| eframe::get_value::<u8>(s, Self::DITHER_METHOD_KEY))
             .unwrap_or(0);
+        let stored_convert = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u8>(s, Self::CONVERT_METHOD_KEY));
+        // Migrate a pre-split config: `dither_method` used to also hold the char-art
+        // converters (7..=13). Move any such value into `convert_method` so live output
+        // is 1:1 (the true dither becomes None, the converter fires unchanged). A config
+        // written after the split has its own `convert_method` key and skips this.
+        let (dither_method, convert_method) = match stored_convert {
+            Some(cv) => (stored_dither, cv),
+            None if stored_dither >= crate::thumb::DITHER_ANSI => (0, stored_dither),
+            None => (stored_dither, 0),
+        };
         let dither_amount = cc
             .storage
             .and_then(|s| eframe::get_value::<f32>(s, Self::DITHER_AMOUNT_KEY))
@@ -4490,6 +4507,12 @@ impl Kaleidotron {
                     .and_then(|s| eframe::get_value::<Vec<FxPreset>>(s, Self::PIXELFX_KEY))
                     .unwrap_or_default();
                 merge_builtin_fx_presets(&mut v);
+                // Normalise pre-split presets (user-saved AND bundled) so their converter lives
+                // in `convert_method` — the working list, capture/save, and apply all see the
+                // post-split shape and render 1:1.
+                for p in &mut v {
+                    migrate_fx_preset(p);
+                }
                 v
             },
             pixelfx_name: String::new(),
@@ -4594,6 +4617,7 @@ impl Kaleidotron {
             ansi_preset_sel: None,
             ansi_preset_rename: None,
             dither_method,
+            convert_method,
             dither_amount,
             dither_custom,
             dither_custom_n,
@@ -22802,11 +22826,11 @@ impl Kaleidotron {
         // Bit-font (ATASCII / Apple ][) spec — only used when the mode is one of them; a cheap
         // empty default otherwise so the pass is a no-op.
         let (bf_font, bf_pool, bf_invert): (&'static [[u8; 8]], Vec<u16>, bool) = if matches!(
-            self.dither_method,
+            self.convert_method,
             crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
         ) {
             self.bitfont_spec()
-        } else if self.dither_method == crate::thumb::DITHER_REXFONT {
+        } else if self.convert_method == crate::thumb::DITHER_REXFONT {
             // REXPaint font reuses the bitfont slots: bitfont_pool = the enabled-glyph pool,
             // bitfont_invert = its inverse toggle.
             (&[], self.rexfont_pool(), self.rexfont_invert)
@@ -22815,6 +22839,7 @@ impl Kaleidotron {
         };
         PipeAux {
             dither_method: self.dither_method,
+            convert_method: self.convert_method,
             dither_amount: self.dither_amount,
             dither_custom: &self.dither_custom,
             dither_n: self.dither_custom_n,
@@ -22834,7 +22859,7 @@ impl Kaleidotron {
             shade_detail: self.shade_detail,
             // Effective cell + font. ASCII adopts its chosen font's native cell; ANSI shade goes in
             // precedence order: VGA50 (8×8) → snap 9×16 → Cell W/H (dither scale).
-            shade_cw: if self.dither_method == crate::thumb::DITHER_ASCII {
+            shade_cw: if self.convert_method == crate::thumb::DITHER_ASCII {
                 self.ascii_cell_dims().0
             } else if self.shade_vga50 {
                 8
@@ -22843,7 +22868,7 @@ impl Kaleidotron {
             } else {
                 dscale_x.max(1)
             },
-            shade_ch: if self.dither_method == crate::thumb::DITHER_ASCII {
+            shade_ch: if self.convert_method == crate::thumb::DITHER_ASCII {
                 self.ascii_cell_dims().1
             } else if self.shade_vga50 {
                 8
@@ -22870,7 +22895,7 @@ impl Kaleidotron {
             ascii_cs: self.ascii_charset(),
             ascii_color: self.ascii_color,
             ascii_invert: self.ascii_invert,
-            ascii_font: if self.dither_method == crate::thumb::DITHER_ASCII {
+            ascii_font: if self.convert_method == crate::thumb::DITHER_ASCII {
                 self.ascii_render_font().map(|(f, _)| f)
             } else {
                 None
@@ -22880,7 +22905,7 @@ impl Kaleidotron {
             bitfont_font: bf_font,
             bitfont_pool: bf_pool,
             // Apple II text was monochrome — force per-cell colour off there (uses the fg/bg chips).
-            bitfont_color: self.bitfont_color && self.dither_method != crate::thumb::DITHER_APPLE,
+            bitfont_color: self.bitfont_color && self.convert_method != crate::thumb::DITHER_APPLE,
             bitfont_invert: bf_invert,
             rexfont_sel: self.rexfont_sel,
             unicode_style: self.unicode_style,
@@ -22927,7 +22952,7 @@ impl Kaleidotron {
     /// The effective character-cell for the current mode — the ASCII font's cell when in ASCII mode,
     /// else the ANSI/shade cell. Drives `pipe_aux`, `build_ansi_grid`, and the viewer's char ruler.
     fn textmode_cell_dims(&self) -> (usize, usize) {
-        if self.dither_method == crate::thumb::DITHER_ASCII {
+        if self.convert_method == crate::thumb::DITHER_ASCII {
             self.ascii_cell_dims()
         } else {
             self.ansi_cell_dims()
@@ -23027,8 +23052,8 @@ impl Kaleidotron {
     /// (ANSI Shade or ASCII) — both build an [`crate::thumb::AnsiGrid`] and share the
     /// fit-to-chars sizing, cell dims, and the whole render/export path.
     fn is_ansi_grid_mode(&self) -> bool {
-        self.dither_method == crate::thumb::DITHER_ANSI
-            || self.dither_method == crate::thumb::DITHER_ASCII
+        self.convert_method == crate::thumb::DITHER_ANSI
+            || self.convert_method == crate::thumb::DITHER_ASCII
     }
 
     /// The resample target dims for a `w`×`h` pipeline buffer: the buffer scaled by
@@ -23242,6 +23267,7 @@ impl Kaleidotron {
             order: self.adjust.order_to_u8().to_vec(),
             postfx: self.postfx.to_record(),
             dither_method: self.dither_method,
+            convert_method: self.convert_method,
             dither_amount: self.dither_amount,
             dither_custom: self.dither_custom.clone(),
             dither_custom_n: self.dither_custom_n,
@@ -23357,7 +23383,12 @@ impl Kaleidotron {
         self.adjust = Adjust::from_array(p.adjust_vals).with_order(&p.order);
         self.adjust.blur = p.blur.clamp(0.0, 8.0);
         self.postfx = PostFx::from_record(&p.postfx);
-        self.dither_method = p.dither_method;
+        // Migrate a pre-split preset defensively: a char-art converter that used to live in
+        // `dither_method` moves to `convert_method` (the true dither becomes None) so it
+        // renders byte-identically. A post-split preset already carries `convert_method`.
+        let (dm, cm) = split_dither_convert(p.dither_method, p.convert_method);
+        self.dither_method = dm;
+        self.convert_method = cm;
         self.dither_amount = p.dither_amount.clamp(0.0, 1.0);
         self.dither_custom_n = if matches!(p.dither_custom_n, 2 | 4 | 8) {
             p.dither_custom_n
@@ -23502,18 +23533,10 @@ impl Kaleidotron {
         }
         !self.adjust.is_identity()
             || self.balance_offset() != [0, 0, 0]
-            || (self.dither_method != 0
-                && (self.dither_amount > 0.0
-                    || matches!(
-                        self.dither_method,
-                        crate::thumb::DITHER_ANSI
-                            | crate::thumb::DITHER_PETSCII
-                            | crate::thumb::DITHER_ASCII
-                            | crate::thumb::DITHER_ATASCII
-                            | crate::thumb::DITHER_APPLE
-                            | crate::thumb::DITHER_REXFONT
-                            | crate::thumb::DITHER_UNICODE
-                    )))
+            // A TRUE dither (needs amount > 0)…
+            || (self.dither_method != 0 && self.dither_amount > 0.0)
+            // …OR a char-art converter (independent of the dither).
+            || self.convert_method != 0
             || self.resize_active()
             || self.postfx.active()
             || self.pixelate_h >= 2.0 // vertical-only pixelate (width can be off)
@@ -23579,7 +23602,7 @@ impl Kaleidotron {
         };
         // ANSI-shade params must fold into the key too, or moving F1/F2/F3 / the
         // half-block / snap toggles won't invalidate the cached preview.
-        let ssig = if self.dither_method == crate::thumb::DITHER_ANSI {
+        let ssig = if self.convert_method == crate::thumb::DITHER_ANSI {
             format!(
                 "|A{:.3}:{:.3}:{:.3}:{}:{}:{}{}{}:{}:{:.3}:{}:{:.3}:{:.3}:iv{}:m{:x}|H{:?}:{:?}|Fit{}:{}x{}",
                 self.shade_f1,
@@ -23611,12 +23634,13 @@ impl Kaleidotron {
             String::new()
         };
         format!(
-            "{}|D{}:{:.2}:{dsig}:S{}x{}|B{},{},{}|R{}:{:.4}:{:.4}",
+            "{}|D{}:{:.2}:{dsig}:S{}x{}|C{}|B{},{},{}|R{}:{:.4}:{:.4}",
             self.adjust.key(),
             self.dither_method,
             self.dither_amount,
             self.dither_scale_x,
             self.dither_scale_y,
+            self.convert_method,
             off[0],
             off[1],
             off[2],
@@ -23629,7 +23653,7 @@ impl Kaleidotron {
             self.pixelate_h,
             self.scale_algo as u8
         ) + &ssig
-            + &if self.dither_method == crate::thumb::DITHER_PETSCII {
+            + &if self.convert_method == crate::thumb::DITHER_PETSCII {
                 format!(
                     "|P{}x{}:pu{:.3}:pg{}:bg{}:{}:pal{}:us{}:pk{:x}:m{:x}",
                     self.petscii_cols,
@@ -23651,7 +23675,7 @@ impl Kaleidotron {
             }
             // ASCII shares the ANSI fit/cell controls (via build_ansi_grid), so its key folds in
             // the range toggles + colour AND the fit/cell state that sets the working resolution.
-            + &if self.dither_method == crate::thumb::DITHER_ASCII {
+            + &if self.convert_method == crate::thumb::DITHER_ASCII {
                 format!(
                     "|Ah{}:c{}:bl{}:bx{}:col{}:iv{}:only{}:m{:x}:v{}:s{}:fnt{}|Fit{}:{}x{}",
                     self.ascii_high as u8,
@@ -23676,7 +23700,7 @@ impl Kaleidotron {
                 self.dither_method,
                 crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
             ) {
-                let mask = if self.dither_method == crate::thumb::DITHER_APPLE {
+                let mask = if self.convert_method == crate::thumb::DITHER_APPLE {
                     &self.apple_mask
                 } else {
                     &self.atascii_mask
@@ -23696,7 +23720,7 @@ impl Kaleidotron {
             } else {
                 String::new()
             }
-            + &if self.dither_method == crate::thumb::DITHER_REXFONT {
+            + &if self.convert_method == crate::thumb::DITHER_REXFONT {
                 // Fold the glyph mask in via a cheap rolling hash so toggling glyphs re-renders.
                 let mask_hash = self.rexfont_mask.iter().enumerate().fold(0u64, |acc, (i, &b)| {
                     if b { acc ^ (0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1)) } else { acc }
@@ -23708,7 +23732,7 @@ impl Kaleidotron {
             } else {
                 String::new()
             }
-            + &if self.dither_method == crate::thumb::DITHER_UNICODE {
+            + &if self.convert_method == crate::thumb::DITHER_UNICODE {
                 format!(
                     "|UNIs{}:c{}:inv{}:r{}:d{}:f{}:x{}",
                     self.unicode_style,
@@ -24091,6 +24115,7 @@ impl Kaleidotron {
         let (tw, th) = self.resize_target(w, h);
         let aux = PipeAux {
             dither_method: 0,
+            convert_method: 0,
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
@@ -24624,7 +24649,7 @@ impl Kaleidotron {
 
     fn bitfont_spec(&self) -> (&'static [[u8; 8]], Vec<u16>, bool) {
         let (font, pool, invert, mask): (&'static [[u8; 8]], Vec<u16>, bool, &Vec<bool>) =
-            if self.dither_method == crate::thumb::DITHER_APPLE {
+            if self.convert_method == crate::thumb::DITHER_APPLE {
                 let font = if self.apple_col80 {
                     crate::thumb::apple_font_80() // PR#3
                 } else {
@@ -24656,7 +24681,7 @@ impl Kaleidotron {
     /// The glyph-picker popup for the REXPaint-font converter (the shared picker over the selected
     /// font; default set = all glyphs).
     fn ui_rexfont_picker(&mut self, ctx: &egui::Context) {
-        if !self.rexfont_picker || self.dither_method != crate::thumb::DITHER_REXFONT {
+        if !self.rexfont_picker || self.convert_method != crate::thumb::DITHER_REXFONT {
             return;
         }
         let Some(font) = crate::decode::rexfont::rexfont(self.rexfont_sel) else {
@@ -24685,7 +24710,7 @@ impl Kaleidotron {
 
     /// PETSCII glyph picker (over the C64 ROM font page; default set = all glyphs).
     fn ui_petscii_picker(&mut self, ctx: &egui::Context) {
-        if !self.petscii_picker || self.dither_method != crate::thumb::DITHER_PETSCII {
+        if !self.petscii_picker || self.convert_method != crate::thumb::DITHER_PETSCII {
             return;
         }
         let page = self.petscii_page.min(1);
@@ -24710,7 +24735,7 @@ impl Kaleidotron {
 
     /// ATASCII glyph picker (over the Atari ROM font; default set = all glyphs).
     fn ui_atascii_picker(&mut self, ctx: &egui::Context) {
-        if !self.atascii_picker || self.dither_method != crate::thumb::DITHER_ATASCII {
+        if !self.atascii_picker || self.convert_method != crate::thumb::DITHER_ATASCII {
             return;
         }
         let font = crate::decode::rexfont::GlyphFont::from_8x8(&crate::decode::ATASCII_FONT);
@@ -24734,7 +24759,7 @@ impl Kaleidotron {
 
     /// Apple ][ glyph picker (text + MouseText; default = all text glyphs, MouseText per its toggle).
     fn ui_apple_picker(&mut self, ctx: &egui::Context) {
-        if !self.apple_picker || self.dither_method != crate::thumb::DITHER_APPLE {
+        if !self.apple_picker || self.convert_method != crate::thumb::DITHER_APPLE {
             return;
         }
         let src = if self.apple_col80 {
@@ -24766,7 +24791,7 @@ impl Kaleidotron {
     /// ASCII glyph picker (over the CP437 font; default set = all glyphs — the range toggles /
     /// "Use only chars" still narrow the pool, and the mask intersects that).
     fn ui_ascii_picker(&mut self, ctx: &egui::Context) {
-        if !self.ascii_picker || self.dither_method != crate::thumb::DITHER_ASCII {
+        if !self.ascii_picker || self.convert_method != crate::thumb::DITHER_ASCII {
             return;
         }
         // Show the glyphs of the ACTUAL render font (CP437 / REXPaint / TTF), so the mask lines up
@@ -24804,7 +24829,7 @@ impl Kaleidotron {
     /// CODEPOINT (robust to range changes), so the picker maps a per-frame mask ↔ the disabled set.
     fn ui_unicode_picker(&mut self, ctx: &egui::Context) {
         if !self.unicode_picker
-            || self.dither_method != crate::thumb::DITHER_UNICODE
+            || self.convert_method != crate::thumb::DITHER_UNICODE
             || self.unicode_style != crate::thumb::UNI_RAMP
         {
             return;
@@ -24853,7 +24878,7 @@ impl Kaleidotron {
     /// what the shade matcher already uses — so it's a no-op until you customize; the matcher only
     /// considers those glyphs, so enabling others has no effect (noted in the window).
     fn ui_ansi_picker(&mut self, ctx: &egui::Context) {
-        if !self.ansi_picker || self.dither_method != crate::thumb::DITHER_ANSI {
+        if !self.ansi_picker || self.convert_method != crate::thumb::DITHER_ANSI {
             return;
         }
         // The default set: only the block glyphs enabled.
@@ -25081,7 +25106,7 @@ impl Kaleidotron {
         apply_pipeline(&mut work, tw, th, &self.adjust.order, &self.adjust, &aux);
         // ASCII and ANSI Shade both produce an AnsiGrid (so they share this build + the whole
         // render/export path); they differ only in the cell→glyph decision.
-        let grid = if self.dither_method == crate::thumb::DITHER_ASCII {
+        let grid = if self.convert_method == crate::thumb::DITHER_ASCII {
             let font = self.ascii_render_font().map(|(f, _)| f).unwrap_or_else(|| {
                 std::sync::Arc::new(crate::thumb::cp437_glyphfont(font_8x8).clone())
             });
@@ -25124,7 +25149,7 @@ impl Kaleidotron {
         };
         let mut grid = grid;
         // ANSI Shade inverse video: swap each cell's fg/bg. (ASCII does its own invert internally.)
-        if self.dither_method == crate::thumb::DITHER_ANSI && self.shade_invert {
+        if self.convert_method == crate::thumb::DITHER_ANSI && self.shade_invert {
             for c in &mut grid.cells {
                 std::mem::swap(&mut c.fg, &mut c.bg);
             }
@@ -25165,7 +25190,7 @@ impl Kaleidotron {
         let (w, h, mut rgba) = self.scale_source(cw, ch, rgba);
         let size = [w, h];
         // PETSCII preview: build the C64 char grid + render it (its own converter/palette).
-        if self.dither_method == crate::thumb::DITHER_PETSCII {
+        if self.convert_method == crate::thumb::DITHER_PETSCII {
             let grid = self.build_petscii_grid(w, h, &rgba);
             let (pw, ph, px) = crate::thumb::petscii_render(&grid, &self.petscii_pal16);
             let tt =
@@ -25177,13 +25202,13 @@ impl Kaleidotron {
         // export uses, then render its glyphs — so what the viewer shows is exactly the
         // `.ans`/`.xb`/`.tnd` that gets written. (Every other dither method stays on the
         // generic resized pipeline below.)
-        if self.dither_method == crate::thumb::DITHER_ANSI
-            || self.dither_method == crate::thumb::DITHER_ASCII
+        if self.convert_method == crate::thumb::DITHER_ANSI
+            || self.convert_method == crate::thumb::DITHER_ASCII
         {
             if let Some(pal) = palette {
                 let (grid, mut work, tw, th, font_8x8) = self.build_ansi_grid(w, h, &rgba, pal);
                 // ASCII can render through a chosen font (REXPaint / TTF); ANSI shade stays CP437.
-                match (self.dither_method == crate::thumb::DITHER_ASCII)
+                match (self.convert_method == crate::thumb::DITHER_ASCII)
                     .then(|| self.ascii_render_font())
                     .flatten()
                 {
@@ -28060,6 +28085,7 @@ impl Kaleidotron {
         self.quantize_n = 16;
         self.quantize_keep_bw = false;
         self.dither_method = 0;
+        self.convert_method = 0;
         self.dither_amount = 1.0;
         self.dither_custom_n = 4;
         self.dither_custom = crate::thumb::bayer_values(4);
@@ -28730,6 +28756,26 @@ impl Kaleidotron {
                     "Recolor".to_string()
                 }
             }
+            RecolorSection::Dither => {
+                if self.dither_method != 0 && self.dither_amount > 0.0 {
+                    format!(
+                        "Dither *  · {}",
+                        crate::thumb::DITHER_NAMES
+                            .get(self.dither_method as usize)
+                            .copied()
+                            .unwrap_or("None")
+                    )
+                } else {
+                    "Dither".to_string()
+                }
+            }
+            RecolorSection::Convert => {
+                if self.convert_method != 0 {
+                    format!("Convert *  · {}", convert_method_name(self.convert_method))
+                } else {
+                    "Convert".to_string()
+                }
+            }
         }
     }
 
@@ -28768,7 +28814,9 @@ impl Kaleidotron {
             RecolorSection::Pixelate => self.ui_sec_pixelate(ui),
             RecolorSection::Balance => self.ui_sec_balance(ui),
             RecolorSection::PostFx => self.ui_sec_postfx(ui),
-            RecolorSection::Recolor => self.ui_sec_recolor(ui, &entry.path, pal_state, has_recolor),
+            RecolorSection::Recolor => self.ui_sec_recolor(ui, pal_state),
+            RecolorSection::Dither => self.ui_sec_dither(ui, &entry.path, has_recolor),
+            RecolorSection::Convert => self.ui_sec_convert(ui, &entry.path, has_recolor),
         });
         self.recolor_open[sec as usize] = head.open;
         if head.grabbed {
@@ -28972,8 +29020,8 @@ impl Kaleidotron {
                 // Export as textmode art. ANSI needs a palette; PETSCII brings its own
                 // (VIC-II) + formats (.petmate/.seq/.json/.png), so it's allowed too.
                 if (has_recolor
-                    || self.dither_method == crate::thumb::DITHER_PETSCII
-                    || self.dither_method == crate::thumb::DITHER_UNICODE)
+                    || self.convert_method == crate::thumb::DITHER_PETSCII
+                    || self.convert_method == crate::thumb::DITHER_UNICODE)
                     && ui
                         .button("Export textmode")
                         .on_hover_text(
@@ -29784,13 +29832,7 @@ impl Kaleidotron {
 
     /// Recolor pane § Recolor: Reduce, the palette chooser, dither and the
     /// textmode/ASCII export options.
-    fn ui_sec_recolor(
-        &mut self,
-        ui: &mut egui::Ui,
-        path: &Path,
-        pal_state: &Option<Option<Vec<[u8; 4]>>>,
-        has_recolor: bool,
-    ) {
+    fn ui_sec_recolor(&mut self, ui: &mut egui::Ui, pal_state: &Option<Option<Vec<[u8; 4]>>>) {
         // ----- Recolor controls (palette-swap / reduce) -----
         let has_own_palette = matches!(pal_state, Some(Some(_)));
         // Reduce works on ANY image: with an extractable palette it
@@ -29898,59 +29940,128 @@ impl Kaleidotron {
                 );
         });
         self.quantize_n = self.quantize_n.clamp(2, 256);
-
-        ui.add_space(4.0);
-        // ----- Dither (a movable pipeline op — the "Dither" row in
-        //       Adjustments picks *where* it applies). Above the palette
-        //       chooser, always visible. -----
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label("Dither");
-            let mut m = self.dither_method as usize;
+            ui.weak("Palettes");
+            if ui
+                .button("🎲 Random")
+                .on_hover_text("Pick a random palette from your library")
+                .clicked()
+                && !self.palette_files.is_empty()
+            {
+                let n = self.palette_files.len();
+                let mut idx = random_index(n);
+                // Avoid re-picking the one that's already selected.
+                if n > 1
+                    && self.selected_palette.as_deref() == Some(self.palette_files[idx].as_path())
+                {
+                    idx = (idx + 1) % n;
+                }
+                let chosen = self.palette_files[idx].clone();
+                self.status = format!("Random palette: {}", palette_label(&chosen));
+                self.selected_palette = Some(chosen);
+                self.custom_palette = None;
+                self.quantize_on = false;
+            }
+            // Show the active palette's name (incl. whatever Random rolled).
+            if let Some(pp) = &self.selected_palette {
+                ui.weak(palette_label(pp));
+            }
+        });
+        // Show the starred palettes alphabetically (by display name).
+        let mut favs = self.palette_favorites.clone();
+        favs.sort_by_key(|p| palette_label(p).to_lowercase());
+        ui.horizontal_wrapped(|ui| {
+            for fav in &favs {
+                let sel = self.selected_palette.as_deref() == Some(fav.as_path());
+                let resp = ui.selectable_label(sel, palette_label(fav));
+                if resp.clicked() {
+                    pick = Some(Some(fav.clone()));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("★ Unfavorite").clicked() {
+                        toggle_fav = Some(fav.clone());
+                        ui.close();
+                    }
+                });
+            }
+        });
+
+        egui::CollapsingHeader::new(format!("All palettes ({})", self.palette_files.len())).show(
+            ui,
+            |ui| {
+                for p in &self.palette_files {
+                    ui.horizontal(|ui| {
+                        // Star toggles favorite (gold = favorited, dim = not).
+                        let is_fav = self.palette_favorites.contains(p);
+                        let color = if is_fav {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        let star =
+                            egui::Button::new(egui::RichText::new("★").color(color)).frame(false);
+                        if ui
+                            .add(star)
+                            .on_hover_text(if is_fav {
+                                "Unfavorite"
+                            } else {
+                                "Favorite (add a quick button)"
+                            })
+                            .clicked()
+                        {
+                            toggle_fav = Some(p.clone());
+                        }
+                        let sel = self.selected_palette.as_deref() == Some(p.as_path());
+                        if ui.selectable_label(sel, palette_label(p)).clicked() {
+                            pick = Some(Some(p.clone()));
+                        }
+                    });
+                }
+            },
+        );
+        if let Some(sel) = pick {
+            // Selecting a palette (or Original) clears Random + Reduce.
+            self.selected_palette = sel;
+            self.custom_palette = None;
+            self.quantize_on = false;
+        }
+        if let Some(fp) = toggle_fav {
+            if let Some(pos) = self.palette_favorites.iter().position(|x| x == &fp) {
+                self.palette_favorites.remove(pos);
+            } else {
+                self.palette_favorites.push(fp);
+            }
+        }
+    }
+
+    /// The **Dither** lane — TRUE pixel dithering only (None / Bayer / Floyd–Steinberg /
+    /// Atkinson / Custom), independent of the Convert lane. `dither_method` holds 0..=6 here;
+    /// the char-art converters moved to `ui_sec_convert`.
+    fn ui_sec_dither(&mut self, ui: &mut egui::Ui, path: &Path, has_recolor: bool) {
+        ui.horizontal(|ui| {
+            ui.label("Dither").on_hover_text(
+                "Pixel dithering: an ordered (Bayer / Custom) bias or error diffusion\n\
+                 (Floyd–Steinberg / Atkinson). Independent of Convert — a dither runs\n\
+                 first, then any converter. It applies at the movable \"Dither\" row in the\n\
+                 Adjustments list.",
+            );
+            // Only the TRUE dithers (0..=6 = None..Custom); the converters live in Convert.
+            let names = &crate::thumb::DITHER_NAMES[0..=crate::thumb::DITHER_CUSTOM as usize];
+            let mut m = (self.dither_method as usize).min(names.len() - 1);
             let cr = eat_scroll(
                 egui::ComboBox::from_id_salt("dither_method")
-                    .selected_text(crate::thumb::DITHER_NAMES.get(m).copied().unwrap_or("None"))
+                    .selected_text(names.get(m).copied().unwrap_or("None"))
                     .show_ui(ui, |ui| {
-                        for (i, name) in crate::thumb::DITHER_NAMES.iter().enumerate() {
+                        for (i, name) in names.iter().enumerate() {
                             ui.selectable_value(&mut m, i, *name);
                         }
                     }),
             );
-            wheel_cycle(ui, &cr, &mut m, crate::thumb::DITHER_NAMES.len());
-            let prev = self.dither_method;
+            wheel_cycle(ui, &cr, &mut m, names.len());
             self.dither_method = m as u8;
-            // Usability: ANSI Shade draws in PALETTE colours, so with nothing
-            // providing any it silently does nothing. When the user switches TO
-            // ANSI Shade and no palette / Reduce is active, auto-enable Reduce → 16
-            // (an ANSI-appropriate default) so it works on the spot — they can then
-            // pick a palette or change N from there.
-            // The palette-coloured char modes (ANSI/ASCII/ATASCII/Apple) auto-enable
-            // Reduce → 16 when switched to with nothing providing colours.
-            if matches!(
-                self.dither_method,
-                crate::thumb::DITHER_ANSI
-                    | crate::thumb::DITHER_ASCII
-                    | crate::thumb::DITHER_ATASCII
-                    | crate::thumb::DITHER_APPLE
-                    | crate::thumb::DITHER_REXFONT
-            ) && prev != self.dither_method
-                && self.custom_palette.is_none()
-                && self.selected_palette.is_none()
-                && !self.quantize_on
-            {
-                self.quantize_on = true;
-                self.quantize_n = 16;
-                self.quantize_cache = None;
-                self.reduce_src = None;
-            }
-            // Switching TO PETSCII: auto-select the matching C64 palette so the
-            // export/save buttons appear (they need an active palette) and the
-            // Colors swatches match the converter's colours.
-            if self.dither_method == crate::thumb::DITHER_PETSCII
-                && prev != crate::thumb::DITHER_PETSCII
-                && !self.petscii_use_selected
-            {
-                self.petscii_sync_selected_palette();
-            }
         });
         // "Amount" applies only to the ordered/error-diffusion methods (1..=6);
         // ANSI Shade, PETSCII and ASCII are hard converters that ignore it.
@@ -29962,84 +30073,124 @@ impl Kaleidotron {
                 wheel_adjust(ui, &resp, &mut self.dither_amount, 0.05, 0.0f32, 1.0f32);
             });
         }
-        // Cell scale — only meaningful for the ordered (Bayer/custom) methods;
-        // error-diffusion has no fixed cell. Per-axis (Width×Height) like the
-        // Resize panel, since art isn't always square; enlarges each cell so a
-        // Bayer pattern reads as a proper crosshatch on high-res art, not noise.
-        // Cell W/H apply to the ordered methods, and to ANSI Shade only
-        // when neither snap (9×16 / 8×8 VGA50) is on (else the cell is fixed).
-        if matches!(self.dither_method, 1..=3)
-            || self.dither_method == crate::thumb::DITHER_CUSTOM
-            || (self.is_ansi_grid_mode() && !self.shade_snap916 && !self.shade_vga50)
+        // Cell W/H is only meaningful for the ordered (Bayer / Custom) dithers — error
+        // diffusion has no fixed cell. (ANSI Shade shows the same control in Convert.)
+        if matches!(self.dither_method, 1..=3) || self.dither_method == crate::thumb::DITHER_CUSTOM
         {
-            // Width (cell X); a locked cell mirrors it to height.
-            let mut sx = self.dither_scale_x;
+            self.ui_dither_cell(ui, path);
+        }
+        if matches!(self.dither_method, 4 | 5) && !has_recolor {
+            ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
+        }
+        if self.dither_method == crate::thumb::DITHER_CUSTOM {
             ui.horizontal(|ui| {
-                ui.label("Cell W")
-                    .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
-                let resp = ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
-                middle_reset(ui, &resp, &mut sx, 1usize);
-                wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
-            });
-            if sx != self.dither_scale_x {
-                self.dither_scale_x = sx;
-                if self.dither_scale_lock {
-                    self.dither_scale_y = sx;
-                }
-            }
-            // Height (cell Y).
-            let mut sy = self.dither_scale_y;
-            ui.horizontal(|ui| {
-                ui.label("Cell H")
-                    .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
-                let resp = ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
-                middle_reset(ui, &resp, &mut sy, 1usize);
-                wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
-            });
-            if sy != self.dither_scale_y {
-                self.dither_scale_y = sy;
-                if self.dither_scale_lock {
-                    self.dither_scale_x = sy;
-                }
-            }
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.dither_scale_lock, "🔒 Lock")
-                    .on_hover_text("Keep the dither cell square")
-                    .clicked()
-                {
-                    self.dither_scale_lock = !self.dither_scale_lock;
-                    if self.dither_scale_lock {
-                        self.dither_scale_y = self.dither_scale_x; // unify on lock
+                ui.label("Matrix");
+                for sz in [2usize, 4, 8] {
+                    if ui
+                        .selectable_label(self.dither_custom_n == sz, format!("{sz}×{sz}"))
+                        .clicked()
+                    {
+                        self.dither_custom_n = sz;
+                        self.dither_custom = crate::thumb::bayer_values(sz);
                     }
                 }
-                // Detect the art's native pixel size (per-axis) + match the cell.
                 if ui
-                    .button("Auto")
-                    .on_hover_text(
-                        "Pick a dither cell for this art: its pixel grid (per axis) \
-                         if it's upscaled pixel art, else scaled to the resolution \
-                         so the pattern reads on hi-res art.",
-                    )
+                    .button("Bayer")
+                    .on_hover_text("Reseed the cells with the Bayer pattern")
                     .clicked()
                 {
-                    if let Some((ax, ay)) = self.detect_dither_scale(path) {
-                        // Locked → keep it square (the coarser of the two).
-                        let (ax, ay) = if self.dither_scale_lock {
-                            let s = ax.max(ay);
-                            (s, s)
-                        } else {
-                            (ax, ay)
-                        };
-                        self.dither_scale_x = ax;
-                        self.dither_scale_y = ay;
-                        self.status = format!("Auto dither cell: {ax}×{ay}px");
-                    }
+                    self.dither_custom = crate::thumb::bayer_values(self.dither_custom_n);
                 }
             });
+            let n = self.dither_custom_n;
+            let hi = (n * n - 1) as u32;
+            ui.weak(format!("cell thresholds 0..={hi} — higher = brighter bias"));
+            if self.dither_custom.len() != n * n {
+                self.dither_custom = crate::thumb::bayer_values(n);
+            }
+            egui::Grid::new("dither_matrix")
+                .spacing([3.0, 3.0])
+                .show(ui, |ui| {
+                    for y in 0..n {
+                        for x in 0..n {
+                            let cell = &mut self.dither_custom[y * n + x];
+                            ui.add(egui::DragValue::new(cell).range(0..=hi).speed(0.1));
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+
+    /// The **Convert** lane — a terminal char-art converter (ANSI Shade / PETSCII / ASCII /
+    /// ATASCII / Apple ][ / REXPaint / Unicode), independent of the Dither lane. `convert_method`
+    /// is 0 (none) or one of the `thumb::DITHER_*` converter constants; it runs at the Dither
+    /// slot AFTER the pixel dither, so the two compose.
+    fn ui_sec_convert(&mut self, ui: &mut egui::Ui, path: &Path, has_recolor: bool) {
+        let _ = has_recolor;
+        ui.horizontal(|ui| {
+            ui.label("Convert").on_hover_text(
+                "Convert the (optionally dithered) image into character art. Independent of\n\
+                 Dither — pick a pixel dither AND a converter and they compose. ANSI/ASCII/\n\
+                 ATASCII/Apple/REXPaint colour from the active palette (auto-enables Reduce);\n\
+                 PETSCII and Unicode bring their own colours.",
+            );
+            let mut chosen = self.convert_method;
+            let cr = eat_scroll(
+                egui::ComboBox::from_id_salt("convert_method")
+                    .selected_text(convert_method_name(chosen))
+                    .show_ui(ui, |ui| {
+                        for (val, name) in CONVERT_ENTRIES {
+                            ui.selectable_value(&mut chosen, val, name);
+                        }
+                    }),
+            );
+            // Mouse-wheel cycles through the entries by position.
+            let mut idx = CONVERT_ENTRIES
+                .iter()
+                .position(|(v, _)| *v == chosen)
+                .unwrap_or(0);
+            wheel_cycle(ui, &cr, &mut idx, CONVERT_ENTRIES.len());
+            chosen = CONVERT_ENTRIES[idx.min(CONVERT_ENTRIES.len() - 1)].0;
+            let prev = self.convert_method;
+            self.convert_method = chosen;
+            // The palette-coloured char converters (ANSI/ASCII/ATASCII/Apple/REXPaint) draw in
+            // PALETTE colours, so with nothing providing any they silently do nothing. Switching
+            // TO one with no palette / Reduce active auto-enables Reduce → 16 (a sensible default).
+            if matches!(
+                self.convert_method,
+                crate::thumb::DITHER_ANSI
+                    | crate::thumb::DITHER_ASCII
+                    | crate::thumb::DITHER_ATASCII
+                    | crate::thumb::DITHER_APPLE
+                    | crate::thumb::DITHER_REXFONT
+            ) && prev != self.convert_method
+                && self.custom_palette.is_none()
+                && self.selected_palette.is_none()
+                && !self.quantize_on
+            {
+                self.quantize_on = true;
+                self.quantize_n = 16;
+                self.quantize_cache = None;
+                self.reduce_src = None;
+            }
+            // Switching TO PETSCII: auto-select the matching C64 palette so the export/save
+            // buttons appear (they need an active palette) and the Colors swatches match.
+            if self.convert_method == crate::thumb::DITHER_PETSCII
+                && prev != crate::thumb::DITHER_PETSCII
+                && !self.petscii_use_selected
+            {
+                self.petscii_sync_selected_palette();
+            }
+        });
+        // ANSI Shade / ASCII render on a character grid whose cell size the Cell W/H control
+        // sets (when neither snap is on). Same fields as the Dither lane's cell — shown here
+        // because it shapes the converter output.
+        if self.is_ansi_grid_mode() && !self.shade_snap916 && !self.shade_vga50 {
+            self.ui_dither_cell(ui, path);
         }
         // ----- ANSI Shade controls (textmode shade-block rendering) -----
-        if self.dither_method == crate::thumb::DITHER_ANSI {
+        if self.convert_method == crate::thumb::DITHER_ANSI {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ANSI Shade").strong());
                 if ui
@@ -30377,7 +30528,7 @@ impl Kaleidotron {
             }
         }
         // ----- PETSCII controls (image → C64 hi-res char art) -----
-        if self.dither_method == crate::thumb::DITHER_PETSCII {
+        if self.convert_method == crate::thumb::DITHER_PETSCII {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("PETSCII").strong());
                 ui.weak("C64 hi-res char art");
@@ -30505,7 +30656,7 @@ impl Kaleidotron {
             });
         }
         // ----- ASCII controls (image → character-density art) -----
-        if self.dither_method == crate::thumb::DITHER_ASCII {
+        if self.convert_method == crate::thumb::DITHER_ASCII {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ASCII").strong());
                 ui.weak("brightness → character density");
@@ -30646,7 +30797,7 @@ impl Kaleidotron {
             }
         }
         // ----- ATASCII controls (image → Atari 8-bit character art) -----
-        if self.dither_method == crate::thumb::DITHER_ATASCII {
+        if self.convert_method == crate::thumb::DITHER_ATASCII {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ATASCII").strong());
                 ui.weak("Atari 8-bit character art");
@@ -30669,7 +30820,7 @@ impl Kaleidotron {
             }
         }
         // ----- Apple ][ controls (image → Apple II character art) -----
-        if self.dither_method == crate::thumb::DITHER_APPLE {
+        if self.convert_method == crate::thumb::DITHER_APPLE {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Apple ][").strong());
                 ui.weak("Apple II character art");
@@ -30701,7 +30852,7 @@ impl Kaleidotron {
             }
         }
         // ----- REXPaint-font controls (image → art in a bundled REXPaint font) -----
-        if self.dither_method == crate::thumb::DITHER_REXFONT {
+        if self.convert_method == crate::thumb::DITHER_REXFONT {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("REXPaint font").strong());
                 let f = crate::decode::rexfont::rexfont(self.rexfont_sel);
@@ -30762,7 +30913,7 @@ impl Kaleidotron {
             }
         }
         // ----- Unicode controls (image → UTF-8 text art) -----
-        if self.dither_method == crate::thumb::DITHER_UNICODE {
+        if self.convert_method == crate::thumb::DITHER_UNICODE {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Unicode").strong());
                 ui.weak("→ copy-pasteable UTF-8");
@@ -30928,143 +31079,77 @@ impl Kaleidotron {
                 }
             });
         }
-        if matches!(self.dither_method, 4 | 5) && !has_recolor {
-            ui.weak("(needs a palette / Reduce so it has colors to diffuse toward)");
-        }
-        if self.dither_method == crate::thumb::DITHER_CUSTOM {
-            ui.horizontal(|ui| {
-                ui.label("Matrix");
-                for sz in [2usize, 4, 8] {
-                    if ui
-                        .selectable_label(self.dither_custom_n == sz, format!("{sz}×{sz}"))
-                        .clicked()
-                    {
-                        self.dither_custom_n = sz;
-                        self.dither_custom = crate::thumb::bayer_values(sz);
-                    }
-                }
-                if ui
-                    .button("Bayer")
-                    .on_hover_text("Reseed the cells with the Bayer pattern")
-                    .clicked()
-                {
-                    self.dither_custom = crate::thumb::bayer_values(self.dither_custom_n);
-                }
-            });
-            let n = self.dither_custom_n;
-            let hi = (n * n - 1) as u32;
-            ui.weak(format!("cell thresholds 0..={hi} — higher = brighter bias"));
-            if self.dither_custom.len() != n * n {
-                self.dither_custom = crate::thumb::bayer_values(n);
-            }
-            egui::Grid::new("dither_matrix")
-                .spacing([3.0, 3.0])
-                .show(ui, |ui| {
-                    for y in 0..n {
-                        for x in 0..n {
-                            let cell = &mut self.dither_custom[y * n + x];
-                            ui.add(egui::DragValue::new(cell).range(0..=hi).speed(0.1));
-                        }
-                        ui.end_row();
-                    }
-                });
-        }
+    }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(2.0);
+    /// The dither/converter **cell size** control (Width × Height + Lock + Auto), shared by the
+    /// Dither lane (Bayer / Custom) and the Convert lane (ANSI Shade / ASCII). Edits the same
+    /// `dither_scale_x/y` fields, so where it is shown never changes the output.
+    fn ui_dither_cell(&mut self, ui: &mut egui::Ui, path: &Path) {
+        // Width (cell X); a locked cell mirrors it to height.
+        let mut sx = self.dither_scale_x;
         ui.horizontal(|ui| {
-            ui.weak("Palettes");
+            ui.label("Cell W")
+                .on_hover_text("Dither cell WIDTH in px — zoom the pattern horizontally");
+            let resp = ui.add(egui::Slider::new(&mut sx, 1..=16).suffix("px"));
+            middle_reset(ui, &resp, &mut sx, 1usize);
+            wheel_adjust(ui, &resp, &mut sx, 1.0, 1usize, 16usize);
+        });
+        if sx != self.dither_scale_x {
+            self.dither_scale_x = sx;
+            if self.dither_scale_lock {
+                self.dither_scale_y = sx;
+            }
+        }
+        // Height (cell Y).
+        let mut sy = self.dither_scale_y;
+        ui.horizontal(|ui| {
+            ui.label("Cell H")
+                .on_hover_text("Dither cell HEIGHT in px — zoom the pattern vertically");
+            let resp = ui.add(egui::Slider::new(&mut sy, 1..=16).suffix("px"));
+            middle_reset(ui, &resp, &mut sy, 1usize);
+            wheel_adjust(ui, &resp, &mut sy, 1.0, 1usize, 16usize);
+        });
+        if sy != self.dither_scale_y {
+            self.dither_scale_y = sy;
+            if self.dither_scale_lock {
+                self.dither_scale_x = sy;
+            }
+        }
+        ui.horizontal(|ui| {
             if ui
-                .button("🎲 Random")
-                .on_hover_text("Pick a random palette from your library")
+                .selectable_label(self.dither_scale_lock, "🔒 Lock")
+                .on_hover_text("Keep the dither cell square")
                 .clicked()
-                && !self.palette_files.is_empty()
             {
-                let n = self.palette_files.len();
-                let mut idx = random_index(n);
-                // Avoid re-picking the one that's already selected.
-                if n > 1
-                    && self.selected_palette.as_deref() == Some(self.palette_files[idx].as_path())
-                {
-                    idx = (idx + 1) % n;
+                self.dither_scale_lock = !self.dither_scale_lock;
+                if self.dither_scale_lock {
+                    self.dither_scale_y = self.dither_scale_x; // unify on lock
                 }
-                let chosen = self.palette_files[idx].clone();
-                self.status = format!("Random palette: {}", palette_label(&chosen));
-                self.selected_palette = Some(chosen);
-                self.custom_palette = None;
-                self.quantize_on = false;
             }
-            // Show the active palette's name (incl. whatever Random rolled).
-            if let Some(pp) = &self.selected_palette {
-                ui.weak(palette_label(pp));
+            // Detect the art's native pixel size (per-axis) + match the cell.
+            if ui
+                .button("Auto")
+                .on_hover_text(
+                    "Pick a dither cell for this art: its pixel grid (per axis) \
+                         if it's upscaled pixel art, else scaled to the resolution \
+                         so the pattern reads on hi-res art.",
+                )
+                .clicked()
+            {
+                if let Some((ax, ay)) = self.detect_dither_scale(path) {
+                    // Locked → keep it square (the coarser of the two).
+                    let (ax, ay) = if self.dither_scale_lock {
+                        let s = ax.max(ay);
+                        (s, s)
+                    } else {
+                        (ax, ay)
+                    };
+                    self.dither_scale_x = ax;
+                    self.dither_scale_y = ay;
+                    self.status = format!("Auto dither cell: {ax}×{ay}px");
+                }
             }
         });
-        // Show the starred palettes alphabetically (by display name).
-        let mut favs = self.palette_favorites.clone();
-        favs.sort_by_key(|p| palette_label(p).to_lowercase());
-        ui.horizontal_wrapped(|ui| {
-            for fav in &favs {
-                let sel = self.selected_palette.as_deref() == Some(fav.as_path());
-                let resp = ui.selectable_label(sel, palette_label(fav));
-                if resp.clicked() {
-                    pick = Some(Some(fav.clone()));
-                }
-                resp.context_menu(|ui| {
-                    if ui.button("★ Unfavorite").clicked() {
-                        toggle_fav = Some(fav.clone());
-                        ui.close();
-                    }
-                });
-            }
-        });
-
-        egui::CollapsingHeader::new(format!("All palettes ({})", self.palette_files.len())).show(
-            ui,
-            |ui| {
-                for p in &self.palette_files {
-                    ui.horizontal(|ui| {
-                        // Star toggles favorite (gold = favorited, dim = not).
-                        let is_fav = self.palette_favorites.contains(p);
-                        let color = if is_fav {
-                            egui::Color32::from_rgb(255, 200, 60)
-                        } else {
-                            ui.visuals().weak_text_color()
-                        };
-                        let star =
-                            egui::Button::new(egui::RichText::new("★").color(color)).frame(false);
-                        if ui
-                            .add(star)
-                            .on_hover_text(if is_fav {
-                                "Unfavorite"
-                            } else {
-                                "Favorite (add a quick button)"
-                            })
-                            .clicked()
-                        {
-                            toggle_fav = Some(p.clone());
-                        }
-                        let sel = self.selected_palette.as_deref() == Some(p.as_path());
-                        if ui.selectable_label(sel, palette_label(p)).clicked() {
-                            pick = Some(Some(p.clone()));
-                        }
-                    });
-                }
-            },
-        );
-        if let Some(sel) = pick {
-            // Selecting a palette (or Original) clears Random + Reduce.
-            self.selected_palette = sel;
-            self.custom_palette = None;
-            self.quantize_on = false;
-        }
-        if let Some(fp) = toggle_fav {
-            if let Some(pos) = self.palette_favorites.iter().position(|x| x == &fp) {
-                self.palette_favorites.remove(pos);
-            } else {
-                self.palette_favorites.push(fp);
-            }
-        }
     }
 
     /// A filename tag describing the active recolor, e.g. "EGA16", "EGA16_floyd",
@@ -31152,7 +31237,7 @@ impl Kaleidotron {
     /// Save-As dialog, mirroring the other exporters.
     fn export_textmode(&mut self, path: &Path) {
         // PETSCII has its own converter/palette + formats (.petmate/.seq/.json/.png).
-        if self.dither_method == crate::thumb::DITHER_PETSCII {
+        if self.convert_method == crate::thumb::DITHER_PETSCII {
             self.export_petscii(path);
             return;
         }
@@ -31167,7 +31252,7 @@ impl Kaleidotron {
             return;
         }
         // Unicode exports real UTF-8 text (.txt).
-        if self.dither_method == crate::thumb::DITHER_UNICODE {
+        if self.convert_method == crate::thumb::DITHER_UNICODE {
             self.export_unicode_text(path);
             return;
         }
@@ -31326,7 +31411,7 @@ impl Kaleidotron {
             }
         }
         apply_pipeline(&mut work, w, h, &self.adjust.order, &self.adjust, &aux);
-        let (cols, rows) = if self.dither_method == crate::thumb::DITHER_REXFONT {
+        let (cols, rows) = if self.convert_method == crate::thumb::DITHER_REXFONT {
             let font = crate::decode::rexfont::rexfont(self.rexfont_sel);
             let font = match font {
                 Some(f) => f,
@@ -31350,7 +31435,7 @@ impl Kaleidotron {
             (c, r)
         } else {
             let (font, pool, invert) = self.bitfont_spec();
-            let color = self.bitfont_color && self.dither_method != crate::thumb::DITHER_APPLE;
+            let color = self.bitfont_color && self.convert_method != crate::thumb::DITHER_APPLE;
             let grid = crate::thumb::bitfont_grid(
                 &work,
                 w,
@@ -31369,7 +31454,7 @@ impl Kaleidotron {
             (c, r)
         };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-        let kind = match self.dither_method {
+        let kind = match self.convert_method {
             m if m == crate::thumb::DITHER_APPLE => "apple",
             m if m == crate::thumb::DITHER_REXFONT => "rexpaint",
             _ => "atascii",
@@ -44524,6 +44609,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::UNI_EXTRA_KEY, &self.unicode_extra);
         eframe::set_value(storage, Self::UNI_FONT_KEY, &self.unicode_font);
         eframe::set_value(storage, Self::DITHER_METHOD_KEY, &self.dither_method);
+        eframe::set_value(storage, Self::CONVERT_METHOD_KEY, &self.convert_method);
         eframe::set_value(storage, Self::DITHER_AMOUNT_KEY, &self.dither_amount);
         eframe::set_value(storage, Self::DITHER_CUSTOM_KEY, &self.dither_custom);
         eframe::set_value(storage, Self::DITHER_CUSTOM_N_KEY, &self.dither_custom_n);
@@ -45819,14 +45905,17 @@ impl Adjust {
 /// the custom matrix), the per-channel color-balance offset, and the palette to snap
 /// to (the Palette op, and error-diffusion dither, both use it).
 struct PipeAux<'a> {
-    dither_method: u8,
+    dither_method: u8, // TRUE dither only (0..=6); the converter is `convert_method`
+    // Terminal char-art converter (0 = none, else DITHER_{ANSI,PETSCII,…}). Runs at the
+    // Dither slot AFTER the true dither, so a dither + a converter compose.
+    convert_method: u8,
     dither_amount: f32,
     dither_custom: &'a [u32],
     dither_n: usize,
     dither_scale_x: usize, // ordered-dither cell width in pixels (≥1)
     dither_scale_y: usize, // ordered-dither cell height in pixels (≥1)
     // ANSI Shade params + the *effective* cell size (9×16 when snap is on, else the
-    // dither cell). Only consulted when dither_method == DITHER_ANSI.
+    // dither cell). Only consulted when convert_method == DITHER_ANSI.
     shade_f1: f32,
     shade_f2: f32,
     shade_f3: f32,
@@ -45928,10 +46017,42 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                 }
             }
             OpKind::Dither if aux.skip_dither_palette => {
-                // Pre-shade export pass: leave the dither op for `ansi_shade_grid`.
+                // Pre-shade export pass: run the TRUE dither (so a dither + converter combo
+                // composes), but leave the char-art converter + palette snap for the grid
+                // builder (`ansi_shade_grid` / `build_petscii_grid`). dither_method 0 is a
+                // no-op, so an existing converter-only preset stays 1:1.
+                crate::thumb::dither_pass(
+                    rgba,
+                    w,
+                    h,
+                    aux.dither_method,
+                    aux.dither_amount,
+                    aux.dither_custom,
+                    aux.dither_n,
+                    aux.dither_scale_x,
+                    aux.dither_scale_y,
+                    aux.palette,
+                );
             }
             OpKind::Dither => {
-                if aux.dither_method == crate::thumb::DITHER_PETSCII {
+                // 1) The TRUE dither first (0 = no-op): a movable ordered bias / error
+                //    diffusion. 2) Then the terminal char-art converter (0 = none) below,
+                //    on the dithered pixels — so dither and conversion are independent and
+                //    compose. A migrated converter-only preset has dither_method 0, so this
+                //    dither_pass is a no-op and the converter output is byte-identical.
+                crate::thumb::dither_pass(
+                    rgba,
+                    w,
+                    h,
+                    aux.dither_method,
+                    aux.dither_amount,
+                    aux.dither_custom,
+                    aux.dither_n,
+                    aux.dither_scale_x,
+                    aux.dither_scale_y,
+                    aux.palette,
+                );
+                if aux.convert_method == crate::thumb::DITHER_PETSCII {
                     // PETSCII brings its OWN 16-colour palette, so it needs no active palette.
                     // This is what makes PETSCII apply through the pipeline — grid tiles, the
                     // details preview, "Apply to grid" — exactly like ANSI Shade.
@@ -45948,7 +46069,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                         aux.petscii_allowed.as_deref(),
                     );
                 } else if matches!(
-                    aux.dither_method,
+                    aux.convert_method,
                     crate::thumb::DITHER_ATASCII | crate::thumb::DITHER_APPLE
                 ) {
                     // ATASCII / Apple ][ — a generic 8×8 bit-font over the mode's ROM font.
@@ -45967,7 +46088,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.tm_mono,
                         );
                     }
-                } else if aux.dither_method == crate::thumb::DITHER_REXFONT {
+                } else if aux.convert_method == crate::thumb::DITHER_REXFONT {
                     // REXPaint font — a generic glyph-font over the selected bundled font.
                     if let (Some(p), Some(font)) = (
                         aux.palette,
@@ -45984,7 +46105,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.bitfont_invert,
                         );
                     }
-                } else if aux.dither_method == crate::thumb::DITHER_UNICODE {
+                } else if aux.convert_method == crate::thumb::DITHER_UNICODE {
                     if aux.unicode_style == crate::thumb::UNI_RAMP {
                         // Ramp: density char-art over the enabled Unicode ranges, rendered from the
                         // user-chosen ramp font (see uniart::set_ramp_src). Colours from the active
@@ -46014,7 +46135,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.unicode_invert,
                         );
                     }
-                } else if aux.dither_method == crate::thumb::DITHER_ASCII {
+                } else if aux.convert_method == crate::thumb::DITHER_ASCII {
                     // ASCII colours from the active palette (like ANSI) — skip if none.
                     if let (Some(p), Some(font)) = (aux.palette, aux.ascii_font.as_ref()) {
                         crate::thumb::ascii_pass(
@@ -46032,7 +46153,7 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.tm_mono,
                         );
                     }
-                } else if aux.dither_method == crate::thumb::DITHER_ANSI {
+                } else if aux.convert_method == crate::thumb::DITHER_ANSI {
                     // ANSI shade needs a palette (like error-diffusion) — skip if none.
                     if let Some(p) = aux.palette {
                         crate::thumb::ansi_shade_pass(
@@ -46060,19 +46181,6 @@ fn apply_pipeline(rgba: &mut [u8], w: usize, h: usize, ops: &[OpKind], a: &Adjus
                             aux.shade_allowed.as_deref(),
                         );
                     }
-                } else {
-                    crate::thumb::dither_pass(
-                        rgba,
-                        w,
-                        h,
-                        aux.dither_method,
-                        aux.dither_amount,
-                        aux.dither_custom,
-                        aux.dither_n,
-                        aux.dither_scale_x,
-                        aux.dither_scale_y,
-                        aux.palette,
-                    );
                 }
             }
             OpKind::ColorBalance => color_balance(rgba, aux.balance),
@@ -46421,7 +46529,11 @@ struct FxPreset {
     blur: f32, // Adjust::blur — kept out of adjust_vals so the array width never changes
     order: Vec<u8>,         // Adjust::order_to_u8() — portable across op additions
     postfx: Vec<f32>,       // PostFx::to_record()
-    dither_method: u8,
+    dither_method: u8,      // TRUE dither only (0..=6); pre-split presets migrate on load
+    // Terminal char-art converter (0 = none). `#[serde(default)]` = 0 for a pre-split preset,
+    // which `split_dither_convert` then fills from that preset's old `dither_method`.
+    #[serde(default)]
+    convert_method: u8,
     dither_amount: f32,
     dither_custom: Vec<u32>,
     dither_custom_n: usize,
@@ -46629,6 +46741,7 @@ impl Default for FxPreset {
             order: Adjust::default().order_to_u8().to_vec(),
             postfx: PostFx::default().to_record(),
             dither_method: 0,
+            convert_method: 0,
             dither_amount: 1.0,
             dither_custom: crate::thumb::bayer_values(4),
             dither_custom_n: 4,
@@ -47068,6 +47181,7 @@ fn adjust_pixels(rgba: &mut [u8], w: usize, h: usize, a: &Adjust) {
         a,
         &PipeAux {
             dither_method: 0,
+            convert_method: 0,
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
@@ -48239,11 +48353,16 @@ enum RecolorSection {
     Balance,
     PostFx,
     Recolor,
+    // Appended after Recolor (discriminants 8/9 — never reorder existing ones, so a
+    // persisted order stays valid). The Dither/Convert split: true pixel dithering and
+    // terminal char-art conversion are independent lanes that compose.
+    Dither,
+    Convert,
 }
 
 impl RecolorSection {
     /// The default top-to-bottom order (also the order the pipeline reads in).
-    const ALL: [RecolorSection; 8] = [
+    const ALL: [RecolorSection; 10] = [
         Self::Palette,
         Self::Cleaning,
         Self::Resize,
@@ -48252,6 +48371,8 @@ impl RecolorSection {
         Self::Balance,
         Self::PostFx,
         Self::Recolor,
+        Self::Dither,
+        Self::Convert,
     ];
     const COUNT: usize = Self::ALL.len();
 
@@ -48267,6 +48388,8 @@ impl RecolorSection {
             Self::Balance => "color_balance",
             Self::PostFx => "postfx",
             Self::Recolor => "recolor",
+            Self::Dither => "dither",
+            Self::Convert => "convert",
         }
     }
 
@@ -48281,6 +48404,49 @@ impl RecolorSection {
             Self::Palette | Self::Adjustments | Self::Balance | Self::Recolor
         )
     }
+}
+
+/// The char-art converters shown in the Convert lane's dropdown: `(convert_method value,
+/// label)`, with 0 = None first. The values reuse the `thumb::DITHER_*` converter constants
+/// (7..=13), so a `convert_method` never collides with a true dither (0..=6).
+const CONVERT_ENTRIES: [(u8, &str); 8] = [
+    (0, "None"),
+    (crate::thumb::DITHER_ANSI, "ANSI Shade"),
+    (crate::thumb::DITHER_PETSCII, "PETSCII"),
+    (crate::thumb::DITHER_ASCII, "ASCII"),
+    (crate::thumb::DITHER_ATASCII, "ATASCII"),
+    (crate::thumb::DITHER_APPLE, "Apple ]["),
+    (crate::thumb::DITHER_REXFONT, "REXPaint font"),
+    (crate::thumb::DITHER_UNICODE, "Unicode"),
+];
+
+/// The label for a `convert_method` value (for the collapsed-lane summary + dropdown text).
+fn convert_method_name(cm: u8) -> &'static str {
+    CONVERT_ENTRIES
+        .iter()
+        .find(|(v, _)| *v == cm)
+        .map(|(_, n)| *n)
+        .unwrap_or("None")
+}
+
+/// Split a possibly pre-split (dither, convert) pair into the post-split model. Before the
+/// Dither/Convert lane split, `dither_method` alone held BOTH the true dithers (1..=6) and
+/// the char-art converters (7..=13). A pre-split value has `convert_method == 0`; if its
+/// `dither_method` is a converter, move it to `convert_method` (true dither → None) so it
+/// renders 1:1. A post-split value already carries `convert_method` and passes through.
+fn split_dither_convert(dither: u8, convert: u8) -> (u8, u8) {
+    if convert == 0 && dither >= crate::thumb::DITHER_ANSI {
+        (0, dither)
+    } else {
+        (dither, convert)
+    }
+}
+
+/// Normalise a preset in place (pre-split → post-split converter fields). Idempotent.
+fn migrate_fx_preset(p: &mut FxPreset) {
+    let (dm, cm) = split_dither_convert(p.dither_method, p.convert_method);
+    p.dither_method = dm;
+    p.convert_method = cm;
 }
 
 /// Rebuild a persisted Recolor-pane section order. Unknown ids (a section this
@@ -56201,7 +56367,7 @@ fn preset_cell_dims(p: &FxPreset) -> (usize, usize) {
 /// the Fit-to-chars canvas if set, else the full source size (Resize is applied as an in-place
 /// detail reduction, not a grid shrink).
 fn preset_resize_target(p: &FxPreset, w: usize, h: usize) -> (usize, usize) {
-    if p.shade_fit_chars && p.dither_method == crate::thumb::DITHER_ANSI {
+    if p.shade_fit_chars && p.convert_method == crate::thumb::DITHER_ANSI {
         let (cw, ch) = preset_cell_dims(p);
         return (p.shade_fit_cols.max(1) * cw, p.shade_fit_rows.max(1) * ch);
     }
@@ -56225,6 +56391,7 @@ fn preset_pipe_aux<'a>(
     };
     PipeAux {
         dither_method: p.dither_method,
+        convert_method: p.convert_method,
         dither_amount: p.dither_amount,
         dither_custom: &p.dither_custom,
         dither_n: p.dither_custom_n,
@@ -56408,6 +56575,11 @@ fn load_all_fx_presets() -> Vec<FxPreset> {
             all.push(u);
         }
     }
+    // Normalise pre-split presets so the batch path (`preset_resize_target`, the export
+    // kind gate) sees the converter in `convert_method`.
+    for p in &mut all {
+        migrate_fx_preset(p);
+    }
     all
 }
 
@@ -56500,7 +56672,7 @@ pub fn run_batch(cli: &CliArgs) -> i32 {
     if cli.batch_list {
         println!("PixelFX presets ({}):", presets.len());
         for p in &presets {
-            let kind = if p.dither_method == crate::thumb::DITHER_ANSI {
+            let kind = if p.convert_method == crate::thumb::DITHER_ANSI {
                 "ANSI"
             } else {
                 "img"
@@ -56517,9 +56689,9 @@ pub fn run_batch(cli: &CliArgs) -> i32 {
         eprintln!("kaleidotron: no PixelFX preset named {name:?} (try --list-presets)");
         return 2;
     };
-    if preset.dither_method != crate::thumb::DITHER_ANSI {
+    if preset.convert_method != crate::thumb::DITHER_ANSI {
         eprintln!(
-            "kaleidotron: preset {name:?} isn't an ANSI Shade preset (its Dither must be 'ANSI Shade') — textmode batch needs one"
+            "kaleidotron: preset {name:?} isn't an ANSI Shade preset (its Convert must be 'ANSI Shade') — textmode batch needs one"
         );
         return 2;
     }
@@ -57780,7 +57952,7 @@ mod tests {
         // opaque image yields a 2×2 cell grid — proving `build_ansi_grid_from_preset`
         // (the twin of the GUI `build_ansi_grid`) runs end-to-end without an App.
         let mut p = FxPreset::default();
-        p.dither_method = crate::thumb::DITHER_ANSI;
+        p.convert_method = crate::thumb::DITHER_ANSI;
         p.shade_snap916 = true;
         p.shade_vga50 = false;
         p.shade_fit_chars = false;
@@ -58036,6 +58208,55 @@ mod tests {
         let old = r#"(name:"Old",color:None,fg:None,adjust_vals:(0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0,0.0,2.0,0.0,0.0),blur:0.0,order:[],postfx:[],dither_method:0,dither_amount:1.0,dither_custom:[],dither_custom_n:4,dither_scale_x:1,dither_scale_y:1,dither_scale_lock:true,shade_f1:0.25,shade_f2:0.5,shade_f3:0.75,shade_half:true,shade_snap916:true,shade_f1_on:true,shade_f2_on:true,shade_f3_on:true,shade_half_on:(true,true,true,true),shade_half_use:(0.5,0.5,0.5,0.5),shade_vga50:false,shade_amount:1.0,shade_smooth:0.5,shade_detail:0.3,shade_ice:false,shade_invert:false,shade_export_format:0,shade_fit_chars:false,shade_fit_cols:80,shade_fit_rows:25,pixelate_h:0.0,pixelate_lock:true,balance_color:(128,128,128),balance_strength:0.0,resize_on:false,resize_fx:1.0,resize_fy:1.0,resize_lock:true,scale_algo:0,quantize_on:false,quantize_n:16,selected_palette:None,custom_palette:None,folder:None)"#;
         let parsed: FxPreset = ron::from_str(old).expect("old preset still parses");
         assert!(parsed.ascii_mask.is_empty() && parsed.unicode_extra.is_empty());
+    }
+
+    #[test]
+    fn pre_split_converter_preset_migrates_to_convert_method() {
+        // The Dither/Convert split: a preset saved before it existed stored the char-art
+        // converter in `dither_method` (7..=13) with no `convert_method`. Migration must move
+        // that converter to `convert_method` and zero `dither_method` so it renders 1:1 (the
+        // true dither becomes a no-op, the converter fires unchanged). Cover every converter.
+        for cm in [
+            crate::thumb::DITHER_ANSI,
+            crate::thumb::DITHER_PETSCII,
+            crate::thumb::DITHER_ASCII,
+            crate::thumb::DITHER_ATASCII,
+            crate::thumb::DITHER_APPLE,
+            crate::thumb::DITHER_REXFONT,
+            crate::thumb::DITHER_UNICODE,
+        ] {
+            // Pure helper: (old dither, no convert) → (None, that converter).
+            assert_eq!(
+                split_dither_convert(cm, 0),
+                (0, cm),
+                "converter {cm} migrates"
+            );
+            // In-place preset migration matches, and is idempotent.
+            let mut p = FxPreset {
+                dither_method: cm,
+                convert_method: 0,
+                ..FxPreset::default()
+            };
+            migrate_fx_preset(&mut p);
+            assert_eq!((p.dither_method, p.convert_method), (0, cm));
+            migrate_fx_preset(&mut p);
+            assert_eq!((p.dither_method, p.convert_method), (0, cm), "idempotent");
+        }
+        // A TRUE dither preset (1..=6) is left untouched — it was never a converter.
+        for dm in [0u8, 1, 2, 3, 4, 5, crate::thumb::DITHER_CUSTOM] {
+            assert_eq!(
+                split_dither_convert(dm, 0),
+                (dm, 0),
+                "true dither {dm} unchanged"
+            );
+        }
+        // A post-split preset (already has convert_method) passes straight through — no double
+        // migration wipes its dither when both are set (dither + convert compose).
+        assert_eq!(
+            split_dither_convert(4, crate::thumb::DITHER_ANSI),
+            (4, crate::thumb::DITHER_ANSI),
+            "post-split dither+convert preserved"
+        );
     }
 
     #[test]
@@ -58880,6 +59101,7 @@ mod tests {
         let pal = [[100u8, 0, 0, 255]];
         let aux = PipeAux {
             dither_method: 0,
+            convert_method: 0,
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
@@ -59115,6 +59337,7 @@ mod tests {
         let a = Adjust::default();
         let aux = PipeAux {
             dither_method: 0,
+            convert_method: 0,
             dither_amount: 0.0,
             dither_custom: &[],
             dither_n: 0,
