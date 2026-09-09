@@ -1,4 +1,4 @@
- -0# kaleidotron
+ # kaleidotron
 
 A fast, **pixel-art-first** media **browser** for Linux/macOS/Windows, written in
 Rust with [egui/eframe](https://github.com/emilk/egui).
