@@ -140,9 +140,10 @@ impl Decoder for AnsiDecoder {
         // The rest are classic scene/BBS readme + documentation extensions (READ.ME,
         // README.1ST, READ.NOW, *.DOC/*.DOX/*.MSG/*.CAP/*.INF) — plain text or ANSI, both
         // render fine through the CP437 path, so they show up and open like any scene doc.
+        // .pcb = PCBoard @X-code display file (auto-detected + rendered via `detect_pcboard`).
         &[
             "ans", "asc", "nfo", "diz", "ice", "cia", "txt", "ace", "hyp", "doc", "dox", "me",
-            "1st", "now", "msg", "cap", "inf", "grp", "fyi",
+            "1st", "now", "msg", "cap", "inf", "grp", "fyi", "pcb",
         ]
     }
 
@@ -167,6 +168,12 @@ pub struct TextStream {
     glyph_h: usize, // 8 (VGA50) or 16
     cols: usize,    // full canvas columns
     rows: usize,    // full canvas rows
+    // Interpret Synchronet Ctrl-A (0x01+letter) color codes, resp. PCBoard `@X`hh /
+    // `@CLS@` codes, when the file was detected to use them (see [`detect_ctrla`] /
+    // [`detect_pcboard`]). Both default OFF so a normal ANSI/ASCII file where 0x01 is the
+    // ☺ glyph and `@` is a literal at-sign renders byte-identically to before.
+    ctrla: bool,
+    pcb: bool,
 }
 
 impl TextStream {
@@ -175,7 +182,12 @@ impl TextStream {
         let (ice, sauce_w, font) = read_sauce(bytes);
         let content = crate::sauce::strip(bytes).to_vec();
         let wrap = sauce_w.unwrap_or(WRAP).clamp(1, MAX_COLS);
-        let (grid, cursor_rows) = parse(&content, wrap, ice);
+        // Detect Synchronet Ctrl-A / PCBoard @-code display files (BBS menu + .msg art).
+        // A file is at most one of these; Ctrl-A wins a tie. Detection is whole-file, not
+        // just the header, so codes that start after a text preamble still register.
+        let ctrla = detect_ctrla(&content);
+        let pcb = !ctrla && detect_pcboard(&content);
+        let (grid, cursor_rows) = parse(&content, wrap, ice, ctrla, pcb);
         if grid.is_empty() {
             return None;
         }
@@ -212,6 +224,8 @@ impl TextStream {
             glyph_h,
             cols,
             rows,
+            ctrla,
+            pcb,
         })
     }
 
@@ -234,7 +248,8 @@ impl TextStream {
     /// — which the viewer uses to auto-scroll a long ANSImation, BBS-style.
     pub fn render_frame(&self, limit: usize) -> (PixImage, u32) {
         let lim = limit.min(self.content.len());
-        let (grid, cursor_rows) = parse(&self.content[..lim], self.wrap, self.ice);
+        let (grid, cursor_rows) =
+            parse(&self.content[..lim], self.wrap, self.ice, self.ctrla, self.pcb);
         // Follow the cursor's full extent (incl. trailing blank lines), capped at the
         // canvas so the scroll lands exactly at the bottom.
         let cursor_px = (cursor_rows.min(self.rows) * self.glyph_h) as u32;
@@ -328,13 +343,99 @@ fn ensure(grid: &mut Vec<Vec<Cell>>, y: usize, x: usize) {
 /// *occupied* (`max_y + 1`) — which counts trailing blank lines the cursor moved onto
 /// but never wrote (e.g. a CRLF run at the end). `grid.len()` only counts written rows;
 /// the cursor extent is what baud auto-scroll follows so it reaches the final blank line.
-fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
+/// Resolve the current attribute state to `(fg_rgb, bg_rgb)` — the exact rule the
+/// printable-char branch uses: a 24-bit override wins, else the 16-colour index with
+/// bold brightening fg and (iCE) blink brightening bg; reverse swaps the two.
+#[inline]
+fn resolve_rgb(
+    fg: u8,
+    bg: u8,
+    bold: bool,
+    blink: bool,
+    reverse: bool,
+    ice: bool,
+    fg_rgb: Option<[u8; 3]>,
+    bg_rgb: Option<[u8; 3]>,
+) -> ([u8; 3], [u8; 3]) {
+    let efg = fg_rgb.unwrap_or(PALETTE[(if bold { fg | 8 } else { fg } & 0x0f) as usize]);
+    let ebg = bg_rgb.unwrap_or(PALETTE[(if ice && blink { bg | 8 } else { bg } & 0x0f) as usize]);
+    if reverse {
+        (ebg, efg)
+    } else {
+        (efg, ebg)
+    }
+}
+
+/// A VGA colour index (0–7, bit order I·R·G·B) → the matching SGR/ANSI index used by
+/// [`PALETTE`]. Only bits R and B swap (VGA blue=1/red=4 ↔ SGR red=1/blue=4). Used to
+/// fold a PCBoard `@X` raw-attribute nibble into the SGR fg/bg state.
+#[inline]
+fn vga_to_sgr(v: u8) -> u8 {
+    let v = v & 7;
+    ((v & 1) << 2) | (v & 2) | ((v & 4) >> 2)
+}
+
+/// True when `data` looks like a Synchronet Ctrl-A display file: several `\x01`+colour/
+/// attribute operands, and those valid pairs are the clear majority of all `\x01` bytes
+/// (so an ordinary ANSI file with a stray ☺ (0x01) glyph doesn't flip into Ctrl-A mode).
+fn detect_ctrla(data: &[u8]) -> bool {
+    let (mut hits, mut misses) = (0u32, 0u32);
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] == 0x01 {
+            let c = data[i + 1].to_ascii_uppercase();
+            if matches!(c, b'K' | b'R' | b'G' | b'Y' | b'B' | b'M' | b'C' | b'W')
+                || matches!(c, b'H' | b'I' | b'E' | b'N')
+                || c.is_ascii_digit() && c <= b'7'
+            {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    hits >= 2 && hits > misses
+}
+
+/// True when `data` looks like a PCBoard `@X` display file: several `@X`+two-hex-digit
+/// colour codes (or `@CLS@`). A stray `@` at-sign in ordinary text won't reach the
+/// threshold, so plain ANSI/ASCII art is unaffected.
+fn detect_pcboard(data: &[u8]) -> bool {
+    let mut hits = 0u32;
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == b'@'
+            && data[i + 1].eq_ignore_ascii_case(&b'X')
+            && data[i + 2].is_ascii_hexdigit()
+            && data[i + 3].is_ascii_hexdigit()
+        {
+            hits += 1;
+            i += 4;
+        } else if data[i] == b'@'
+            && data[i..].len() >= 5
+            && data[i + 1..i + 5].eq_ignore_ascii_case(b"CLS@")
+        {
+            hits += 1;
+            i += 5;
+        } else {
+            i += 1;
+        }
+    }
+    hits >= 2
+}
+
+fn parse(data: &[u8], wrap: usize, ice: bool, ctrla: bool, pcb: bool) -> (Vec<Vec<Cell>>, usize) {
     let mut grid: Vec<Vec<Cell>> = Vec::new();
     let (mut x, mut y) = (0usize, 0usize);
     let mut max_y = 0usize;
     let mut saved = (0usize, 0usize); // ESC[s/u and ESC 7/8 cursor save/restore
     let (mut fg, mut bg) = (7u8, 0u8);
     let (mut bold, mut blink, mut reverse) = (false, false, false);
+    // Synchronet Ctrl-A `\x01+` / `\x01-` attribute LIFO stack: (fg, bg, bold, blink).
+    let mut attr_stack: Vec<(u8, u8, bool, bool)> = Vec::new();
     // 24-bit overrides (PabloDraw `ESC[…t` / SGR 38;2/48;2): `Some` wins over the 16-color
     // index, `None` falls back to the palette. Cleared whenever a 16-color SGR sets fg/bg.
     let (mut fg_rgb, mut bg_rgb): (Option<[u8; 3]>, Option<[u8; 3]>) = (None, None);
@@ -541,6 +642,165 @@ fn parse(data: &[u8], wrap: usize, ice: bool) -> (Vec<Vec<Cell>>, usize) {
             // appends SAUCE (and sometimes a stray run of 0x1A) after it; without this the
             // 0x1A renders as its CP437 glyph (→) at the end of the art.
             0x1A => break,
+            // Synchronet Ctrl-A codes: `\x01` + one operand. Mirrors sbbs `con_out.cpp`
+            // `ctrl_a()`. Colours resolve through the SAME fg/bg/bold/blink state as SGR
+            // (Ctrl-A `R`ed = SGR red, background `1` = SGR red, …), so a file may freely
+            // mix ANSI escapes and Ctrl-A codes. Gated by `ctrla` so 0x01 stays a ☺ glyph
+            // in ordinary ANSI art.
+            0x01 if ctrla => {
+                let code = data.get(i + 1).copied().unwrap_or(0);
+                i += 2;
+                if code == 0 {
+                    // trailing lone 0x01 — nothing to do
+                } else if code > 0x7f {
+                    x += (code as usize) - 0x7f; // move cursor right (code-127) columns
+                } else if code <= 26 {
+                    // Ctrl-A + control char = per-flag echo gate; a viewer shows all → no-op.
+                } else {
+                    match code.to_ascii_uppercase() {
+                        // Foreground colour (by name → SGR index), keeping bold/blink/bg.
+                        b'K' => (fg, fg_rgb) = (0, None),
+                        b'R' => (fg, fg_rgb) = (1, None),
+                        b'G' => (fg, fg_rgb) = (2, None),
+                        b'Y' => (fg, fg_rgb) = (3, None),
+                        b'B' => (fg, fg_rgb) = (4, None),
+                        b'M' => (fg, fg_rgb) = (5, None),
+                        b'C' => (fg, fg_rgb) = (6, None),
+                        b'W' => (fg, fg_rgb) = (7, None),
+                        // Background colour (digit == SGR index directly), keeping blink.
+                        b'0'..=b'7' => (bg, bg_rgb) = (code - b'0', None),
+                        b'H' => bold = true,         // high-intensity fg
+                        b'I' | b'E' => blink = true, // blink / bright-bg (iCE) share the bit
+                        b'F' => bold = true,         // alt blink-font unavailable → HIGH (sbbs)
+                        b'N' => {
+                            (fg, bg, bold, blink) = (7, 0, false, false);
+                            (fg_rgb, bg_rgb) = (None, None);
+                        }
+                        b'+' => attr_stack.push((fg, bg, bold, blink)),
+                        b'-' => {
+                            if let Some((f, b, bo, bl)) = attr_stack.pop() {
+                                (fg, bg, bold, blink) = (f, b, bo, bl);
+                                (fg_rgb, bg_rgb) = (None, None);
+                            } else if bold || blink || bg != 0 {
+                                (fg, bg, bold, blink) = (7, 0, false, false);
+                                (fg_rgb, bg_rgb) = (None, None);
+                            }
+                        }
+                        b'_' => {
+                            if blink || bg != 0 {
+                                (fg, bg, bold, blink) = (7, 0, false, false);
+                                (fg_rgb, bg_rgb) = (None, None);
+                            }
+                        }
+                        b'L' => {
+                            grid.clear();
+                            (x, y, max_y) = (0, 0, 0); // CLS + home cursor
+                        }
+                        b'\'' | b'`' => (x, y) = (0, 0), // home cursor
+                        b'[' => x = 0,                   // carriage return
+                        b']' => y += 1,                  // line feed
+                        b'<' => x = x.saturating_sub(1), // non-destructive backspace
+                        b'/' => {
+                            if x > 0 {
+                                (x, y) = (0, y + 1); // conditional newline
+                            }
+                        }
+                        b'>' => {
+                            if let Some(row) = grid.get_mut(y) {
+                                row.truncate(x); // clear to end-of-line
+                            }
+                        }
+                        b'J' => {
+                            if let Some(row) = grid.get_mut(y) {
+                                row.truncate(x); // clear to end-of-screen
+                            }
+                            for r in grid.iter_mut().skip(y + 1) {
+                                r.clear();
+                            }
+                        }
+                        b'A' | b'Z' => {
+                            // Emit a literal Ctrl-A (0x01=☺) / Ctrl-Z (0x1A=→) glyph.
+                            let lit = if code.eq_ignore_ascii_case(&b'A') { 0x01 } else { 0x1A };
+                            if x < MAX_COLS {
+                                let (cfg, cbg) =
+                                    resolve_rgb(fg, bg, bold, blink, reverse, ice, fg_rgb, bg_rgb);
+                                ensure(&mut grid, y, x);
+                                grid[y][x] = Cell {
+                                    ch: lit,
+                                    fg: cfg,
+                                    bg: cbg,
+                                };
+                            }
+                            x += 1;
+                        }
+                        // P Q T D , ; . S X x U u V v \\ ? ~ and macros → no-op for a static view.
+                        _ => {}
+                    }
+                }
+            }
+            // PCBoard `@X`bf / `@CLS@` / `@@` codes. `bf` is a raw VGA attribute byte (first
+            // nibble background, second foreground), converted to the SGR fg/bg state. Gated
+            // by `pcb`; an ordinary `@` at-sign stays a literal glyph.
+            b'@' if pcb => {
+                let rest = &data[i..];
+                if rest.get(1) == Some(&b'@') {
+                    // `@@` → one literal '@'
+                    if x < MAX_COLS {
+                        let (cfg, cbg) =
+                            resolve_rgb(fg, bg, bold, blink, reverse, ice, fg_rgb, bg_rgb);
+                        ensure(&mut grid, y, x);
+                        grid[y][x] = Cell {
+                            ch: b'@',
+                            fg: cfg,
+                            bg: cbg,
+                        };
+                    }
+                    x += 1;
+                    i += 2;
+                } else if rest.len() >= 4
+                    && rest[1].eq_ignore_ascii_case(&b'X')
+                    && rest[2].is_ascii_hexdigit()
+                    && rest[3].is_ascii_hexdigit()
+                {
+                    let bgn = (rest[2] as char).to_digit(16).unwrap_or(0) as u8;
+                    let fgn = (rest[3] as char).to_digit(16).unwrap_or(7) as u8;
+                    (fg, bold, fg_rgb) = (vga_to_sgr(fgn & 7), fgn & 8 != 0, None);
+                    (bg, blink, bg_rgb) = (vga_to_sgr(bgn & 7), bgn & 8 != 0, None);
+                    i += 4;
+                } else if rest.len() >= 5 && rest[1..5].eq_ignore_ascii_case(b"CLS@") {
+                    grid.clear();
+                    (x, y, max_y) = (0, 0, 0);
+                    i += 5;
+                } else if rest.len() >= 5 && rest[1..5].eq_ignore_ascii_case(b"POS:") {
+                    // `@POS:col@` (1-based column on the current row). Scan to the closing '@'.
+                    let mut j = i + 5;
+                    while j < data.len() && data[j] != b'@' {
+                        j += 1;
+                    }
+                    let col: usize = std::str::from_utf8(&data[i + 5..j])
+                        .ok()
+                        .and_then(|s| s.split(|c| c == ',' || c == ';').next())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(1);
+                    x = col.saturating_sub(1);
+                    i = if j < data.len() { j + 1 } else { j };
+                } else {
+                    // A literal '@' or an unhandled macro (@USER@, @TIME@, …): print the '@'
+                    // rather than risk eating real text; a macro then shows as literal text.
+                    if x < MAX_COLS {
+                        let (cfg, cbg) =
+                            resolve_rgb(fg, bg, bold, blink, reverse, ice, fg_rgb, bg_rgb);
+                        ensure(&mut grid, y, x);
+                        grid[y][x] = Cell {
+                            ch: b'@',
+                            fg: cfg,
+                            bg: cbg,
+                        };
+                    }
+                    x += 1;
+                    i += 1;
+                }
+            }
             ch => {
                 if x < MAX_COLS {
                     // Resolve to RGB. A 24-bit override (`*_rgb`) wins; otherwise the
@@ -585,10 +845,10 @@ mod tests {
     fn cursor_up_and_back_reposition() {
         // ESC[A moves up a row: 'B' overwrites 'A' on row 0 (the half-block overlay
         // technique these 1994 pieces rely on — was previously ignored → scattered).
-        let (g, _) = parse(b"A\n\x1b[AB", WRAP, true);
+        let (g, _) = parse(b"A\n\x1b[AB", WRAP, true, false, false);
         assert_eq!(g[0][0].ch, b'B', "ESC[A returned to row 0");
         // ESC[2D steps the cursor back two columns: 'C' overwrites 'A' on col 0.
-        let (g, _) = parse(b"AB\x1b[2DC", WRAP, true);
+        let (g, _) = parse(b"AB\x1b[2DC", WRAP, true, false, false);
         assert_eq!(g[0][0].ch, b'C', "ESC[2D moved back to col 0");
     }
 
@@ -630,7 +890,7 @@ mod tests {
         // row. Otherwise a full-width piece (every row filled to the margin then CRLF)
         // renders a blank row between every content row — venetian-blind black stripes.
         // Matches ansilove (wrap lives in the printable-char branch). wrap=4.
-        let (g, _) = parse(b"AAAA\r\nB", 4, true);
+        let (g, _) = parse(b"AAAA\r\nB", 4, true, false, false);
         assert_eq!(
             g.len(),
             2,
@@ -648,7 +908,7 @@ mod tests {
     fn parse_reports_cursor_extent_past_blank_lines() {
         // The cursor moves onto blank lines via trailing newlines; cursor_rows counts
         // them (grid.len() doesn't) so baud auto-scroll can reach the final blank line.
-        let (g, rows) = parse(b"AB\n\n\n", 80, true);
+        let (g, rows) = parse(b"AB\n\n\n", 80, true, false, false);
         assert_eq!(g.len(), 1, "only row 0 was written");
         assert_eq!(rows, 4, "cursor reached row 3 (3 newlines) → 4 rows");
     }
@@ -673,14 +933,14 @@ mod tests {
     fn bare_esc_is_consumed_not_drawn() {
         // A lone/trailing ESC (e.g. a baud-playback prefix cut mid-sequence) must not
         // render as CP437 0x1B (a ← arrow) flickering at the cursor — ansilove eats it.
-        let (g, _) = parse(b"AB\x1b", 80, true);
+        let (g, _) = parse(b"AB\x1b", 80, true, false, false);
         assert_eq!(
             g[0].iter().filter(|c| c.ch != 0).count(),
             2,
             "only A and B, no ←"
         );
         // ESC followed by a non-CSI byte: ESC is dropped, the next byte still prints.
-        let (g, _) = parse(b"A\x1bZ", 80, true);
+        let (g, _) = parse(b"A\x1bZ", 80, true, false, false);
         let chars: Vec<u8> = g[0].iter().filter(|c| c.ch != 0).map(|c| c.ch).collect();
         assert_eq!(chars, vec![b'A', b'Z']);
     }
@@ -689,7 +949,7 @@ mod tests {
     fn stops_rendering_at_the_dos_eof() {
         // SUB (0x1A) ends the art; bytes after it (a trailing run + SAUCE) aren't drawn,
         // so the EOF never shows up as its CP437 glyph (→). gj-9703c.ans has `…\x1a\x1aSAUCE`.
-        let (g, _) = parse(b"AB\x1a\x1aXY", 80, true);
+        let (g, _) = parse(b"AB\x1a\x1aXY", 80, true, false, false);
         assert_eq!(g.len(), 1, "only the row before the EOF");
         assert_eq!(g[0].iter().filter(|c| c.ch != 0).count(), 2, "just A and B");
     }
@@ -837,7 +1097,7 @@ mod tests {
     #[test]
     fn overflow_without_newline_still_wraps() {
         // No newline: the 5th char wraps to row 1 (deferred wrap still happens).
-        let (g, _) = parse(b"AAAAB", 4, true);
+        let (g, _) = parse(b"AAAAB", 4, true, false, false);
         assert_eq!(g.len(), 2);
         assert_eq!(g[1][0].ch, b'B');
     }
@@ -848,7 +1108,7 @@ mod tests {
         // wrap must fire *before* the save (like ansilove), so it captures the wrapped
         // (0,1) position — not the parked (4,0). Otherwise cursor-addressed art that does
         // `…fill row…[s\r\n[u…` shears (ACID-RN.ANS, gj-os.ans). ESC[u then 'B' → (0,1).
-        let (g, _) = parse(b"AAAA\x1b[s\x1b[uB", 4, true);
+        let (g, _) = parse(b"AAAA\x1b[s\x1b[uB", 4, true, false, false);
         assert_eq!(g.len(), 2, "cursor wrapped to row 1 before the save");
         assert_eq!(
             g[1][0].ch, b'B',
@@ -864,7 +1124,7 @@ mod tests {
     #[test]
     fn tab_advances_to_next_8col_stop() {
         // "A\tB": A at col 0, tab → col 8, B at col 8.
-        let (g, _) = parse(b"A\tB", WRAP, true);
+        let (g, _) = parse(b"A\tB", WRAP, true, false, false);
         assert_eq!(g[0][0].ch, b'A');
         assert_eq!(g[0][8].ch, b'B', "tab jumped to column 8");
     }
@@ -993,5 +1253,102 @@ mod tests {
             .unwrap();
         std::fs::write("/tmp/ansi_out.png", buf).unwrap();
         eprintln!("wrote /tmp/ansi_out.png {}x{}", img.width, img.height);
+    }
+
+    // --- Synchronet Ctrl-A + PCBoard @X display codes --------------------------------
+
+    #[test]
+    fn detect_recognizes_ctrla_and_not_plain_ansi() {
+        assert!(detect_ctrla(b"\x01RHello \x01Gworld\x01N"));
+        assert!(!detect_ctrla(b"plain \x1b[31mansi\x1b[0m art"));
+        // A lone stray ☺ (0x01) glyph in ordinary art must NOT flip into Ctrl-A mode.
+        assert!(!detect_ctrla(b"a face \x01 here"));
+    }
+
+    #[test]
+    fn detect_recognizes_pcboard_and_not_stray_at() {
+        assert!(detect_pcboard(b"@X07Hello @X0Fworld @CLS@"));
+        assert!(!detect_pcboard(b"email me @ home or @ work"));
+    }
+
+    #[test]
+    fn ctrla_maps_colors_like_synchronet() {
+        // \x01R = red fg, \x011 = red bg, \x01H+\x01G = bright green fg.
+        let (g, _) = parse(b"\x01RA\x011B\x01H\x01GC", WRAP, true, true, false);
+        assert_eq!(g[0][0].ch, b'A');
+        assert_eq!(g[0][0].fg, PALETTE[1], "R = red fg");
+        assert_eq!(g[0][1].ch, b'B');
+        assert_eq!(g[0][1].bg, PALETTE[1], "1 = red bg");
+        assert_eq!(g[0][2].ch, b'C');
+        assert_eq!(g[0][2].fg, PALETTE[10], "H then G = bright green");
+    }
+
+    #[test]
+    fn ctrla_normal_resets_attrs() {
+        let (g, _) = parse(b"\x01H\x01R\x011\x01NA", WRAP, true, true, false);
+        assert_eq!(g[0][0].fg, PALETTE[7], "N → light-grey fg");
+        assert_eq!(g[0][0].bg, PALETTE[0], "N → black bg");
+    }
+
+    #[test]
+    fn ctrla_push_pop_attributes() {
+        // Push red, switch to green, pop back to red.
+        let (g, _) = parse(b"\x01R\x01+\x01GA\x01-B", WRAP, true, true, false);
+        assert_eq!(g[0][0].fg, PALETTE[2], "inside push: green");
+        assert_eq!(g[0][1].fg, PALETTE[1], "after pop: red restored");
+    }
+
+    #[test]
+    fn pcboard_x_code_is_bg_then_fg_vga() {
+        // @X1E → background 1 (VGA blue), foreground E (VGA bright brown = bright yellow).
+        let (g, _) = parse(b"@X1EA", WRAP, true, false, true);
+        assert_eq!(g[0][0].ch, b'A');
+        assert_eq!(g[0][0].bg, PALETTE[4], "bg nibble 1 (VGA blue) → SGR blue");
+        assert_eq!(g[0][0].fg, PALETTE[11], "fg nibble E (VGA bright brown) → bright yellow");
+    }
+
+    #[test]
+    fn pcboard_escapes_double_at() {
+        let (g, _) = parse(b"@@X", WRAP, true, false, true);
+        assert_eq!(g[0][0].ch, b'@', "@@ → literal @");
+        assert_eq!(g[0][1].ch, b'X');
+    }
+
+    #[test]
+    fn ctrla_export_roundtrips_and_redetects() {
+        use crate::thumb::{AnsiCell, AnsiGrid};
+        let palette: Vec<[u8; 4]> = PALETTE.iter().map(|c| [c[0], c[1], c[2], 255]).collect();
+        let cells = vec![
+            AnsiCell { fg: 1, bg: 0, ch: b'H' }, // red
+            AnsiCell { fg: 2, bg: 0, ch: b'i' }, // green
+            AnsiCell { fg: 9, bg: 0, ch: b'!' }, // bright red (H + R)
+        ];
+        let grid = AnsiGrid { cols: 3, rows: 1, cell_w: 8, cell_h: 16, palette, cells };
+        let bytes = crate::thumb::ansi_grid_to_ctrla(&grid, true);
+        assert!(detect_ctrla(&bytes), "exported file re-detects as Ctrl-A");
+        let (g, _) = parse(&bytes, WRAP, true, true, false);
+        assert_eq!(g[0][0].ch, b'H');
+        assert_eq!(g[0][0].fg, PALETTE[1]);
+        assert_eq!(g[0][1].ch, b'i');
+        assert_eq!(g[0][1].fg, PALETTE[2]);
+        assert_eq!(g[0][2].ch, b'!');
+        assert_eq!(g[0][2].fg, PALETTE[9], "bright red preserved");
+    }
+
+    #[test]
+    fn pcboard_export_roundtrips_and_redetects() {
+        use crate::thumb::{AnsiCell, AnsiGrid};
+        let palette: Vec<[u8; 4]> = PALETTE.iter().map(|c| [c[0], c[1], c[2], 255]).collect();
+        let cells = vec![
+            AnsiCell { fg: 4, bg: 1, ch: b'A' }, // blue fg, red bg
+            AnsiCell { fg: 11, bg: 0, ch: b'B' }, // bright yellow fg
+        ];
+        let grid = AnsiGrid { cols: 2, rows: 1, cell_w: 8, cell_h: 16, palette, cells };
+        let bytes = crate::thumb::ansi_grid_to_pcboard(&grid, true);
+        assert!(detect_pcboard(&bytes), "exported file re-detects as PCBoard");
+        let (g, _) = parse(&bytes, WRAP, true, false, true);
+        assert_eq!(g[0][0].fg, PALETTE[4]);
+        assert_eq!(g[0][0].bg, PALETTE[1]);
+        assert_eq!(g[0][1].fg, PALETTE[11]);
     }
 }

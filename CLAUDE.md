@@ -177,7 +177,10 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     ansi.rs          .ans/.asc/.nfo/.diz/.ice/.cia — CP437 + ANSI SGR/cursor + iCE
                      + SAUCE-driven 8×8 (VGA50/EGA43) vs 8×16 cell selection;
                      optional 9-dot VGA cell (font_9px); pads to a ≥25-row screen;
-                     TextStream renders byte prefixes for baud-rate ANSImation playback
+                     TextStream renders byte prefixes for baud-rate ANSImation playback.
+                     ALSO renders Synchronet **Ctrl-A** (`\x01`+letter) + PCBoard **@X**
+                     BBS display codes — folded into `parse()` (gated by `detect_ctrla`/
+                     `detect_pcboard`; see "Synchronet Ctrl-A / PCBoard" below)
     xbin.rs          .xb/.xbin — binary ANSI: palette/font + RLE; shared render_textmode;
                      default palette is ansi::VGA_PALETTE (raw VGA attr order, not SGR)
     bin.rs           .bin — raw char/attr pairs (SAUCE width); idf/adf reuse render_textmode
@@ -1519,6 +1522,39 @@ handed by the raw `attr & 0x0f`, so the **caller** picks the right order: `bin.r
 already VGA-ordered (raw RGB by attribute index) and are indexed directly. Bug symptom:
 a piece whose 16colors/ansilove thumbnail is red renders blue in the viewer
 (`MULTI-13.BIN`); guarded by `bin::tests::vga_attribute_indices_are_not_ansi_order`.
+
+## Synchronet Ctrl-A + PCBoard @X (BBS display codes)
+
+BBS "display files" (Synchronet `.msg`/menu art, PCBoard `.pcb`) color text with **inline
+control codes**, not ANSI escapes. Both are **rendered AND exported**, and both are handled
+**inside `decode/ansi.rs`'s `parse()`** rather than as separate decoders — a Synchronet file
+can freely mix ANSI escapes, Ctrl-A, and CP437 in one stream, and reusing `TextStream`
+(SAUCE width, canvas sizing, `render_grid`, baud playback) is free.
+
+- **Why gated, not always-on:** the lead bytes are legit CP437 glyphs (Ctrl-A `0x01`=☺,
+  PCBoard `@`=at-sign), so interpreting them unconditionally would corrupt ordinary art.
+  `parse()` takes `ctrla`/`pcb` bools, set by **whole-file heuristics** `detect_ctrla` /
+  `detect_pcboard` in `TextStream::new` (need ≥2 valid code sequences that outnumber the
+  misses). Off ⇒ byte-identical to the old ANSI path. A file is at most one; Ctrl-A wins a tie.
+- **Ctrl-A** (`\x01`+operand) maps onto the SAME `fg/bg/bold/blink` SGR state the SGR parser
+  uses — `\x01R`ed → SGR index 1, background digit == SGR index directly — so colours resolve
+  through `PALETTE` identically. Authoritative reference is **`~/git/sbbs/src/sbbs3/con_out.cpp`
+  `sbbs_t::ctrl_a()`** (colours K/R/G/Y/B/M/C/W, bg `0`–`7`, H/I/E/N, push/pop `+`/`-`/`_`,
+  cursor/clear `L ' [ ] < / > J`, `128-255` cursor-right, `A`/`Z` literal glyph). Delay/pause/
+  macro/security codes are no-ops for a static view.
+- **PCBoard** (`@X`+two hex) is a **raw VGA attribute byte** — first nibble bg, second fg
+  (`@X1E` = blue bg, yellow fg) — folded into the SGR state via `vga_to_sgr` (swaps the R/B
+  bits; SGR and VGA disagree on 1/4). Plus `@@`→literal `@`, `@CLS@`, `@POS:col@`; an unknown
+  `@macro@` prints literally (never eat text).
+- **Export**: two `shade_export_format` codes in the Recolor textmode dropdown — **7 =
+  Synchronet Ctrl-A (`.asc`)**, **8 = PCBoard @X (`.pcb`)** — serialized by
+  `thumb::ansi_grid_to_ctrla` / `ansi_grid_to_pcboard` (diff-on-change like `ansi_grid_to_ans`,
+  CRLF rows, **no SAUCE** — bare code streams, so they early-return in `serialize_textmode`).
+  Ctrl-A emit order mirrors icy_engine's `save_ctrla`: `\x01N` reset when clearing bold/bright-
+  bg, then `H`/`E`, then fg letter + bg digit. `--format ctrla|asc|pcb|pcboard` for the batch.
+- `.pcb` was added to the AnsiDecoder extensions + the two parallel `is_image_ext`/
+  `is_textmode_ext` lists (`.asc`/`.msg`/`.ans` were already there; auto-detect handles them).
+  Round-trip + detection are unit-tested in `ansi::tests` (`ctrla_*` / `pcboard_*`).
 
 ## Startup order (settings before the first scan)
 

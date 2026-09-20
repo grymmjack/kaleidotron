@@ -236,7 +236,7 @@ big ones in prose; this is the exhaustive index.)
 
 **Crop** — non-destructive & per-image, **Auto-crop** (isolate the subject on a transparent/flat background, hands-free as you browse), zoom/pan placement, Thirds/Golden/Grid/Spiral guides, Free/4:3/16:9/16:10 aspect + flip, named presets, optional bake-to-file
 
-**Image → text-art converters** — **ANSI Shade**, **ASCII**, **Unicode** (half-block / Braille / ramp), **PETSCII**, **ATASCII**, **Apple ][**, and **REXPaint font** (45 bundled fonts); a shared drag-select **glyph picker**; exports to `.ans` / `.xb` / `.tnd` / `.xp` / `.petmate` / `.seq` / `.json` / `.txt` / `.png`
+**Image → text-art converters** — **ANSI Shade**, **ASCII**, **Unicode** (half-block / Braille / ramp), **PETSCII**, **ATASCII**, **Apple ][**, and **REXPaint font** (45 bundled fonts); a shared drag-select **glyph picker**; exports to `.ans` / `.xb` / `.tnd` / `.xp` / **`.asc` (Synchronet Ctrl-A)** / **`.pcb` (PCBoard)** / `.petmate` / `.seq` / `.json` / `.txt` / `.png`
 
 **Palettes** — 55 bundled (CGA/EGA/VGA/Game Boy/NES/C64/PICO-8/DawnBringer/Endesga/…), `.GPL` import/export, palette-preserving decoders
 
@@ -322,6 +322,7 @@ down to the extensions a decoder claims.
 |---|---|---|
 | **ANSI / ASCII art** | `.ans` `.asc` `.nfo` `.diz` `.ice` `.cia` `.ace` `.hyp` + scene readme/doc exts (`.doc` `.dox` `.me` `.1st` `.now` `.msg` `.cap` `.inf` `.grp` `.fyi`) | CP437 + ANSI SGR/cursor, iCE colors, 24-bit, SAUCE-driven cells, baud ANSImation |
 | **Binary scene art** | **XBin** (`.xb`/`.xbin`), **raw BIN** (`.bin`), **TundraDraw** (`.tnd`, 24-bit), **iCE Draw** (`.idf`), **Artworx** (`.adf`) | |
+| **BBS display codes** | **Synchronet Ctrl-A** (`\x01`+letter, in `.asc`/`.msg`/menu files) + **PCBoard** (`@X`hex, `.pcb`) | Auto-detected in any text file; colour/attribute codes rendered like a BBS terminal |
 | **Commodore** | **PETSCII** (`.seq`/`.pet`), **petmate** (`.petmate`) | Authentic C64 font + VIC-II palette |
 | **Any unrecognized extension** | group-specific oddities (`.hpe` `.ad` `.img` `.lgc` `.ltd` `.mir` `.qck` …) | **Content-sniffed** — a file with a SAUCE record, ANSI escapes or CP437 block glyphs renders as scene art even under an unknown extension. Right-click → **Open as text art** forces it on anything |
 

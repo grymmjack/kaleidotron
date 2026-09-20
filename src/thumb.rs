@@ -1392,6 +1392,126 @@ pub fn ansi_grid_to_ans(grid: &AnsiGrid, ice: bool, depth: u8) -> Vec<u8> {
     out
 }
 
+/// Swap the red/blue bits of a 0–7 colour index — the involution between SGR/ANSI order
+/// (used by [`nearest_ansi16`] + `PALETTE`) and VGA attribute order (used by PCBoard `@X`).
+#[inline]
+fn swap_rb(v: u8) -> u8 {
+    let v = v & 7;
+    ((v & 1) << 2) | (v & 2) | ((v & 4) >> 2)
+}
+
+/// Serialize an [`AnsiGrid`] to a **Synchronet Ctrl-A** display file (`.asc`/`.msg`).
+/// Emits `\x01`+letter colour/attribute codes, diffing state per cell like
+/// [`ansi_grid_to_ans`] and matching icy_engine's `save_ctrla`: a `\x01N` reset whenever a
+/// bold or bright-background attribute must be *cleared* (Ctrl-A can't turn one off
+/// individually), then `H`/`E`, then the foreground letter (`KRGYBMCW` = ANSI/SGR indices
+/// 0–7) and the background digit (`0`–`7`). Rows are CRLF-separated (no trailing CRLF).
+/// No SAUCE trailer — a Synchronet display file is a bare code stream.
+pub fn ansi_grid_to_ctrla(grid: &AnsiGrid, ice: bool) -> Vec<u8> {
+    const FG: [u8; 8] = [b'K', b'R', b'G', b'Y', b'B', b'M', b'C', b'W'];
+    let rgb = |idx: u8, fb: [u8; 3]| {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or(fb)
+    };
+    let mut out: Vec<u8> = Vec::new();
+    // Emitted state: fg 0-7, bg 0-7, bold, bright-bg. `first` forces an initial `\x01N`.
+    let (mut cf, mut cb, mut ch, mut ce) = (7u8, 0u8, false, false);
+    let mut first = true;
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let f16 = nearest_ansi16(rgb(cell.fg, [170, 170, 170]));
+            let b16 = nearest_ansi16(rgb(cell.bg, [0, 0, 0]));
+            let (nf, nbold) = (f16 % 8, f16 >= 8);
+            let (nb, nbright) = (b16 % 8, b16 >= 8 && ice);
+            // Ctrl-A can only clear bold/bright-bg via a full Normal reset.
+            if first || (ch && !nbold) || (ce && !nbright) {
+                out.extend_from_slice(b"\x01N");
+                (cf, cb, ch, ce) = (7, 0, false, false);
+                first = false;
+            }
+            if nbold && !ch {
+                out.extend_from_slice(b"\x01H");
+                ch = true;
+            }
+            if nbright && !ce {
+                out.extend_from_slice(b"\x01E");
+                ce = true;
+            }
+            if nf != cf {
+                out.push(0x01);
+                out.push(FG[nf as usize]);
+                cf = nf;
+            }
+            if nb != cb {
+                out.push(0x01);
+                out.push(b'0' + nb);
+                cb = nb;
+            }
+            match cell.ch {
+                0x01 => out.extend_from_slice(b"\x01A"), // escape a literal Ctrl-A byte
+                c => out.push(c),
+            }
+        }
+        if cy + 1 < grid.rows {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out
+}
+
+/// Serialize an [`AnsiGrid`] to a **PCBoard** `@X` display file (`.pcb`). Each attribute
+/// change emits `@X`+two uppercase hex nibbles — **first background, then foreground** — a
+/// raw VGA attribute byte (so `@X1E` = blue background, yellow foreground). A literal `@`
+/// in content is escaped as `@@`. Rows are CRLF-separated. No SAUCE trailer.
+pub fn ansi_grid_to_pcboard(grid: &AnsiGrid, ice: bool) -> Vec<u8> {
+    let rgb = |idx: u8, fb: [u8; 3]| {
+        grid.palette
+            .get(idx as usize)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or(fb)
+    };
+    let hex = |n: u8| -> u8 {
+        let n = n & 0xF;
+        if n < 10 {
+            b'0' + n
+        } else {
+            b'A' + (n - 10)
+        }
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut cur: Option<u8> = None; // last emitted VGA attribute byte
+    for cy in 0..grid.rows {
+        for cx in 0..grid.cols {
+            let cell = grid.cells[cy * grid.cols + cx];
+            let f16 = nearest_ansi16(rgb(cell.fg, [170, 170, 170]));
+            let b16 = nearest_ansi16(rgb(cell.bg, [0, 0, 0]));
+            let fvga = swap_rb(f16 & 7) | (f16 & 8); // SGR index → VGA nibble, keep bright
+            let mut bvga = swap_rb(b16 & 7) | (b16 & 8);
+            if !ice {
+                bvga &= 0x7; // no bright background without iCE colours
+            }
+            let attr = (bvga << 4) | fvga;
+            if cur != Some(attr) {
+                out.extend_from_slice(b"@X");
+                out.push(hex(bvga));
+                out.push(hex(fvga));
+                cur = Some(attr);
+            }
+            match cell.ch {
+                b'@' => out.extend_from_slice(b"@@"),
+                c => out.push(c),
+            }
+        }
+        if cy + 1 < grid.rows {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out
+}
+
 /// Serialize an [`AnsiGrid`] to a **TundraDraw** (`.tnd`) file — the scene-native
 /// binary 24-bit-truecolour format, so an RGB export keeps every colour exactly.
 /// Serialize an [`AnsiGrid`] to a REXPaint `.xp` file (gzipped). A single layer of the grid's

@@ -23420,7 +23420,7 @@ impl Kaleidotron {
         self.shade_detail = p.shade_detail.clamp(0.0, 5.0);
         self.shade_ice = p.shade_ice;
         self.shade_invert = p.shade_invert;
-        self.shade_export_format = p.shade_export_format.min(6);
+        self.shade_export_format = p.shade_export_format.min(8);
         self.shade_fit_chars = p.shade_fit_chars;
         self.shade_fit_cols = p.shade_fit_cols.clamp(1, 1000);
         self.shade_fit_rows = p.shade_fit_rows.clamp(1, 1000);
@@ -24429,7 +24429,7 @@ impl Kaleidotron {
         self.shade_vga50 = p.vga50;
         self.shade_half = p.half;
         self.shade_ice = p.ice;
-        self.shade_export_format = p.export_format.min(6);
+        self.shade_export_format = p.export_format.min(8);
         self.shade_fit_chars = p.fit_chars;
         self.shade_fit_cols = p.fit_cols.max(1);
         self.shade_fit_rows = p.fit_rows.max(1);
@@ -30356,10 +30356,12 @@ impl Kaleidotron {
                      • ANSI truecolor (.ans) — 24-bit SGR\n\
                      • XBin 16-color (.xb) — embeds palette + font (Moebius)\n\
                      • Tundra 24-bit (.tnd) — binary truecolor\n\
-                     • REXPaint (.xp) — gzipped CP437 + 24-bit fg/bg",
+                     • REXPaint (.xp) — gzipped CP437 + 24-bit fg/bg\n\
+                     • Synchronet Ctrl-A (.asc) — BBS \\x01+letter color codes\n\
+                     • PCBoard (.pcb) — BBS @X<bg><fg> hex color codes",
                 );
                 let mut f = self.shade_export_format as usize;
-                const FORMATS: [&str; 7] = [
+                const FORMATS: [&str; 9] = [
                     "Auto",
                     "ANSI 16-color (.ans)",
                     "ANSI 256-color (.ans)",
@@ -30367,10 +30369,12 @@ impl Kaleidotron {
                     "XBin 16-color (.xb)",
                     "Tundra 24-bit (.tnd)",
                     "REXPaint (.xp)",
+                    "Synchronet Ctrl-A (.asc)",
+                    "PCBoard @X (.pcb)",
                 ];
                 let cr = eat_scroll(
                     egui::ComboBox::from_id_salt("shade_export_format")
-                        .selected_text(FORMATS[f.min(6)])
+                        .selected_text(FORMATS[f.min(8)])
                         .show_ui(ui, |ui| {
                             for (i, name) in FORMATS.iter().enumerate() {
                                 ui.selectable_value(&mut f, i, *name);
@@ -31297,6 +31301,8 @@ impl Kaleidotron {
             "tnd" => ("TundraDraw", &["tnd"]),
             "xb" => ("XBin", &["xb", "xbin"]),
             "xp" => ("REXPaint", &["xp"]),
+            "asc" => ("Synchronet Ctrl-A", &["asc", "msg"]),
+            "pcb" => ("PCBoard", &["pcb"]),
             _ => ("ANSI art", &["ans"]),
         };
         let Some(dest) = rfd::FileDialog::new()
@@ -55556,7 +55562,7 @@ fn is_image_ext(p: &std::path::Path) -> bool {
         "ase", "xcf", "draw", "ico", "cur", "svg", "ans", "asc", "nfo", "diz", "txt", "ace", "hyp",
         "doc", "dox", "me", "1st", "now", "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin",
         "ice", "cia", "tnd", "idf", "adf", "seq", "pet", "petscii", "petmate", "rip", "pdf",
-        "xmind", "iff", "ilbm", "lbm", "xp",
+        "xmind", "iff", "ilbm", "lbm", "xp", "pcb",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => {
@@ -55587,7 +55593,7 @@ fn is_textmode_ext(p: &std::path::Path) -> bool {
     const EXTS: &[&str] = &[
         "ans", "asc", "nfo", "diz", "txt", "ice", "cia", "ace", "hyp", "doc", "dox", "me", "1st",
         "now", "msg", "cap", "inf", "grp", "fyi", "xb", "xbin", "bin", "tnd", "idf", "adf", "seq",
-        "pet", "petscii", "petmate", "xp",
+        "pet", "petscii", "petmate", "xp", "pcb",
     ];
     match p.extension().and_then(|x| x.to_str()) {
         Some(x) => EXTS.contains(&x.to_ascii_lowercase().as_str()),
@@ -56270,7 +56276,7 @@ fn render_one(
 
 /// Serialize an ANSI grid to a full textmode file (bytes INCLUDING the SAUCE trailer).
 /// Shared by the GUI export and the headless batch. `format` is the `shade_export_format`
-/// code (0 Auto … 5 Tundra). Returns `(bytes, extension, human note)`.
+/// code (0 Auto … 6 REXPaint, 7 Ctrl-A, 8 PCBoard). Returns `(bytes, extension, human note)`.
 fn serialize_textmode(
     grid: &crate::thumb::AnsiGrid,
     format: u8,
@@ -56285,6 +56291,21 @@ fn serialize_textmode(
             crate::thumb::ansi_grid_to_xp(grid),
             "xp",
             " (REXPaint)".to_string(),
+        );
+    }
+    // Synchronet Ctrl-A / PCBoard @X are bare BBS display-code streams — no SAUCE trailer.
+    if format == 7 {
+        return (
+            crate::thumb::ansi_grid_to_ctrla(grid, ice),
+            "asc",
+            " (Synchronet Ctrl-A)".to_string(),
+        );
+    }
+    if format == 8 {
+        return (
+            crate::thumb::ansi_grid_to_pcboard(grid, ice),
+            "pcb",
+            " (PCBoard @X)".to_string(),
         );
     }
     let ega = crate::thumb::palette_is_ega16(&grid.palette);
@@ -56651,7 +56672,7 @@ fn batch_one(
     Ok((out, grid.cols, grid.rows))
 }
 
-/// Map a `--format` string to a `shade_export_format` code (0 Auto … 5 Tundra).
+/// Map a `--format` string to a `shade_export_format` code (0 Auto … 8 PCBoard).
 fn textmode_format_code(s: &str) -> Option<u8> {
     Some(match s.to_ascii_lowercase().as_str() {
         "auto" | "ans" => 0,
@@ -56661,6 +56682,8 @@ fn textmode_format_code(s: &str) -> Option<u8> {
         "xb" | "xbin" => 4,
         "tnd" | "tundra" => 5,
         "xp" | "rexpaint" | "rex" => 6,
+        "ctrla" | "ctrl-a" | "synchronet" | "asc" => 7,
+        "pcb" | "pcboard" => 8,
         _ => return None,
     })
 }
