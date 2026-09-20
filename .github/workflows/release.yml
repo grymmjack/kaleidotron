@@ -108,15 +108,11 @@ jobs:
       matrix:
         include:
           # Apple Silicon — native build on the arm64 runner image.
+          # (Intel/x86_64 dropped: the only native Intel runner, macos-13, is
+          # deprecated/EOL and its queue stalls the release for ages.)
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-arm64
-          # Intel — native build on macos-13, the last Intel-based runner
-          # (macos-14/15/latest are all Apple Silicon). Native avoids
-          # cross-arch C linking of the vendored libxmp (built by build.rs).
-          - os: macos-13
-            target: x86_64-apple-darwin
-            name: macos-x86_64
     steps:
       - uses: actions/checkout@v5
 
