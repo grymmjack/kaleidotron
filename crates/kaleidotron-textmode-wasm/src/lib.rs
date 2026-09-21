@@ -16,8 +16,10 @@ thread_local! {
     static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// The finished RGBA8 output + its dimensions.
     static OUTPUT: RefCell<(u32, u32, Vec<u8>)> = const { RefCell::new((0, 0, Vec::new())) };
-    /// Rendered tracker PCM (interleaved-stereo f32 at 44.1 kHz).
+    /// Rendered PCM (interleaved-stereo f32 at 44.1 kHz) — tracker/RAD/MIDI.
     static AUDIO: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// The caller-filled SoundFont (.sf2) bytes, for MIDI synthesis.
+    static SOUNDFONT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Map a small integer code to the extension string the decoder dispatches on.
@@ -126,6 +128,56 @@ pub extern "C" fn out_len() -> u32 {
 #[no_mangle]
 pub extern "C" fn decode_tracker() -> u32 {
     let pcm = INPUT.with(|b| kaleidotron_textmode::tracker::render(&b.borrow()));
+    match pcm {
+        Some(p) if !p.is_empty() => {
+            AUDIO.with(|a| *a.borrow_mut() = p);
+            1
+        }
+        _ => {
+            AUDIO.with(|a| a.borrow_mut().clear());
+            0
+        }
+    }
+}
+
+/// Render the RAD (Reality Adlib Tracker) module in the input buffer via OPL3 FM
+/// synthesis. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn decode_rad() -> u32 {
+    let pcm = INPUT.with(|b| kaleidotron_textmode::tracker::render_rad(&b.borrow()));
+    match pcm {
+        Some(p) if !p.is_empty() => {
+            AUDIO.with(|a| *a.borrow_mut() = p);
+            1
+        }
+        _ => {
+            AUDIO.with(|a| a.borrow_mut().clear());
+            0
+        }
+    }
+}
+
+/// Reserve (or grow) the SoundFont buffer to `len` bytes and return its pointer.
+/// The caller writes the `.sf2` bytes there before calling [`decode_midi`].
+#[no_mangle]
+pub extern "C" fn soundfont_ptr(len: usize) -> *mut u8 {
+    SOUNDFONT.with(|b| {
+        let mut b = b.borrow_mut();
+        b.clear();
+        b.resize(len, 0);
+        b.as_mut_ptr()
+    })
+}
+
+/// Render the MIDI file in the input buffer through the SoundFont in the
+/// soundfont buffer. Returns 1 on success, 0 on failure (bad MIDI/SoundFont).
+#[no_mangle]
+pub extern "C" fn decode_midi() -> u32 {
+    let pcm = INPUT.with(|midi| {
+        SOUNDFONT.with(|sf| {
+            kaleidotron_textmode::tracker::render_midi(&midi.borrow(), &sf.borrow())
+        })
+    });
     match pcm {
         Some(p) if !p.is_empty() => {
             AUDIO.with(|a| *a.borrow_mut() = p);

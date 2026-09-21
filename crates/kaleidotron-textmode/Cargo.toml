@@ -28,3 +28,5 @@ retrofont = { git = "https://github.com/mkrueger/retrofont", rev = "a7731d9", de
 # Tracker-module playback (MOD/XM/S3M/IT) — pure Rust, renders to PCM (wasm-verified).
 xmrs = "0.14"
 xmrsplayer = "0.14"
+# RAD (OPL3 FM) + MIDI (General MIDI SoundFont synth) → PCM. Pure Rust, wasm-ok.
+rustysynth = "1.3"

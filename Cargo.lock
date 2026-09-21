@@ -2690,6 +2690,7 @@ dependencies = [
  "image 0.25.10",
  "psd",
  "retrofont",
+ "rustysynth",
  "serde_json",
  "ttf-parser",
  "xcf",
