@@ -20,16 +20,23 @@ pub use image_types::{Indexed, PixImage, Rgba};
 /// when `text` is empty. `None` if nothing is drawable.
 fn font_sample(bytes: &[u8], ext: &str, text: &str) -> Option<PixImage> {
     use decode::{fon, font, tdf};
-    if text.trim().is_empty() {
-        // Default "font name" sample = the ordinary Decoder path (what a thumbnail shows).
-        return decode(bytes, ext).ok();
-    }
+    let empty = text.trim().is_empty();
     match ext {
-        "tdf" => tdf::render_tdf(bytes, 0, text, &tdf::TdfOpts::default()),
-        "ttf" | "otf" | "ttc" | "otc" => {
-            font::render_text(bytes, text, &font::TextOpts::default())
+        // TheDraw fonts are 9-dot VGA fonts — colour glyphs only tile correctly at
+        // 9px, so we render via render_tdf (not the 8px decode()/thumbnail path).
+        "tdf" => {
+            let opts = tdf::TdfOpts { font_9px: true, ..Default::default() };
+            let t = if empty { tdf::default_sample_text(bytes) } else { text.to_string() };
+            tdf::render_tdf(bytes, 0, &t, &opts)
         }
-        _ => fon::render_text(bytes, 0, text, [235, 235, 235]),
+        "ttf" | "otf" | "ttc" | "otc" => {
+            if empty { decode(bytes, ext).ok() }
+            else { font::render_text(bytes, text, &font::TextOpts::default()) }
+        }
+        _ => {
+            if empty { decode(bytes, ext).ok() }
+            else { fon::render_text(bytes, 0, text, [235, 235, 235]) }
+        }
     }
 }
 
@@ -38,9 +45,9 @@ fn font_grid(bytes: &[u8], ext: &str) -> Option<PixImage> {
     use decode::{fon, font, tdf};
     match ext {
         "tdf" => {
+            let opts = tdf::TdfOpts { font_9px: true, ..Default::default() };
             let chars: Vec<char> = (33u8..=126).map(|b| b as char).collect();
-            tdf::render_glyph_grid(bytes, 0, &chars, 16, 48, &tdf::TdfOpts::default())
-                .map(|(img, _)| img)
+            tdf::render_glyph_grid(bytes, 0, &chars, 16, 48, &opts).map(|(img, _)| img)
         }
         "ttf" | "otf" | "ttc" | "otc" => {
             let chars = font::glyph_chars(bytes);

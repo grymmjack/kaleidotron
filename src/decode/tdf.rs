@@ -258,6 +258,14 @@ pub fn render_glyph_grid(
 
 /// A representative sample string for a grid tile: the font's own name (uppercased — many TDF
 /// fonts are A–Z only), trimmed to something that fits, falling back to a stock string.
+/// The default sample (the font's own name), for the font viewer's "Name" mode.
+pub fn default_sample_text(bytes: &[u8]) -> String {
+    TdfFont::load(bytes)
+        .ok()
+        .and_then(|fonts| fonts.first().map(sample_text))
+        .unwrap_or_else(|| "ABC".to_string())
+}
+
 fn sample_text(font: &TdfFont) -> String {
     let name: String = font
         .name
