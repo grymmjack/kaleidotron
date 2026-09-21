@@ -22375,6 +22375,20 @@ impl Kaleidotron {
                     rename = Some(i);
                     ui.close();
                 }
+                ui.separator();
+                // Copy the pin's path (absolute, or relative to $HOME) to the clipboard.
+                if ui.button("⧉ Copy path").clicked() {
+                    ui.ctx().copy_text(fav.to_string_lossy().into_owned());
+                    ui.close();
+                }
+                if ui.button("⧉ Copy relative path").clicked() {
+                    let rel = home_dir()
+                        .and_then(|h| fav.strip_prefix(&h).ok().map(|p| p.to_path_buf()))
+                        .unwrap_or_else(|| fav.clone());
+                    ui.ctx().copy_text(rel.to_string_lossy().into_owned());
+                    ui.close();
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(vis_pos > 0, egui::Button::new("⬆ Move up"))
@@ -51233,6 +51247,7 @@ impl AudioPlayer {
     /// Decode `bytes` and open the default device — a convenience wrapping `decode_audio` +
     /// `from_decoded` for callers that don't consult the decode cache.
     #[cfg(test)]
+    #[allow(dead_code)]
     fn open(path: &Path, bytes: Vec<u8>) -> Result<Self, String> {
         Self::from_decoded(path, decode_audio(path, bytes, None)?)
     }
@@ -57998,7 +58013,6 @@ mod tests {
         assert_eq!(textmode_format_code("nope"), None);
     }
 
-    #[test]
     // Emit a byte-correct RON record for the "JPEG De-Artifact" bundled preset, to paste into
     // assets/pixelfx_builtin.ron. Run: cargo test --release dump_deartifact_preset -- --ignored --nocapture
     #[test]
@@ -61411,7 +61425,7 @@ mod gui_tests {
         h.state_mut().show_prefs = true;
         h.state_mut().prefs_section = 8;
         h.run_steps(3);
-        let fill = |h: &Harness<'_, Kaleidotron>| h.ctx.style().visuals.window_fill;
+        let fill = |h: &Harness<'_, Kaleidotron>| h.ctx.global_style().visuals.window_fill;
         // A saved theme (bundled on first run) changes the window fill.
         h.get_by_label("Midnight").click();
         h.run_steps(3);

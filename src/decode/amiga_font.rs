@@ -591,7 +591,7 @@ mod tests {
     /// the archive on disk. Two 2x2 glyphs, depth 2, four palette entries.
     fn synth() -> Vec<u8> {
         let mut b = Vec::new();
-        let mut push32 = |v: u32, b: &mut Vec<u8>| b.extend_from_slice(&v.to_be_bytes());
+        let push32 = |v: u32, b: &mut Vec<u8>| b.extend_from_slice(&v.to_be_bytes());
         push32(HUNK_HEADER, &mut b);
         push32(0, &mut b); // no resident names
         push32(1, &mut b); // table size

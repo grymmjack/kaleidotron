@@ -1414,6 +1414,25 @@ and 1 (ByteRun1/PackBits, output-bounded), 1–8 planes, optional mask plane ski
 fallback for a short CMAP. Verified: **all 1030 previews decode, 0 failures.** `is_image_ext` includes
 the exts so previews open in the viewer.
 
+## TheDraw `.tdf` export gotcha (`decode/tdf.rs` `export_font`)
+
+TheDraw `.tdf` fonts are **parsed** by `retrofont::tdf::TdfFont` (Mike Krüger's crate), but **"Save
+TDF"** (`export_font`) is serialised **by us**, NOT via retrofont's `to_bytes()` — that serialiser is
+**broken for colour fonts and does not round-trip**. retrofont's parser (`decode_glyph`) consumes a
+**char + attribute byte pair** for *every* colour-font cell except `13` (NewLine) / `0` (EndMarker) /
+`&` (a no-op end marker) — including space (`Skip`) and `0xFF` (`HardBlank`) — but `to_bytes()` writes
+those two as a **single byte with no attr**. That drops one byte per space, desyncing the whole cell
+stream on reload, so a re-saved colour font rendered as **garbage** (green fragments + stray red/cyan
+cells) — everywhere it was re-parsed (kaleidotron viewer, `--render`, the VS Code extension's wasm),
+while the *original* file rendered fine. So `export_font` hand-writes the format (header magic + font
+indicator `0xFF00AA55` + 12-byte name + type/spacing + a 94-entry u16 offset table + the glyph block),
+emitting colour cells as char+attr pairs — the exact inverse of the parser. Guarded by a load → export
+→ reload → render round-trip that must be **pixel-identical** to the source. `default_sample_text`
+(the font's own name) is `#[allow(dead_code)]` in the app binary — it's consumed only by the
+`kaleidotron-textmode` lib's `render_font` (the extension). NB the `crates/kaleidotron-textmode`
+copy must be kept in sync, and the extension's viewer translates a literal `\n` in its sample box to a
+real newline so a colour font previews multi-line.
+
 ## Code viewer font + current-line highlight
 
 Preferences → Appearance → "Code viewer": `code_font_size` (6–32 pt), `code_font_path` (any

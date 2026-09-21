@@ -183,10 +183,100 @@ fn append_ansi_sauce(out: &mut Vec<u8>, cols: usize, rows: usize, s: &AnsiSauce)
     out.extend(std::iter::repeat_n(0u8, 22 - font.len()));
 }
 
-/// Export font `index` as a standalone `.tdf` file (via retrofont's serializer).
+/// Export font `index` as a standalone `.tdf` file.
+///
+/// We serialise this **ourselves** rather than via retrofont's `to_bytes()`, whose colour-font
+/// serialiser is broken and does not round-trip: for a `Color` font its parser consumes a
+/// **char + attribute** byte pair for every cell except `13`/`0`/`&` — *including* space (`Skip`)
+/// and `0xFF` (`HardBlank`) — but `to_bytes()` writes those two as a **single byte with no attr`.
+/// That drops one byte per space/hard-blank, desyncing the cell stream on reload, so a "Save TDF"
+/// round-trip rendered as garbage (green fragments + stray red/cyan cells). This writer is the exact
+/// inverse of retrofont's parser (`decode_glyph`): colour cells are always a char+attr pair.
 pub fn export_font(bytes: &[u8], index: usize) -> Option<Vec<u8>> {
     let fonts = TdfFont::load(bytes).ok()?;
-    fonts.get(index)?.to_bytes().ok()
+    let font = fonts.get(index)?;
+    let mut out = Vec::new();
+    // File header: length-prefixed "TheDraw FONTS file" magic + Ctrl-Z.
+    const ID: &[u8] = b"TheDraw FONTS file";
+    out.push(ID.len() as u8 + 1);
+    out.extend_from_slice(ID);
+    out.push(0x1A);
+    append_tdf_font(&mut out, font);
+    Some(out)
+}
+
+const TDF_NAME_LEN: usize = 12;
+const TDF_INVALID_GLYPH: u16 = 0xFFFF;
+
+/// Serialise one font block (indicator, name, type/spacing, offset table + glyph data). Inverse of
+/// retrofont's `decode_glyph`: a colour font stores **char + attr** for every cell, a NewLine as a
+/// bare `13`, and ends each glyph with a `0`. (Block/outline fonts store a bare char per cell.)
+fn append_tdf_font(out: &mut Vec<u8>, font: &TdfFont) {
+    out.extend_from_slice(&0xFF00_AA55u32.to_le_bytes()); // font indicator
+    let name = font.name.as_bytes();
+    let nlen = name.len().min(TDF_NAME_LEN);
+    out.push(TDF_NAME_LEN as u8);
+    out.extend_from_slice(&name[..nlen]);
+    out.extend(std::iter::repeat_n(0u8, TDF_NAME_LEN - nlen));
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.push(match font.font_type {
+        TdfFontType::Outline => 0,
+        TdfFontType::Block => 1,
+        TdfFontType::Color => 2,
+    });
+    out.push(font.spacing as u8);
+
+    let color = font.font_type == TdfFontType::Color;
+    let mut lookup: Vec<u8> = Vec::with_capacity(94 * 2);
+    let mut block: Vec<u8> = Vec::new();
+    for b in 33u8..=126 {
+        match font.glyph(b as char) {
+            Some(g) => {
+                lookup.extend_from_slice(&(block.len() as u16).to_le_bytes());
+                block.push(g.width as u8);
+                block.push(g.height as u8);
+                for part in &g.parts {
+                    match part {
+                        GlyphPart::NewLine => block.push(13),
+                        // The trailing `0` terminator marks glyph end; drop the no-op marker part.
+                        GlyphPart::EndMarker => {}
+                        GlyphPart::HardBlank => {
+                            block.push(0xFF);
+                            if color {
+                                block.push(0);
+                            }
+                        }
+                        GlyphPart::Skip => {
+                            block.push(b' ');
+                            if color {
+                                block.push(0);
+                            }
+                        }
+                        GlyphPart::FillMarker => block.push(b'@'),
+                        GlyphPart::OutlineHole => block.push(b'O'),
+                        GlyphPart::OutlinePlaceholder(pb) => block.push(*pb),
+                        GlyphPart::Char(c) => {
+                            block.push(unicode_to_cp437(*c));
+                            if color {
+                                block.push(0);
+                            }
+                        }
+                        GlyphPart::AnsiChar { ch, fg, bg, blink } => {
+                            block.push(unicode_to_cp437(*ch));
+                            block.push(
+                                ((bg & 0x07) << 4) | (fg & 0x0F) | if *blink { 0x80 } else { 0 },
+                            );
+                        }
+                    }
+                }
+                block.push(0); // glyph terminator
+            }
+            None => lookup.extend_from_slice(&TDF_INVALID_GLYPH.to_le_bytes()),
+        }
+    }
+    out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+    out.extend_from_slice(&lookup);
+    out.extend_from_slice(&block);
 }
 
 /// The TheDraw character slots `'!'..='~'` (33..=126) with whether font `index` defines each —
@@ -259,6 +349,8 @@ pub fn render_glyph_grid(
 /// A representative sample string for a grid tile: the font's own name (uppercased — many TDF
 /// fonts are A–Z only), trimmed to something that fits, falling back to a stock string.
 /// The default sample (the font's own name), for the font viewer's "Name" mode.
+/// (Consumed by the `kaleidotron-textmode` lib's `render_font`; unused in the app binary.)
+#[allow(dead_code)]
 pub fn default_sample_text(bytes: &[u8]) -> String {
     TdfFont::load(bytes)
         .ok()

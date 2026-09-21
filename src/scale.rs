@@ -897,7 +897,7 @@ mod tests {
     use super::*;
 
     // A tiny helper: build a w×h RGBA buffer from a grayscale grid (0/255).
-    fn buf(vals: &[u8], w: usize) -> Vec<u8> {
+    fn buf(vals: &[u8], _w: usize) -> Vec<u8> {
         vals.iter().flat_map(|&v| [v, v, v, 255]).collect()
     }
     fn px(out: &[u8], ow: usize, x: usize, y: usize) -> u8 {
