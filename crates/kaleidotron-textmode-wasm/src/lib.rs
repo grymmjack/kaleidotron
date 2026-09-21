@@ -51,6 +51,7 @@ fn ext_str(code: u32) -> &'static str {
         21 => "ttf", // TTF/OTF vector font preview
         22 => "f16", // raw bitmap font (.fon/.fnt/.psf/.fNN) — height from file size
         23 => "tdf", // TheDraw font
+        25 => "bsave", // QB64/BASIC BSAVE image
         _ => "ans",
     }
 }

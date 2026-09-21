@@ -10,6 +10,7 @@ pub mod ansi;
 pub mod adf;
 pub mod aseprite;
 pub mod bin;
+pub mod bsave;
 pub mod builtin;
 pub mod fon;
 pub mod font;
@@ -84,6 +85,7 @@ fn decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(psd::PsdDecoder),
         Box::new(xcf::XcfDecoder),
         Box::new(iff::IlbmDecoder),
+        Box::new(bsave::BsaveDecoder),
         Box::new(pcx::PcxDecoder),
         // Fonts → a rendered preview / glyph grid.
         Box::new(tdf::TdfDecoder),
