@@ -2684,11 +2684,14 @@ dependencies = [
 name = "kaleidotron-textmode"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "asefile",
  "icy_parser_core",
  "image 0.25.10",
  "psd",
+ "retrofont",
  "serde_json",
+ "ttf-parser",
  "xcf",
 ]
 

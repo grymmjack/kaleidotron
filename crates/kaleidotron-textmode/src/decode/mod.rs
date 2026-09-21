@@ -11,6 +11,8 @@ pub mod adf;
 pub mod aseprite;
 pub mod bin;
 pub mod builtin;
+pub mod fon;
+pub mod font;
 pub mod idf;
 pub mod iff;
 pub mod pcx;
@@ -18,6 +20,7 @@ pub mod petmate;
 pub mod petscii;
 pub mod psd;
 pub mod rip;
+pub mod tdf;
 pub mod tundra;
 pub mod xbin;
 pub mod xcf;
@@ -82,6 +85,10 @@ fn decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(xcf::XcfDecoder),
         Box::new(iff::IlbmDecoder),
         Box::new(pcx::PcxDecoder),
+        // Fonts → a rendered preview / glyph grid.
+        Box::new(tdf::TdfDecoder),
+        Box::new(font::FontDecoder),
+        Box::new(fon::FonDecoder),
         Box::new(builtin::ImageCrateDecoder),
         Box::new(ansi::AnsiDecoder), // catch-all for text
     ]

@@ -20,3 +20,8 @@ xcf = "0.4.0"
 asefile = "0.3.8"
 # .petmate is nurpax/petmate JSON PETSCII.
 serde_json = "1"
+# Font previews: ab_glyph rasterises TTF/OTF glyphs (same crate egui uses, wasm-friendly);
+# retrofont parses TheDraw .tdf fonts (Mike Krüger, pinned rev; wasm-verified).
+ab_glyph = "0.2"
+ttf-parser = "0.25"
+retrofont = { git = "https://github.com/mkrueger/retrofont", rev = "a7731d9", default-features = false, features = ["tdf"] }
