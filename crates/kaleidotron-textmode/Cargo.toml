@@ -1,0 +1,20 @@
+[package]
+name = "kaleidotron-textmode"
+version = "0.1.0"
+edition = "2021"
+description = "Text-mode / scene-art decoders (ANSI, XBIN, BIN, Tundra, IDF, ADF, PETSCII) from kaleidotron — egui-free, wasm-ready"
+license = "MIT"
+
+[dependencies]
+# Mike Krüger's lightweight scene-art parser (PETSCII). Pinned to the exact rev
+# kaleidotron uses so the two stay byte-compatible. No tokio/egui — wasm-friendly.
+icy_parser_core = { git = "https://github.com/mkrueger/icy_tools", rev = "68d4b4866c6b67bce0ad99d30f449bc8a8c30515" }
+# Raster formats the browser can't decode natively (TGA/TIFF/QOI/PNM/farbfeld …),
+# plus PCX/PSD/XCF/Aseprite/IFF. All pure-Rust and wasm-friendly. HDR/DDS/EXR are
+# left off (heavier, rarely needed) to keep the wasm lean.
+image = { version = "0.25", default-features = false, features = [
+    "png", "gif", "bmp", "jpeg", "webp", "tga", "tiff", "pnm", "qoi", "ico", "ff",
+] }
+psd = "0.3.5"
+xcf = "0.4.0"
+asefile = "0.3.8"

@@ -1,0 +1,14 @@
+[package]
+name = "kaleidotron-textmode-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for kaleidotron-textmode — a lean no-bindgen ABI for the vscode-kaleidotron viewer"
+license = "MIT"
+
+[lib]
+# cdylib → a .wasm module with a hand-rolled C ABI (no wasm-bindgen, no extra
+# tooling beyond the wasm32 target). The webview reads wasm memory directly.
+crate-type = ["cdylib"]
+
+[dependencies]
+kaleidotron-textmode = { path = "../kaleidotron-textmode" }

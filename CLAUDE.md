@@ -1642,6 +1642,38 @@ before every test that touched a plugin-gated format; `qa-harness`'s `formats.sh
   `libsqlite3-sys` 0.38 whose build script uses the still-unstable `cfg_select!` and fails
   on stable rustc 1.92 (see Cargo.toml comment).
 
+## Workspace: shared decoder crates for the VS Code extension (`crates/`)
+
+The repo is a **Cargo workspace** (`[workspace]` in the root `Cargo.toml`;
+`default-members = ["."]` keeps a bare `cargo build`/`cargo test` focused on the app).
+Two library crates under `crates/` exist to power the **`vscode-kaleidotron`** extension
+(a separate repo, `~/git/vscode-kaleidotron`, published on Open VSX) — a native in-editor
+viewer for the text-mode / scene / raster formats:
+
+- **`crates/kaleidotron-textmode`** — the **egui-free** decoders, extracted so they compile
+  to WebAssembly: `image_types` (`PixImage`), `sauce`, and `decode` (the `Decoder` trait +
+  `DecodeError` + the fonts + `ansi`/`xbin`/`bin`/`tundra`/`petscii`/`idf`/`adf`/`rip` +
+  `pcx`/`psd`/`xcf`/`aseprite`/`iff`/`builtin` (the `image` crate), + `render_textmode`).
+  The module layout **mirrors `src/decode/`** so the decoder source is byte-for-byte the
+  same — only the `#[cfg(test)]` blocks (which reach into the app's `thumb` module) are
+  dropped. `decode(bytes, ext)` does sniff-then-extension dispatch; `set_font_9px` is the
+  9-dot toggle. Deps: `icy_parser_core` (PETSCII/RIP), `image`, `psd`, `xcf`, `asefile` —
+  all wasm-friendly (HDR/DDS/EXR left off to keep it lean).
+- **`crates/kaleidotron-textmode-wasm`** — a `cdylib` with a **lean no-bindgen C ABI**
+  (`input_ptr` / `decode_input(ext_code, font9)` / `out_w` / `out_h` / `out_ptr` / `out_len`),
+  built for `wasm32-unknown-unknown`; the extension's webview reads wasm memory directly. No
+  wasm-bindgen, no extra tooling beyond the wasm target.
+
+**Currently these are COPIES** of the binary's decoder source (kept in sync by hand). The
+planned follow-up is to flip the binary to consume the lib via re-export shims and delete
+its copies (true single-source) — deferred because a handful of integration tests span BOTH
+a decoder's private internals (`parse`/`detect_ctrla`/`PALETTE`) AND the app's `thumb`
+module, so it needs a focused refactor + full `cargo test`. Until then, **a decoder change
+in `src/decode/` must be mirrored into `crates/kaleidotron-textmode/src/decode/`** (and the
+wasm rebuilt) for the extension to pick it up. The extension has **exact parity** with the
+app's decode capabilities — including limits (e.g. an XCF version the `xcf` crate rejects
+fails in both).
+
 ## Adding a format (the common task)
 
 Copy `decode/pcx.rs`, implement the `Decoder` trait (`name`, `extensions`,

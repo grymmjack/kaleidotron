@@ -1,3 +1,12 @@
+[workspace]
+# The kaleidotron binary (this package, the implicit root member) plus the
+# extracted, egui-free text-mode decoder library that the vscode-kaleidotron
+# WebAssembly viewer shares. `default-members` keeps a bare `cargo build` /
+# `cargo test` focused on the app; the wasm crate is built explicitly for its
+# own target (see crates/kaleidotron-textmode-wasm).
+members = ["crates/kaleidotron-textmode", "crates/kaleidotron-textmode-wasm"]
+default-members = ["."]
+
 [package]
 name = "kaleidotron"
 version = "0.1.11"
