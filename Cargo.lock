@@ -2693,6 +2693,8 @@ dependencies = [
  "serde_json",
  "ttf-parser",
  "xcf",
+ "xmrs",
+ "xmrsplayer",
 ]
 
 [[package]]

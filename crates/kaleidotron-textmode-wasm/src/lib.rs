@@ -16,6 +16,8 @@ thread_local! {
     static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// The finished RGBA8 output + its dimensions.
     static OUTPUT: RefCell<(u32, u32, Vec<u8>)> = const { RefCell::new((0, 0, Vec::new())) };
+    /// Rendered tracker PCM (interleaved-stereo f32 at 44.1 kHz).
+    static AUDIO: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Map a small integer code to the extension string the decoder dispatches on.
@@ -114,4 +116,47 @@ pub extern "C" fn out_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn out_len() -> u32 {
     OUTPUT.with(|o| o.borrow().2.len() as u32)
+}
+
+// ---- audio: render a tracker module (MOD/XM/S3M/IT) to PCM ----
+
+/// Render the tracker module currently in the input buffer to interleaved-stereo
+/// f32 PCM at 44.1 kHz. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn decode_tracker() -> u32 {
+    let pcm = INPUT.with(|b| kaleidotron_textmode::tracker::render(&b.borrow()));
+    match pcm {
+        Some(p) if !p.is_empty() => {
+            AUDIO.with(|a| *a.borrow_mut() = p);
+            1
+        }
+        _ => {
+            AUDIO.with(|a| a.borrow_mut().clear());
+            0
+        }
+    }
+}
+
+/// Pointer to the rendered PCM (f32 samples, interleaved stereo).
+#[no_mangle]
+pub extern "C" fn audio_ptr() -> *const u8 {
+    AUDIO.with(|a| a.borrow().as_ptr() as *const u8)
+}
+
+/// Byte length of the rendered PCM (= sample count · 4).
+#[no_mangle]
+pub extern "C" fn audio_len() -> u32 {
+    AUDIO.with(|a| (a.borrow().len() * 4) as u32)
+}
+
+/// Channel count of the rendered PCM (always 2).
+#[no_mangle]
+pub extern "C" fn audio_channels() -> u32 {
+    2
+}
+
+/// Sample rate of the rendered PCM (always 44100).
+#[no_mangle]
+pub extern "C" fn audio_rate() -> u32 {
+    44_100
 }

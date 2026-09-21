@@ -11,6 +11,7 @@
 pub mod decode;
 pub mod image_types;
 pub mod sauce;
+pub mod tracker;
 
 pub use decode::{decode, known_extensions, set_font_9px, DecodeError, Decoder};
 pub use image_types::{Indexed, PixImage, Rgba};

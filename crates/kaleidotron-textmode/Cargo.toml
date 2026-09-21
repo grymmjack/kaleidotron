@@ -25,3 +25,6 @@ serde_json = "1"
 ab_glyph = "0.2"
 ttf-parser = "0.25"
 retrofont = { git = "https://github.com/mkrueger/retrofont", rev = "a7731d9", default-features = false, features = ["tdf"] }
+# Tracker-module playback (MOD/XM/S3M/IT) — pure Rust, renders to PCM (wasm-verified).
+xmrs = "0.14"
+xmrsplayer = "0.14"
