@@ -45,6 +45,7 @@ fn ext_str(code: u32) -> &'static str {
         17 => "qoi",
         18 => "pnm",
         19 => "ff",
+        20 => "petmate",
         _ => "ans",
     }
 }

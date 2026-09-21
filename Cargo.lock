@@ -2688,6 +2688,7 @@ dependencies = [
  "icy_parser_core",
  "image 0.25.10",
  "psd",
+ "serde_json",
  "xcf",
 ]
 

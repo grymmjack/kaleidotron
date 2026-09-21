@@ -14,6 +14,7 @@ pub mod builtin;
 pub mod idf;
 pub mod iff;
 pub mod pcx;
+pub mod petmate;
 pub mod petscii;
 pub mod psd;
 pub mod rip;
@@ -72,6 +73,7 @@ fn decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(idf::IdfDecoder),
         Box::new(adf::AdfDecoder),
         Box::new(petscii::PetsciiDecoder),
+        Box::new(petmate::PetmateDecoder),
         Box::new(bin::BinDecoder),
         // Raster: specific magic-byte decoders first, then the broad image crate.
         // PCX before ImageCrate (its 0x0A magic is ambiguous — same as the app).
