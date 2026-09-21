@@ -138,13 +138,13 @@ pub extern "C" fn text_ptr(len: usize) -> *mut u8 {
 }
 
 /// Render the font in the input buffer to the RGBA output (read via `out_*`).
-/// `grid` != 0 → the full glyph grid; else a sample using the text buffer (empty
-/// text → the format's default "font name" sample). Returns 1 ok, 0 on failure.
+/// `mode`: 0 = sample only, 1 = grid only, 2 = both (sample + grid). The sample
+/// uses the text buffer (empty → the format's default "font name"). Returns 1 ok.
 #[no_mangle]
-pub extern "C" fn decode_font(ext_code: u32, grid: u32) -> u32 {
+pub extern "C" fn decode_font(ext_code: u32, mode: u32) -> u32 {
     let text = TEXT.with(|t| String::from_utf8_lossy(&t.borrow()).into_owned());
     let img = INPUT.with(|b| {
-        kaleidotron_textmode::render_font(&b.borrow(), ext_str(ext_code), grid != 0, &text)
+        kaleidotron_textmode::render_font(&b.borrow(), ext_str(ext_code), mode, &text)
     });
     match img {
         Some(im) => {
