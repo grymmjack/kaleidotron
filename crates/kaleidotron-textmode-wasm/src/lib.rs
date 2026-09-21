@@ -20,6 +20,8 @@ thread_local! {
     static AUDIO: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     /// The caller-filled SoundFont (.sf2) bytes, for MIDI synthesis.
     static SOUNDFONT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// The caller-filled custom sample text (UTF-8), for the font viewer.
+    static TEXT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Map a small integer code to the extension string the decoder dispatches on.
@@ -119,6 +121,41 @@ pub extern "C" fn out_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn out_len() -> u32 {
     OUTPUT.with(|o| o.borrow().2.len() as u32)
+}
+
+// ---- font viewer: sample (custom text) or glyph grid ----
+
+/// Reserve (or grow) the text buffer to `len` bytes and return its pointer. The
+/// caller writes the UTF-8 sample text there before calling [`decode_font`].
+#[no_mangle]
+pub extern "C" fn text_ptr(len: usize) -> *mut u8 {
+    TEXT.with(|b| {
+        let mut b = b.borrow_mut();
+        b.clear();
+        b.resize(len, 0);
+        b.as_mut_ptr()
+    })
+}
+
+/// Render the font in the input buffer to the RGBA output (read via `out_*`).
+/// `grid` != 0 → the full glyph grid; else a sample using the text buffer (empty
+/// text → the format's default "font name" sample). Returns 1 ok, 0 on failure.
+#[no_mangle]
+pub extern "C" fn decode_font(ext_code: u32, grid: u32) -> u32 {
+    let text = TEXT.with(|t| String::from_utf8_lossy(&t.borrow()).into_owned());
+    let img = INPUT.with(|b| {
+        kaleidotron_textmode::render_font(&b.borrow(), ext_str(ext_code), grid != 0, &text)
+    });
+    match img {
+        Some(im) => {
+            OUTPUT.with(|o| *o.borrow_mut() = (im.width, im.height, im.rgba_bytes()));
+            1
+        }
+        None => {
+            OUTPUT.with(|o| *o.borrow_mut() = (0, 0, Vec::new()));
+            0
+        }
+    }
 }
 
 // ---- audio: render a tracker module (MOD/XM/S3M/IT) to PCM ----
