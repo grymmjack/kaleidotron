@@ -2488,6 +2488,14 @@ pub struct Kaleidotron {
     // Git status of the current local folder's repo (badge / column / details / tint).
     // Computed off-thread on each folder change; None when not a repo or disabled.
     git_enabled: bool, // Preferences toggle (persisted); off = feature fully inert
+    // Esc-to-quit (Preferences → Viewer, persisted). `esc_exits_app`: Esc in the browser (with
+    // nothing else to close) quits — default OFF. `esc_exits_cli`: when launched on a file/folder
+    // from the command line, Esc quits instead of dropping back to the grid — default ON, so
+    // `kt pic.png` behaves like a quick-look viewer. `cli_launch` records how we were launched
+    // (0 = normal, 1 = --folder/path, 2 = --open file); not persisted.
+    esc_exits_app: bool,
+    esc_exits_cli: bool,
+    cli_launch: u8,
     git_info: Option<crate::git::GitInfo>, // current folder's status map (runtime)
     #[allow(clippy::type_complexity)]
     git_rx: Option<std::sync::mpsc::Receiver<(PathBuf, Option<crate::git::GitInfo>)>>, // pending compute
@@ -3078,6 +3086,8 @@ impl Kaleidotron {
     const TD_LIGHT_KEY: &'static str = "td_light"; // [yaw, pitch]
     const TD_BG_KEY: &'static str = "td_bg";
     const GIT_ENABLED_KEY: &'static str = "git_enabled";
+    const ESC_EXITS_APP_KEY: &'static str = "esc_exits_app";
+    const ESC_EXITS_CLI_KEY: &'static str = "esc_exits_cli";
     const TASKS_ENABLED_KEY: &'static str = "tasks_enabled";
     const OSD_ENABLED_KEY: &'static str = "osd_enabled";
     const OSD_POSITION_KEY: &'static str = "osd_position";
@@ -3481,6 +3491,13 @@ impl Kaleidotron {
         // target so prev/next work and `resolve_local` has a real base. `--view` also flips
         // `view_only` (minimal chrome, Esc quits).
         let cli_view_only = cli.view.is_some();
+        let cli_launch: u8 = if cli.open.is_some() || cli.view.is_some() {
+            2
+        } else if cli.folder.is_some() {
+            1
+        } else {
+            0
+        };
         let cli_open_file = cli
             .open
             .clone()
@@ -3764,6 +3781,8 @@ impl Kaleidotron {
             .unwrap_or([0.4, 0.6]);
         let td_bg = get_rgb(Self::TD_BG_KEY, [24, 24, 28]);
         let git_enabled = get_bool(Self::GIT_ENABLED_KEY).unwrap_or(true);
+        let esc_exits_app = get_bool(Self::ESC_EXITS_APP_KEY).unwrap_or(false);
+        let esc_exits_cli = get_bool(Self::ESC_EXITS_CLI_KEY).unwrap_or(true);
         let osd_enabled = get_bool(Self::OSD_ENABLED_KEY).unwrap_or(true);
         let osd_position = get_u8(Self::OSD_POSITION_KEY).unwrap_or(1).min(7);
         let osd_secs = cc
@@ -5069,6 +5088,9 @@ impl Kaleidotron {
             td_light_pitch: td_light[1],
             td_bg,
             git_enabled,
+            esc_exits_app,
+            esc_exits_cli,
+            cli_launch,
             git_info: None,
             git_rx: None,
             text_enc: crate::decode::Encoding::default(),
@@ -5501,6 +5523,8 @@ impl Kaleidotron {
             e(A, "code_line_highlight", self.code_line_highlight, "tint the line the cursor is on"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
+            e(V, "esc_exits_app", self.esc_exits_app, "Esc in the browser quits the program"),
+            e(V, "esc_exits_cli", self.esc_exits_cli, "Esc quits when a file/folder was opened from the command line"),
             e(V, "open_on_double_click", self.open_on_double_click, "grid/table: require a double-click to open (else single-click)"),
             e(A, "caption_fields", self.caption_fields, "bitmask: what to show under a thumbnail"),
             e(A, "grid_hover_caption", self.grid_hover_caption, "hide grid captions; show them on hover as an overlay"),
@@ -5787,6 +5811,12 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "yt_max_height") {
             self.yt_max_height = (v as u32).clamp(144, 4320);
+        }
+        if let Some(v) = st::get_bool(&m, "esc_exits_app") {
+            self.esc_exits_app = v;
+        }
+        if let Some(v) = st::get_bool(&m, "esc_exits_cli") {
+            self.esc_exits_cli = v;
         }
         if let Some(v) = st::get_bool(&m, "git_enabled") {
             self.git_enabled = v;
@@ -43025,7 +43055,24 @@ impl eframe::App for Kaleidotron {
             } else if let Some(stars) = rate {
                 self.apply_rating(stars);
             }
-            if esc && self.mode == Mode::Single && self.confirm_discard_text() {
+            // Esc-to-quit: a CLI-opened file quits from the viewer (instead of going back to the
+            // grid); the browser quits when either option applies to this launch.
+            let cli_quit = self.esc_exits_cli && self.cli_launch > 0;
+            let quit = esc
+                && match self.mode {
+                    Mode::Single => self.esc_exits_cli && self.cli_launch == 2,
+                    Mode::Grid => self.esc_exits_app || cli_quit,
+                    _ => false,
+                }
+                && self.palette.is_none()
+                && !self.sel_mask_open
+                && self.renaming.is_none()
+                && self.path_edit.is_none();
+            if quit {
+                if self.mode != Mode::Single || self.confirm_discard_text() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            } else if esc && self.mode == Mode::Single && self.confirm_discard_text() {
                 self.stop_video(); // don't leave a video's soundtrack playing in the grid
                 self.set_mode(Mode::Grid);
                 if self.text_doc.is_some() {
@@ -44502,6 +44549,8 @@ impl eframe::App for Kaleidotron {
         );
         eframe::set_value(storage, Self::TD_BG_KEY, &self.td_bg);
         eframe::set_value(storage, Self::GIT_ENABLED_KEY, &self.git_enabled);
+        eframe::set_value(storage, Self::ESC_EXITS_APP_KEY, &self.esc_exits_app);
+        eframe::set_value(storage, Self::ESC_EXITS_CLI_KEY, &self.esc_exits_cli);
         eframe::set_value(storage, Self::TASKS_ENABLED_KEY, &self.tasks_enabled);
         eframe::set_value(storage, Self::OSD_ENABLED_KEY, &self.osd_enabled);
         eframe::set_value(storage, Self::OSD_POSITION_KEY, &self.osd_position);
@@ -55975,7 +56024,7 @@ const USAGE: &str = "\
 kaleidotron — a pixel-art-first media browser
 
 USAGE:
-    kaleidotron [OPTIONS]
+    kaleidotron [OPTIONS] [FILE|DIR]    (a FILE opens like --open, a DIR like --folder)
     kaleidotron --render <PATH>... [RENDER OPTIONS]   (headless; no window)
     kaleidotron --batch <IMG|DIR>... --preset \"NAME\" [BATCH OPTIONS]  (headless)
 
@@ -55986,6 +56035,8 @@ OPTIONS:
         --view <FILE>             Open FILE in a MINIMAL single-window viewer: no menus/docks,
                                   just the art with scroll / zoom / pan, and Esc to quit. Ideal
                                   as a file-association viewer from mc / ranger / xdg-open.
+                                  (By default Esc also quits after --open / --folder / a bare
+                                  path — Preferences → Viewer → Escape key.)
     -t, --thumbnail-size <SIZE>   Thumbnail tile size: a number (e.g. 160) or
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
@@ -56135,6 +56186,14 @@ impl CliArgs {
                     },
                     None => cli_fail("--sheet requires a number"),
                 },
+                // A bare path: a file opens in the viewer (like --open), a folder browses it
+                // (like --folder) — so `kaleidotron pic.png` / `kaleidotron ~/art` just work.
+                other if !other.starts_with('-') && Path::new(other).is_file() => {
+                    out.open = Some(PathBuf::from(other))
+                }
+                other if !other.starts_with('-') && Path::new(other).is_dir() => {
+                    out.folder = Some(PathBuf::from(other))
+                }
                 other => cli_fail(&format!("unknown argument '{other}' (try --help)")),
             }
         }
@@ -60195,6 +60254,22 @@ impl Kaleidotron {
                                 "Append the open folder or file to the title bar. The GUI zoom % \
                              (Ctrl +/-) always shows in parens when it isn't 100%.",
                             );
+                    });
+                    pref_card(&mut c[0], "Escape key", accent, |ui| {
+                        ui.checkbox(&mut self.esc_exits_app, "Esc to exit main program")
+                            .on_hover_text(
+                                "In the browser, Esc quits kaleidotron once there's nothing else \
+                                 for it to close (dialog, search, viewer).",
+                            );
+                        ui.checkbox(
+                            &mut self.esc_exits_cli,
+                            "Esc to exit when opening image or path via CLI",
+                        )
+                        .on_hover_text(
+                            "When launched as `kaleidotron FILE` / `--open FILE`, Esc quits instead \
+                             of returning to the grid; when launched on a folder, Esc in the \
+                             browser quits. (`--view` always quits on Esc.)",
+                        );
                     });
                     pref_card(&mut c[0], "Text-mode (ANSI/scene) zoom", accent, |ui| {
                         let mut tz = self.textmode_zoom.round() as i32;
