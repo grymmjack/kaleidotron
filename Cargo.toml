@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "kaleidotron"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "A fast, pixel-art-first media browser — images, scene art, 3D, video, audio and text"
 

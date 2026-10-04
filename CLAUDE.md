@@ -1594,6 +1594,19 @@ sets registry flags; `sync_syntax_theme`'s cache-drop is a no-op on an empty lis
 point of doing it while the listing is still empty). Found by the QA suite, which had to press F5
 before every test that touched a plugin-gated format; `qa-harness`'s `formats.sh` now pins it.
 
+## Esc to exit (`esc_exits_app` / `esc_exits_cli`)
+
+Preferences → Viewer → "Escape key", both persisted (eframe keys + `settings.json`).
+`esc_exits_app` (default **off**): Esc in `Mode::Grid` quits. `esc_exits_cli` (default **on**):
+applies only when launched from the CLI — `cli_launch` (not persisted) is `2` for `--open`/
+`--view`/a bare FILE arg, `1` for `--folder`/a bare DIR arg, `0` otherwise. With it on, a
+file launch quits from `Mode::Single` (instead of back-to-grid) and any CLI launch quits from
+the grid. Lives in the rating/nav key block (so `typing`, the dialog-Esc consume, and the
+search/filter closes all win first), plus explicit guards for the command palette /
+select-by-mask / rename / path edit (which handle Esc *later* in the frame), and still runs
+`confirm_discard_text` before closing. `--view`'s own unconditional Esc-quit is unchanged.
+The CLI parser also accepts a **bare path** (FILE → `open`, DIR → `folder`).
+
 ## Settings & ratings
 
 - **`settings.json` is written atomically** (temp + rename) and **never overwritten when it exists

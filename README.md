@@ -289,7 +289,7 @@ big ones in prose; this is the exhaustive index.)
 
 **Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; **export / import your whole setup** to one JSON file (API keys excluded by default); persisted window geometry
 
-**Command line** — `--open FILE` (full viewer) / `--view FILE` (minimal, chromeless viewer — wire it as a file-association viewer for mc / ranger / xdg-open); headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
+**Command line** — a bare `FILE`/`DIR` argument, `--open FILE` (full viewer) / `--view FILE` (minimal, chromeless viewer — wire it as a file-association viewer for mc / ranger / xdg-open); headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
 
 ---
 
@@ -1250,7 +1250,7 @@ persist to a hand-editable `keybindings.json`. The full, always-current referenc
 | Key | Action | Scope |
 |---|---|---|
 | `←` / `→` | Previous / next image | Navigation |
-| `Esc` | Back to grid | Navigation |
+| `Esc` | Back to grid (or quit — see *Esc to exit*) | Navigation |
 | `Backspace` | Parent folder | Navigation |
 | `Home` / `End` | First / last item | Navigation |
 | `T` | Grid / Table toggle | Grid |
@@ -1325,7 +1325,7 @@ zoom ladder. (Holding `Z` suppresses the `1`–`5` rating keys.)
 kaleidotron — a pixel-art-first media browser
 
 USAGE:
-    kaleidotron [OPTIONS]
+    kaleidotron [OPTIONS] [FILE|DIR]    (a FILE opens like --open, a DIR like --folder)
     kaleidotron --render <PATH>... [RENDER OPTIONS]   (headless; no window)
 
 OPTIONS:
@@ -1424,7 +1424,14 @@ shows everything it decodes — from a file manager, a launcher, or a MIME assoc
 ```sh
 kaleidotron --open ART.ANS     # full app, opened on ART.ANS (all chrome, prev/next work)
 kaleidotron --view ART.ANS     # minimal viewer: no chrome, scroll/zoom/pan, Esc quits
+kaleidotron ART.ANS            # a bare file = --open; a bare folder = --folder
 ```
+
+**Esc to exit.** By default, a file or folder opened from the command line quits on Esc
+(after `--open`/a bare file, Esc quits from the viewer instead of returning to the grid;
+after `--folder`/a bare folder, Esc in the browser quits). Toggle it in **Preferences →
+Viewer → Escape key**, which also has an off-by-default **Esc to exit main program** (Esc in
+the browser quits on a normal launch too). `--view` always quits on Esc.
 
 `--view` is the one to wire up as a **file-association viewer**. It shows only the art with
 the viewer's controls (drag to pan, Ctrl+wheel / `Z`-chord to zoom, arrows to scroll), and
