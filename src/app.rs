@@ -56040,6 +56040,9 @@ OPTIONS:
     -t, --thumbnail-size <SIZE>   Thumbnail tile size: a number (e.g. 160) or
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
+        --list-extensions         Print every file extension kaleidotron opens, one per
+                                  line as <ext><TAB><group>, and exit (for editor and
+                                  file-manager integrations).
     -h, --help                    Print this help
 
 PROFILE OPTIONS (test a build from a clean slate; settings live in the data dir):
@@ -56094,6 +56097,15 @@ impl CliArgs {
             match a.as_str() {
                 "-h" | "--help" => {
                     print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--list-extensions" => {
+                    for (ext, group) in Registry::with_builtins().extension_table() {
+                        println!("{ext}\t{group}");
+                    }
+                    for ext in crate::archive::ARCHIVE_EXTS {
+                        println!("{ext}\tarchive");
+                    }
                     std::process::exit(0);
                 }
                 "-f" | "--folder" => match args.next() {

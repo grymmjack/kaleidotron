@@ -117,9 +117,7 @@ impl std::fmt::Display for DecodeError {
 }
 
 pub trait Decoder: Send + Sync {
-    /// Human-readable decoder name. Part of the trait's descriptive API; not yet
-    /// surfaced in the UI, so allow it to be unused for now.
-    #[allow(dead_code)]
+    /// Short decoder name — the group column of `--list-extensions`.
     fn name(&self) -> &'static str;
     fn extensions(&self) -> &'static [&'static str];
     /// Cheap check against the first bytes of the file.
@@ -210,6 +208,19 @@ impl Registry {
             || (!self.mesh_on.load(Relaxed)
                 && (mesh3d::MESH_EXTS.contains(&ext) || mesh3d::AUX_EXTS.contains(&ext)))
             || (!self.video_on.load(Relaxed) && video::VIDEO_EXTS.contains(&ext))
+    }
+
+    /// Every extension some decoder claims, paired with that decoder's name (first claim
+    /// wins), for `--list-extensions` — so editor / file-manager integrations can offer
+    /// "Open in kaleidotron" on exactly the types the app opens. Plugin toggles are ignored:
+    /// this is what the app *can* open, not what the current profile lists.
+    pub fn extension_table(&self) -> Vec<(&'static str, &'static str)> {
+        let mut seen = std::collections::HashSet::new();
+        self.decoders
+            .iter()
+            .flat_map(|d| d.extensions().iter().map(move |e| (*e, d.name())))
+            .filter(|(e, _)| seen.insert(*e))
+            .collect()
     }
 
     /// Does any decoder claim this extension? Used to filter a folder listing. A disabled
