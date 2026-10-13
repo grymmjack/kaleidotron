@@ -289,7 +289,7 @@ big ones in prose; this is the exhaustive index.)
 
 **Interface** — activity rail, **command palette** (Ctrl+Shift+P), **quick open** (Ctrl+P), per-mode panel layouts, toasts, recents; **themes** with **VS Code theme import** (chrome / syntax / both); four editable JSON config files; **export / import your whole setup** to one JSON file (API keys excluded by default); persisted window geometry
 
-**Command line** — a bare `FILE`/`DIR` argument, `--open FILE` (full viewer) / `--view FILE` (minimal, chromeless viewer — wire it as a file-association viewer for mc / ranger / xdg-open); headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
+**Command line** — a bare `FILE`/`DIR` argument, `--open FILE` (full viewer) / `--view FILE` (minimal, chromeless viewer — wire it as a file-association viewer for mc / ranger / xdg-open); headless `--render` (batch any viewable art/image to files), `--folder`, `--font-9px`, `--scale`, `--format`, `--sheet` (XMind); `--list-extensions` (every type it opens, for editor / file-manager integrations); `--data-dir` / `--reset` / `--restore` for a clean-slate profile
 
 ---
 
@@ -1338,6 +1338,9 @@ OPTIONS:
     -t, --thumbnail-size <SIZE>   Thumbnail tile size: a number (e.g. 160) or
                                   WxH (e.g. 120x160 — tiles are square, so the
                                   larger dimension is used)
+        --list-extensions         Print every file extension kaleidotron opens, one per
+                                  line as <ext><TAB><group>, and exit (for editor and
+                                  file-manager integrations).
     -h, --help                    Print this help
 
 PROFILE OPTIONS (test a build from a clean slate; settings live in the data dir):
@@ -1454,6 +1457,12 @@ mime ^image, has kaleidotron = kaleidotron --view "$@"
 Both accept relative paths and load the file's folder too, so **prev/next flip through the
 rest of the directory**. Point them at any format in the [Supported formats](#supported-formats)
 list — ANSI, XBin, images, PDF, 3D, video, audio waveforms all open through the same window.
+
+To wire up **every** type at once, ask kaleidotron for its list instead of hand-writing a regex:
+`kaleidotron --list-extensions` prints one `<ext><TAB><group>` line per extension, straight from
+the decoder registry (group = the decoder, e.g. `image-crate`, `audio`, `ansi`, `code`,
+`archive`). The [VS Code extension](https://github.com/grymmjack/vscode-kaleidotron) uses it to
+show **Open in Kaleidotron (app)** on exactly those files in the Explorer.
 
 ---
 

@@ -1607,6 +1607,16 @@ select-by-mask / rename / path edit (which handle Esc *later* in the frame), and
 `confirm_discard_text` before closing. `--view`'s own unconditional Esc-quit is unchanged.
 The CLI parser also accepts a **bare path** (FILE → `open`, DIR → `folder`).
 
+## `--list-extensions`
+
+Prints `<ext>\t<group>` per line and exits, from `Registry::extension_table()` (each decoder's
+`extensions()` paired with its `name()`, first claim wins) plus `archive::ARCHIVE_EXTS` as group
+`archive`. Plugin toggles are deliberately ignored — it reports what the build *can* open, not
+what the current profile lists. Consumers (the vscode-kaleidotron Explorer menu) key off the
+group names, notably `code` (left out of the menu by default) and `archive` (launched with
+`--folder`), so **renaming a decoder's `name()` is a contract change**. The extension keeps a
+snapshot of this output as its fallback — regenerate it there when adding a decoder.
+
 ## Settings & ratings
 
 - **`settings.json` is written atomically** (temp + rename) and **never overwritten when it exists
