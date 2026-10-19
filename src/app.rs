@@ -3839,8 +3839,9 @@ impl Kaleidotron {
             .clamp(0.0, 1.0);
         let undither_snap = get_bool(Self::UNDITHER_SNAP_KEY).unwrap_or(false);
         let auto_crop_on = get_bool(Self::AUTO_CROP_KEY).unwrap_or(false);
-        // `td_shade` is a 3-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay, bit2 = Stats hidden.
-        let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b111;
+        // `td_shade` is a 4-bit mask: bit0 = Textured base, bit1 = Wireframe overlay,
+        // bit2 = Stats hidden, bit3 = world axes.
+        let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b1111;
         let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
         let td_light = cc
             .storage
@@ -12367,6 +12368,7 @@ impl Kaleidotron {
             textured: false,
             wireframe: false,
             wire_color: [30, 32, 38],
+            axes: false, // a logo is a picture, not a scene to navigate
             light_yaw: self.font_3d_light_yaw,
             light_pitch: self.font_3d_light_pitch,
             light_rgb: self.font_3d_light_rgb,
@@ -35666,6 +35668,19 @@ impl Kaleidotron {
                 ui.color_edit_button_srgb(&mut self.td_wire_color)
                     .on_hover_text("Wireframe line colour");
             });
+            // World axes — the answer to "which way is X from here?" once a model has been
+            // tumbled. Colour-matched to the corner gizmo and to the Spin X/Y/Z buttons, so all
+            // three surfaces name the same axis the same way.
+            let mut axes = self.td_shade & 8 != 0;
+            if ui
+                .checkbox(&mut axes, "Axes")
+                .on_hover_text(
+                    "Draw the world X (red) / Y (green) / Z (blue) axes through the origin.\nDepth-tested, so an axis behind the model is hidden by it; the negative half is dimmed",
+                )
+                .changed()
+            {
+                self.td_shade = (self.td_shade & !8) | ((axes as u8) << 3);
+            }
             let mut stats = self.td_shade & 4 == 0;
             if ui
                 .checkbox(&mut stats, "Stats")
@@ -35745,10 +35760,10 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             // Axis colours, Blender's: X red, Y green, Z blue. Used by the buttons AND the gizmo
             // so a button and the ball it corresponds to are obviously the same thing.
-            let axc = |a: usize| match a {
-                0 => egui::Color32::from_rgb(226, 86, 86),
-                1 => egui::Color32::from_rgb(124, 196, 94),
-                _ => egui::Color32::from_rgb(86, 142, 232),
+            // One definition of "X is red", shared with the gizmo and the rendered world axes.
+            let axc = |a: usize| {
+                let c = mesh3d::AXIS_RGB[a.min(2)];
+                egui::Color32::from_rgb(c[0], c[1], c[2])
             };
             ui.weak("Drag:");
             for (i, (icon, name, hint)) in [
@@ -35878,6 +35893,7 @@ impl Kaleidotron {
             textured: self.td_shade & 1 != 0,
             wireframe: self.td_shade & 2 != 0,
             wire_color: self.td_wire_color,
+            axes: self.td_shade & 8 != 0,
             light_yaw: self.td_light_yaw,
             light_pitch: self.td_light_pitch,
             light_rgb: [255, 255, 255],
@@ -52876,7 +52892,22 @@ fn three_d_stats_overlay(ctx: &egui::Context, rect: egui::Rect, st: &crate::deco
                     row(ui, "GPU vertices", n(st.split_verts),
                         "What a game engine uploads: a vertex is copied wherever its UV or shading changes (seams, hard edges). Blender shows this number right after importing a glTF");
                     row(ui, "UV map", if st.uvs { "yes" } else { "none" }.into(), "Texture coordinates: where each face sits on the texture");
-                    row(ui, "Texture", st.texture.map_or("none".into(), |(w, h)| format!("{w} × {h}")), "The base-colour image");
+                    // Name the file as well as its size, and say when it was matched by
+                    // convention rather than named by the model — a texture the file never asked
+                    // for should be visible as a guess, not silently applied.
+                    let (tex_val, tex_tip) = match (&st.texture, &st.texture_src) {
+                        (Some((w, h)), Some((name, guessed))) => (
+                            format!("{name}  {w} × {h}{}", if *guessed { "  ~" } else { "" }),
+                            if *guessed {
+                                "The model names no texture, so this one was matched beside it by name (…_tex / …_diffuse / same stem). The ~ marks the guess"
+                            } else {
+                                "The base-colour image the model asks for"
+                            },
+                        ),
+                        (Some((w, h)), None) => (format!("{w} × {h}"), "The base-colour image"),
+                        _ => ("none".into(), "The base-colour image"),
+                    };
+                    row(ui, "Texture", tex_val, tex_tip);
                     row(ui, "Size", format!("{:.2} × {:.2} × {:.2}", st.size[0], st.size[1], st.size[2]),
                         "Bounding box (X × Y × Z) in the file's units — metres for glTF");
                 });
@@ -52939,10 +52970,9 @@ fn paint_axis_gizmo(
     });
     // Far balls first (depth: +fwd points away from the viewer).
     balls.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    let col = |axis: usize| match axis {
-        0 => egui::Color32::from_rgb(226, 86, 86),
-        1 => egui::Color32::from_rgb(124, 196, 94),
-        _ => egui::Color32::from_rgb(86, 142, 232),
+    let col = |axis: usize| {
+        let c = crate::decode::mesh3d::AXIS_RGB[axis.min(2)];
+        egui::Color32::from_rgb(c[0], c[1], c[2])
     };
     for (axis, neg, p, _) in &balls {
         let c = col(*axis);
@@ -57211,6 +57241,13 @@ pub struct CliArgs {
     pub render_scale: u32,           // --scale N: nearest-neighbor upscale (0 = unset ⇒ 1×)
     pub render_format: Option<String>, // --format png|bmp|…: force the encoder
     pub render_sheet: Option<usize>, // --sheet N: render sheet N (1-based) of a multi-sheet .xmind
+    // 3D-model render controls. A model has no single "correct" picture — which way it is facing
+    // is the whole question — so the headless path can pick the angle and the overlays instead of
+    // always producing the one default three-quarter view.
+    pub render_view: Option<String>, // --angle front|back|left|right|top|bottom|iso
+    pub render_axes: bool,           // --axes: draw the world X/Y/Z axes
+    pub render_wire: bool,           // --wireframe: hidden-line overlay
+    pub render_flat: bool,           // --flat: ignore the texture (flat material colour)
     // Headless TEXTMODE batch (`--batch`): apply a PixelFX preset to images and dump
     // .ans/.xb/.tnd, no window. Reuses `render_outdir` (--outdir) + `render_format`
     // (--format, mapped to a textmode code).
@@ -57276,6 +57313,15 @@ RENDER OPTIONS (convert text art — ANS/XB/XBIN/RIP/… — and images to files
                                   inferring it from the output filename's extension.
         --sheet <N>               Render sheet N (1-based) of a multi-sheet .xmind mind map.
                                   Default: the first sheet.
+        --angle <ANGLE>           3D models: render from front | back | left | right | top |
+                                  bottom | iso (default: the iso three-quarter view). Which
+                                  way a model faces is the whole question, and the viewport
+                                  is no use over SSH.
+        --axes                    3D models: draw the world X (red) / Y (green) / Z (blue)
+                                  axes through the origin, depth-tested against the model.
+        --wireframe               3D models: overlay hidden-line edges.
+        --flat                    3D models: ignore the texture and shade the material colour
+                                  (the default is textured when the model has one).
 
 BATCH OPTIONS (apply a PixelFX preset to images → textmode .ans/.xb/.tnd, no window):
         --batch <IMG|DIR>...      One or more input images and/or folders (folders are
@@ -57398,6 +57444,25 @@ impl CliArgs {
                     Some(v) => out.render_format = Some(v.to_ascii_lowercase()),
                     None => cli_fail("--format requires a value like png or bmp"),
                 },
+                // `--angle`, not `--view`: `--view FILE` already means "open this file in the
+                // minimal viewer". (rustc caught the collision as an unreachable pattern.)
+                "--angle" => match args.next() {
+                    Some(v) => {
+                        let v = v.to_ascii_lowercase();
+                        if matches!(
+                            v.as_str(),
+                            "front" | "back" | "left" | "right" | "top" | "bottom" | "iso"
+                        ) {
+                            out.render_view = Some(v);
+                        } else {
+                            cli_fail("--angle must be front|back|left|right|top|bottom|iso");
+                        }
+                    }
+                    None => cli_fail("--angle requires a value like front or top"),
+                },
+                "--axes" => out.render_axes = true,
+                "--wireframe" => out.render_wire = true,
+                "--flat" => out.render_flat = true,
                 "--sheet" => match args.next() {
                     Some(v) => match v.parse::<usize>() {
                         Ok(n) if n >= 1 => out.render_sheet = Some(n),
@@ -57513,6 +57578,53 @@ fn upscale_nn(pixels: &[crate::image_types::Rgba], w: u32, h: u32, s: u32) -> (V
 }
 
 /// Decode one file and write the resulting image. Returns the path written on success.
+/// Render a 3D model from a named angle, headless — no window, no GPU, no X server.
+///
+/// The viewport is the only place a model's orientation can normally be chosen, which makes it
+/// useless over SSH and awkward to verify in a script: the default thumbnail is one fixed
+/// three-quarter view, and "is the texture on the right faces?" or "which way is +X?" cannot be
+/// answered from it. With `--view`/`--axes`/`--wireframe` the same CPU rasterizer the viewport
+/// uses produces the picture directly.
+fn render_mesh_headless(
+    input: &Path,
+    cli: &CliArgs,
+) -> Result<crate::image_types::PixImage, String> {
+    use crate::decode::mesh3d::{self, Orbit, RenderOpts, View};
+    let mesh = mesh3d::load(input).ok_or_else(|| "could not load the model".to_string())?;
+    // Square and generous: the output is upscaled by --scale afterwards if asked.
+    let side = 512usize;
+    let mut orbit = Orbit::frame(mesh.center, mesh.radius);
+    if let Some(v) = cli.render_view.as_deref() {
+        // `iso` keeps the default three-quarter framing; the rest look straight down an axis.
+        let axis = match v {
+            "right" => Some((0usize, false)),
+            "left" => Some((0, true)),
+            "top" => Some((1, false)),
+            "bottom" => Some((1, true)),
+            "front" => Some((2, false)),
+            "back" => Some((2, true)),
+            _ => None,
+        };
+        if let Some((a, neg)) = axis {
+            orbit.rot = Orbit::axis_rot(a, neg);
+        }
+    }
+    let opts = RenderOpts {
+        // Textured unless asked otherwise — `render` falls back to flat when there is no texture.
+        textured: !cli.render_flat,
+        wireframe: cli.render_wire,
+        axes: cli.render_axes,
+        bg: [0, 0, 0, 0], // transparent, like the thumbnail
+        ..RenderOpts::default()
+    };
+    let px = mesh3d::render(&mesh, side, side, &View::Free(orbit.to_free()), &opts);
+    Ok(crate::image_types::PixImage::from_rgba(
+        side as u32,
+        side as u32,
+        px,
+    ))
+}
+
 fn render_one(
     reg: &crate::decode::Registry,
     input: &Path,
@@ -57525,6 +57637,14 @@ fn render_one(
             let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
             crate::decode::render_xmind_sheet(&bytes, n.saturating_sub(1))
                 .map_err(|e| e.to_string())?
+        }
+        _ if is_mesh_path(input)
+            && (cli.render_view.is_some()
+                || cli.render_axes
+                || cli.render_wire
+                || cli.render_flat) =>
+        {
+            render_mesh_headless(input, cli)?
         }
         _ => reg.decode_path(input).map_err(|e| e.to_string())?,
     };

@@ -1041,6 +1041,26 @@ The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF
   eframe's **wgpu** backend (NOT glow — `eframe` 0.34's default; verify `cargo tree -e normal |
   grep egui-wgpu`), so a glow `PaintCallback` would need a global renderer switch; the CPU path
   is zero-risk, testable headless, and matches the RIP/ANSI hand-rolled ethos.
+- **A model with UVs but no declared texture gets one matched beside it** (`sibling_texture`).
+  Plenty of exporters write no `.mtl` at all — a glTF→OBJ script, a game's own asset pipeline —
+  leaving a model that is *fully UV-mapped* with nothing pointing at the atlas sitting next to it,
+  so it rendered flat while the texture was right there. Tries `<stem>_tex`, `_texture`,
+  `_diffuse`, `_diff`, `_albedo`, `_basecolor`, `_base_color`, `_color`, then bare `<stem>`, across
+  png/jpg/tga/bmp/webp/tif/gif; one `read_dir` compared lowercased, so `SCREENS_Tex.PNG` matches on
+  a case-sensitive filesystem. **Only** consulted when the file itself declared nothing (a real
+  material is never second-guessed) and **only** when there are non-zero UVs (otherwise a texture
+  would be smeared from one texel over an unmapped model). `Mesh3D::texture_src` records the path
+  and whether it was a guess; the Stats overlay prints the file name with a `~` for a match, so it
+  is never silent magic.
+- **Thumbnails render textured** (`decode_thumb` sets `textured: true`). `render` falls back to
+  flat when there is no texture or no UVs, so it costs an untextured model nothing — and for a
+  textured prop a grey blob is a far worse tile than the actual object.
+- **World axes (`RenderOpts.axes`, `td_shade` bit 3, the `Axes` checkbox).** X/Y/Z through the
+  **world origin** in `AXIS_RGB` — the single definition of "X is red", shared with the corner
+  gizmo and the Spin buttons. Drawn by `draw_line_depth` **into the z-buffer**, so an axis behind
+  the model is hidden by it (that occlusion is the orientation cue); the positive half is full
+  strength and the negative dimmed, so the picture says which way `+X` is, not just where X is.
+  Off by default — a thumbnail must never sprout axes.
 - **Extension routing.** `MESH_EXTS` is routed in `decode_bytes` **before** the sniff loop
   (OBJ/PLY are plain text another decoder might sniff; loaders need the PATH for `.mtl`/`.bin`)
   → `mesh3d::decode_thumb(path, 512)`. `.blend`/`.blend1` are likewise path-routed →
@@ -1096,6 +1116,67 @@ The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF
     front of wherever you stopped (`Orbit::from_fly`). **Verified pixel-identical** across
     orbit → FPS → orbit. **Home** returns to the stashed view, or frames the model when there
     isn't one.
+### Seeing a 3D model yourself (the recipe for Claude)
+
+You cannot judge 3D work from the code. Render it and **Read the PNG** — a model that loads, has
+the right triangle count and passes every test can still be inside-out, unlit, untextured or
+facing the wrong way, and the only way to know is to look.
+
+**Headless first — no window, no GPU, no X server.** This is the reliable path and it works over
+SSH:
+
+```sh
+cargo build --release
+M=path/to/model.obj
+./target/release/kaleidotron --render $M -o /tmp/iso.png --angle iso   --axes --scale 2
+./target/release/kaleidotron --render $M -o /tmp/top.png --angle top   --axes
+./target/release/kaleidotron --render $M -o /tmp/fnt.png --angle front --wireframe
+```
+then `Read /tmp/iso.png`. `--angle` is `front|back|left|right|top|bottom|iso` (**not** `--view` —
+that already means "open this file in the minimal viewer"). `--flat` drops the texture;
+`--wireframe` overlays hidden-line edges; `--scale N` upscales the 512px square.
+
+**Reading the picture.** Textures are on by default, so a grey model means it has no texture (or
+no UVs) — check the Stats overlay in the GUI, or `mesh3d::load(path).texture_src`. With `--axes`:
+**X red, Y green, Z blue**, the positive half bright and the negative half dimmed, and the lines
+are **depth-tested** — an axis vanishing behind the model is telling you that part of it is
+*behind* the model. Rendering the same model from two angles is the quickest way to confirm a
+camera change did what you meant.
+
+**The GUI, when you need to drive it interactively:**
+
+```sh
+CFG=/tmp/kt_probe                    # never use the real profile — the app autosaves over it
+mkdir -p $CFG/kaleidotron
+printf '{ "plugin_3d": true, "plugin_code": true }\n' > $CFG/kaleidotron/settings.json
+env -u WAYLAND_DISPLAY DISPLAY=:1 XDG_DATA_HOME=$CFG ./target/release/kaleidotron --open $M &
+until WID=$(DISPLAY=:1 xdotool search --name kaleidotron | head -1); [ -n "$WID" ]; do sleep 0.5; done
+DISPLAY=:1 xdotool windowsize $WID 1400 900 windowmove $WID 0 0 windowactivate --sync $WID
+sleep 3                                        # let the first frame + decode land
+DISPLAY=:1 xdotool mousemove 1750 1050         # park the pointer OFF the window, or a tooltip
+sleep 1                                        # covers whatever you were trying to photograph
+DISPLAY=:1 xwd -id $WID | xwdtopnm | pnmtopng > /tmp/shot.png
+```
+Then drive it: `xdotool key --clearmodifiers 7` (top view), `1`/`3`, `Ctrl+1`, `4`/`6`/`8`/`2` to
+step-turn, or drag with `mousemove … mousedown 1 / mousemove_relative / mouseup 1`. Kill with
+`pkill -x kaleidotron` (**`-x`**, not `-f` — `-f` matches your own shell command and kills it).
+
+**Gotchas, each of which cost a debugging round:**
+
+- **Synthetic events do not reach egui.** `xdotool key --window $WID …` and
+  `click --window $WID` are silently ignored; use the *real* pointer/keyboard
+  (`xdotool key …` with no `--window`) after `windowactivate --sync`.
+- **If `windowactivate` prints `XGetWindowProperty[_NET_ACTIVE_WINDOW] failed`, every click after
+  it does nothing** — the screenshot looks fine and the toggle just never flips. Don't chase it;
+  fall back to the headless path.
+- **Grid thumbnails are cached by path**, so a decoder fix does not show until **Shift+F5**
+  (`clear_current_view_cache`) or a fresh profile. A stale grey tile is not necessarily a bug.
+- **Window coordinates ≠ screen coordinates.** Read them: `eval $(xdotool getwindowgeometry
+  --shell $WID)` then click at `$((X+wx)) $((Y+wy))`.
+- `ls` is aliased to `eza` here and can hang in a non-interactive shell — use `find -maxdepth 1`.
+- **Grep the compiler for `warning` as well as `error`.** A second `"--view"` match arm compiled
+  fine and silently never ran; rustc had said `unreachable pattern` and only `^error` was checked.
+
 - **Scene setup (`RenderOpts`, persisted `td_*`).** Top-bar controls: **`[x] Textured`** +
   **`[x] Wireframe`** (independent — bits 0/1 of `td_shade`; wireframe is an OVERLAY, composes
   with flat AND textured) + a **wireframe colour chip** (`td_wire_color`); a **`Scene…`** menu

@@ -1046,7 +1046,16 @@ turned any way up, not just spun like a globe on a fixed axis.
 - `Textured` and `Wireframe` are independent — wireframe is a depth-tested overlay, so
   it composes with either shading mode
 - **Scene…** menu with named light presets (Studio / Product / Top / Rim / Dramatic…)
+- **Axes** draws the world X (red) / Y (green) / Z (blue) axes through the origin, depth-tested
+  against the model, so you can always tell which way you're looking at it from
 - **⬇ PNG** exports the current view at viewport size with a transparent background
+- **Textures are found even when the model forgets to name them.** Plenty of exporters write no
+  `.mtl` at all, leaving a fully UV-mapped model with nothing pointing at the atlas beside it —
+  kaleidotron matches `<name>_tex.png` (and `_diffuse`, `_albedo`, `_basecolor`, …) and says so in
+  the Stats box. Grid thumbnails are textured too
+- **Headless, from any angle** — `--render model.obj -o out.png --angle top --axes` renders without
+  a window (handy over SSH, or for checking a model in a script):
+  `--angle front|back|left|right|top|bottom|iso`, `--axes`, `--wireframe`, `--flat`
 - **🧊 Open in 3D editor** (the viewer's bar, the 3D logo maker, extruded SVGs, and the right-click
   menu on models and `.blend` files) — Blender, found automatically (PATH, Flatpak, Snap, `/opt` and
   `~/blender-*` tarballs, Steam, `/Applications`, Program Files), starts with the model imported,

@@ -18,7 +18,7 @@
 
 use super::{DecodeError, Decoder};
 use crate::image_types::PixImage;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Extensions handled by the 3D plugin. Routed by extension in `decode_bytes` (like
 /// `code`/`audio`) because the loaders need the *path*, not just the bytes.
@@ -52,6 +52,10 @@ pub struct Mesh3D {
     pub indices: Vec<u32>,        // triangle list (3 per face)
     pub texcoords: Vec<[f32; 2]>, // parallel to positions ([] = untextured → falls back to solid)
     pub texture: Option<Texture>, // the material's diffuse map (map_Kd / base colour)
+    /// Where the texture was read from, and whether the *file* named it or we matched a sibling
+    /// by convention. Surfaced in the Stats overlay: a texture the model never asked for should
+    /// be visible as such, not magic.
+    pub texture_src: Option<(PathBuf, bool)>, // (path, matched_by_convention)
     pub base_rgb: [u8; 3],        // material diffuse colour (Kd) for solid shading
     pub tri_rgb: Vec<[u8; 3]>,    // optional per-TRIANGLE colour (len = tri_count); [] = use base_rgb.
     // Lets one mesh carry a face colour vs. an extruded-side colour (the 3D font maker).
@@ -87,7 +91,7 @@ impl PolyCounts {
 }
 
 /// Blender-style statistics for the 3D viewer's overlay.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct MeshStats {
     pub objects: usize,
     pub verts: usize,       // points, with the copies at UV seams / hard edges merged (what Blender counts)
@@ -98,6 +102,8 @@ pub struct MeshStats {
     pub polys: Option<PolyCounts>,
     pub uvs: bool,
     pub texture: Option<(usize, usize)>,
+    /// File name of the texture, and whether it was matched by convention rather than declared.
+    pub texture_src: Option<(String, bool)>,
     pub size: [f32; 3], // bounding box, in the file's units
 }
 
@@ -147,6 +153,15 @@ impl Mesh3D {
             polys: self.polys,
             uvs: self.texcoords.iter().any(|uv| *uv != [0.0, 0.0]),
             texture: self.texture.as_ref().map(|t| (t.w, t.h)),
+            texture_src: self.texture_src.as_ref().map(|(p, guessed)| {
+                (
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    *guessed,
+                )
+            }),
             size: if self.positions.is_empty() {
                 [0.0; 3]
             } else {
@@ -215,11 +230,72 @@ pub fn load(path: &Path) -> Option<Mesh3D> {
             mesh.polys = (pc.faces() > 0).then_some(pc);
         }
     }
+    // A model that is fully UV-mapped but names no texture: look for one lying beside it.
+    // Only consulted when the file itself said nothing, so a real material is never second-guessed.
+    let has_uvs = mesh
+        .texcoords
+        .iter()
+        .any(|t| t[0] != 0.0 || t[1] != 0.0);
+    if mesh.texture.is_none() && has_uvs {
+        if let Some((src, tex)) = sibling_texture(path) {
+            mesh.texture = Some(tex);
+            mesh.texture_src = Some((src, true));
+        }
+    }
     if mesh.base_rgb == [0, 0, 0] {
         mesh.base_rgb = [150, 170, 200]; // default cool-grey when the file has no material colour
     }
     mesh.recompute_bounds();
     Some(mesh)
+}
+
+/// Find the texture for a model that has UVs but never declared one.
+///
+/// Plenty of exporters write no `.mtl` at all — a glTF→OBJ conversion script, a game's own asset
+/// pipeline — and leave a model that is *completely UV-mapped* with nothing pointing at its atlas.
+/// It then renders flat while the texture sits right there in the same folder under the obvious
+/// name. Matching the conventional sibling names recovers it.
+///
+/// One `read_dir`, compared lowercased, so `SCREENS_Tex.PNG` matches on a case-sensitive
+/// filesystem too. Suffixes are tried most-specific first; the bare `<stem>.<ext>` is last,
+/// because beside a model that name is as likely to be a preview render as a texture.
+fn sibling_texture(path: &Path) -> Option<(PathBuf, Texture)> {
+    const SUFFIXES: [&str; 9] = [
+        "_tex",
+        "_texture",
+        "_diffuse",
+        "_diff",
+        "_albedo",
+        "_basecolor",
+        "_base_color",
+        "_color",
+        "",
+    ];
+    const EXTS: [&str; 9] = [
+        "png", "jpg", "jpeg", "tga", "bmp", "webp", "tif", "tiff", "gif",
+    ];
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let files: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| (n.to_ascii_lowercase(), e.path()))
+        })
+        .collect();
+    for suffix in SUFFIXES {
+        for ext in EXTS {
+            let want = format!("{stem}{suffix}.{ext}");
+            if let Some((_, p)) = files.iter().find(|(name, _)| *name == want) {
+                if let Some(t) = load_texture(p) {
+                    return Some((p.clone(), t));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// OBJ / STL / COLLADA via `mesh-loader` (PLY is `load_ply`). Sub-meshes are merged into one
@@ -266,6 +342,9 @@ fn load_via_mesh_loader(path: &Path) -> Option<Mesh3D> {
                     dir.join(tp)
                 };
                 out.texture = load_texture(&full);
+                if out.texture.is_some() {
+                    out.texture_src = Some((full, false));
+                }
             }
         }
     }
@@ -605,6 +684,9 @@ impl FlyCam {
 // ---------------------------------------------------------------------------------------------
 // Free orbit camera (quaternion)
 // ---------------------------------------------------------------------------------------------
+
+/// X / Y / Z, in the colours every 3D package uses (and the viewport gizmo matches).
+pub const AXIS_RGB: [[u8; 3]; 3] = [[226, 86, 86], [124, 196, 94], [86, 142, 232]];
 
 /// A rotation as `[x, y, z, w]`.
 ///
@@ -946,6 +1028,9 @@ pub struct RenderOpts {
     pub textured: bool, // sample the diffuse map (falls back to flat if none / no UVs)
     pub wireframe: bool, // overlay hidden-line edges on top of the shaded surface
     pub wire_color: [u8; 3], // wireframe line colour
+    /// Draw the world X/Y/Z axes through the origin, in the gizmo's colours. Depth-tested, so an
+    /// axis passing behind the model is hidden by it — which is itself the orientation cue.
+    pub axes: bool,
     pub light_yaw: f32, // light azimuth (view space)
     pub light_pitch: f32, // light elevation
     pub light_rgb: [u8; 3], // key-light colour (tints the diffuse term; white = neutral)
@@ -958,6 +1043,7 @@ impl Default for RenderOpts {
             textured: false,
             wireframe: false,
             wire_color: [30, 32, 38],
+            axes: false,
             light_yaw: 0.4,
             light_pitch: 0.6,
             light_rgb: [255, 255, 255],
@@ -1198,7 +1284,137 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
             }
         }
     }
+    if opts.axes {
+        draw_axes(&mut color, &mut depth, w, h, mesh, view);
+    }
     color
+}
+
+/// Project one world point for `view` → `(screen x, y, depth)`, or `None` when it falls behind
+/// the near plane. Mirrors the vertex stage in [`render`] so an overlay lands on the same pixels
+/// the mesh did.
+fn project_world(
+    view: &View,
+    w: usize,
+    h: usize,
+    center: [f32; 3],
+    radius: f32,
+    p: [f32; 3],
+) -> Option<(f32, f32, f32)> {
+    let (cx, cyc) = (w as f32 * 0.5, h as f32 * 0.5);
+    let r = radius.max(1e-4);
+    match view {
+        View::Orbit(cam) => {
+            let (sy, cy) = cam.yaw.sin_cos();
+            let (sp, cp) = cam.pitch.sin_cos();
+            let scale = (w.min(h) as f32 * 0.5 / r) * 0.9 * cam.zoom;
+            let pan = [cam.pan[0] * w as f32, cam.pan[1] * h as f32];
+            let v = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+            let rv = orbit_rotate(v, sy, cy, sp, cp);
+            Some((cx + rv[0] * scale + pan[0], cyc - rv[1] * scale + pan[1], rv[2]))
+        }
+        _ => {
+            let fc = view.perspective()?;
+            let rel = [p[0] - fc.eye[0], p[1] - fc.eye[1], p[2] - fc.eye[2]];
+            let vz = dot(rel, fc.fwd);
+            let near = r * 0.02;
+            if vz <= near {
+                return None;
+            }
+            let focal = (h as f32 * 0.5) / (0.5f32).tan();
+            let inv = 1.0 / vz;
+            Some((
+                cx + dot(rel, fc.right) * inv * focal,
+                cyc - dot(rel, fc.up) * inv * focal,
+                inv,
+            ))
+        }
+    }
+}
+
+/// Draw a depth-tested line into the colour + depth buffers.
+///
+/// Depth interpolates **linearly in screen space**, which is exact for both projections here: the
+/// perspective path stores `1/z` (linear in screen space by construction) and the orthographic one
+/// stores `z` (where the mapping is affine anyway).
+#[allow(clippy::too_many_arguments)]
+fn draw_line_depth(
+    color: &mut [[u8; 4]],
+    depth: &mut [f32],
+    w: usize,
+    h: usize,
+    a: (f32, f32, f32),
+    b: (f32, f32, f32),
+    rgb: [u8; 3],
+    thick: i32,
+) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let steps = dx.abs().max(dy.abs()).ceil().max(1.0);
+    if !steps.is_finite() || steps > 1e6 {
+        return;
+    }
+    let n = steps as i32;
+    for i in 0..=n {
+        let t = i as f32 / steps;
+        let (x, y) = (a.0 + dx * t, a.1 + dy * t);
+        let d = a.2 + (b.2 - a.2) * t;
+        // A little thickness, or a 1-pixel line vanishes on a high-DPI viewport.
+        for oy in -thick..=thick {
+            for ox in -thick..=thick {
+                let (px, py) = (x.round() as i32 + ox, y.round() as i32 + oy);
+                if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                    continue;
+                }
+                let idx = py as usize * w + px as usize;
+                if d > depth[idx] {
+                    depth[idx] = d;
+                    color[idx] = [rgb[0], rgb[1], rgb[2], 255];
+                }
+            }
+        }
+    }
+}
+
+/// Draw the world X/Y/Z axes through the origin, depth-tested against the rendered mesh.
+///
+/// The positive half of each axis is drawn at full strength and the negative half dimmed, so the
+/// picture says which way is `+X` as well as where X is — the thing that is genuinely hard to hold
+/// on to once a model has been tumbled a few times.
+fn draw_axes(
+    color: &mut [[u8; 4]],
+    depth: &mut [f32],
+    w: usize,
+    h: usize,
+    mesh: &Mesh3D,
+    view: &View,
+) {
+    // Long enough to span the model wherever it sits relative to the origin.
+    let reach = (len3(mesh.center) + mesh.radius).max(1e-3) * 1.6;
+    let thick = ((w.min(h) as f32 / 600.0).round() as i32).clamp(0, 2);
+    let origin = [0.0f32, 0.0, 0.0];
+    for axis in 0..3usize {
+        let mut far = origin;
+        far[axis] = reach;
+        let mut near = origin;
+        near[axis] = -reach;
+        let rgb = AXIS_RGB[axis];
+        let dim = [
+            (rgb[0] as f32 * 0.45) as u8,
+            (rgb[1] as f32 * 0.45) as u8,
+            (rgb[2] as f32 * 0.45) as u8,
+        ];
+        let o = project_world(view, w, h, mesh.center, mesh.radius, origin);
+        // Each half is its own segment so the origin keeps its exact place even when one end is
+        // clipped away behind the camera.
+        for (end, col) in [(far, rgb), (near, dim)] {
+            if let (Some(p0), Some(p1)) = (
+                o,
+                project_world(view, w, h, mesh.center, mesh.radius, end),
+            ) {
+                draw_line_depth(color, depth, w, h, p0, p1, col, thick);
+            }
+        }
+    }
 }
 
 /// Export `mesh` as a flat-shaded **SVG** — a crisp *vector snapshot* of the 3D view (painter's-
@@ -1364,6 +1580,10 @@ pub fn decode_thumb(path: &Path, size: u32) -> Result<PixImage, DecodeError> {
     let s = size.max(16) as usize;
     let opts = RenderOpts {
         bg: [0, 0, 0, 0], // transparent thumbnail
+        // Texture the tile. `render` already falls back to flat when there is no texture or no
+        // UVs, so this costs nothing for an untextured model — and for a textured one a flat grey
+        // blob is a far worse thumbnail than the actual prop.
+        textured: true,
         ..RenderOpts::default()
     };
     let px = render(&mesh, s, s, &View::Orbit(Camera::default()), &opts);
@@ -1961,6 +2181,94 @@ mod tests {
     }
 
     /// The free camera must render: a Free view of a known mesh is not the background colour.
+    /// The axes must be depth-tested against the model, not pasted over it — an axis that is
+    /// behind the object has to be hidden by it, because that occlusion is itself the cue for
+    /// which end of the axis is pointing at you.
+    #[test]
+    fn world_axes_draw_and_are_hidden_behind_the_model() {
+        // A big quad centred on the origin, facing the camera: it covers the middle of the frame.
+        let mut mesh = Mesh3D {
+            positions: vec![
+                [-2.0, -2.0, 0.0],
+                [2.0, -2.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [-2.0, 2.0, 0.0],
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            ..Default::default()
+        };
+        mesh.recompute_bounds();
+        let o = Orbit {
+            pivot: [0.0, 0.0, 0.0],
+            // Look down -Z from in front, so the quad is square-on and the X/Y axes lie in its
+            // plane — i.e. exactly at the same depth, and never drawn in front of it.
+            rot: Orbit::axis_rot(2, false),
+            dist: 8.0,
+        };
+        let view = View::Free(o.to_free());
+        let base = RenderOpts {
+            bg: [0, 0, 0, 255],
+            ..Default::default()
+        };
+        let plain = render(&mesh, 96, 96, &view, &base);
+        let axed = render(
+            &mesh,
+            96,
+            96,
+            &view,
+            &RenderOpts { axes: true, ..base },
+        );
+        // The Z axis points straight at the camera, so it IS in front of the quad and must show.
+        assert!(plain != axed, "axes drew nothing at all");
+        let blue = AXIS_RGB[2];
+        assert!(
+            axed.iter().any(|p| p[0] == blue[0] && p[1] == blue[1] && p[2] == blue[2]),
+            "the Z axis (pointing at the camera) should be visible"
+        );
+        // …and the X axis, lying *in* the quad's plane, must not punch through it. The axis is
+        // longer than the quad, so simply counting red pixels would count the legitimate parts
+        // sticking out past its edges; the property to assert is *where* they are. Take the quad's
+        // silhouette from the control render and require no red strictly inside it.
+        let bg = [0u8, 0, 0, 255];
+        let quad: Vec<bool> = plain.iter().map(|p| *p != bg).collect();
+        let inside = |x: usize, y: usize| {
+            // Eroded by one pixel: a line landing exactly on the silhouette's edge is rounding,
+            // not leakage.
+            x > 0
+                && y > 0
+                && x + 1 < 96
+                && y + 1 < 96
+                && quad[y * 96 + x]
+                && quad[y * 96 + x - 1]
+                && quad[y * 96 + x + 1]
+                && quad[(y - 1) * 96 + x]
+                && quad[(y + 1) * 96 + x]
+        };
+        let red = AXIS_RGB[0];
+        let leaked = (0..96)
+            .flat_map(|y| (0..96).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = axed[y * 96 + x];
+                p[0] == red[0] && p[1] == red[1] && p[2] == red[2] && inside(x, y)
+            })
+            .count();
+        assert_eq!(
+            leaked, 0,
+            "the X axis punched through a quad it is level with — it is not depth-tested"
+        );
+        // Sanity: it did draw *somewhere* (outside the quad), so the assertion above is meaningful.
+        assert!(
+            axed.iter().any(|p| p[0] == red[0] && p[1] == red[1] && p[2] == red[2]),
+            "the X axis drew nothing at all"
+        );
+    }
+
+    /// Off by default, and off means off: a thumbnail must never sprout axes.
+    #[test]
+    fn axes_are_off_unless_asked_for() {
+        assert!(!RenderOpts::default().axes);
+    }
+
     #[test]
     fn a_free_view_actually_rasterizes() {
         // A tetrahedron is enough geometry to fill pixels from any angle.
@@ -2003,6 +2311,78 @@ f 2 3 4
         let p = std::env::temp_dir().join(format!("pv_mesh_{}_{name}", std::process::id()));
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// A model that is fully UV-mapped but names no texture must still find one. This is the real
+    /// shape of the problem: an exporter writes `v`/`vt`/`f a/b c/d` and no `mtllib` at all, so
+    /// nothing points at the atlas sitting beside it and the prop renders as a grey blob.
+    #[test]
+    fn a_uv_mapped_obj_with_no_mtl_finds_its_texture_beside_it() {
+        let dir = std::env::temp_dir().join("kt_sibling_tex");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A single UV-mapped triangle, with no mtllib/usemtl — exactly the failing case.
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n";
+        let model = dir.join("screens.obj");
+        std::fs::write(&model, obj).expect("write obj");
+        // …and the texture under the conventional name.
+        let tex = image::RgbaImage::from_pixel(4, 2, image::Rgba([10, 200, 30, 255]));
+        tex.save(dir.join("screens_tex.png")).expect("write png");
+
+        let mesh = load(&model).expect("loads");
+        let t = mesh.texture.as_ref().expect("texture matched beside the model");
+        assert_eq!((t.w, t.h), (4, 2));
+        // …and it is flagged as a guess, so the UI can say so rather than implying the file asked.
+        let (src, guessed) = mesh.texture_src.as_ref().expect("source recorded");
+        assert!(guessed, "a conventional match must be marked as one");
+        assert_eq!(src.file_name().and_then(|n| n.to_str()), Some("screens_tex.png"));
+        assert_eq!(
+            mesh.stats().texture_src.map(|(n, g)| (n, g)),
+            Some(("screens_tex.png".to_string(), true))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback must not fire when there is nothing to map it onto, or a texture would be
+    /// smeared from one texel across a model that has no UVs at all.
+    #[test]
+    fn no_uvs_means_no_sibling_texture() {
+        let dir = std::env::temp_dir().join("kt_sibling_tex_nouv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let model = dir.join("blob.obj");
+        std::fs::write(&model, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("write");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(dir.join("blob_tex.png"))
+            .expect("write png");
+        let mesh = load(&model).expect("loads");
+        assert!(mesh.texture.is_none(), "a model with no UVs must stay flat");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Most-specific name wins, and the bare `<stem>.png` is a last resort — beside a model that
+    /// name is as likely to be a preview render as a texture.
+    #[test]
+    fn sibling_texture_prefers_the_conventional_suffix() {
+        let dir = std::env::temp_dir().join("kt_sibling_tex_order");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let model = dir.join("prop.obj");
+        std::fs::write(
+            &model,
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n",
+        )
+        .expect("write");
+        // Same stem (3×3) and the conventional one (5×5): the suffix must win.
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([0, 0, 0, 255]))
+            .save(dir.join("prop.png"))
+            .expect("png");
+        image::RgbaImage::from_pixel(5, 5, image::Rgba([0, 0, 0, 255]))
+            .save(dir.join("prop_tex.png"))
+            .expect("png");
+        let mesh = load(&model).expect("loads");
+        assert_eq!(mesh.texture.map(|t| (t.w, t.h)), Some((5, 5)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
