@@ -27,10 +27,11 @@ to the new name:*
   export; plays trackers (MOD/XM/S3M/IT/…), MIDI (SoundFont), and RAD (OPL3 FM)
 - **Plays & edits video** — ffmpeg-backed player with A/V sync, hover-scrub thumbnails,
   **lossless trim & join**, and YouTube-compatible `.md` chapter markers
-- **Renders 3D** — obj/stl/ply/gltf/glb/dae via a CPU rasterizer, interactive orbit + FPS
-  free-fly viewer, PNG export
+- **Renders 3D** — obj/stl/ply/gltf/glb/dae via a CPU rasterizer, a Blender-style viewport
+  (free tumble, roll, axis gizmo, numpad views) + FPS free-fly, PNG export
 - **Reads code, PDFs, mind maps** — ~90 syntax-highlighted languages (VS Code theme import),
-  real PDF page renders, `.xmind` with the file's own theme
+  real PDF page renders, `.xmind` with the file's own theme, and **`.md` rendered as a page**
+  (GitHub/VS Code-style preview: links, images, tables, GFM alerts, an outline sidebar)
 - **Twelve web sources** — 16colo.rs, Poly Haven, Google Fonts, Lospec (palettes + gallery),
   The Mod Archive, Openverse, Iconify, Wikimedia, a URL "HTTP browser," YouTube, Steam, and DeviantArt
 - **Became a real browser** — VS Code-shaped UI (activity rail, command palette, quick open),
@@ -146,7 +147,7 @@ and the rest of the demoscene / textmode art world — right down to baud-rate
   browsed as a folder** of their samples). Each is a **toggleable plugin** you can switch off in
   Preferences.
 - **3D models** (`obj/stl/ply/gltf/glb/dae`) with real thumbnails and an interactive
-  viewer — orbit or FPS free-fly, textured/wireframe, light presets, PNG export. Rendered
+  viewer — orbit or FPS free-fly, textured/wireframe, light presets, poly-count stats, PNG export. Rendered
   on the **CPU**, so the same renderer draws the tile and the viewport.
 - **Video** (`mp4/mkv/webm/mov/…` via ffmpeg) — real frame thumbnails, hover-scrub, an
   in-app player with A/V sync, audio-scrubbing seek, **lossless trim and join**, frame
@@ -795,6 +796,26 @@ open the file in its associated editor.
 
 ![A Rust source file rendered with syntax highlighting and a line-number gutter](docs/screenshots/source-viewer.png)
 
+**Markdown** — a `.md` file gets a third reading: the **rendered page**, the way GitHub or VS
+Code's preview shows it. Headings (with a clickable **outline** sidebar), **bold**/*italic*/
+~~strike~~/`code`, links, images, nested and task lists, blockquotes, GitHub **alerts**
+(`> [!NOTE]`), fenced code with syntax highlighting and a copy button, GFM tables with column
+alignment, footnotes, front matter, and `<details>` sections.
+
+![A README rendered as a page, with a heading outline beside it](docs/screenshots/markdown-preview.png)
+
+It is styled from **your active theme** — import a VS Code theme and the preview follows it,
+matching the code viewer exactly. Links work the way you'd want in a file browser: an external URL
+opens in your browser, a `#heading` scrolls the page, and a **relative link opens inside
+kaleidotron** — a sibling `.md` in the preview, an image in the viewer, a folder in the browser.
+Images load from disk through kaleidotron's own decoders (so an inline `.pcx`, `.ans` or `.svg`
+renders — which github.com cannot do) and remote badges come through the shared HTTP cache.
+
+Right-click a `.md` for **Preview (rendered)** / Preview (image) / View (text) / Edit (text), or
+press **Ctrl+Shift+M** to flip between the page and the source from either side (rebindable in
+Preferences → Hotkeys). Preferences → Appearance has the body text size, the reading-column width
+and the outline toggle.
+
 **PDF** — the grid tile is the **real first page** (rendered via poppler's `pdftoppm`; a
 labeled placeholder if poppler isn't installed), and opening one enters an in-app viewer
 with **Prev / Next**, a page counter, and a **1-page / 2-page spread** toggle (`←`/`→` turn
@@ -1002,14 +1023,39 @@ The renderer is a **z-buffered CPU rasterizer**, not the GPU. That isn't a compr
 — the thumbnailer runs on worker threads with no GPU context, and using one renderer
 for both the tile and the viewport means they can never disagree.
 
-- **Orbit** (default) — drag to rotate, wheel to zoom, `Space`+drag to pan, `W`/`S` dolly
+**Navigation is Blender-shaped, and the camera is a quaternion** — so a model really can be
+turned any way up, not just spun like a globe on a fixed axis.
+
+![The 3D viewport: navigation bar, per-axis spin buttons and the X/Y/Z gizmo](docs/screenshots/3d-navigation.png)
+
+- **Drag to turn it.** Middle-drag orbits, `Shift`+middle pans, `Ctrl`+drag zooms and
+  **`Alt`+drag rolls**, as in Blender. No middle button? The **Drag: Orbit / Move / Zoom**
+  buttons say what a plain left-drag does
+- **Trackball or Turntable.** Trackball (the default) tumbles freely — over the top, onto its
+  back, any axis. Turntable keeps the model's up pointing up, if you prefer that
+- **Spin X / Y / Z buttons** turn the model about *its own* axes in 15° steps — or a square 90°
+  with `Shift` — plus a **Roll** pair for the view axis
+- **The X/Y/Z gizmo** in the corner shows which way the model's axes point from where you are
+  standing; click a ball to swing round and look straight down that axis (it animates, so you
+  can see which way it went)
+- **Numpad, Blender's:** `1`/`3`/`7` front/right/top (`Ctrl` for the opposite side), `4`/`6`/`8`/`2`
+  turn in steps, `9` flips, `5` switches orbit style, `+`/`-` zoom, `.` and `Home` frame the model
 - **Right-click** toggles **FPS free-fly** (Blender walk-mode) — mouse looks, `WASD`
-  moves, `Q`/`E` down/up. Entering seeds the camera from the orbit view so nothing
-  jumps; leaving carries the pose back
+  moves, `Q`/`E` down/up. Entering and leaving is pixel-identical: the view never jumps,
+  and `Home` brings you back to where you took off from
 - `Textured` and `Wireframe` are independent — wireframe is a depth-tested overlay, so
   it composes with either shading mode
 - **Scene…** menu with named light presets (Studio / Product / Top / Rim / Dramatic…)
 - **⬇ PNG** exports the current view at viewport size with a transparent background
+- **🧊 Open in 3D editor** (the viewer's bar, the 3D logo maker, extruded SVGs, and the right-click
+  menu on models and `.blend` files) — Blender, found automatically (PATH, Flatpak, Snap, `/opt` and
+  `~/blender-*` tarballs, Steam, `/Applications`, Program Files), starts with the model imported,
+  framed and in Material Preview. Preferences → **3D editor** sets another program instead (it just
+  gets the file). The logo maker's and SVGs' meshes are written to an `.obj` + `.mtl` in the cache first
+- **Stats** box (top-left, on by default) — objects, vertices, edges, faces and triangles, like
+  Blender's Statistics overlay (vertices welded at UV seams, as Blender shows after Merge by Distance), plus **GPU vertices**
+  (what an engine uploads), UV map, texture size and bounding box. OBJ and PLY keep their quads
+  and n-gons, so the Faces row shows those; glTF/GLB/STL store triangles only
 
 `.blend` files can't be parsed — no Rust crate reads modern Blender 4.x — so
 right-click → **🎬 Render with Blender** shells out to `blender -b` and *caches the

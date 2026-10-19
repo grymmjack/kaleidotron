@@ -631,6 +631,18 @@ struct Palette {
     toks: [[u8; 3]; ALL_TOKS.len()],
 }
 
+/// The colours a fenced code block paints with: `(background, one colour per [`ALL_TOKS`] kind)`.
+///
+/// The markdown preview renders fenced code through this highlighter, and has to resolve exactly
+/// what the raster tile and the text viewer resolve — the active theme per field, the built-in
+/// palette elsewhere — or three surfaces showing the same snippet disagree about its colours. The
+/// resolution already exists as `Palette`; this just hands it out, so there is still one
+/// implementation of it and no second copy of the theme/fallback rules.
+pub fn code_palette(ext: &str) -> ([u8; 3], [[u8; 3]; ALL_TOKS.len()]) {
+    let p = Palette::resolve(ext);
+    (p.bg, p.toks)
+}
+
 impl Palette {
     /// Resolve for `ext`: the active theme where it has an opinion, the built-in palette otherwise.
     /// Falling back per *field* rather than per theme means a sparse theme still contributes what

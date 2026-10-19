@@ -174,15 +174,21 @@ enum Mode {
 struct ThreeDView {
     path: PathBuf, // display identity (for stepping / the title)
     mesh: crate::decode::mesh3d::Mesh3D,
-    // ONE perspective camera drives the viewport. In orbit mode drag rotates it around
-    // `pivot`; in FPS mode it free-flies. Unifying to a single camera means toggling FPS
-    // (or leaving it) never changes the view — no snap, no ortho↔perspective jump.
+    /// The orbit camera: a pivot, a **quaternion** orientation and a distance. Quaternion
+    /// because yaw/pitch about a fixed world up is a turntable — it can only spin a model like
+    /// a globe, never tip it onto its back or roll it. See `mesh3d::Orbit`.
+    orbit: crate::decode::mesh3d::Orbit,
+    /// The first-person camera. Orbit and FPS are kept in step at each switch (`Orbit::to_fly`
+    /// / `from_fly`) so toggling never moves the view.
     fly: crate::decode::mesh3d::FlyCam,
-    pivot: [f32; 3], // orbit pivot (default: mesh centre)
-    pre_fly: Option<(crate::decode::mesh3d::FlyCam, [f32; 3])>, // saved on FPS entry (Home restores)
-    tex: Option<egui::TextureHandle>,                           // last rasterized frame
+    pre_fly: Option<crate::decode::mesh3d::Orbit>, // orbit view saved on FPS entry (Home restores)
+    /// A running view change (gizmo click, axis button, keypad): `(from, to, t)`, slerped. A view
+    /// that teleports costs the reader their bearings; half a second of turning keeps them.
+    anim: Option<(crate::decode::mesh3d::Quat, crate::decode::mesh3d::Quat, f32)>,
+    tex: Option<egui::TextureHandle>, // last rasterized frame
     sig: u64,  // hash of (cam+opts, viewport px) the tex was rendered for
     fps: bool, // first-person fly mode (right-click toggles): mouse looks, WASD moves
+    stats: crate::decode::mesh3d::MeshStats, // counted once on open, for the Stats overlay
 }
 
 /// Named 3D "scenes" — a key-light direction (view-space azimuth ↔ / elevation ↕) + a
@@ -1315,6 +1321,8 @@ enum Action {
     Refresh,
     Fullscreen,
     OpenPrefs,
+    /// Markdown: rendered page ⇄ source text.
+    MarkdownPreview,
 }
 
 /// A key plus its modifier state — the value a rebindable [`Action`] maps to. `ctrl` is matched
@@ -1473,7 +1481,7 @@ impl ActionScope {
 impl Action {
     // New actions are APPENDED so persisted keymap indices (`to_u8`, legacy load) stay valid;
     // `keybindings.json` keys off the stable `id()`, so order here is otherwise free.
-    const ALL: [Action; 33] = [
+    const ALL: [Action; 34] = [
         Action::PrevImage,
         Action::NextImage,
         Action::BackToGrid,
@@ -1507,6 +1515,7 @@ impl Action {
         Action::Refresh,
         Action::Fullscreen,
         Action::OpenPrefs,
+        Action::MarkdownPreview,
     ];
     /// Which use-case group this action belongs to (for the Preferences → Keyboard cards).
     fn scope(self) -> ActionScope {
@@ -1533,7 +1542,8 @@ impl Action {
             | Action::ToggleCrt
             | Action::FitWidth
             | Action::SnapZoom
-            | Action::OpenExternal => ActionScope::Viewer,
+            | Action::OpenExternal
+            | Action::MarkdownPreview => ActionScope::Viewer,
             Action::PaneExplorer
             | Action::PaneDetails
             | Action::PaneRecolor
@@ -1580,6 +1590,7 @@ impl Action {
             Action::Refresh => "refresh",
             Action::Fullscreen => "fullscreen",
             Action::OpenPrefs => "open_prefs",
+            Action::MarkdownPreview => "markdown_preview",
         }
     }
     fn from_id(id: &str) -> Option<Action> {
@@ -1620,6 +1631,7 @@ impl Action {
             Action::Refresh => "Refresh folder",
             Action::Fullscreen => "Immersive fullscreen",
             Action::OpenPrefs => "Preferences",
+            Action::MarkdownPreview => "Markdown: preview / source",
         }
     }
     fn default_bind(self) -> KeyBind {
@@ -1664,6 +1676,16 @@ impl Action {
             Action::Refresh => KeyBind::key(Key::F5),
             Action::Fullscreen => KeyBind::key(Key::F11),
             Action::OpenPrefs => KeyBind::ctrl(Key::Comma),
+            // **Not** VS Code's Ctrl+Shift+V, however much muscle memory wants it: egui-winit
+            // turns any `command+V` into a paste event and returns before emitting a key event,
+            // so a Ctrl+Shift+V binding could never fire. Ctrl+Shift+M is free, and it is
+            // rebindable here like every other action.
+            Action::MarkdownPreview => KeyBind {
+                key: Key::M,
+                ctrl: true,
+                alt: false,
+                shift: true,
+            },
         }
     }
     fn to_u8(self) -> u8 {
@@ -1912,7 +1934,7 @@ pub struct Kaleidotron {
     // Places → PixelFX sub-tab. Save/apply/rename/colorize/remove.
     pixelfx: Vec<FxPreset>,
     pixelfx_name: String,                    // "save current" name buffer
-    pixelfx_folder: String, // "save into folder" buffer (empty = top level); also the "＋ new folder" target in Move-to
+    pixelfx_folder: String, // "save into folder" buffer (empty = top level); also the "+ new folder" target in Move-to
     pixelfx_rename: Option<(usize, String)>, // inline-rename buffer (transient)
     // User-managed "Samples" locations (name, dir, optional color tag) — quick jumps to sample
     // folders to drag/assign into pads. Add/rename/colorize/remove from the Samples sub-tab.
@@ -2408,11 +2430,19 @@ pub struct Kaleidotron {
     // A 2×2 Repeat-wrapped checker texture, rebuilt when the two colours change (runtime).
     checker_tex: Option<(egui::TextureHandle, [u8; 3], [u8; 3])>,
     // 3D viewer "scene setup" (persisted): shading, light direction, background.
-    td_shade: u8,           // bitmask: bit0 = Textured base, bit1 = Wireframe overlay
+    td_shade: u8,           // bitmask: bit0 = Textured base, bit1 = Wireframe overlay, bit2 = Stats overlay hidden
     td_wire_color: [u8; 3], // wireframe overlay line colour
     td_light_yaw: f32,      // view-space key-light azimuth
     td_light_pitch: f32,    // view-space key-light elevation
     td_bg: [u8; 3],         // 3D viewport background colour
+    /// Orbit style, Blender's preference of the same name. `false` = **turntable** (the model's
+    /// up stays up — the familiar "spin it round" drag); `true` = **trackball** (rotates about
+    /// the camera's own axes, so a drag tumbles freely through the poles and onto its back).
+    td_trackball: bool,
+    /// What a plain left-drag does: 0 = orbit, 1 = move (pan), 2 = zoom. Middle-drag always
+    /// orbits and Shift+middle always pans, so a three-button mouse never needs this; it is for
+    /// a trackpad, and for reaching one gesture deliberately.
+    td_nav: u8,
     // Metadata OSD: a fading info overlay shown on each newly opened image.
     osd_enabled: bool,                         // show the OSD at all (persisted)
     osd_position: u8, // anchor 0..=7: TL,T,TR,L,R,BL,B,BR (3×3 grid, no center) (persisted)
@@ -2830,6 +2860,33 @@ pub struct Kaleidotron {
     /// Tint the line the cursor is on. Cheap and, in a viewer used to follow along in a listing,
     /// the single most useful editor affordance after syntax colour.
     code_line_highlight: bool,
+    /// **Rendered markdown.** A `.md` file has three honest readings: the syntax-highlighted
+    /// raster tile (what the grid paints), the text editor (`draw_text_ui`), and the
+    /// GitHub/VS Code-style page — this. On by default, because a README opened to be *read* is
+    /// the common case; the Source button is one click away. See `src/markdown.rs`.
+    md_preview: bool,
+    /// Show the heading outline beside the preview, like VS Code's document outline.
+    md_outline: bool,
+    /// Body point size for the preview. Deliberately not `code_font_size`: prose and a code
+    /// listing are comfortable at different sizes, and having to compromise between them is the
+    /// annoyance that split `code_font_size` off the UI zoom in the first place.
+    md_font_size: f32,
+    /// The reading column, in points — text that runs the full width of a 4K display is
+    /// unreadable, which is why every documentation site measures its column. 0 = fill the pane.
+    md_max_width: f32,
+    /// The parsed document, keyed by `(path, body length)`: a steady frame reuses it, an edit in
+    /// the source view re-parses. Parsing is cheap, but not 60 times a second.
+    md_doc: Option<(PathBuf, usize, crate::markdown::Doc)>,
+    /// Images the preview has resolved, keyed by the URL exactly as the document writes it.
+    md_imgs: HashMap<String, crate::markdown::Img>,
+    /// Finished image loads coming back from the workers. Decoding happens off the UI thread and
+    /// only CPU pixels cross back — the thumbnailer's rule, for the same reason.
+    md_img_rx: std::sync::mpsc::Receiver<MdImgMsg>,
+    md_img_tx: std::sync::mpsc::Sender<MdImgMsg>,
+    /// Every URL already requested, so one is fetched once however many frames ask for it.
+    md_img_asked: std::collections::HashSet<String>,
+    /// A `#heading` anchor the next render should scroll to (an outline or in-document link).
+    md_scroll: Option<String>,
     /// Dock layout per mode, keyed by the mode's stable id. Saved when leaving a mode and restored
     /// when entering one.
     panel_layouts: HashMap<u8, PanelLayout>,
@@ -2897,6 +2954,9 @@ pub struct Kaleidotron {
     // executables (`.com`/`.exe`/`.bat`) list in the grid and run in DOSBox on double-click /
     // right-click "Run in DOSBox". None = the feature is off (they aren't listed as runnable).
     dosbox_path: Option<PathBuf>,
+    // The 3D editor "Open in 3D editor" launches (Preferences-editable, persisted). None = Blender,
+    // found automatically (PATH, Flatpak, Snap, the usual install folders); see `editor3d`.
+    editor3d_path: Option<PathBuf>,
     // Keep the DOSBox window open after the program exits (run it, then `pause` for a keypress) so
     // a program's outro screen / final ANSI is readable instead of vanishing when DOSBox quits.
     // Persisted; default ON (this browser is for looking at scene art, outros included).
@@ -2982,6 +3042,7 @@ impl Kaleidotron {
     const PLUGIN_VIDEO_KEY: &'static str = "plugin_video";
     const YT_DIR_KEY: &'static str = "yt_download_dir";
     const DOSBOX_PATH_KEY: &'static str = "dosbox_path";
+    const EDITOR3D_PATH_KEY: &'static str = "editor3d_path";
     const DOSBOX_KEEP_OPEN_KEY: &'static str = "dosbox_keep_open";
     const DOSBOX_MACHINE_KEY: &'static str = "dosbox_machine";
     const DOSBOX_SVGA_KEY: &'static str = "dosbox_svga";
@@ -3085,6 +3146,8 @@ impl Kaleidotron {
     const TD_WIRE_COLOR_KEY: &'static str = "td_wire_color";
     const TD_LIGHT_KEY: &'static str = "td_light"; // [yaw, pitch]
     const TD_BG_KEY: &'static str = "td_bg";
+    const TD_TRACKBALL_KEY: &'static str = "td_trackball";
+    const TD_NAV_KEY: &'static str = "td_nav";
     const GIT_ENABLED_KEY: &'static str = "git_enabled";
     const ESC_EXITS_APP_KEY: &'static str = "esc_exits_app";
     const ESC_EXITS_CLI_KEY: &'static str = "esc_exits_cli";
@@ -3327,6 +3390,10 @@ impl Kaleidotron {
         let dosbox_path = cc
             .storage
             .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::DOSBOX_PATH_KEY))
+            .flatten();
+        let editor3d_path = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<PathBuf>>(s, Self::EDITOR3D_PATH_KEY))
             .flatten();
         let dosbox_keep_open = cc
             .storage
@@ -3772,14 +3839,18 @@ impl Kaleidotron {
             .clamp(0.0, 1.0);
         let undither_snap = get_bool(Self::UNDITHER_SNAP_KEY).unwrap_or(false);
         let auto_crop_on = get_bool(Self::AUTO_CROP_KEY).unwrap_or(false);
-        // `td_shade` is a 2-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay.
-        let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b11;
+        // `td_shade` is a 3-bit mask now: bit0 = Textured base, bit1 = Wireframe overlay, bit2 = Stats hidden.
+        let td_shade = get_u8(Self::TD_SHADE_KEY).unwrap_or(0) & 0b111;
         let td_wire_color = get_rgb(Self::TD_WIRE_COLOR_KEY, [30, 32, 38]);
         let td_light = cc
             .storage
             .and_then(|s| eframe::get_value::<[f32; 2]>(s, Self::TD_LIGHT_KEY))
             .unwrap_or([0.4, 0.6]);
         let td_bg = get_rgb(Self::TD_BG_KEY, [24, 24, 28]);
+        // Trackball by default: free tumbling is what a model viewer is for, and the turntable is
+        // one click away for anyone who wants the model's up pinned.
+        let td_trackball = get_bool(Self::TD_TRACKBALL_KEY).unwrap_or(true);
+        let td_nav = get_u8(Self::TD_NAV_KEY).unwrap_or(0).min(2);
         let git_enabled = get_bool(Self::GIT_ENABLED_KEY).unwrap_or(true);
         let esc_exits_app = get_bool(Self::ESC_EXITS_APP_KEY).unwrap_or(false);
         let esc_exits_cli = get_bool(Self::ESC_EXITS_CLI_KEY).unwrap_or(true);
@@ -4279,6 +4350,8 @@ impl Kaleidotron {
         }
         // Shared channel for background archive-thumbnail (montage) builds.
         let (archive_montage_tx, archive_montage_rx) = std::sync::mpsc::channel();
+        // Shared channel for the markdown preview's image loads (local decodes and HTTP fetches).
+        let (md_img_tx, md_img_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
             registry,
@@ -5083,6 +5156,8 @@ impl Kaleidotron {
             transp_color,
             checker_tex: None,
             td_shade,
+            td_trackball,
+            td_nav,
             td_wire_color,
             td_light_yaw: td_light[0],
             td_light_pitch: td_light[1],
@@ -5327,6 +5402,16 @@ impl Kaleidotron {
             code_font_path: String::new(),
             code_font_loaded: None,
             code_line_highlight: true,
+            md_preview: true,
+            md_outline: true,
+            md_font_size: 15.0,
+            md_max_width: 820.0,
+            md_doc: None,
+            md_imgs: HashMap::new(),
+            md_img_rx,
+            md_img_tx,
+            md_img_asked: std::collections::HashSet::new(),
+            md_scroll: None,
             panel_layouts: cc
                 .storage
                 .and_then(|s| eframe::get_value::<Vec<(u8, [bool; 3])>>(s, Self::PANEL_LAYOUTS_KEY))
@@ -5399,6 +5484,7 @@ impl Kaleidotron {
             steam_names: HashMap::new(),
             yt_download_dir,
             dosbox_path,
+            editor3d_path,
             dosbox_keep_open,
             dosbox_machine,
             dosbox_svga,
@@ -5521,6 +5607,10 @@ impl Kaleidotron {
             e(A, "code_font_size", self.code_font_size, "point size of the code viewer's text"),
             e(A, "code_font_path", self.code_font_path.clone(), "a .ttf/.otf for code (blank = built-in monospace)"),
             e(A, "code_line_highlight", self.code_line_highlight, "tint the line the cursor is on"),
+            e(A, "md_preview", self.md_preview, "open .md as the rendered page (else the text editor)"),
+            e(A, "md_outline", self.md_outline, "show the heading outline beside the markdown preview"),
+            e(A, "md_font_size", self.md_font_size, "body point size of the markdown preview"),
+            e(A, "md_max_width", self.md_max_width, "markdown reading column width in points (0 = fill)"),
             e(A, "rail_icon_size", self.rail_icon_size, "activity-rail icon size in points"),
             e(A, "grid_tile_border", self.grid_tile_border, "draw a border around each tile"),
             e(V, "esc_exits_app", self.esc_exits_app, "Esc in the browser quits the program"),
@@ -5588,6 +5678,7 @@ impl Kaleidotron {
             e(PA, "palette_dir", self.palette_dir.clone(), "extra folder scanned for .gpl palettes"),
             e(PA, "yt_download_dir", self.yt_download_dir.clone(), "where YouTube downloads land (null = default)"),
             e(PA, "dosbox_path", self.dosbox_path.clone(), "path to the DOSBox binary (null = off; enables Run in DOSBox for .com/.exe/.bat)"),
+            e(PA, "editor3d_path", self.editor3d_path.clone(), "3D editor for Open in 3D editor (null = Blender, found automatically)"),
             e(PA, "dosbox_keep_open", self.dosbox_keep_open, "keep the DOSBox window open after a program exits (press a key), so outro screens are readable"),
             e(PA, "dosbox_machine", self.dosbox_machine as u64, "emulated CPU preset index (0=Auto, 4=486DX2/66 — see the Preferences dropdown)"),
             e(PA, "dosbox_svga", self.dosbox_svga, "force an SVGA (S3 Trio + VESA) video adapter in DOSBox for high-res viewers/demos"),
@@ -5634,6 +5725,19 @@ impl Kaleidotron {
         }
         if let Some(v) = st::get_u64(&m, "theme_scope") {
             self.theme_scope = (v as u8).min(2);
+        }
+        if let Some(v) = st::get_bool(&m, "md_preview") {
+            self.md_preview = v;
+        }
+        if let Some(v) = st::get_bool(&m, "md_outline") {
+            self.md_outline = v;
+        }
+        if let Some(v) = st::get_f32(&m, "md_font_size") {
+            self.md_font_size = v.clamp(8.0, 48.0);
+        }
+        if let Some(v) = st::get_f32(&m, "md_max_width") {
+            // 0 means "fill the pane"; anything between 0 and a readable column is a typo.
+            self.md_max_width = if v <= 0.0 { 0.0 } else { v.clamp(320.0, 4000.0) };
         }
         if let Some(v) = st::get_f32(&m, "code_font_size") {
             // Clamped rather than trusted: settings.json is hand-editable, and a 0 or a 4000 here
@@ -5788,6 +5892,12 @@ impl Kaleidotron {
         }
         if let Some(v) = m.get("dosbox_path") {
             self.dosbox_path = v
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from);
+        }
+        if let Some(v) = m.get("editor3d_path") {
+            self.editor3d_path = v
                 .as_str()
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from);
@@ -12304,6 +12414,36 @@ impl Kaleidotron {
         format!("{}_{}_3d", clean(&base, 24), clean(&self.font_sample, 24))
     }
 
+    /// The 3D editor (Preferences, else Blender found automatically), or None with the status set.
+    fn editor3d(&mut self) -> Option<crate::editor3d::Editor> {
+        let e = crate::editor3d::resolve(self.editor3d_path.as_deref());
+        if e.is_none() {
+            self.status = "No 3D editor: install Blender (blender.org), or set one in Preferences → 3D editor".into();
+        }
+        e
+    }
+
+    /// 🧊 Open in 3D editor: a model file (archive members resolve to their real file first).
+    fn open_in_3d_editor(&mut self, path: &Path) {
+        let Some(ed) = self.editor3d() else { return };
+        let real = self.resolve_local(path);
+        self.status = crate::editor3d::open(&ed, &real).unwrap_or_else(|e| e);
+    }
+
+    /// 🧊 Open in 3D editor for a mesh that only exists here (the logo maker, an extruded SVG):
+    /// written to an .obj in the cache first.
+    fn open_mesh_in_3d_editor(&mut self, mesh: Option<crate::decode::mesh3d::Mesh3D>, name: &str) {
+        let Some(mesh) = mesh else {
+            self.status = "Nothing to open.".into();
+            return;
+        };
+        let Some(ed) = self.editor3d() else { return };
+        self.status = match crate::editor3d::export_obj(&mesh, name) {
+            Ok(obj) => crate::editor3d::open(&ed, &obj).unwrap_or_else(|e| e),
+            Err(e) => format!("Couldn't write the model for the 3D editor: {e}"),
+        };
+    }
+
     /// Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle).
     fn export_font_3d_svg(&mut self) {
         let Some(svg) = self.font_3d_svg(1600, 1200) else {
@@ -12533,7 +12673,7 @@ impl Kaleidotron {
                 }
                 ui.weak(format!("· {} upem", info.units_per_em));
                 if ui
-                    .small_button("📋 family")
+                    .small_button(format!("{} family", icons::COPY))
                     .on_hover_text("Copy the family name")
                     .clicked()
                 {
@@ -12720,7 +12860,12 @@ impl Kaleidotron {
                 if ui.small_button("💾 SVG").on_hover_text("Save the current 3D view as a flat-shaded vector SVG (a snapshot at this angle — edit in Inkscape)").clicked() {
                     self.export_font_3d_svg();
                 }
-                if ui.small_button("📋 SVG").on_hover_text("Copy the 3D view as vector SVG").clicked() {
+                if ui.small_button(format!("{} Open in 3D editor", icons::CUBE)).on_hover_text(editor3d_hover(self.editor3d_path.as_deref())).clicked() {
+                    let mesh = crate::decode::font3d::extrude_text(&self.font_bytes, &self.font_sample, &self.font_3d_opts());
+                    let name = self.font_export_stem();
+                    self.open_mesh_in_3d_editor(mesh, &name);
+                }
+                if ui.small_button(format!("{} SVG", icons::COPY)).on_hover_text("Copy the 3D view as vector SVG").clicked() {
                     if let Some(svg) = self.font_3d_svg(1400, 1000) {
                         ctx.copy_text(svg);
                         self.status = "Copied 3D composition SVG".into();
@@ -12731,21 +12876,21 @@ impl Kaleidotron {
         }
         ui.horizontal_wrapped(|ui| {
             if ui
-                .small_button("📋 text")
+                .small_button(format!("{} text", icons::COPY))
                 .on_hover_text("Copy the sample text")
                 .clicked()
             {
                 want_copy = Some(self.font_sample.clone());
             }
             if ui
-                .small_button("📋 image")
+                .small_button(format!("{} image", icons::COPY))
                 .on_hover_text("Copy the rendered sample as a bitmap")
                 .clicked()
             {
                 copy_img = true;
             }
             if ui
-                .small_button("📋 SVG")
+                .small_button(format!("{} SVG", icons::COPY))
                 .on_hover_text("Copy the whole composition as vector SVG")
                 .clicked()
             {
@@ -13456,14 +13601,14 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
             if ui
-                .small_button("📋 text")
+                .small_button(format!("{} text", icons::COPY))
                 .on_hover_text("Copy the sample text")
                 .clicked()
             {
                 want_copy = Some(self.font_sample.clone());
             }
             if ui
-                .small_button("📋 image")
+                .small_button(format!("{} image", icons::COPY))
                 .on_hover_text("Copy the rendered art to the clipboard as a bitmap")
                 .clicked()
             {
@@ -14216,14 +14361,14 @@ impl Kaleidotron {
         ui.horizontal_wrapped(|ui| {
             ui.label("Sample");
             if ui
-                .button("📋 PNG")
+                .button(format!("{} PNG", icons::COPY))
                 .on_hover_text("Save the styled sample as a PNG")
                 .clicked()
             {
                 want_png = true;
             }
             if ui
-                .button("📋 Copy")
+                .button(format!("{} Copy", icons::COPY))
                 .on_hover_text("Copy the styled sample to the clipboard as a bitmap")
                 .clicked()
             {
@@ -14847,11 +14992,11 @@ impl Kaleidotron {
         let mut copy_img = false;
         ui.horizontal(|ui| {
             ui.label("Sample");
-            if ui.small_button("📋 text").on_hover_text("Copy the sample characters").clicked() {
+            if ui.small_button(format!("{} text", icons::COPY)).on_hover_text("Copy the sample characters").clicked() {
                 want_copy = Some(self.font_sample.clone());
             }
             if ui
-                .small_button("📋 image")
+                .small_button(format!("{} image", icons::COPY))
                 .on_hover_text("Copy the rendered sample to the clipboard as a bitmap (paste into any program)")
                 .clicked()
             {
@@ -21380,6 +21525,17 @@ impl Kaleidotron {
                     self.text_doc = Some((path.clone(), body));
                     self.text_follow_len = std::fs::metadata(&real).map(|m| m.len()).unwrap_or(0);
                     self.text_edit = want == Some(OpenAs::TextEdit);
+                    // Markdown's rendered reading. An explicit pick from the context menu wins;
+                    // otherwise the persisted preference decides, so "I read my READMEs rendered"
+                    // only has to be said once. Editing always means the source.
+                    if is_markdown_ext(&path) {
+                        match want {
+                            Some(OpenAs::Rendered) => self.md_preview = true,
+                            Some(OpenAs::Text) | Some(OpenAs::TextEdit) => self.md_preview = false,
+                            _ => {}
+                        }
+                    }
+                    self.md_reset();
                     self.set_mode(Mode::Single);
                     self.full_tex = None;
                     self.mark_viewed(&path);
@@ -21533,18 +21689,17 @@ impl Kaleidotron {
         // still routes the mesh ext to a static CPU-rendered thumbnail as a graceful default.
         if self.plugin_3d && is_mesh_path(&path) {
             if let Some(mesh) = crate::decode::mesh3d::load(&src) {
-                let fly = crate::decode::mesh3d::FlyCam::from_orbit(
-                    &crate::decode::mesh3d::Camera::default(),
-                    mesh.center,
-                    mesh.radius,
-                );
-                let pivot = mesh.center;
+                let orbit = crate::decode::mesh3d::Orbit::frame(mesh.center, mesh.radius);
+                let fly = orbit.to_fly();
+                let stats = mesh.stats();
                 self.three_d = Some(ThreeDView {
                     path: path.clone(),
+                    stats,
                     mesh,
+                    orbit,
                     fly,
-                    pivot,
                     pre_fly: None,
+                    anim: None,
                     tex: None,
                     sig: u64::MAX, // force a first render
                     fps: false,
@@ -22407,11 +22562,11 @@ impl Kaleidotron {
                 }
                 ui.separator();
                 // Copy the pin's path (absolute, or relative to $HOME) to the clipboard.
-                if ui.button("⧉ Copy path").clicked() {
+                if ui.button(format!("{} Copy path", icons::COPY)).clicked() {
                     ui.ctx().copy_text(fav.to_string_lossy().into_owned());
                     ui.close();
                 }
-                if ui.button("⧉ Copy relative path").clicked() {
+                if ui.button(format!("{} Copy relative path", icons::COPY)).clicked() {
                     let rel = home_dir()
                         .and_then(|h| fav.strip_prefix(&h).ok().map(|p| p.to_path_buf()))
                         .unwrap_or_else(|| fav.clone());
@@ -26119,7 +26274,7 @@ impl Kaleidotron {
                 if ui.button("🎬 Find videos").clicked() {
                     want_videos = true;
                 }
-                if ui.button("🛒 Store page").clicked() {
+                if ui.button(format!("{} Store page", icons::CART)).clicked() {
                     want_url = Some(g.store_url());
                 }
                 if ui.button("👥 Community hub").clicked() {
@@ -26321,7 +26476,7 @@ impl Kaleidotron {
                         want_fetch_info = true;
                     }
                     if ui
-                        .button("📋 Copy for LLM")
+                        .button(format!("{} Copy for LLM", icons::COPY))
                         .on_hover_text(
                             "Copy title + description + stats + transcript + comments to the \
                              clipboard (fetch transcript/comments first for the full dump)",
@@ -26716,7 +26871,7 @@ impl Kaleidotron {
         let mut save_prompt = false;
         let mut save_style = false;
         let mut add_size = false;
-        egui::Window::new("🤖 AI — Generate")
+        egui::Window::new(format!("{} AI — Generate", icons::ROBOT))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -26897,7 +27052,7 @@ impl Kaleidotron {
                     let r = ui.add(egui::DragValue::new(&mut self.ai_gen_h).range(8..=4096));
                     wheel_adjust(ui, &r, &mut self.ai_gen_h, 1.0, 8, 4096);
                     if ui
-                        .small_button("＋")
+                        .small_button(icons::PLUS)
                         .on_hover_text("Add this size to the presets")
                         .clicked()
                     {
@@ -27076,7 +27231,7 @@ impl Kaleidotron {
                     self.ai_tool_sel = self.ai_tool_sel.saturating_sub(1);
                 }
                 ui.horizontal(|ui| {
-                    if ui.small_button("＋ Add tool").clicked() {
+                    if ui.small_button(format!("{} Add tool", icons::PLUS)).clicked() {
                         self.ai_tools.push(crate::ai::AiTool {
                             name: "new tool".into(),
                             ..Default::default()
@@ -27152,7 +27307,7 @@ impl Kaleidotron {
                 self.ai_styles.remove(i);
                 self.ai_style_sel = self.ai_style_sel.saturating_sub(1);
             }
-            if ui.small_button("＋ Add style").clicked() {
+            if ui.small_button(format!("{} Add style", icons::PLUS)).clicked() {
                 self.ai_styles.push(crate::ai::AiStyle {
                     name: "new style".into(),
                     ..Default::default()
@@ -27211,7 +27366,7 @@ impl Kaleidotron {
                     self.ai_prompts.remove(i);
                     self.ai_prompt_sel = self.ai_prompt_sel.saturating_sub(1);
                 }
-                if ui.small_button("＋ Add prompt").clicked() {
+                if ui.small_button(format!("{} Add prompt", icons::PLUS)).clicked() {
                     self.ai_prompts.push(crate::ai::AiPrompt {
                         name: "new prompt".into(),
                         ..Default::default()
@@ -29783,8 +29938,8 @@ impl Kaleidotron {
             for (d, sym, tip) in [
                 (0u8, "==", "Horizontal"),
                 (1u8, "||", "Vertical"),
-                (2u8, "\\\\", "Diagonal ＼"),
-                (3u8, "//", "Diagonal ／"),
+                (2u8, "\\\\", "Diagonal \\"),
+                (3u8, "//", "Diagonal /"),
             ] {
                 if ui
                     .selectable_label(fx.scan_dir == d, sym)
@@ -31806,6 +31961,7 @@ impl Kaleidotron {
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
+        let mut open_3d: Option<usize> = None; // a model → the 3D editor
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut join_sel = false; // "Join videos" on this entry (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
@@ -32721,6 +32877,7 @@ impl Kaleidotron {
                                     TilePick::CompareSource => compare_pick = Some((idx, false)),
                                     TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                     TilePick::RenderBlend => render_blend = Some(idx),
+                                    TilePick::Open3dEditor => open_3d = Some(idx),
                                     TilePick::ExportBlendRender => export_blend = Some(idx),
                                     TilePick::JoinVideos => join_sel = true,
                                     TilePick::OpenInBrowser => open_in_browser = Some(idx),
@@ -32824,6 +32981,11 @@ impl Kaleidotron {
                 self.start_blend_render(p);
             }
         }
+        if let Some(idx) = open_3d {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.open_in_3d_editor(&p);
+            }
+        }
         if let Some(idx) = export_blend {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.export_blend_render(&p);
@@ -32907,7 +33069,7 @@ impl Kaleidotron {
         bg.context_menu(|ui| {
             if ai_on {
                 if ui
-                    .button("🤖 Generate images here…")
+                    .button(format!("{} Generate images here…", icons::ROBOT))
                     .on_hover_text("Run an AI generator and import the results into this folder")
                     .clicked()
                 {
@@ -33230,6 +33392,7 @@ impl Kaleidotron {
         let mut folder_act: Option<(usize, FolderActPick)> = None; // "Open folder in…" on a dir
         let mut compare_pick: Option<(usize, bool)> = None; // "Compare ▸ …" (idx, is_diff)
         let mut render_blend: Option<usize> = None; // ".blend" → render with headless Blender
+        let mut open_3d: Option<usize> = None; // a model → the 3D editor
         let mut export_blend: Option<usize> = None; // ".blend" → copy its cached render to a PNG
         let mut join_sel = false; // "Join videos" (uses the current selection)
         let selected_videos = self.selection.iter().filter(|p| is_video_ext(p)).count();
@@ -33873,6 +34036,7 @@ impl Kaleidotron {
                                 TilePick::CompareSource => compare_pick = Some((idx, false)),
                                 TilePick::CompareDiff => compare_pick = Some((idx, true)),
                                 TilePick::RenderBlend => render_blend = Some(idx),
+                                TilePick::Open3dEditor => open_3d = Some(idx),
                                 TilePick::ExportBlendRender => export_blend = Some(idx),
                                 TilePick::JoinVideos => join_sel = true,
                                 TilePick::OpenInBrowser => open_in_browser = Some(idx),
@@ -34021,6 +34185,11 @@ impl Kaleidotron {
         if let Some(idx) = render_blend {
             if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
                 self.start_blend_render(p);
+            }
+        }
+        if let Some(idx) = open_3d {
+            if let Some(p) = self.entries.get(idx).map(|e| e.path.clone()) {
+                self.open_in_3d_editor(&p);
             }
         }
         if let Some(idx) = export_blend {
@@ -34305,7 +34474,20 @@ impl Kaleidotron {
         // Real text viewer for source/text: selectable, copyable, searchable — a rasterised
         // bitmap can be none of those. The grid tile still uses the raster path.
         if self.text_doc.is_some() {
-            self.draw_text_ui(ui, immersive);
+            // Markdown has a rendered reading as well as a textual one, and which you get is a
+            // persisted preference plus a toolbar toggle — so the branch is here rather than
+            // inside `draw_text_ui`, which stays exactly the text viewer it was.
+            let rendered = self.md_preview
+                && !self.text_edit
+                && self
+                    .text_doc
+                    .as_ref()
+                    .is_some_and(|(p, _)| is_markdown_ext(p));
+            if rendered {
+                self.draw_markdown_ui(ctx, ui, immersive);
+            } else {
+                self.draw_text_ui(ui, immersive);
+            }
             return;
         }
 
@@ -34883,6 +35065,11 @@ impl Kaleidotron {
                     if ui.small_button("💾 SVG").on_hover_text("Save this 3D view as a flat-shaded vector SVG").clicked() {
                         self.export_svg_3d_svg(&path);
                     }
+                    if ui.small_button(format!("{} Open in 3D editor", icons::CUBE)).on_hover_text(editor3d_hover(self.editor3d_path.as_deref())).clicked() {
+                        let mesh = self.svg_3d_mesh_for(&path);
+                        let name = format!("{}_3d", path.file_stem().and_then(|s| s.to_str()).unwrap_or("svg"));
+                        self.open_mesh_in_3d_editor(mesh, &name);
+                    }
                 }
                 // "Open in…" — shown in BOTH 2D and 3D, matching the font viewer. A program that
                 // handles SVG gets vector; anything else gets a rendered PNG.
@@ -35429,13 +35616,20 @@ impl Kaleidotron {
     /// moves, Q/E down/up, wheel = dolly forward. Scene setup (shading / light / background) in
     /// the top bar; Esc / ‹ Grid = back, ←/→ = prev/next.
     fn ui_three_d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        use crate::decode::mesh3d::{self, Camera, FlyCam, RenderOpts, View};
+        use crate::decode::mesh3d::{self, RenderOpts, View};
         let mut want_back = false;
         let mut want_prev = false;
         let mut want_next = false;
         let mut want_reset = false;
         let mut want_export = false;
         let mut want_home = false;
+        let mut want_editor = false;
+        let mut want_frame = false; // re-centre + fit without turning the model (Home / ⛶ / .)
+        let mut want_look: Option<mesh3d::Quat> = None; // snap to an axis view (animated)
+        let mut want_spin: Option<([f32; 3], f32, bool)> = None; // (axis, radians, world-space?)
+        let mut want_dolly: Option<f32> = None; // zoom button
+        let mut gizmo_hit: Option<(usize, bool)> = None; // axis ball under the pointer
+        let trackball = self.td_trackball;
 
         // ── Top control bar (mutates self.td_* directly — runs before the three_d borrow) ──
         ui.horizontal(|ui| {
@@ -35472,6 +35666,14 @@ impl Kaleidotron {
                 ui.color_edit_button_srgb(&mut self.td_wire_color)
                     .on_hover_text("Wireframe line colour");
             });
+            let mut stats = self.td_shade & 4 == 0;
+            if ui
+                .checkbox(&mut stats, "Stats")
+                .on_hover_text("Vertices, edges, faces and triangles, like Blender's Statistics overlay")
+                .changed()
+            {
+                self.td_shade = (self.td_shade & !4) | ((!stats as u8) << 2);
+            }
             // Scene setup: light presets + manual light + background.
             ui.menu_button("Scene…", |ui| {
                 ui.label("Light presets");
@@ -35504,6 +35706,13 @@ impl Kaleidotron {
             {
                 want_export = true;
             }
+            if ui
+                .button(format!("{} Open in 3D editor", icons::CUBE))
+                .on_hover_text(editor3d_hover(self.editor3d_path.as_deref()))
+                .clicked()
+            {
+                want_editor = true;
+            }
             let fps = self.three_d.as_ref().is_some_and(|v| v.fps);
             if let Some(v) = &self.three_d {
                 ui.separator();
@@ -35522,10 +35731,145 @@ impl Kaleidotron {
             if fps {
                 ui.colored_label(
                     egui::Color32::from_rgb(120, 200, 120),
-                    "● FPS: mouse look · WASD move · Q/E down/up · right-click to exit (keeps view) · Home",
+                    "● FPS: mouse look · WASD move · Q/E down/up · right-click to exit (keeps view) · Home returns",
                 );
             } else {
-                ui.weak("Drag: orbit · Wheel: zoom · Space+drag: pan · WASD · Right-click: FPS fly");
+                ui.weak("Wheel: zoom · Alt+drag: roll · WASD · Right-click: FPS fly");
+            }
+        });
+
+        // ── Navigation bar: what a drag does, how a drag rotates, and explicit turn/zoom/view
+        // buttons. The viewport was previously drag-only and turntable-only, which made some
+        // rotations (tip it onto its back, roll it, look straight up its own axis) effectively
+        // unreachable with a mouse.
+        ui.horizontal_wrapped(|ui| {
+            // Axis colours, Blender's: X red, Y green, Z blue. Used by the buttons AND the gizmo
+            // so a button and the ball it corresponds to are obviously the same thing.
+            let axc = |a: usize| match a {
+                0 => egui::Color32::from_rgb(226, 86, 86),
+                1 => egui::Color32::from_rgb(124, 196, 94),
+                _ => egui::Color32::from_rgb(86, 142, 232),
+            };
+            ui.weak("Drag:");
+            for (i, (icon, name, hint)) in [
+                (icons::ORBIT, "Orbit", "Left-drag turns the model (middle-drag always does this)"),
+                (icons::MOVE, "Move", "Left-drag slides the model (Shift+drag, or Space+drag, always does this)"),
+                (icons::ZOOM, "Zoom", "Left-drag up/down zooms (Ctrl+drag always does this)"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let on = self.td_nav == i as u8;
+                if ui
+                    .add(egui::Button::new(format!("{icon} {name}")).selected(on))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.td_nav = i as u8;
+                }
+            }
+            ui.separator();
+            // Orbit style — the actual fix for "it spins like a globe".
+            let mut tb = self.td_trackball;
+            if ui
+                .add(egui::Button::new(if tb { "Trackball" } else { "Turntable" }).min_size(
+                    fixed_btn_size(ui, &["Trackball", "Turntable"]),
+                ))
+                .on_hover_text(if tb {
+                    "Trackball: a drag tumbles freely — over the top, onto its back, any axis.\nClick for Turntable (keeps the model's up pointing up)."
+                } else {
+                    "Turntable: the model's up stays up, so it can only spin like a globe.\nClick for Trackball (free tumble in any direction)."
+                })
+                .clicked()
+            {
+                tb = !tb;
+                self.td_trackball = tb;
+            }
+            ui.separator();
+            // Explicit per-axis turns. Step is 15°, or a square 90° with Shift — the two
+            // rotations anyone actually types into a 3D package by hand.
+            let step = if ui.input(|i| i.modifiers.shift) {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                std::f32::consts::PI / 12.0
+            };
+            ui.label("Spin");
+            for a in 0..3usize {
+                let mut axis = [0.0f32; 3];
+                axis[a] = 1.0;
+                let name = ["X", "Y", "Z"][a];
+                ui.colored_label(axc(a), name);
+                for (glyph, sign) in [("\u{21ba}", 1.0f32), ("\u{21bb}", -1.0)] {
+                    if ui
+                        .add(egui::Button::new(glyph).min_size(egui::vec2(22.0, 0.0)))
+                        .on_hover_text(format!(
+                            "Turn the model {} about its {name} axis ({}° — hold Shift for 90°)",
+                            if sign > 0.0 { "one way" } else { "the other" },
+                            (step.to_degrees()).round()
+                        ))
+                        .clicked()
+                    {
+                        want_spin = Some((axis, step * sign, true));
+                    }
+                }
+            }
+            // Roll is about the *view* axis, so it gets its own control rather than an X/Y/Z one.
+            ui.colored_label(ui.visuals().weak_text_color(), "Roll");
+            for (glyph, sign) in [("\u{21ba}", 1.0f32), ("\u{21bb}", -1.0)] {
+                if ui
+                    .add(egui::Button::new(glyph).min_size(egui::vec2(22.0, 0.0)))
+                    .on_hover_text("Roll the view around the direction you are looking (Alt+drag)")
+                    .clicked()
+                {
+                    want_spin = Some(([0.0, 0.0, 1.0], step * sign, false));
+                }
+            }
+            ui.separator();
+            // The six square-on views, as a menu (the gizmo in the corner does the same thing by
+            // clicking an axis ball, which is quicker once you know it is there).
+            ui.menu_button(format!("{} View", icons::AXIS), |ui| {
+                for (label, axis, neg, key) in [
+                    ("Front", 2usize, false, "1"),
+                    ("Back", 2, true, "Ctrl+1"),
+                    ("Right", 0, false, "3"),
+                    ("Left", 0, true, "Ctrl+3"),
+                    ("Top", 1, false, "7"),
+                    ("Bottom", 1, true, "Ctrl+7"),
+                ] {
+                    let txt = egui::RichText::new(label).color(axc(axis));
+                    if ui
+                        .add(egui::Button::new(txt).shortcut_text(key))
+                        .clicked()
+                    {
+                        want_look = Some(mesh3d::Orbit::axis_rot(axis, neg));
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Look straight down an axis");
+            ui.separator();
+            ui.label("Zoom");
+            if ui
+                .add(egui::Button::new("\u{2212}").min_size(egui::vec2(24.0, 0.0)))
+                .on_hover_text("Zoom out (wheel down, or Numpad −)")
+                .clicked()
+            {
+                want_dolly = Some(1.25);
+            }
+            if ui
+                .add(egui::Button::new("+").min_size(egui::vec2(24.0, 0.0)))
+                .on_hover_text("Zoom in (wheel up, or Numpad +)")
+                .clicked()
+            {
+                want_dolly = Some(0.8);
+            }
+            if ui
+                .button(format!("{} Frame", icons::FRAME_FIT))
+                .on_hover_text("Centre and fit the model, keeping the angle you are looking from (Home)")
+                .clicked()
+            {
+                want_frame = true;
             }
         });
 
@@ -35540,9 +35884,13 @@ impl Kaleidotron {
             bg: [self.td_bg[0], self.td_bg[1], self.td_bg[2], 255],
         };
 
-        let avail = ui.available_size();
+        // Never wider/taller than the window (available_size can report far more on the first
+        // frames), and the rendered frame never past the GPU's texture limit (wgpu panics).
+        let avail = ui.available_size().min(ctx.content_rect().size()).max(egui::vec2(1.0, 1.0));
         let (resp, painter) = ui.allocate_painter(avail, egui::Sense::click_and_drag());
         let ppp = ctx.pixels_per_point();
+        let max_side = ctx.input(|i| i.max_texture_side) as f32;
+        let ppp = ppp.min(max_side / avail.x.max(avail.y));
 
         // Gather input up front (a single `ui.input` borrow) so the camera mutation doesn't
         // re-borrow. Keys are read as *down* for continuous navigation.
@@ -35571,9 +35919,34 @@ impl Kaleidotron {
         if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
             want_next = true;
         }
-        let rotating = resp.dragged_by(egui::PointerButton::Middle)
-            || (!space && resp.dragged_by(egui::PointerButton::Primary));
-        let panning = space && resp.dragged_by(egui::PointerButton::Primary);
+        // Modifier/button gestures first, then the chosen tool for a plain left-drag. Middle-drag
+        // orbits and Shift+middle pans exactly as in Blender, so a three-button mouse never has to
+        // touch the toolbar; the tool is there for a trackpad and for picking one deliberately.
+        let (shift, ctrl, alt) = ui.input(|i| {
+            (
+                i.modifiers.shift,
+                i.modifiers.command,
+                i.modifiers.alt,
+            )
+        });
+        // The gizmo lives in the top-right of the viewport. Its hit test is needed BEFORE the
+        // gesture mapping, so a click on an axis ball snaps the view instead of nudging it.
+        let giz_r = (avail.x.min(avail.y) * 0.11).clamp(28.0, 54.0);
+        let giz_c = egui::pos2(
+            resp.rect.right() - giz_r - 10.0,
+            resp.rect.top() + giz_r + 10.0,
+        );
+        let giz_hover = resp
+            .hover_pos()
+            .filter(|p| p.distance(giz_c) <= giz_r * 1.15);
+        let mid = resp.dragged_by(egui::PointerButton::Middle);
+        let left = resp.dragged_by(egui::PointerButton::Primary);
+        let tool = self.td_nav;
+        let plain_left = left && !space && !shift && !ctrl && !alt; // no modifier ⇒ the chosen tool
+        let rotating = (mid && !shift && !ctrl) || (plain_left && tool == 0);
+        let panning = (mid && shift) || (left && (space || shift)) || (plain_left && tool == 1);
+        let zooming = ((mid || left) && ctrl) || (plain_left && tool == 2);
+        let rolling = left && alt && !space; // Alt+drag rolls (a turntable has no such gesture)
         let drag = resp.drag_delta();
         let wasd = kw || ka || ks || kd || kq || ke;
         let toggle_fps = resp.clicked_by(egui::PointerButton::Secondary);
@@ -35591,30 +35964,78 @@ impl Kaleidotron {
             if toggle_fps {
                 v.fps = !v.fps;
                 if v.fps {
-                    v.pre_fly = Some((v.fly, v.pivot)); // Home restores this exact view
+                    v.pre_fly = Some(v.orbit); // Home restores this exact view
+                    // Hand the orbit pose over so entering FPS doesn't move the camera. Roll is
+                    // dropped — the fly camera has a world up by construction, and walking into a
+                    // scene with a tilted horizon is disorienting (Blender levels it too).
+                    v.fly = v.orbit.to_fly();
                 } else {
-                    // Leaving FPS: put the orbit pivot in front of the camera WITHOUT moving
-                    // it — so the view is byte-identical (no snap), and future orbit-drags
-                    // rotate around what you were looking at.
+                    // Leaving FPS: put the orbit pivot in front of the camera WITHOUT moving it —
+                    // so the view is unchanged, and future orbit-drags turn around what you were
+                    // looking at.
                     let f = v.fly.forward();
                     let d = dist3(v.fly.eye, center).max(radius);
-                    v.pivot = [
+                    let pivot = [
                         v.fly.eye[0] + f[0] * d,
                         v.fly.eye[1] + f[1] * d,
                         v.fly.eye[2] + f[2] * d,
                     ];
+                    v.orbit = mesh3d::Orbit::from_fly(&v.fly, pivot);
                 }
             }
             if want_home {
-                if let Some((fly, pivot)) = v.pre_fly {
-                    v.fly = fly;
-                    v.pivot = pivot;
+                // Home means "get me back to a sensible view". Coming out of FPS that is the
+                // view you flew away from; in orbit there is nothing to come back to, so it
+                // means Blender's Frame All instead.
+                match v.pre_fly.take() {
+                    Some(o) => v.orbit = o,
+                    None => want_frame = true,
                 }
                 v.fps = false;
             }
             if want_reset {
-                v.fly = FlyCam::from_orbit(&Camera::default(), center, radius);
-                v.pivot = center;
+                v.orbit = mesh3d::Orbit::frame(center, radius);
+                v.anim = None;
+            }
+            if want_frame {
+                // Frame the model without changing which way you are looking at it (Blender's
+                // "Frame All"): re-centre on the mesh and back off to fit.
+                v.orbit.pivot = center;
+                v.orbit.dist = radius.max(1e-4) * 3.0;
+                v.fps = false;
+            }
+            // A view change asked for by a button, the gizmo or the keypad: slerp into it rather
+            // than cut, so you can see which way the model turned.
+            if let Some(q) = want_look {
+                v.anim = Some((v.orbit.rot, q, 0.0));
+                v.fps = false;
+            }
+            if let Some((axis, ang, world)) = want_spin {
+                // Step rotations animate too, so a 90° button press reads as a turn.
+                let mut target = v.orbit;
+                if world {
+                    target.spin_world(axis, ang);
+                } else {
+                    target.spin_local(axis, ang);
+                }
+                v.anim = Some((v.orbit.rot, target.rot, 0.0));
+                v.fps = false;
+            }
+            if let Some(f) = want_dolly {
+                v.orbit.dolly(f, radius);
+            }
+            // Advance a running view animation (ease-in-out over ~0.35 s).
+            if let Some((from, to, t)) = v.anim {
+                let t = (t + dt / 0.35).min(1.0);
+                let e = t * t * (3.0 - 2.0 * t); // smoothstep
+                v.orbit.rot = mesh3d::quat_slerp(from, to, e);
+                v.anim = if t >= 1.0 {
+                    v.orbit.rot = to; // land exactly on the asked-for view
+                    None
+                } else {
+                    Some((from, to, t))
+                };
+                ctx.request_repaint();
             }
             let fps = v.fps;
             if fps {
@@ -35658,73 +36079,68 @@ impl Kaleidotron {
                     v.fly.eye[1] + mv[1] * speed,
                     v.fly.eye[2] + mv[2] * speed,
                 ];
+                // Keep the orbit camera shadowing the fly one, so leaving FPS — by any route —
+                // never jumps.
+                let f = v.fly.forward();
+                let d = dist3(v.fly.eye, center).max(radius);
+                let pivot = [
+                    v.fly.eye[0] + f[0] * d,
+                    v.fly.eye[1] + f[1] * d,
+                    v.fly.eye[2] + f[2] * d,
+                ];
+                v.orbit = mesh3d::Orbit::from_fly(&v.fly, pivot);
             } else {
-                // ── Orbit around `pivot` (perspective) — one camera, so exiting FPS never
-                // jumps. Work in spherical (azimuth/elevation/radius) about the pivot. ──
-                let pivot = v.pivot;
-                let off = sub3(v.fly.eye, pivot);
-                let mut r = norm3(off).max(radius * 0.05);
-                let mut az = off[0].atan2(off[2]);
-                let mut el = (off[1] / r).clamp(-0.999, 0.999).asin();
+                // ── Orbit on a quaternion ──
+                // Rotation, pan and dolly all act on `v.orbit` directly; nothing here decomposes
+                // the pose into angles, which is what used to pin the model to a world-up axis
+                // and make it behave like a globe.
                 if rotating {
-                    az += drag.x * 0.01;
-                    el = (el - drag.y * 0.01).clamp(-1.5, 1.5);
+                    v.orbit.tumble(drag.x, drag.y, trackball);
+                    v.anim = None; // a drag takes over from any running animation
+                }
+                if panning {
+                    v.orbit.pan(drag.x, drag.y);
+                }
+                if zooming {
+                    // Vertical drag as a dolly, for the Zoom tool and Ctrl+drag.
+                    v.orbit.dolly(1.0 + drag.y * 0.006, radius);
+                }
+                if rolling {
+                    // Roll about the view axis — the one thing a turntable can never do.
+                    v.orbit.roll(drag.x * 0.01);
                 }
                 if ka {
-                    az -= dt * 1.6; // A/D turn around the model
+                    v.orbit.spin_world([0.0, 1.0, 0.0], -dt * 1.6); // A/D turn around the model
                 }
                 if kd {
-                    az += dt * 1.6;
+                    v.orbit.spin_world([0.0, 1.0, 0.0], dt * 1.6);
                 }
                 if hov && scroll.abs() > 0.0 {
-                    r *= 1.0 - scroll * 0.0015; // wheel dolly
+                    v.orbit.dolly(1.0 - scroll * 0.0015, radius); // wheel dolly
                 }
                 if hov && (zdelta - 1.0).abs() > 1e-3 {
-                    r /= zdelta;
+                    v.orbit.dolly(1.0 / zdelta, radius);
                 }
                 if kw {
-                    r *= 1.0 - dt * 1.5; // W/S dolly in/out
+                    v.orbit.dolly(1.0 - dt * 1.5, radius); // W/S dolly in/out
                 }
                 if ks {
-                    r *= 1.0 + dt * 1.5;
+                    v.orbit.dolly(1.0 + dt * 1.5, radius);
                 }
-                r = r.clamp(radius * 0.1, radius * 60.0);
-                let (ce, se) = (el.cos(), el.sin());
-                let (ca, sa) = (az.cos(), az.sin());
-                let mut eye = [
-                    pivot[0] + r * ce * sa,
-                    pivot[1] + r * se,
-                    pivot[2] + r * ce * ca,
-                ];
-                // Pan (Space+drag): translate eye AND pivot together (relative view unchanged).
-                if panning {
-                    let dir = normalize3(sub3(pivot, eye));
-                    let right = normalize3(cross3([0.0, 1.0, 0.0], dir));
-                    let up = cross3(dir, right);
-                    let k = r * 0.0022;
-                    let shift = [
-                        -drag.x * right[0] * k + drag.y * up[0] * k,
-                        -drag.x * right[1] * k + drag.y * up[1] * k,
-                        -drag.x * right[2] * k + drag.y * up[2] * k,
-                    ];
-                    v.pivot = [
-                        pivot[0] + shift[0],
-                        pivot[1] + shift[1],
-                        pivot[2] + shift[2],
-                    ];
-                    eye = [eye[0] + shift[0], eye[1] + shift[1], eye[2] + shift[2]];
-                }
-                // Point the camera at the pivot.
-                let dir = normalize3(sub3(v.pivot, eye));
-                v.fly.eye = eye;
-                v.fly.pitch = dir[1].clamp(-0.999, 0.999).asin();
-                v.fly.yaw = dir[0].atan2(dir[2]);
+                v.fly = v.orbit.to_fly(); // keep FPS ready to take over without a jump
             }
 
             // Re-rasterize only when the camera / opts / viewport size changed (tracked by `sig`).
             let wpx = (avail.x * ppp).round().max(1.0) as usize;
             let hpx = (avail.y * ppp).round().max(1.0) as usize;
-            let view = View::Fly(v.fly); // one perspective camera drives the viewport
+            // Orbit renders through the FREE camera (explicit basis), so a rolled or
+            // straight-down view reaches the rasterizer at all — a yaw/pitch camera derives its
+            // right vector from a world up and can express neither.
+            let view = if v.fps {
+                View::Fly(v.fly)
+            } else {
+                View::Free(v.orbit.to_free())
+            };
             let sig = three_d_sig(&view, &opts, wpx, hpx);
             if v.tex.is_none() || sig != v.sig {
                 let px = mesh3d::render(&v.mesh, wpx, hpx, &view, &opts);
@@ -35740,6 +36156,27 @@ impl Kaleidotron {
             if let Some(tex) = &v.tex {
                 let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 painter.image(tex.id(), resp.rect, full, egui::Color32::WHITE);
+            }
+            // The navigation gizmo, over the model: which way X/Y/Z point from here, and a click
+            // target for each. Drawn from the FPS camera's basis while flying so it still reads.
+            if !v.fps {
+                gizmo_hit = paint_axis_gizmo(&painter, giz_c, giz_r, &v.orbit, giz_hover);
+            } else {
+                let o = mesh3d::Orbit::from_fly(&v.fly, v.orbit.pivot);
+                paint_axis_gizmo(&painter, giz_c, giz_r, &o, None);
+            }
+        }
+        // A click on an axis ball looks down that axis. Applied after the borrow, and only on a
+        // click — a *drag* that starts on the gizmo still orbits, like Blender's.
+        if let (Some((axis, neg)), true) = (gizmo_hit, resp.clicked()) {
+            if let Some(v) = self.three_d.as_mut() {
+                v.anim = Some((v.orbit.rot, mesh3d::Orbit::axis_rot(axis, neg), 0.0));
+                v.fps = false;
+            }
+        }
+        if self.td_shade & 4 == 0 {
+            if let Some(v) = &self.three_d {
+                three_d_stats_overlay(ctx, resp.rect, &v.stats);
             }
         }
 
@@ -35761,6 +36198,12 @@ impl Kaleidotron {
             self.export_three_d_png(ew, eh, opts);
         }
 
+        if want_editor {
+            if let Some(p) = self.three_d.as_ref().map(|v| v.path.clone()) {
+                self.open_in_3d_editor(&p);
+            }
+        }
+
         // Apply deferred navigation (out of the `three_d` borrow).
         if want_back {
             self.set_mode(Mode::Grid);
@@ -35769,6 +36212,94 @@ impl Kaleidotron {
             self.step_image(ctx, false);
         } else if want_next {
             self.step_image(ctx, true);
+        }
+    }
+
+    /// Blender's viewport keypad, for the 3D viewer: `1`/`3`/`7` look down an axis (Ctrl for the
+    /// opposite side), `4`/`6`/`8`/`2` turn in 15° steps, `9` flips, `5` switches orbit style,
+    /// `+`/`-` zoom, `.` frames the model.
+    ///
+    /// Handled here, **before** the rating keys, and `consume_key`d: egui reports a numpad `1` as
+    /// plain `Key::Num1` (there is no separate numpad key), so without consuming it a tap of `1`
+    /// to look at the front would also give the model a one-star rating. Only runs in
+    /// `Mode::ThreeD`, so digits mean exactly what they always did everywhere else.
+    fn three_d_keys(&mut self, ctx: &egui::Context) {
+        use crate::decode::mesh3d::Orbit;
+        use egui::{Key, Modifiers};
+        if self.mode != Mode::ThreeD || self.three_d.is_none() {
+            return;
+        }
+        let n = Modifiers::NONE;
+        let c = Modifiers::COMMAND;
+        // (key, with-ctrl?) → the axis view to animate to.
+        let views: [(Key, usize); 3] = [(Key::Num1, 2), (Key::Num3, 0), (Key::Num7, 1)];
+        let mut look: Option<[f32; 4]> = None;
+        for (key, axis) in views {
+            if ctx.input_mut(|i| i.consume_key(n, key)) {
+                look = Some(Orbit::axis_rot(axis, false));
+            } else if ctx.input_mut(|i| i.consume_key(c, key)) {
+                look = Some(Orbit::axis_rot(axis, true)); // Ctrl = the opposite side
+            }
+        }
+        let step = std::f32::consts::PI / 12.0; // 15°, Blender's
+        // (key, axis, radians, world-space?) — left/right turn about the model's up; up/down
+        // about the camera's own right, so they always mean "tip it toward/away from me".
+        let spins: [(Key, [f32; 3], f32, bool); 5] = [
+            (Key::Num4, [0.0, 1.0, 0.0], -step, true),
+            (Key::Num6, [0.0, 1.0, 0.0], step, true),
+            (Key::Num8, [1.0, 0.0, 0.0], -step, false),
+            (Key::Num2, [1.0, 0.0, 0.0], step, false),
+            (Key::Num9, [0.0, 1.0, 0.0], std::f32::consts::PI, true), // flip to the far side
+        ];
+        let mut spin: Option<([f32; 3], f32, bool)> = None;
+        for (key, axis, ang, world) in spins {
+            if ctx.input_mut(|i| i.consume_key(n, key)) {
+                spin = Some((axis, ang, world));
+            }
+        }
+        // Blender's Numpad 5 toggles orthographic; this viewport is always perspective, so the
+        // key gets the other thing you reach for mid-navigation — how a drag rotates.
+        if ctx.input_mut(|i| i.consume_key(n, Key::Num5)) {
+            self.td_trackball = !self.td_trackball;
+            self.status = if self.td_trackball {
+                "Orbit: trackball (free tumble)".into()
+            } else {
+                "Orbit: turntable (model's up stays up)".into()
+            };
+        }
+        let mut dolly = 1.0f32;
+        if ctx.input_mut(|i| i.consume_key(n, Key::Plus) || i.consume_key(n, Key::Equals)) {
+            dolly = 0.8;
+        }
+        if ctx.input_mut(|i| i.consume_key(n, Key::Minus)) {
+            dolly = 1.25;
+        }
+        let frame = ctx.input_mut(|i| i.consume_key(n, Key::Period));
+        let Some(v) = self.three_d.as_mut() else {
+            return;
+        };
+        if let Some(q) = look {
+            v.anim = Some((v.orbit.rot, q, 0.0));
+            v.fps = false;
+        }
+        if let Some((axis, ang, world)) = spin {
+            let mut target = v.orbit;
+            if world {
+                target.spin_world(axis, ang);
+            } else {
+                target.spin_local(axis, ang);
+            }
+            v.anim = Some((v.orbit.rot, target.rot, 0.0));
+            v.fps = false;
+        }
+        if dolly != 1.0 {
+            let r = v.mesh.radius;
+            v.orbit.dolly(dolly, r);
+        }
+        if frame {
+            v.orbit.pivot = v.mesh.center;
+            v.orbit.dist = v.mesh.radius.max(1e-4) * 3.0;
+            v.fps = false;
         }
     }
 
@@ -35786,7 +36317,12 @@ impl Kaleidotron {
             let Some(v) = &self.three_d else {
                 return;
             };
-            let view = View::Fly(v.fly); // the viewport is always the perspective fly camera
+            // Exactly what the viewport shows, roll included.
+            let view = if v.fps {
+                View::Fly(v.fly)
+            } else {
+                View::Free(v.orbit.to_free())
+            };
             let px = crate::decode::mesh3d::render(&v.mesh, ew, eh, &view, &opts);
             let mut buf = Vec::with_capacity(px.len() * 4);
             for p in &px {
@@ -38908,6 +39444,7 @@ impl Kaleidotron {
         let (mut want_edit, mut want_revert, mut want_save, mut want_save_as) =
             (false, false, false, false);
         let mut want_follow: Option<bool> = None;
+        let mut want_preview = false;
         let mut want_task: Option<String> = None;
         let mut want_enc: Option<crate::decode::Encoding> = None;
         let mut wrap = self.text_wrap;
@@ -38967,6 +39504,18 @@ impl Kaleidotron {
                         want_follow = Some(!follow);
                     }
                 }
+                // Markdown reads two ways; this is the way back to the rendered page. Only shown
+                // for markdown, so every other source file's toolbar is unchanged.
+                if is_markdown_ext(&path) {
+                    let key = self.bind_for(Action::MarkdownPreview).label();
+                    if ui
+                        .add(egui::Button::new("\u{1f4d6} Preview").shortcut_text(key))
+                        .on_hover_text("Show the rendered page")
+                        .clicked()
+                    {
+                        want_preview = true;
+                    }
+                }
                 ui.separator();
                 if ui
                     .add(egui::Button::new("🔍 Find").selected(find_open))
@@ -38976,7 +39525,7 @@ impl Kaleidotron {
                     find_open = !find_open;
                 }
                 ui.checkbox(&mut wrap, "Wrap");
-                if ui.button("📋 Copy").clicked() {
+                if ui.button(format!("{} Copy", icons::COPY)).clicked() {
                     ui.ctx().copy_text(body.clone());
                 }
                 // Code page. Shown always, not only when the guess was CP437: knowing what a file
@@ -39037,6 +39586,22 @@ impl Kaleidotron {
             } else {
                 self.text_edit = true;
                 self.text_follow = false; // following a file you are editing makes no sense
+            }
+        }
+        if want_preview {
+            // The preview is not editable, so leaving an edit behind would bounce straight back
+            // to source: ask about unsaved work the same way every other exit does.
+            if self.confirm_discard_text() {
+                if self.text_edit {
+                    self.text_edit = false;
+                    let orig = self.text_orig.clone();
+                    if let Some((_, b)) = self.text_doc.as_mut() {
+                        *b = orig;
+                    }
+                }
+                self.md_preview = true;
+                self.md_doc = None;
+                self.write_settings_file();
             }
         }
         if want_revert && self.confirm_discard_text() {
@@ -39338,6 +39903,398 @@ impl Kaleidotron {
                     }
                 });
             });
+    }
+
+
+    // =========================================================================================
+    // Rendered markdown preview (see src/markdown.rs)
+    // =========================================================================================
+
+    /// The parsed document for the open `.md`, parsed on demand and cached by `(path, length)`.
+    ///
+    /// Re-parsing every frame would be wasteful but not wrong; re-parsing *never* would be wrong,
+    /// because the source view can edit the buffer underneath us. The length is a cheap stand-in
+    /// for "has it changed" — an edit that keeps the byte count identical is caught by the explicit
+    /// invalidation in `draw_markdown_ui` when leaving edit mode.
+    fn md_parse(&mut self) {
+        let Some((path, body)) = self.text_doc.as_ref() else {
+            return;
+        };
+        let fresh = self
+            .md_doc
+            .as_ref()
+            .is_some_and(|(p, n, _)| p == path && *n == body.len());
+        if fresh {
+            return;
+        }
+        let doc = crate::markdown::parse(body);
+        self.md_doc = Some((path.clone(), body.len(), doc));
+    }
+
+    /// Kick off a load for an image the preview asked for. Local files decode through the usual
+    /// `Registry` (so an inline `.pcx`, `.ans` or `.svg` renders — github.com cannot do that);
+    /// remote ones go through the shared HTTP cache, so a README's badges are fetched once and are
+    /// instant on every later open.
+    fn md_request_image(&mut self, url: &str, base: &Path) {
+        if self.md_img_asked.contains(url) {
+            return;
+        }
+        self.md_img_asked.insert(url.to_string());
+        self.md_imgs
+            .insert(url.to_string(), crate::markdown::Img::Pending);
+        let tx = self.md_img_tx.clone();
+        let registry = Arc::clone(&self.registry);
+        let url_owned = url.to_string();
+        // A `data:` URI carries its own bytes; everything else is a path or an HTTP URL.
+        let local: Option<PathBuf> = if crate::markdown::is_url(url) {
+            None
+        } else {
+            let rel = url.split(['#', '?']).next().unwrap_or(url);
+            let rel = crate::markdown::percent_decode(rel);
+            let p = Path::new(&rel);
+            Some(if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            })
+        };
+        std::thread::spawn(move || {
+            let decoded = (|| -> Option<(u32, u32, Vec<u8>)> {
+                let img = match &local {
+                    Some(p) => registry.decode_path(p).ok()?,
+                    None => {
+                        // One day: a badge changes when the build does, but not minute to minute.
+                        let bytes = crate::cache::get_bytes(&url_owned, Some(86_400)).ok()?;
+                        registry
+                            .decode_bytes(&bytes, Path::new(&md_url_name(&url_owned)))
+                            .ok()?
+                    }
+                };
+                // `PixImage::pixels` is `[u8; 4]` per pixel; the texture upload wants flat RGBA.
+                let flat: Vec<u8> = img.pixels.iter().flatten().copied().collect();
+                Some((img.width, img.height, flat))
+            })();
+            let _ = tx.send((url_owned, decoded));
+        });
+    }
+
+    /// Upload finished markdown images. Textures are created here, on the UI thread — the workers
+    /// stop at CPU pixels, exactly like the thumbnailer.
+    fn poll_md_images(&mut self, ctx: &egui::Context) {
+        let msgs: Vec<MdImgMsg> = self.md_img_rx.try_iter().collect();
+        if msgs.is_empty() {
+            return;
+        }
+        for (url, got) in msgs {
+            let state = match got {
+                Some((w, h, rgba)) if w > 0 && h > 0 => {
+                    // LINEAR: a screenshot or a badge shrunk into the reading column must
+                    // area-average. These are documents, not pixel art (the project's
+                    // nearest-for-upscale / linear-for-downscale rule).
+                    let tex = load_texture_capped(
+                        ctx,
+                        format!("md:{url}"),
+                        [w as usize, h as usize],
+                        &rgba,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    crate::markdown::Img::Ready {
+                        tex,
+                        size: egui::vec2(w as f32, h as f32),
+                    }
+                }
+                _ => crate::markdown::Img::Failed,
+            };
+            self.md_imgs.insert(url, state);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Drop every cached image + the parsed document. Called when a different file is opened, and
+    /// by the toolbar's reload.
+    fn md_reset(&mut self) {
+        self.md_doc = None;
+        self.md_imgs.clear();
+        self.md_img_asked.clear();
+        self.md_scroll = None;
+    }
+
+    /// The rendered-markdown viewer: toolbar, optional outline, the document.
+    fn draw_markdown_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, immersive: bool) {
+        let Some((path, body)) = self.text_doc.clone() else {
+            return;
+        };
+        self.md_parse();
+        // Deferred intents — the toolbar runs inside egui closures that cannot borrow `self`
+        // twice, the same pattern as the text viewer's.
+        let mut back = false;
+        let mut want_source = false;
+        let mut want_edit = false;
+        let mut want_reload = false;
+        let mut want_outline: Option<bool> = None;
+        let mut want_task: Option<String> = None;
+        let mut want_open_external = false;
+        let mut jump: Option<String> = None;
+        let mut font_size = self.md_font_size;
+        if !immersive {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("‹ Grid").clicked() {
+                    back = true;
+                }
+                ui.separator();
+                ui.strong(short_name(&path));
+                let words = body.split_whitespace().count();
+                ui.weak(format!("{words} words"));
+                ui.separator();
+                // The one control that matters: which reading of this file you are looking at.
+                let key = self.bind_for(Action::MarkdownPreview).label();
+                if ui
+                    .add(egui::Button::new("\u{1f4c4} Source").shortcut_text(key))
+                    .on_hover_text("Show the markdown source instead")
+                    .clicked()
+                {
+                    want_source = true;
+                }
+                if ui
+                    .button("\u{270e} Edit")
+                    .on_hover_text("Edit the source text")
+                    .clicked()
+                {
+                    want_edit = true;
+                }
+                if ui
+                    .add(egui::Button::new("\u{2630}").selected(self.md_outline))
+                    .on_hover_text("Document outline")
+                    .clicked()
+                {
+                    want_outline = Some(!self.md_outline);
+                }
+                if ui
+                    .button("\u{27f3}")
+                    .on_hover_text("Re-read the file from disk and re-fetch its images")
+                    .clicked()
+                {
+                    want_reload = true;
+                }
+                ui.separator();
+                ui.label("Size");
+                ui.add(
+                    egui::Slider::new(&mut font_size, 10.0..=28.0)
+                        .show_value(false)
+                        .fixed_decimals(0),
+                )
+                .on_hover_text("Body text size for the preview");
+                if ui
+                    .button("\u{1f310}")
+                    .on_hover_text("Open in the default application")
+                    .clicked()
+                {
+                    want_open_external = true;
+                }
+                if !self.tasks.is_empty() {
+                    ui.separator();
+                    ui.menu_button("\u{25b6} Run", |ui| {
+                        want_task = self.tasks_menu(ui);
+                    });
+                }
+            });
+            ui.separator();
+        }
+        self.md_font_size = font_size;
+
+        // The outline is a sibling column, not a panel: the viewer is already inside whatever
+        // docks the user has open, and a nested SidePanel there fights them for width.
+        let total = ui.available_width();
+        let show_outline = self.md_outline
+            && !immersive
+            && total > 520.0
+            && self
+                .md_doc
+                .as_ref()
+                .is_some_and(|(_, _, d)| d.outline.len() > 1);
+        let base = self.resolve_local(&path);
+        let base_dir = base.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let theme = self.syntax_theme().cloned();
+        let mono = self.ensure_code_font(&ui.ctx().clone());
+        let style = crate::markdown::MdStyle::resolve(
+            ui,
+            theme.as_ref(),
+            self.md_font_size,
+            mono,
+            self.md_max_width,
+        );
+        let scroll_to = self.md_scroll.take();
+        // Rendering borrows `md_imgs` immutably, so the requests it makes and the action it
+        // reports come back in the `Render` and are applied afterwards.
+        let mut want_images: Vec<String> = Vec::new();
+        let mut action: Option<crate::markdown::Action> = None;
+        ui.horizontal_top(|ui| {
+            if show_outline {
+                let w = (total * 0.22).clamp(150.0, 280.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(w);
+                        ui.label(egui::RichText::new("OUTLINE").weak().small());
+                        ui.add_space(2.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("md_outline")
+                            .show(ui, |ui| {
+                                if let Some((_, _, doc)) = self.md_doc.as_ref() {
+                                    // Indent by heading level so the structure is readable at a
+                                    // glance; levels are clamped because a document may start at
+                                    // `###` and nesting it four deep would waste the column.
+                                    let min = doc
+                                        .outline
+                                        .iter()
+                                        .map(|(l, _, _)| *l)
+                                        .min()
+                                        .unwrap_or(1);
+                                    for (level, text, anchor) in &doc.outline {
+                                        let indent =
+                                            (level.saturating_sub(min)).min(3) as f32 * 10.0;
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(indent);
+                                            let label = if *level <= min {
+                                                egui::RichText::new(text).strong()
+                                            } else {
+                                                egui::RichText::new(text)
+                                            };
+                                            if ui
+                                                .add(
+                                                    egui::Label::new(label)
+                                                        .sense(egui::Sense::click())
+                                                        .truncate(),
+                                                )
+                                                .on_hover_text(text)
+                                                .clicked()
+                                            {
+                                                jump = Some(anchor.clone());
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                    },
+                );
+                ui.separator();
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("md_body")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    let Some((_, _, doc)) = self.md_doc.as_ref() else {
+                        return;
+                    };
+                    let mut r =
+                        crate::markdown::Render::new(&style, &self.md_imgs, base_dir.clone());
+                    r.scroll_to = scroll_to;
+                    r.doc(ui, doc);
+                    want_images = std::mem::take(&mut r.want_images);
+                    action = r.action.take();
+                    // An anchor that was never reached (a link to a heading above the current
+                    // scroll, or a bad `#name`) must not be retried forever.
+                    self.md_scroll = r.scroll_to.take();
+                });
+        });
+
+        for url in want_images {
+            self.md_request_image(&url, &base_dir);
+        }
+        if let Some(a) = jump {
+            self.md_scroll = Some(a);
+        }
+        if let Some(a) = action {
+            self.md_action(ctx, a, &path);
+        }
+        if let Some(on) = want_outline {
+            self.md_outline = on;
+            self.write_settings_file();
+        }
+        if want_reload {
+            self.md_reset();
+            self.md_reload_from_disk(&path);
+        }
+        if want_source || want_edit {
+            // Switching readings must not silently lose what the preview cached.
+            self.md_preview = false;
+            self.write_settings_file();
+            if want_edit {
+                self.text_edit = true;
+            }
+            self.md_doc = None;
+        }
+        if want_open_external {
+            let p = self.resolve_local(&path);
+            self.open_in_default_app(&p);
+        }
+        if let Some(label) = want_task {
+            let file = path.clone();
+            self.run_task(&label, &file);
+        }
+        if back {
+            self.set_mode(Mode::Grid);
+            self.text_doc = None;
+            self.reset_text_editor();
+            self.md_reset();
+        }
+    }
+
+    /// Act on a click in the preview.
+    fn md_action(&mut self, ctx: &egui::Context, action: crate::markdown::Action, doc_path: &Path) {
+        match action {
+            crate::markdown::Action::Url(u) => {
+                self.open_url(&u);
+                self.status = format!("Opened {u}");
+            }
+            crate::markdown::Action::Anchor(a) => self.md_scroll = Some(a),
+            crate::markdown::Action::Copy(text) => {
+                ctx.copy_text(text);
+                self.status = "Copied code block".into();
+            }
+            crate::markdown::Action::Local(p) => {
+                // A relative link resolves *inside kaleidotron*: a sibling `.md` opens in the
+                // preview, an image in the viewer, a folder in the browser. That is the whole
+                // point of reading documentation in a file browser.
+                if p.is_dir() {
+                    self.open_folder(p);
+                } else if p.is_file() {
+                    self.load_full(ctx, p);
+                } else {
+                    self.status = format!(
+                        "{} does not exist (linked from {})",
+                        p.display(),
+                        short_name(doc_path)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Re-read the open document from disk (the toolbar's ⟳). The preview is a *view* of a file
+    /// that other programs edit — an editor on the other monitor, a generator, `git pull` — so a
+    /// one-click refresh is worth more here than in an editor you typed the buffer into yourself.
+    fn md_reload_from_disk(&mut self, path: &Path) {
+        let real = self.resolve_local(path);
+        let Ok(bytes) = std::fs::read(&real) else {
+            self.status = format!("Could not re-read {}", short_name(path));
+            return;
+        };
+        let (raw, enc) = crate::decode::decode_text(&bytes);
+        self.text_enc = enc;
+        self.text_raw = bytes;
+        self.text_crlf = raw.contains("\r\n");
+        let body = if self.text_crlf {
+            raw.replace("\r\n", "\n")
+        } else {
+            raw
+        };
+        self.text_orig = body.clone();
+        if let Some((_, b)) = self.text_doc.as_mut() {
+            *b = body;
+        }
+        self.status = format!("Reloaded {}", short_name(path));
     }
 
     /// Does the selected theme style the app chrome? (scope 0 = all, 2 = chrome only)
@@ -40892,7 +41849,7 @@ impl Kaleidotron {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.weak("Lists");
-                            if ui.small_button("＋ New").on_hover_text("Create an empty list").clicked() {
+                            if ui.small_button(format!("{} New", icons::PLUS)).on_hover_text("Create an empty list").clicked() {
                                 list_new = true;
                             }
                         });
@@ -41394,7 +42351,7 @@ impl Kaleidotron {
                                 }
                             });
                         }
-                        if let Some(p) = self.favorites_buttons(ui, "🧊", crate::polyhaven::is_remote, false) {
+                        if let Some(p) = self.favorites_buttons(ui, icons::CUBE, crate::polyhaven::is_remote, false) {
                             nav = Some(p);
                         }
                     } else if self.places_tab == 13 {
@@ -41683,7 +42640,7 @@ impl Kaleidotron {
                             )
                             .on_hover_text(
                                 "File the saved preset into this folder (blank = top level); also the \
-                                 target of a preset's right-click → Move to ▸ ＋",
+                                 target of a preset's right-click → Move to ▸ +",
                             );
                         });
                         ui.separator();
@@ -41807,7 +42764,7 @@ impl Kaleidotron {
                                     }
                                     if !new_folder.is_empty()
                                         && !folder_names.iter().any(|x| x == &new_folder)
-                                        && ui.button(format!("＋ {new_folder}")).clicked()
+                                        && ui.button(format!("{} {new_folder}", icons::PLUS)).clicked()
                                     {
                                         fx_move = Some((i, Some(new_folder.clone())));
                                         ui.close();
@@ -41870,7 +42827,7 @@ impl Kaleidotron {
                         // Samples: user-managed sample folders — quick jumps to browse + drag/assign
                         // into pads. Add / rename / colorize / remove.
                         if ui
-                            .button("＋ Add location…")
+                            .button(format!("{} Add location…", icons::PLUS))
                             .on_hover_text("Pick a folder of samples to add as a place")
                             .clicked()
                         {
@@ -42454,6 +43411,33 @@ impl eframe::App for Kaleidotron {
             {
                 self.text_find_open = false;
             }
+            // Markdown: rendered page ⇄ source. Handled here, ahead of the `typing` gate and
+            // consumed, for the same reason Ctrl+S and Ctrl+Shift+B are: it fires while the
+            // editor has focus — switching to the preview mid-edit is exactly when it is wanted
+            // — and the key must not also reach the buffer as a stray character.
+            if self
+                .text_doc
+                .as_ref()
+                .is_some_and(|(p, _)| is_markdown_ext(p))
+                && self.take(&ctx, Action::MarkdownPreview)
+            {
+                self.md_preview = !self.md_preview;
+                // Leaving edit mode is implied by asking for the preview: the preview is not
+                // editable, so staying in `text_edit` would just bounce straight back to source.
+                if self.md_preview {
+                    if self.confirm_discard_text() {
+                        self.text_edit = false;
+                        let orig = self.text_orig.clone();
+                        if let Some((_, b)) = self.text_doc.as_mut() {
+                            *b = orig;
+                        }
+                    } else {
+                        self.md_preview = false;
+                    }
+                }
+                self.md_doc = None;
+                self.write_settings_file();
+            }
         }
         // Ctrl+Shift+B — the default build task, the same binding VS Code uses, so muscle memory
         // carries over. Consumed (not just read) because it fires while a text field has focus:
@@ -42769,9 +43753,14 @@ impl eframe::App for Kaleidotron {
             (true, true, true, true)
         };
 
-        // R — jump to a new random 16colo.rs pack (skip a dud). Not while typing/searching.
+        // R — jump to a new random 16colo.rs pack (skip a dud). Not while typing/searching, and
+        // **not in the 3D viewer**: there the keyboard is the camera (WASD/QE fly, A/D turn), so a
+        // stray R was starting a pack download and navigating out of the model you were looking
+        // at. Every other viewer key is already scoped this way — see the `Mode::Single` block
+        // below; this one just never got the same treatment.
         let random_key = self.bind_for(Action::RandomPack);
         if !typing
+            && self.mode != Mode::ThreeD
             && self.search.is_none()
             && !self.show_search
             && ctx.input(|i| random_key.matches(i))
@@ -42832,6 +43821,7 @@ impl eframe::App for Kaleidotron {
         self.poll_midi(ctx.input(|i| i.time) as f32); // hardware MIDI keys → pads / sample
         self.poll_audio_load(ctx.input(|i| i.stable_dt)); // background audio decode → build player
         self.poll_text_follow(&ctx); // tail -f: re-read a growing file
+        self.poll_md_images(&ctx); // markdown preview: upload finished image loads
         self.poll_video_load(ctx.input(|i| i.stable_dt)); // background video open → build player
         self.poll_pad_retrigger(ctx.input(|i| i.time) as f32); // live edit → re-fire a sounding loop
                                                                // Screensaver: once a (random) pack has finished downloading + mounting, open its
@@ -42976,6 +43966,10 @@ impl eframe::App for Kaleidotron {
         // typing into any field (path, rename, search box, criteria) must not rate
         // images or trigger nav keys — `typing` now also covers focused text fields.
         {
+            // The 3D viewport's keypad goes first and consumes what it uses: egui cannot tell a
+            // numpad `1` from a top-row `1`, so otherwise "look at the front" would also rate the
+            // model one star.
+            self.three_d_keys(&ctx);
             let back_key = self.bind_for(Action::BackToGrid);
             let parent_key = self.bind_for(Action::ParentDir);
             let view_key = self.bind_for(Action::ToggleView);
@@ -44222,6 +45216,7 @@ impl eframe::App for Kaleidotron {
         eframe::set_value(storage, Self::PLUGIN_VIDEO_KEY, &self.plugin_video);
         eframe::set_value(storage, Self::YT_DIR_KEY, &self.yt_download_dir);
         eframe::set_value(storage, Self::DOSBOX_PATH_KEY, &self.dosbox_path);
+        eframe::set_value(storage, Self::EDITOR3D_PATH_KEY, &self.editor3d_path);
         eframe::set_value(storage, Self::DOSBOX_KEEP_OPEN_KEY, &self.dosbox_keep_open);
         eframe::set_value(storage, Self::DOSBOX_MACHINE_KEY, &self.dosbox_machine);
         eframe::set_value(storage, Self::DOSBOX_SVGA_KEY, &self.dosbox_svga);
@@ -44548,6 +45543,8 @@ impl eframe::App for Kaleidotron {
             &[self.td_light_yaw, self.td_light_pitch],
         );
         eframe::set_value(storage, Self::TD_BG_KEY, &self.td_bg);
+        eframe::set_value(storage, Self::TD_TRACKBALL_KEY, &self.td_trackball);
+        eframe::set_value(storage, Self::TD_NAV_KEY, &self.td_nav);
         eframe::set_value(storage, Self::GIT_ENABLED_KEY, &self.git_enabled);
         eframe::set_value(storage, Self::ESC_EXITS_APP_KEY, &self.esc_exits_app);
         eframe::set_value(storage, Self::ESC_EXITS_CLI_KEY, &self.esc_exits_cli);
@@ -45397,7 +46394,7 @@ fn apply_fonts(ctx: &egui::Context, code: Option<Vec<u8>>) {
 /// at U+F001/F002 and egui's bundled emoji-icon-font is FontAwesome-based, so low codepoints get
 /// shadowed (a music note rendered as "fi"). Every codepoint below is verified present in
 /// `assets/SymbolsNerdFont-Regular.ttf` (fonttools cmap check — see git log). No more tofu.
-mod icons {
+pub mod icons {
     pub const PLAY: &str = "\u{f040a}"; // nf-md-play
     pub const PAUSE: &str = "\u{f03e4}"; // nf-md-pause
     pub const STOP: &str = "\u{f04db}"; // nf-md-stop
@@ -45420,6 +46417,18 @@ mod icons {
     pub const ROBOT: &str = "\u{f06a9}"; // nf-md-robot (AI)
     pub const LOCK: &str = "\u{f033e}"; // nf-md-lock (pad key-lock, engaged)
     pub const LOCK_OPEN: &str = "\u{f033f}"; // nf-md-lock_open (pad key-lock, free)
+    /// Copy-to-clipboard. **Not** 📋 (U+1F4CB): that is in neither bundled fallback — not Symbols
+    /// Nerd Font, not DejaVu Sans — so it renders as a tofu diamond. Verified in both cmaps.
+    pub const COPY: &str = "\u{f018f}"; // nf-md-content_copy
+    // 3D viewport navigation tools. ✋ / 🔍 / ⌖ are in NEITHER bundled fallback (checked both
+    // cmaps), so these are Nerd Font's Material set — plane 15, out of reach of the stacked fonts.
+    pub const ORBIT: &str = "\u{f04c1}"; // nf-md-rotate_3d
+    pub const MOVE: &str = "\u{f0491}"; // nf-md-cursor_move
+    pub const ZOOM: &str = "\u{f0349}"; // nf-md-magnify
+    pub const AXIS: &str = "\u{f0b2c}"; // nf-md-axis_arrow
+    pub const FRAME_FIT: &str = "\u{f0e2f}"; // nf-md-fit_to_page_outline
+    pub const PLUS: &str = "\u{f0415}"; // nf-md-plus (NOT ＋ U+FF0B — no bundled font has it)
+    pub const CART: &str = "\u{f0110}"; // nf-md-cart (NOT 🛒 — likewise)
                                              // The two exceptions to the plane-15 rule above: these are Nerd Font's
                                              // **Codicons** — VSCode's own icon set — so a collapse/expand-all toolbar
                                              // button reads exactly like the one in VSCode's Explorer. They sit at U+EAxx/
@@ -49237,6 +50246,41 @@ fn load_texture_capped(
     ctx.load_texture(name, color, options)
 }
 
+/// Markdown, which this program renders as a page rather than only as text (`src/markdown.rs`).
+///
+/// Kept beside the other `is_*_ext` predicates rather than derived from `CODE_EXTS`: markdown is
+/// in that list too (it is perfectly good text), and what makes it special is that it has a
+/// *rendered* reading as well.
+fn is_markdown_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "md" | "markdown" | "mdown" | "mkd" | "mdx"
+    )
+}
+
+/// A finished markdown-preview image load: `(url, Some((w, h, rgba)))`, or `None` when it could
+/// not be fetched or decoded (a dead badge URL, a missing file, a format we don't read).
+type MdImgMsg = (String, Option<(u32, u32, Vec<u8>)>);
+
+/// The filename at the end of a URL, so a fetched image can be dispatched by extension.
+///
+/// The decoder registry sniffs magic bytes first and falls back to the extension — and the
+/// fallback is what a `.svg` badge needs, since SVG has no magic number. Shields.io serves
+/// `…/badge.svg`, so the name carries the answer.
+fn md_url_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("image");
+    if name.is_empty() {
+        "image".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// Largest centered rect with `content`'s aspect ratio that fits inside `into`.
 fn fit_centered(into: egui::Rect, content: egui::Vec2) -> egui::Rect {
     let scale = (into.width() / content.x).min(into.height() / content.y);
@@ -51791,6 +52835,149 @@ fn is_ico_path(p: &Path) -> bool {
 
 /// A cheap change-signature for the 3D viewport: the active camera + scene options + the
 /// viewport pixel size. Unchanged ⇒ the last rasterized texture is reused (no re-render).
+/// The 3D viewer's Statistics box (top-left of the viewport), in Blender's terms.
+fn three_d_stats_overlay(ctx: &egui::Context, rect: egui::Rect, st: &crate::decode::mesh3d::MeshStats) {
+    let n = |v: usize| {
+        let s = v.to_string();
+        let mut out = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && (s.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    egui::Area::new(egui::Id::new("three_d_stats"))
+        .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                egui::Grid::new("three_d_stats_grid").num_columns(2).spacing([14.0, 2.0]).show(ui, |ui| {
+                    let row = |ui: &mut egui::Ui, k: &str, v: String, tip: &str| {
+                        ui.label(k).on_hover_text(tip);
+                        ui.monospace(v).on_hover_text(tip);
+                        ui.end_row();
+                    };
+                    row(ui, "Objects", n(st.objects), "Separate meshes in the file");
+                    row(ui, "Vertices", n(st.verts), "Points in the mesh, with the copies at UV seams and hard edges merged (Blender shows this after Merge by Distance)");
+                    row(ui, "Edges", n(st.edges), "Lines between vertices");
+                    let faces_tip = match st.polys {
+                        Some(p) => format!("As the file stores them: {} quads · {} triangles · {} n-gons", n(p.quads), n(p.tris), n(p.ngons)),
+                        None => "This format stores triangles only (glTF / GLB / STL), so every face is a triangle".to_string(),
+                    };
+                    row(ui, "Faces", n(st.faces), &faces_tip);
+                    row(ui, "Triangles", n(st.tris), "What the graphics card draws: each quad is 2, each n-gon n−2");
+                    if let Some(p) = st.polys.filter(|p| p.quads + p.ngons > 0) {
+                        row(ui, "", format!("{} quads", n(p.quads)), &faces_tip);
+                        if p.ngons > 0 {
+                            row(ui, "", format!("{} n-gons", n(p.ngons)), &faces_tip);
+                        }
+                    }
+                    row(ui, "GPU vertices", n(st.split_verts),
+                        "What a game engine uploads: a vertex is copied wherever its UV or shading changes (seams, hard edges). Blender shows this number right after importing a glTF");
+                    row(ui, "UV map", if st.uvs { "yes" } else { "none" }.into(), "Texture coordinates: where each face sits on the texture");
+                    row(ui, "Texture", st.texture.map_or("none".into(), |(w, h)| format!("{w} × {h}")), "The base-colour image");
+                    row(ui, "Size", format!("{:.2} × {:.2} × {:.2}", st.size[0], st.size[1], st.size[2]),
+                        "Bounding box (X × Y × Z) in the file's units — metres for glTF");
+                });
+            });
+        });
+}
+
+/// What format!("{} Open in 3D editor", icons::CUBE) will launch, for its tooltip.
+fn editor3d_hover(setting: Option<&Path>) -> String {
+    match crate::editor3d::resolve(setting) {
+        Some(e) if e.blender => format!("Open this model in {} (imported, framed, Material Preview)", e.name),
+        Some(e) => format!("Open this model in {}", e.name),
+        None => "No 3D editor found: install Blender, or set one in Preferences → 3D editor".into(),
+    }
+}
+
+/// Paint Blender's navigation gizmo — the little X/Y/Z ball cluster in the corner of a 3D
+/// viewport — and report which axis ball the pointer is over.
+///
+/// It is two things at once: a **readout** (which way is the model's X, Y, Z from here — the one
+/// thing a bare render cannot tell you) and a **control** (click a ball to look straight down that
+/// axis). Returns `Some((axis, negative))` for the ball under `hover`, so the caller can both
+/// highlight it and act on a click.
+///
+/// Balls are drawn back-to-front by their depth along the view axis, so the near ones occlude the
+/// far ones and the cluster reads as a solid object rather than a flat diagram.
+fn paint_axis_gizmo(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    orbit: &crate::decode::mesh3d::Orbit,
+    hover: Option<egui::Pos2>,
+) -> Option<(usize, bool)> {
+    let (right, up, fwd) = orbit.basis();
+    let ball_r = radius * 0.22;
+    // Each world axis, projected into view space: x/y give the screen position, z the depth.
+    let mut balls: Vec<(usize, bool, egui::Pos2, f32)> = Vec::with_capacity(6);
+    for axis in 0..3usize {
+        for neg in [false, true] {
+            let mut w = [0.0f32; 3];
+            w[axis] = if neg { -1.0 } else { 1.0 };
+            let vx = w[0] * right[0] + w[1] * right[1] + w[2] * right[2];
+            let vy = w[0] * up[0] + w[1] * up[1] + w[2] * up[2];
+            let vz = w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2];
+            let p = egui::pos2(
+                center.x + vx * (radius - ball_r),
+                center.y - vy * (radius - ball_r), // screen y grows downward
+            );
+            balls.push((axis, neg, p, vz));
+        }
+    }
+    // Hit-test before drawing, so the hovered ball can be drawn highlighted. Nearest to the
+    // camera wins when two overlap, which is the one you can see.
+    let hit = hover.and_then(|h| {
+        balls
+            .iter()
+            .filter(|(_, _, p, _)| p.distance(h) <= ball_r * 1.35)
+            .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(a, n, _, _)| (*a, *n))
+    });
+    // Far balls first (depth: +fwd points away from the viewer).
+    balls.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    let col = |axis: usize| match axis {
+        0 => egui::Color32::from_rgb(226, 86, 86),
+        1 => egui::Color32::from_rgb(124, 196, 94),
+        _ => egui::Color32::from_rgb(86, 142, 232),
+    };
+    for (axis, neg, p, _) in &balls {
+        let c = col(*axis);
+        let hot = hit == Some((*axis, *neg));
+        if !neg {
+            // Only the positive axes get an arm, exactly as Blender draws it — six spokes is a
+            // snowflake, three is a coordinate frame.
+            painter.line_segment([center, *p], egui::Stroke::new(2.0, c.gamma_multiply(0.85)));
+        }
+        if *neg && !hot {
+            // Hollow: a negative axis is a target to click, not a direction to read.
+            painter.circle_stroke(*p, ball_r, egui::Stroke::new(1.6, c.gamma_multiply(0.75)));
+        } else {
+            painter.circle_filled(*p, ball_r, if hot { c } else { c.gamma_multiply(0.9) });
+        }
+        if hot {
+            painter.circle_stroke(
+                *p,
+                ball_r + 2.0,
+                egui::Stroke::new(1.5, egui::Color32::WHITE.gamma_multiply(0.8)),
+            );
+        }
+        if !neg || hot {
+            painter.text(
+                *p,
+                egui::Align2::CENTER_CENTER,
+                ["X", "Y", "Z"][*axis],
+                egui::FontId::proportional(ball_r * 1.25),
+                egui::Color32::from_rgb(16, 16, 20),
+            );
+        }
+    }
+    hit
+}
+
 fn three_d_sig(
     view: &crate::decode::mesh3d::View,
     opts: &crate::decode::mesh3d::RenderOpts,
@@ -51804,6 +52991,15 @@ fn three_d_sig(
     let (disc, floats): (u8, Vec<f32>) = match view {
         View::Orbit(c) => (0, vec![c.yaw, c.pitch, c.zoom, c.pan[0], c.pan[1]]),
         View::Fly(c) => (1, vec![c.eye[0], c.eye[1], c.eye[2], c.yaw, c.pitch]),
+        // The free camera carries a full basis, so every component has to reach the hash — two
+        // different rolls at the same eye and forward are different pictures.
+        View::Free(c) => (
+            2,
+            vec![
+                c.eye[0], c.eye[1], c.eye[2], c.right[0], c.right[1], c.right[2], c.up[0], c.up[1],
+                c.up[2], c.fwd[0], c.fwd[1], c.fwd[2],
+            ],
+        ),
     };
     disc.hash(&mut hsh);
     for v in floats.into_iter().chain([opts.light_yaw, opts.light_pitch]) {
@@ -51911,21 +53107,6 @@ fn norm3(a: [f32; 3]) -> f32 {
 }
 fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
     norm3(sub3(a, b))
-}
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-fn normalize3(a: [f32; 3]) -> [f32; 3] {
-    let l = norm3(a);
-    if l < 1e-8 {
-        [0.0, 0.0, 1.0]
-    } else {
-        [a[0] / l, a[1] / l, a[2] / l]
-    }
 }
 
 /// A cheap directory change-signature: entry count folded with the newest mtime (unix
@@ -53886,6 +55067,9 @@ enum OpenAs {
     /// Force-decode the file as ANSI/CP437 **text art** (the group-specific scene extensions that
     /// auto-detection misses), shown in the image viewer with the crisp text-mode treatment.
     TextArt,
+    /// Markdown's fourth reading: the **rendered page** (headings, links, images, tables) — the
+    /// GitHub/VS Code preview. Only meaningful for `.md`; see `src/markdown.rs`.
+    Rendered,
 }
 
 enum TilePick {
@@ -53904,6 +55088,7 @@ enum TilePick {
     CompareSource,         // "Compare ▸ Set as source" — this file becomes the left pane
     CompareDiff,           // "Compare ▸ Set as diff" — this file becomes the right pane
     RenderBlend,           // ".blend" → render frame 1 with headless Blender → becomes its tile
+    Open3dEditor,          // a model / .blend → open it in the 3D editor (Blender, found automatically)
     ExportBlendRender,     // ".blend" → copy its cached Blender render out to a PNG next to it
     JoinVideos,            // join the selected video files into one clip (lossless ffmpeg concat)
     OpenInBrowser,         // a YouTube result → open its watch page in the OS default browser
@@ -54479,6 +55664,17 @@ fn entry_context_menu(
     // the navigator) and the real editor. Offered explicitly rather than guessed — and it is also
     // the escape hatch when one of them can't handle a particular file.
     if is_code {
+        // Markdown's rendered reading goes first: for a README it is almost always the one wanted,
+        // and it is what the other three are alternatives to.
+        if is_markdown_ext(&entry.path)
+            && ui
+                .button("\u{1f4d6} Preview (rendered)")
+                .on_hover_text("The formatted page — headings, links, images, tables")
+                .clicked()
+        {
+            pick = Some(TilePick::Open(OpenAs::Rendered));
+            ui.close();
+        }
         if ui
             .button("\u{1f5bc} Preview (image)")
             .on_hover_text("The rendered page, with pan/zoom and the navigator")
@@ -54577,6 +55773,17 @@ fn entry_context_menu(
                 ui.close();
             }
         });
+        // A model or .blend → the 3D editor (Blender gets it imported).
+        if ext == "blend" || ext == "blend1" || crate::decode::mesh3d::MESH_EXTS.contains(&ext.as_str()) || ext == "fbx" {
+            if ui
+                .button(format!("{} Open in 3D editor", icons::CUBE))
+                .on_hover_text("Open it in Blender (found automatically) or the 3D editor set in Preferences")
+                .clicked()
+            {
+                pick = Some(TilePick::Open3dEditor);
+                ui.close();
+            }
+        }
         // .blend: render frame 1 headless with Blender → becomes this tile's thumbnail.
         if ext == "blend" || ext == "blend1" {
             if ui
@@ -54719,12 +55926,12 @@ fn entry_context_menu(
     }
     // Add a video (YouTube or local) to a list (Watch Later / a custom list).
     if is_video {
-        ui.menu_button("＋ Add to list", |ui| {
+        ui.menu_button(format!("{} Add to list", icons::PLUS), |ui| {
             if ui.button("⏰ Watch Later").clicked() {
                 pick = Some(TilePick::AddToList("Watch Later".to_string()));
                 ui.close();
             }
-            if ui.button("＋ New list…").clicked() {
+            if ui.button(format!("{} New list…", icons::PLUS)).clicked() {
                 pick = Some(TilePick::AddToNewList);
                 ui.close();
             }
@@ -60561,6 +61768,55 @@ impl Kaleidotron {
                             out.refresh = true;
                         }
                     });
+                    pref_card(&mut c[0], "3D editor", accent, |ui| {
+                        let mut s = self
+                            .editor3d_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut s)
+                                .hint_text("blank = Blender, found automatically")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if resp.changed() {
+                            let t = s.trim();
+                            self.editor3d_path = (!t.is_empty()).then(|| PathBuf::from(t));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Browse…").clicked() {
+                                if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                    self.editor3d_path = Some(f);
+                                }
+                            }
+                            if self.editor3d_path.is_some() && ui.button("Clear").clicked() {
+                                self.editor3d_path = None;
+                            }
+                        });
+                        match &self.editor3d_path {
+                            Some(p) if p.exists() => {
+                                ui.weak(format!("\u{2713} Found: {}", p.display()));
+                            }
+                            Some(p) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 80),
+                                    format!("\u{2717} Not found at {}", p.display()),
+                                );
+                            }
+                            None => match crate::editor3d::detect_blender() {
+                                Some(e) => {
+                                    ui.weak(format!("\u{2713} Auto: {}", e.name));
+                                }
+                                None => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 120, 80),
+                                        "\u{2717} No Blender found — install it (blender.org), or Browse… to your 3D editor",
+                                    );
+                                }
+                            },
+                        }
+                        ui.weak("Used by Open in 3D editor in the 3D views and the right-click menu. Blender gets the model imported; any other program gets the file.");
+                    });
                     pref_card(&mut c[0], "DOSBox", accent, |ui| {
                         let mut s = self
                             .dosbox_path
@@ -61602,6 +62858,71 @@ mod gui_tests {
             harness.state().text_doc.is_some(),
             "a .bas must open in the text viewer"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole markdown wiring in one pass: a `.md` opens into the rendered preview, parses,
+    /// renders without panicking, and the toggle lands back on the text viewer.
+    ///
+    /// The parser has its own unit tests; what this guards is the part they cannot see — that
+    /// `load_full` routes markdown to `draw_markdown_ui`, that a frame of real rendering (headings,
+    /// a table, a code block, links, an image request) survives egui, and that Source/Preview is
+    /// genuinely a round trip rather than a one-way door.
+    #[test]
+    fn markdown_opens_as_a_rendered_preview_and_toggles_back() {
+        let dir = std::env::temp_dir().join("kt_markdown_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("DOC.md");
+        // One line, no Rust string continuations: a `\` continuation that keeps its leading
+        // whitespace silently turns the next block into an INDENTED CODE BLOCK, which is how
+        // this fixture first "lost" its list, table and alert.
+        std::fs::write(&src, "# Title\n\nSome **bold** text with a [link](https://example.com) and `code`.\n\n- a list item\n- [x] a task\n\n| a | b |\n|:--|--:|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n\n> [!NOTE]\n> an alert\n\n![missing](nope.png)\n").expect("write");
+
+        let mut harness = Harness::builder().build_eframe(move |cc| {
+            let mut app = Kaleidotron::new(cc, CliArgs::default());
+            app.plugin_code = true; // markdown rides the source/text plugin
+            app.registry.set_plugin("code", true);
+            app.md_preview = true;
+            app
+        });
+        harness.run_steps(2);
+        let ctx = harness.ctx.clone();
+        harness.state_mut().load_full(&ctx, src.clone());
+        harness.run_steps(3);
+        assert!(
+            harness.state().text_doc.is_some(),
+            "a .md must open as a document"
+        );
+        let doc = harness
+            .state()
+            .md_doc
+            .as_ref()
+            .map(|(_, _, d)| d.blocks.len())
+            .unwrap_or(0);
+        assert!(doc >= 6, "expected the document to parse into blocks, got {doc}");
+        assert_eq!(
+            harness
+                .state()
+                .md_doc
+                .as_ref()
+                .map(|(_, _, d)| d.outline.len()),
+            Some(1),
+            "the heading should reach the outline"
+        );
+        // The image is missing on disk, so it must be *requested* (and then fail) rather than
+        // being retried every frame — a bad `src` in a README is common and must not spin.
+        assert!(
+            harness.state().md_img_asked.contains("nope.png"),
+            "a missing image should still be asked for exactly once"
+        );
+
+        // …and the toggle is a round trip, not a one-way door.
+        harness.state_mut().md_preview = false;
+        harness.run_steps(2);
+        assert!(harness.state().text_doc.is_some(), "source view keeps the buffer");
+        harness.state_mut().md_preview = true;
+        harness.run_steps(2);
+        assert!(harness.state().md_doc.is_some(), "preview re-parses on the way back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

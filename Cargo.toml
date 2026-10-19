@@ -76,6 +76,12 @@ serde = { version = "1", features = ["derive"] }
 # `Vec<FxPreset>` as compact RON, so we embed + parse that exact format. Already in the
 # tree via eframe (0.12.x); a direct dep just unifies to that same build.
 ron = "0.12"
+# GitHub-flavoured Markdown parsing for the rendered `.md` viewer. A parser ONLY — the
+# rendering is ours (egui widgets styled from the active theme), the same split as
+# icy_parser_core: borrow the format expertise, keep the pixels. `default-features = false`
+# drops the `getopts` CLI + the HTML writer we have no use for; what's left is
+# bitflags/memchr/unicase, all already in the tree. See src/markdown.rs.
+pulldown-cmark = { version = "0.13", default-features = false }
 # HQx pixel-art upscalers (HQ2x/3x/4x). Operates on raw &[u32] ARGB — no image-crate
 # coupling — so it plugs straight into the scale module's RGBA buffers.
 hqx = "0.1"

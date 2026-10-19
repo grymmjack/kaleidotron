@@ -57,11 +57,102 @@ pub struct Mesh3D {
     // Lets one mesh carry a face colour vs. an extruded-side colour (the 3D font maker).
     pub center: [f32; 3],
     pub radius: f32,
+    pub objects: usize,             // meshes in the file (glTF mesh nodes / OBJ groups); 0 = not counted → 1
+    pub polys: Option<PolyCounts>,  // the file's own faces before triangulating (OBJ, PLY); None = triangles only
+}
+
+/// The faces a model file stored before we fan-triangulated them (OBJ and PLY keep quads and
+/// n-gons; glTF and STL store triangles only). `diagonals` = the edges triangulating added.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct PolyCounts {
+    pub tris: usize,
+    pub quads: usize,
+    pub ngons: usize,
+    pub diagonals: usize,
+}
+
+impl PolyCounts {
+    fn add(&mut self, corners: usize) {
+        match corners {
+            3 => self.tris += 1,
+            4 => self.quads += 1,
+            n if n > 4 => self.ngons += 1,
+            _ => return, // a point or a line, not a face
+        }
+        self.diagonals += corners - 3;
+    }
+    pub fn faces(&self) -> usize {
+        self.tris + self.quads + self.ngons
+    }
+}
+
+/// Blender-style statistics for the 3D viewer's overlay.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MeshStats {
+    pub objects: usize,
+    pub verts: usize,       // points, with the copies at UV seams / hard edges merged (what Blender counts)
+    pub split_verts: usize, // what a game engine uploads: one per position+UV+normal combination
+    pub edges: usize,
+    pub faces: usize,
+    pub tris: usize,
+    pub polys: Option<PolyCounts>,
+    pub uvs: bool,
+    pub texture: Option<(usize, usize)>,
+    pub size: [f32; 3], // bounding box, in the file's units
 }
 
 impl Mesh3D {
     pub fn tri_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Count what Blender's Statistics overlay counts: vertices welded by exact position, unique
+    /// edges (minus the diagonals triangulation added), faces as the file stored them.
+    pub fn stats(&self) -> MeshStats {
+        use std::collections::{HashMap, HashSet};
+        let mut weld: HashMap<[u32; 3], u32> = HashMap::with_capacity(self.positions.len());
+        let id: Vec<u32> = self
+            .positions
+            .iter()
+            .map(|p| {
+                let key = p.map(|c| (c + 0.0).to_bits()); // + 0.0 folds -0.0 into 0.0
+                let n = weld.len() as u32;
+                *weld.entry(key).or_insert(n)
+            })
+            .collect();
+        let mut edges: HashSet<u64> = HashSet::with_capacity(self.indices.len());
+        for t in self.indices.chunks_exact(3) {
+            let v = [id[t[0] as usize], id[t[1] as usize], id[t[2] as usize]];
+            for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                if a != b {
+                    edges.insert(((a.min(b) as u64) << 32) | a.max(b) as u64);
+                }
+            }
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &self.positions {
+            for i in 0..3 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+        let tris = self.tri_count();
+        MeshStats {
+            objects: self.objects.max(1),
+            verts: weld.len(),
+            split_verts: self.positions.len(),
+            edges: edges.len().saturating_sub(self.polys.map_or(0, |p| p.diagonals)),
+            faces: self.polys.map_or(tris, |p| p.faces()),
+            tris,
+            polys: self.polys,
+            uvs: self.texcoords.iter().any(|uv| *uv != [0.0, 0.0]),
+            texture: self.texture.as_ref().map(|t| (t.w, t.h)),
+            size: if self.positions.is_empty() {
+                [0.0; 3]
+            } else {
+                [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]
+            },
+        }
     }
 
     /// Recompute `center` + `radius` from the current positions (bounding-sphere-ish:
@@ -113,6 +204,17 @@ pub fn load(path: &Path) -> Option<Mesh3D> {
     if mesh.positions.is_empty() || mesh.indices.len() < 3 {
         return None;
     }
+    if ext == "obj" {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut pc = PolyCounts::default();
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                if let Some(rest) = line.trim_start().strip_prefix("f ") {
+                    pc.add(rest.split_whitespace().count());
+                }
+            }
+            mesh.polys = (pc.faces() > 0).then_some(pc);
+        }
+    }
     if mesh.base_rgb == [0, 0, 0] {
         mesh.base_rgb = [150, 170, 200]; // default cool-grey when the file has no material colour
     }
@@ -126,6 +228,7 @@ pub fn load(path: &Path) -> Option<Mesh3D> {
 fn load_via_mesh_loader(path: &Path) -> Option<Mesh3D> {
     let scene = mesh_loader::Loader::default().load(path).ok()?;
     let mut out = Mesh3D::default();
+    out.objects = scene.meshes.len();
     for m in &scene.meshes {
         let base = out.positions.len() as u32;
         out.positions
@@ -250,6 +353,7 @@ fn load_ply(path: &Path) -> Option<Mesh3D> {
                         let idx: Vec<u32> = (0..n)
                             .map(|_| it.next().unwrap_or("0").parse().unwrap_or(0))
                             .collect();
+                        out.polys.get_or_insert_default().add(idx.len());
                         for k in 1..idx.len().saturating_sub(1) {
                             out.indices.extend([idx[0], idx[k], idx[k + 1]]); // fan-triangulate
                         }
@@ -302,6 +406,7 @@ fn load_ply(path: &Path) -> Option<Mesh3D> {
                         for _ in 0..n {
                             idx.push(read(&bytes, &mut pos, it)? as u32);
                         }
+                        out.polys.get_or_insert_default().add(idx.len());
                         for k in 1..idx.len().saturating_sub(1) {
                             out.indices.extend([idx[0], idx[k], idx[k + 1]]);
                         }
@@ -386,6 +491,7 @@ fn load_texture(path: &Path) -> Option<Texture> {
 fn load_gltf(path: &Path) -> Option<Mesh3D> {
     let (doc, buffers, images) = gltf::import(path).ok()?;
     let mut out = Mesh3D::default();
+    out.objects = doc.nodes().filter(|n| n.mesh().is_some()).count();
     for mesh in doc.meshes() {
         for prim in mesh.primitives() {
             if prim.mode() != gltf::mesh::Mode::Triangles {
@@ -494,23 +600,316 @@ impl FlyCam {
     pub fn right(&self) -> [f32; 3] {
         normalize(cross([0.0, 1.0, 0.0], self.forward()))
     }
-    /// Seed a fly camera from the current orbit view so entering FPS mode doesn't jump:
-    /// place `eye` back along the orbit look direction, framing the whole model.
-    pub fn from_orbit(cam: &Camera, center: [f32; 3], radius: f32) -> Self {
-        // Orbit rotates the mesh by R = Rx(pitch)Ry(yaw) and looks down -Z, so the camera
-        // sits at R⁻¹·[0,0,dist] from centre; the look dir is toward the centre.
-        let dist = (radius * 3.0 / cam.zoom.max(0.15)).max(radius * 1.2);
-        let (sy, cy) = cam.yaw.sin_cos();
-        let (sp, cp) = cam.pitch.sin_cos();
-        // R⁻¹ = Ry(-yaw)·Rx(-pitch) applied to [0,0,dist].
-        let v = [0.0, 0.0, dist];
-        let (x1, y1, z1) = (v[0], cp * v[1] + sp * v[2], -sp * v[1] + cp * v[2]); // Rx(-pitch)
-        let off = [cy * x1 + sy * z1, y1, -sy * x1 + cy * z1]; // Ry(-yaw)
-        let eye = [center[0] + off[0], center[1] + off[1], center[2] + off[2]];
-        let fwd = normalize([-off[0], -off[1], -off[2]]); // look toward centre
-        let pitch = fwd[1].clamp(-0.999, 0.999).asin();
-        let yaw = fwd[0].atan2(fwd[2]);
-        FlyCam { eye, yaw, pitch }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Free orbit camera (quaternion)
+// ---------------------------------------------------------------------------------------------
+
+/// A rotation as `[x, y, z, w]`.
+///
+/// The orbit camera is a **quaternion, not Euler angles**, and that is the whole point: yaw/pitch
+/// about a fixed world up is a *turntable*, which can only ever spin a model like a globe — the
+/// horizon stays level, there is no roll, and the poles are singular (which is why the old viewer
+/// clamped elevation and you could never tip a model over to look at its underside). A quaternion
+/// has no preferred axis and no gimbal lock, so a drag can tumble through the pole and a model can
+/// be spun about X, Y or Z equally.
+pub type Quat = [f32; 4];
+
+pub fn quat_identity() -> Quat {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+/// Rotation of `angle` radians about `axis` (need not be unit length).
+pub fn quat_axis_angle(axis: [f32; 3], angle: f32) -> Quat {
+    let a = normalize(axis);
+    let (s, c) = (angle * 0.5).sin_cos();
+    [a[0] * s, a[1] * s, a[2] * s, c]
+}
+
+/// `a` then `b`… in the usual convention: the result applies `b` first, then `a`.
+pub fn quat_mul(a: Quat, b: Quat) -> Quat {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// Re-normalize. Called after every edit: composing thousands of drag deltas drifts off the unit
+/// sphere, and a non-unit quaternion quietly *scales* the scene as well as rotating it.
+pub fn quat_normalize(q: Quat) -> Quat {
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if n <= 1e-12 {
+        return quat_identity();
+    }
+    [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+}
+
+/// Rotate a vector by `q`.
+pub fn quat_rotate(q: Quat, v: [f32; 3]) -> [f32; 3] {
+    // v + 2q_v × (q_v × v + w·v) — the standard expansion, no matrix build.
+    let u = [q[0], q[1], q[2]];
+    let t = cross(u, v);
+    let t = [t[0] + q[3] * v[0], t[1] + q[3] * v[1], t[2] + q[3] * v[2]];
+    let t = cross(u, t);
+    [v[0] + 2.0 * t[0], v[1] + 2.0 * t[1], v[2] + 2.0 * t[2]]
+}
+
+/// The quaternion whose local axes are these world vectors (columns of the rotation matrix).
+///
+/// Shepperd's method: pick the largest diagonal term so the square root is never taken of
+/// something near zero, which is what makes a naive conversion explode at 180°.
+pub fn quat_from_basis(right: [f32; 3], up: [f32; 3], fwd: [f32; 3]) -> Quat {
+    let m = [right, up, fwd]; // m[col][row]
+    let (m00, m11, m22) = (m[0][0], m[1][1], m[2][2]);
+    let tr = m00 + m11 + m22;
+    let q = if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0;
+        [
+            (m[1][2] - m[2][1]) / s,
+            (m[2][0] - m[0][2]) / s,
+            (m[0][1] - m[1][0]) / s,
+            0.25 * s,
+        ]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [
+            0.25 * s,
+            (m[1][0] + m[0][1]) / s,
+            (m[2][0] + m[0][2]) / s,
+            (m[1][2] - m[2][1]) / s,
+        ]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [
+            (m[1][0] + m[0][1]) / s,
+            0.25 * s,
+            (m[2][1] + m[1][2]) / s,
+            (m[2][0] - m[0][2]) / s,
+        ]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [
+            (m[2][0] + m[0][2]) / s,
+            (m[2][1] + m[1][2]) / s,
+            0.25 * s,
+            (m[0][1] - m[1][0]) / s,
+        ]
+    };
+    quat_normalize(q)
+}
+
+/// Shortest-arc interpolation, for animating a view change instead of teleporting.
+pub fn quat_slerp(a: Quat, b: Quat, t: f32) -> Quat {
+    let mut d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    let mut b = b;
+    if d < 0.0 {
+        // q and -q are the same rotation; take the near one or the view spins the long way.
+        b = [-b[0], -b[1], -b[2], -b[3]];
+        d = -d;
+    }
+    if d > 0.9995 {
+        // Nearly parallel: lerp (slerp's sin goes to zero and the division blows up).
+        return quat_normalize([
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t,
+        ]);
+    }
+    let th0 = d.clamp(-1.0, 1.0).acos();
+    let th = th0 * t;
+    let (s, c) = th.sin_cos();
+    let s0 = c - d * s / th0.sin();
+    let s1 = s / th0.sin();
+    quat_normalize([
+        a[0] * s0 + b[0] * s1,
+        a[1] * s0 + b[1] * s1,
+        a[2] * s0 + b[2] * s1,
+        a[3] * s0 + b[3] * s1,
+    ])
+}
+
+
+/// A camera given by an explicit orthonormal basis.
+///
+/// [`FlyCam`] derives its basis from yaw/pitch against a world up, so it *cannot* roll and cannot
+/// look straight down without its right vector becoming undefined. A free orbit needs both, so the
+/// basis is passed in already built.
+#[derive(Clone, Copy)]
+pub struct FreeCam {
+    pub eye: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub fwd: [f32; 3],
+}
+
+impl FreeCam {
+    /// The equivalent free camera for a fly camera (world-up basis, no roll).
+    pub fn from_fly(fc: &FlyCam) -> FreeCam {
+        let fwd = fc.forward();
+        let right = fc.right();
+        FreeCam {
+            eye: fc.eye,
+            right,
+            up: cross(fwd, right),
+            fwd,
+        }
+    }
+}
+
+/// An orbit camera: an orientation + a distance from a pivot.
+///
+/// Everything a Blender-style viewport navigation needs — tumble, roll, pan, dolly, axis snaps —
+/// expressed on a quaternion so none of it is special-cased at the poles.
+#[derive(Clone, Copy)]
+pub struct Orbit {
+    pub pivot: [f32; 3],
+    /// Camera orientation: maps camera-local axes (`+X` right, `+Y` up, `+Z` forward) to world.
+    pub rot: Quat,
+    pub dist: f32,
+}
+
+impl Orbit {
+    /// `(right, up, forward)` in world space.
+    pub fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        (
+            quat_rotate(self.rot, [1.0, 0.0, 0.0]),
+            quat_rotate(self.rot, [0.0, 1.0, 0.0]),
+            quat_rotate(self.rot, [0.0, 0.0, 1.0]),
+        )
+    }
+
+    /// The camera sits `dist` back along its own forward axis from the pivot.
+    pub fn eye(&self) -> [f32; 3] {
+        let (_, _, f) = self.basis();
+        [
+            self.pivot[0] - f[0] * self.dist,
+            self.pivot[1] - f[1] * self.dist,
+            self.pivot[2] - f[2] * self.dist,
+        ]
+    }
+
+    pub fn to_free(self) -> FreeCam {
+        let (right, up, fwd) = self.basis();
+        FreeCam {
+            eye: self.eye(),
+            right,
+            up,
+            fwd,
+        }
+    }
+
+    /// The default "hero" three-quarter view, framing a mesh of `radius` about `center`.
+    pub fn frame(center: [f32; 3], radius: f32) -> Orbit {
+        let r = radius.max(1e-4);
+        let mut o = Orbit {
+            pivot: center,
+            rot: quat_identity(),
+            dist: r * 3.0,
+        };
+        // The thumbnail's "hero" three-quarter angle, so the viewport opens on the picture the
+        // grid tile showed: start square-on, turn 0.6 rad about the model's up, tilt down 0.5.
+        o.rot = Orbit::axis_rot(2, false);
+        o.spin_world([0.0, 1.0, 0.0], 0.6);
+        o.spin_local([1.0, 0.0, 0.0], -0.5);
+        o
+    }
+
+    /// Drag-to-rotate. `dx`/`dy` are pointer deltas in points.
+    ///
+    /// **Turntable** keeps the model's up axis up (Blender's default, and what most people expect
+    /// of a "turn it around" drag). **Trackball** rotates about the camera's own axes, so the drag
+    /// goes wherever you push it, through the poles and upside down — which is the only way to
+    /// casually spin a model about its X or Y.
+    pub fn tumble(&mut self, dx: f32, dy: f32, trackball: bool) {
+        const K: f32 = 0.01;
+        if trackball {
+            // Both rotations about *camera-local* axes ⇒ composed on the right.
+            let qx = quat_axis_angle([0.0, 1.0, 0.0], dx * K);
+            let qy = quat_axis_angle([1.0, 0.0, 0.0], dy * K);
+            self.rot = quat_normalize(quat_mul(quat_mul(self.rot, qx), qy));
+        } else {
+            // Azimuth about the WORLD up (left-composed), elevation about the camera's own right.
+            let qa = quat_axis_angle([0.0, 1.0, 0.0], dx * K);
+            let qe = quat_axis_angle([1.0, 0.0, 0.0], dy * K);
+            self.rot = quat_normalize(quat_mul(quat_mul(qa, self.rot), qe));
+        }
+    }
+
+    /// Roll about the view axis — the one thing a turntable can never do.
+    pub fn roll(&mut self, radians: f32) {
+        self.rot = quat_normalize(quat_mul(self.rot, quat_axis_angle([0.0, 0.0, 1.0], radians)));
+    }
+
+    /// Spin the view about a **world** axis — what the X / Y / Z buttons do, so "turn it 90° about
+    /// Y" means the model's Y, not the screen's.
+    pub fn spin_world(&mut self, axis: [f32; 3], radians: f32) {
+        self.rot = quat_normalize(quat_mul(quat_axis_angle(axis, radians), self.rot));
+    }
+
+    /// Spin about a **camera-local** axis (screen right / up / into the screen).
+    pub fn spin_local(&mut self, axis: [f32; 3], radians: f32) {
+        self.rot = quat_normalize(quat_mul(self.rot, quat_axis_angle(axis, radians)));
+    }
+
+    /// Screen-space pan: slide the pivot (and so the camera) across the view plane.
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        let (right, up, _) = self.basis();
+        let k = self.dist * 0.0022;
+        for i in 0..3 {
+            self.pivot[i] += -dx * right[i] * k + dy * up[i] * k;
+        }
+    }
+
+    /// Dolly in/out by a factor, clamped to a sane multiple of the model's size.
+    pub fn dolly(&mut self, factor: f32, radius: f32) {
+        let r = radius.max(1e-4);
+        self.dist = (self.dist * factor).clamp(r * 0.05, r * 60.0);
+    }
+
+    /// The orientation that looks down `axis` (`0=X, 1=Y, 2=Z`), from the positive side unless
+    /// `neg`. Top and bottom need their own up vector: the world up is the view direction there,
+    /// so the usual `cross(worldUp, fwd)` is zero — exactly the degeneracy a turntable cannot
+    /// survive and a quaternion handles by being told the basis outright.
+    pub fn axis_rot(axis: usize, neg: bool) -> Quat {
+        let s = if neg { -1.0 } else { 1.0 };
+        let (right, up, fwd) = match axis {
+            // Camera on +X looking back along -X (and the mirror for -X).
+            0 => ([0.0, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, 0.0]),
+            // Top / bottom: the world up IS the view direction here, so up becomes world ±Z.
+            // The sign matters — the mirror of it is a left-handed basis (determinant −1), which
+            // is a *reflection*, and `quat_from_basis` has no rotation to return for one.
+            1 => ([1.0, 0.0, 0.0], [0.0, 0.0, s], [0.0, -s, 0.0]),
+            _ => ([-s, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -s]),
+        };
+        quat_from_basis(right, up, fwd)
+    }
+
+    /// Adopt a fly camera's pose (used when leaving FPS mode), orbiting `pivot`.
+    pub fn from_fly(fly: &FlyCam, pivot: [f32; 3]) -> Orbit {
+        let fwd = fly.forward();
+        let right = fly.right();
+        let up = cross(fwd, right);
+        Orbit {
+            pivot,
+            rot: quat_from_basis(right, up, fwd),
+            dist: len3(sub(pivot, fly.eye)).max(1e-4),
+        }
+    }
+
+    /// Hand the pose to a fly camera (used when entering FPS mode). Roll is dropped — the fly
+    /// camera has a world up by construction, and walking into a scene with a tilted horizon is
+    /// disorienting, which is why Blender levels it on entry too.
+    pub fn to_fly(self) -> FlyCam {
+        let (_, _, fwd) = self.basis();
+        FlyCam {
+            eye: self.eye(),
+            yaw: fwd[0].atan2(fwd[2]),
+            pitch: fwd[1].clamp(-0.999, 0.999).asin(),
+        }
     }
 }
 
@@ -518,6 +917,23 @@ impl FlyCam {
 pub enum View {
     Orbit(Camera),
     Fly(FlyCam),
+    /// A perspective camera with an explicit basis — the free orbit (and anything else that needs
+    /// roll or a straight-down view).
+    Free(FreeCam),
+}
+
+impl View {
+    /// The perspective basis this view projects with, or `None` for the orthographic turntable.
+    ///
+    /// Fly and Free differ only in how their basis is *derived*, so both projection paths (the
+    /// rasterizer and the SVG exporter) take it from here and have one implementation each.
+    fn perspective(&self) -> Option<FreeCam> {
+        match self {
+            View::Orbit(_) => None,
+            View::Fly(fc) => Some(FreeCam::from_fly(fc)),
+            View::Free(fc) => Some(*fc),
+        }
+    }
 }
 
 /// Scene/look options for a render — the "scene setup" controls. `textured` picks the base
@@ -629,10 +1045,15 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                 })
                 .collect()
         }
-        View::Fly(fc) => {
-            let fwd = fc.forward();
-            let right = fc.right();
-            let up = cross(fwd, right); // orthonormal
+        // One perspective path for Fly and Free: they differ only in how the basis is derived.
+        _ => {
+            let fc = view.perspective().unwrap_or(FreeCam {
+                eye: [0.0, 0.0, 1.0],
+                right: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                fwd: [0.0, 0.0, 1.0],
+            });
+            let (fwd, right, up) = (fc.fwd, fc.right, fc.up);
             let focal = (h as f32 * 0.5) / (0.5f32).tan(); // ~53° vertical FOV
             let near = r * 0.02;
             (0..mesh.positions.len())
@@ -674,12 +1095,10 @@ pub fn render(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                 let (sp, cp) = cam.pitch.sin_cos();
                 orbit_rotate(n, sy, cy, sp, cp)
             }
-            View::Fly(fc) => {
-                let fwd = fc.forward();
-                let right = fc.right();
-                let up = cross(fwd, right);
-                [dot(n, right), dot(n, up), dot(n, fwd)]
-            }
+            _ => match view.perspective() {
+                Some(fc) => [dot(n, fc.right), dot(n, fc.up), dot(n, fc.fwd)],
+                None => n,
+            },
         }
     };
 
@@ -810,10 +1229,14 @@ pub fn to_svg(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                 })
                 .collect()
         }
-        View::Fly(fc) => {
-            let fwd = fc.forward();
-            let right = fc.right();
-            let up = cross(fwd, right);
+        _ => {
+            let fc = view.perspective().unwrap_or(FreeCam {
+                eye: [0.0, 0.0, 1.0],
+                right: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                fwd: [0.0, 0.0, 1.0],
+            });
+            let (fwd, right, up) = (fc.fwd, fc.right, fc.up);
             let focal = (h as f32 * 0.5) / (0.5f32).tan();
             let near = r * 0.02;
             mesh.positions
@@ -837,12 +1260,10 @@ pub fn to_svg(mesh: &Mesh3D, w: usize, h: usize, view: &View, opts: &RenderOpts)
                 let (sp, cp) = cam.pitch.sin_cos();
                 orbit_rotate(n, sy, cy, sp, cp)
             }
-            View::Fly(fc) => {
-                let fwd = fc.forward();
-                let right = fc.right();
-                let up = cross(fwd, right);
-                [dot(n, right), dot(n, up), dot(n, fwd)]
-            }
+            _ => match view.perspective() {
+                Some(fc) => [dot(n, fc.right), dot(n, fc.up), dot(n, fc.fwd)],
+                None => n,
+            },
         }
     };
 
@@ -914,6 +1335,11 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
+/// Euclidean length.
+fn len3(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let l = dot(v, v).sqrt();
     if l < 1e-8 {
@@ -1337,6 +1763,228 @@ impl Decoder for BlendDecoder {
 
 #[cfg(test)]
 mod tests {
+
+    // ── Free orbit camera (the quaternion navigation) ─────────────────────────────────────────
+
+    fn approx(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|i| (a[i] - b[i]).abs() < 1e-4)
+    }
+
+    /// The basis must stay orthonormal no matter how much it is dragged. A drifting quaternion
+    /// silently *scales* the model as well as turning it.
+    #[test]
+    fn tumbling_keeps_the_basis_orthonormal() {
+        for trackball in [false, true] {
+            let mut o = Orbit::frame([0.0, 0.0, 0.0], 1.0);
+            // Thousands of deltas, the way a long drag accumulates them.
+            for i in 0..2000 {
+                o.tumble((i % 7) as f32 - 3.0, (i % 5) as f32 - 2.0, trackball);
+            }
+            let (r, u, f) = o.basis();
+            for v in [r, u, f] {
+                assert!((len3(v) - 1.0).abs() < 1e-3, "not unit: {v:?} (trackball={trackball})");
+            }
+            assert!(dot(r, u).abs() < 1e-3, "right·up drifted (trackball={trackball})");
+            assert!(dot(r, f).abs() < 1e-3, "right·fwd drifted (trackball={trackball})");
+            assert!(dot(u, f).abs() < 1e-3, "up·fwd drifted (trackball={trackball})");
+        }
+    }
+
+    /// The whole point of the rewrite: a trackball drag goes over the top and keeps going, so a
+    /// model can be turned onto its back. The old turntable clamped elevation to ±1.5 rad and
+    /// could only ever spin it like a globe.
+    #[test]
+    fn a_trackball_drag_can_tip_the_model_right_over() {
+        let mut o = Orbit::frame([0.0, 0.0, 0.0], 1.0);
+        let (_, up0, _) = o.basis();
+        // Drag "down" far enough to pass the pole (dy total = 400 → 4 radians at K=0.01).
+        for _ in 0..100 {
+            o.tumble(0.0, 4.0, true);
+        }
+        let (_, up1, _) = o.basis();
+        assert!(
+            dot(up0, up1) < 0.0,
+            "the view never passed the pole: up {up0:?} → {up1:?}"
+        );
+        // …and nothing degenerated on the way.
+        assert!((len3(up1) - 1.0).abs() < 1e-3);
+    }
+
+    /// Roll is the other thing a yaw/pitch camera cannot express at all.
+    #[test]
+    fn roll_turns_the_horizon_and_leaves_the_view_direction_alone() {
+        let mut o = Orbit::frame([0.0, 0.0, 0.0], 1.0);
+        let (_, up0, fwd0) = o.basis();
+        o.roll(std::f32::consts::FRAC_PI_2);
+        let (_, up1, fwd1) = o.basis();
+        assert!(approx(fwd0, fwd1), "roll moved the view direction: {fwd0:?} → {fwd1:?}");
+        assert!(dot(up0, up1).abs() < 1e-3, "a quarter roll should put up at right angles");
+    }
+
+    /// Each gizmo axis must look straight down that axis — including top and bottom, where the
+    /// world up IS the view direction and a world-up basis is undefined.
+    #[test]
+    fn every_axis_view_looks_down_its_axis() {
+        // (label, axis index, negative) — the six square-on views.
+        let views: [(&str, usize, bool); 6] = [
+            ("X", 0, false),
+            ("Y", 1, false),
+            ("Z", 2, false),
+            ("-X", 0, true),
+            ("-Y", 1, true),
+            ("-Z", 2, true),
+        ];
+        for (label, axis, neg) in views {
+            let o = Orbit {
+                pivot: [0.0, 0.0, 0.0],
+                rot: Orbit::axis_rot(axis, neg),
+                dist: 10.0,
+            };
+            let (r, u, f) = o.basis();
+            let mut want = [0.0f32; 3];
+            want[axis] = if neg { 1.0 } else { -1.0 }; // camera on +axis looks back along -axis
+            assert!(approx(f, want), "{label}: forward {f:?}, wanted {want:?}");
+            // The eye really is out along the axis it is named for.
+            let eye = o.eye();
+            assert!(
+                eye[axis] * if neg { -1.0 } else { 1.0 } > 9.0,
+                "{label}: eye {eye:?} is not on that side"
+            );
+            // Still a proper right-handed orthonormal frame at the poles.
+            assert!((len3(u) - 1.0).abs() < 1e-4, "{label}: up not unit: {u:?}");
+            assert!(dot(r, u).abs() < 1e-4, "{label}: not orthogonal");
+            // Right-handed, i.e. a rotation and not a reflection: `right × up = forward`.
+            assert!(approx(cross(r, u), f), "{label}: left-handed basis (a reflection)");
+            assert!(approx(cross(u, f), r), "{label}: basis is not orthonormal-consistent");
+        }
+    }
+
+    /// A basis → quaternion → basis round trip, including the 180° case Shepperd's method exists
+    /// for (a naive conversion divides by zero there).
+    #[test]
+    fn quaternion_round_trips_any_basis_including_180_degrees() {
+        let cases: [([f32; 3], [f32; 3], [f32; 3]); 3] = [
+            ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]), // identity
+            ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]), // 180° about Y
+            ([1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]), // 180° about X
+        ];
+        for (r, u, f) in cases {
+            let q = quat_from_basis(r, u, f);
+            assert!(approx(quat_rotate(q, [1.0, 0.0, 0.0]), r), "right {r:?}");
+            assert!(approx(quat_rotate(q, [0.0, 1.0, 0.0]), u), "up {u:?}");
+            assert!(approx(quat_rotate(q, [0.0, 0.0, 1.0]), f), "fwd {f:?}");
+        }
+    }
+
+    /// Slerp must take the short way round: `q` and `-q` are the same rotation, and interpolating
+    /// toward the wrong sign sends the view spinning the long way for no reason.
+    #[test]
+    fn slerp_takes_the_short_arc_and_lands_exactly() {
+        let a = Orbit::axis_rot(2, false);
+        let b = [-a[0], -a[1], -a[2], -a[3]]; // same rotation, opposite sign
+        let mid = quat_slerp(a, b, 0.5);
+        assert!(
+            approx(quat_rotate(mid, [0.0, 0.0, 1.0]), quat_rotate(a, [0.0, 0.0, 1.0])),
+            "halfway between a rotation and itself should not move"
+        );
+        // Endpoints are exact, so a finished animation lands on the view that was asked for.
+        let x = Orbit::axis_rot(0, false);
+        let y = Orbit::axis_rot(1, false);
+        assert!(approx(quat_rotate(quat_slerp(x, y, 0.0), [0.0, 0.0, 1.0]), quat_rotate(x, [0.0, 0.0, 1.0])));
+        assert!(approx(quat_rotate(quat_slerp(x, y, 1.0), [0.0, 0.0, 1.0]), quat_rotate(y, [0.0, 0.0, 1.0])));
+    }
+
+    /// Entering and leaving FPS must not move the camera. (Roll is deliberately dropped on the way
+    /// in — the fly camera has a world up by construction — so the round trip is only exact for an
+    /// un-rolled view, which is what the viewer guarantees by levelling on entry.)
+    #[test]
+    fn orbit_and_fly_agree_on_the_same_pose() {
+        let mut o = Orbit::frame([1.0, 2.0, 3.0], 2.0);
+        o.tumble(30.0, -20.0, false); // turntable keeps the horizon level ⇒ no roll to lose
+        let fly = o.to_fly();
+        assert!(approx(fly.eye, o.eye()), "eye moved: {:?} vs {:?}", fly.eye, o.eye());
+        let back = Orbit::from_fly(&fly, o.pivot);
+        let (_, _, f0) = o.basis();
+        let (_, _, f1) = back.basis();
+        assert!(approx(f0, f1), "view direction moved: {f0:?} → {f1:?}");
+        assert!((back.dist - o.dist).abs() < 1e-3, "distance moved");
+    }
+
+    /// A world-axis spin is about the MODEL's axis, not the screen's — that is what makes the
+    /// X/Y/Z buttons mean "spin it about Y" rather than "spin it about whatever is up on screen".
+    #[test]
+    fn world_spin_is_independent_of_where_the_camera_is() {
+        let mut a = Orbit::frame([0.0, 0.0, 0.0], 1.0);
+        let mut b = a;
+        b.tumble(50.0, 15.0, true); // look from somewhere else entirely
+        let quarter = std::f32::consts::FRAC_PI_2;
+        a.spin_world([0.0, 1.0, 0.0], quarter);
+        b.spin_world([0.0, 1.0, 0.0], quarter);
+        // Both eyes rotated about the world Y axis by the same quarter turn: their Y is unchanged.
+        for (before, after) in [
+            (Orbit::frame([0.0, 0.0, 0.0], 1.0).eye()[1], a.eye()[1]),
+        ] {
+            assert!((before - after).abs() < 1e-3, "a Y spin should not change height");
+        }
+        assert!(b.eye().iter().all(|v| v.is_finite()));
+    }
+
+    /// Panning slides the pivot across the view plane and never along the view direction — a pan
+    /// that drifts the camera closer reads as a zoom and makes framing a model maddening.
+    #[test]
+    fn panning_moves_across_the_view_not_along_it() {
+        let mut o = Orbit::frame([0.0, 0.0, 0.0], 1.0);
+        let (_, _, f) = o.basis();
+        let before = o.eye();
+        let d0 = o.dist;
+        o.pan(40.0, 25.0);
+        let after = o.eye();
+        let moved = sub(after, before);
+        assert!(len3(moved) > 1e-4, "pan did nothing");
+        assert!(dot(moved, f).abs() < 1e-3, "pan drifted along the view axis");
+        assert!((o.dist - d0).abs() < 1e-6, "pan changed the distance");
+    }
+
+    /// Dolly is clamped, so a flick of the wheel cannot bury the camera inside the model or throw
+    /// it so far away the model is a dot.
+    #[test]
+    fn dolly_is_clamped_both_ways() {
+        let mut o = Orbit::frame([0.0, 0.0, 0.0], 2.0);
+        for _ in 0..200 {
+            o.dolly(0.5, 2.0);
+        }
+        assert!(o.dist >= 2.0 * 0.05 - 1e-4, "dollied inside the model: {}", o.dist);
+        for _ in 0..200 {
+            o.dolly(2.0, 2.0);
+        }
+        assert!(o.dist <= 2.0 * 60.0 + 1e-3, "dollied into the void: {}", o.dist);
+    }
+
+    /// The free camera must render: a Free view of a known mesh is not the background colour.
+    #[test]
+    fn a_free_view_actually_rasterizes() {
+        // A tetrahedron is enough geometry to fill pixels from any angle.
+        let mut mesh = Mesh3D {
+            positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+            ..Default::default()
+        };
+        mesh.center = [0.25, 0.25, 0.25];
+        mesh.radius = 1.0;
+        let o = Orbit::frame(mesh.center, mesh.radius);
+        let opts = RenderOpts {
+            bg: [0, 0, 0, 0],
+            ..Default::default()
+        };
+        let px = render(&mesh, 64, 64, &View::Free(o.to_free()), &opts);
+        assert!(px.iter().any(|p| p[3] > 0), "nothing was drawn");
+        // …and a rolled view draws something different (proving roll reaches the rasterizer —
+        // the old Fly path derived its basis from a world up and could not express it).
+        let mut rolled = o;
+        rolled.roll(std::f32::consts::FRAC_PI_4);
+        let px2 = render(&mesh, 64, 64, &View::Free(rolled.to_free()), &opts);
+        assert!(px != px2, "roll had no effect on the render");
+    }
     use super::*;
 
     // A minimal ASCII-OBJ unit tetrahedron, written to a temp file and loaded.
@@ -1355,6 +2003,29 @@ f 2 3 4
         let p = std::env::temp_dir().join(format!("pv_mesh_{}_{name}", std::process::id()));
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    #[test]
+    fn stats_count_like_blender() {
+        // A cube of 6 quads: Blender shows 8 vertices, 12 edges, 6 faces, 12 triangles.
+        let cube = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 0 0 1\nv 1 0 1\nv 1 1 1\nv 0 1 1\n\
+                    f 1 4 3 2\nf 5 6 7 8\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
+        let p = write_temp("cube.obj", cube);
+        let st = load(&p).expect("cube.obj loads").stats();
+        assert_eq!((st.objects, st.verts, st.edges, st.faces, st.tris), (1, 8, 12, 6, 12));
+        assert_eq!(st.polys.map(|p| (p.quads, p.tris, p.ngons)), Some((6, 0, 0)));
+        assert!((st.size[0] - 1.0).abs() < 1e-6 && (st.size[2] - 1.0).abs() < 1e-6);
+        std::fs::remove_file(&p).ok();
+        // Triangles only (no source faces): the tetra is 4 vertices, 6 edges, 4 faces.
+        let mut m = Mesh3D {
+            positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+            ..Default::default()
+        };
+        m.positions.extend_from_within(0..1); // a seam copy of vertex 0 — welded back
+        m.indices[0] = 4;
+        let st = m.stats();
+        assert_eq!((st.verts, st.split_verts, st.edges, st.faces, st.tris), (4, 5, 6, 4, 4));
     }
 
     #[test]

@@ -35,7 +35,9 @@ embedded CP437 VGA font), and the binary scene formats **XBin** (`.xb`/`.xbin`),
 (`.rip` — EGA vector BBS graphics), both via Mike Krüger's `icy_parser_core` — all with
 SAUCE-driven hints, shown in the Details pane. Also **source code + text** (~90 exts: rs,
 c/cpp/h, py, js/ts, css, html, php, lua, asm, gd, json, yaml, md, log, … — rasterized with
-the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`), **PDF**
+the CP437 font + a lean hand-rolled syntax highlighter, `decode/code.rs`) — and **`.md` additionally
+renders as a page** (GitHub/VS Code-style preview: headings, links, images, tables, GFM alerts,
+an outline sidebar; `markdown.rs`), **PDF**
 (`decode/pdf.rs`: the tile is the **real first page**, rendered in-process by **pdfium**
 (`pdfium-render`, a bundled `pdfium.dll` on Windows — no external tool, thread-safe for the
 thumbnailer), then falling back to poppler's `pdftoppm` (PDF on stdin, PNG on stdout), then a
@@ -86,6 +88,10 @@ src/
   app.rs             Kaleidotron: the whole UI — panels, grid/single views, model,
                      settings persistence, sort/filter, ratings, CLI parsing
   image_types.rs     PixImage (RGBA + optional indexed/palette)
+  markdown.rs        rendered Markdown (`.md`): pulldown-cmark parses, we draw — a GitHub /
+                     VS Code-style preview in native egui widgets, styled from the active theme.
+                     Pure parser half (model + GFM + autolinks + the HTML subset) is unit-tested;
+                     the renderer half owns links/images/tables/alerts. See the section below.
   cache.rs           persistent HTTP cache for 16colors (JSON/thumbnails/files/zips):
                      blob files under <data>/cache/ + a SQLite index (cache.db) for
                      TTL freshness, LRU eviction (2 GiB cap) + size stats; thread-safe
@@ -140,7 +146,9 @@ vendor/libxmp/       vendored libxmp 4.6.3 source (MIT) — src/ + include/ + li
     opl3.rs          OPL3 FM-synth chip emulator (public-domain "Opal" port) — for .rad
     rad.rs           Reality Adlib Tracker replayer (public-domain RADPlayer port) — .rad
     mod.rs           Decoder trait + Registry (sniff-then-extension dispatch)
-    mesh3d.rs        3D models (obj/stl/ply/gltf/glb/dae) — mesh-loader + gltf → a flat
+    mesh3d.rs        3D models (obj/stl/ply/gltf/glb/dae). Also the viewport's **quaternion orbit
+                     camera** (`Orbit`/`Quat`/`FreeCam`: tumble, roll, world/local spins, pan,
+                     dolly, axis snaps, slerp) — pure + unit-tested, egui-free. mesh-loader + gltf → a flat
                      triangle Mesh3D (+ UVs/texture) + bounding sphere; a unified CPU z-buffer
                      rasterizer (`render`: orbit-ortho / fly-perspective, solid|textured +
                      wireframe overlay + lighting) for the thumbnail AND the interactive viewer.
@@ -1039,19 +1047,55 @@ The **"3d" format plugin** (Preferences → Format plugins, default OFF like PDF
   `mesh3d::decode_blend(path)`. Gated by `plugin_disabled` (mesh_on) for `MESH_EXTS` + `AUX_EXTS`.
 - **`Mode::ThreeD` (`ui_three_d`) + cameras.** `load_full`'s `is_mesh_path` branch decodes via
   `resolve_local` (archive/16colors virtual paths work) into a `ThreeDView { mesh, orbit, fly,
-  pre_fly, tex, sig, fps }`. **`load_full` OWNS the view mode** (defaults to Single at the top,
+  pre_fly, anim, tex, sig, fps }`. **`load_full` OWNS the view mode** (defaults to Single at the top,
   the mesh branch overrides to ThreeD) — callers must NOT set `self.mode = Single` *after*
   `load_full` (that clobbered ThreeD → "Nothing loaded"; the old `activate`/`poll_colo_open`
   bug). Re-rasterizes only when the camera / scene-opts / viewport px change (`three_d_sig`
   hashes the active View + `RenderOpts` + w/h), uploaded LINEAR.
-  - **Orbit (default):** drag / middle-drag = rotate, wheel/pinch = zoom, Space+drag = pan,
-    W/S dolly, A/D turn, ←/→ = prev/next, Esc / ‹ Grid = back.
+  - **Orbit is a QUATERNION (`mesh3d::Orbit { pivot, rot, dist }`), not yaw/pitch.** This is the
+    fix for "it spins like a globe": yaw/pitch about a fixed world up is a *turntable* — the
+    horizon is always level, there is no roll, and the poles are singular, so the old code clamped
+    elevation to ±1.5 rad and a model could never be tipped onto its back or viewed straight down
+    its own axis. A quaternion has no preferred axis and no gimbal lock. `Orbit` owns the whole
+    navigation vocabulary (`tumble` / `roll` / `spin_world` / `spin_local` / `pan` / `dolly` /
+    `axis_rot` / `frame`), all of it pure and unit-tested — the drift, pole, handedness and
+    short-arc cases are exactly the ones that are invisible until a model is upside down.
+  - **The renderer needed a new camera too.** `FlyCam` derives its right vector from a world up,
+    so it *cannot* express roll and is undefined looking straight down. `View::Free(FreeCam {
+    eye, right, up, fwd })` takes the basis outright; `View::perspective()` maps Fly and Free onto
+    one projection path, so the rasterizer and the SVG exporter each still have ONE implementation.
+    The viewport renders `Free` in orbit and `Fly` in FPS.
+  - **Gestures.** Middle-drag orbits and Shift+middle pans (Blender), Ctrl+drag zooms, **Alt+drag
+    rolls**, Space+drag pans, wheel/pinch zooms. A plain left-drag does whatever the **Drag:
+    Orbit / Move / Zoom** tool says (`td_nav`, persisted) — that exists for trackpads, which have
+    no middle button.
+  - **Orbit style (`td_trackball`, persisted, default trackball).** Blender's preference of the
+    same name: **turntable** keeps the model's up up; **trackball** rotates about the camera's own
+    axes, so a drag tumbles freely through the poles. Toggle in the nav bar or with `5`.
+  - **The axis gizmo** (`paint_axis_gizmo`, top-right of the viewport) is both a readout — which
+    way the model's X/Y/Z point from here, which a bare render cannot tell you — and a control:
+    click a ball to look down that axis. Balls are depth-sorted so the cluster reads as a solid
+    object; positive axes get an arm and a letter, negative ones are hollow until hovered. A
+    *click* snaps; a *drag* starting on it still orbits, as in Blender.
+  - **Axis snaps animate** (`anim: Option<(Quat, Quat, f32)>` + `quat_slerp`, smoothstepped over
+    ~0.35 s). A view that teleports costs the reader their bearings.
+  - **`R` does not fire here.** `Action::RandomPack` (jump to a random 16colo.rs pack) had no mode
+    gate, so a stray `R` while flying started a pack download and navigated out of the model. Every
+    other viewer key was already scoped to `Mode::Single`; this one just never was.
+  - **Keypad (`three_d_keys`)**: `1`/`3`/`7` front/right/top (Ctrl = the opposite side), `4`/`6`/
+    `8`/`2` turn 15°, `9` flips, `5` switches orbit style, `+`/`-` zoom, `.` frames.
+    **These are `consume_key`'d and run BEFORE the rating keys**: egui reports a numpad `1` as
+    plain `Key::Num1` (it cannot tell numpad from the top row), so without consuming it a tap of
+    `1` to look at the front would also give the model a one-star rating. Gated to `Mode::ThreeD`,
+    so digits mean exactly what they always did everywhere else.
   - **Right-click toggles FPS free-fly** (Blender walk-mode). `FlyCam { eye, yaw, pitch }`
     (perspective): mouse motion (`pointer.delta`) looks, WASD moves (A/D **strafe**), **Q/E**
-    down/up (world Y), wheel dollies, cursor hidden, continuous repaint. Entering seeds the fly
-    cam from the orbit view (`FlyCam::from_orbit`, no jump) and stashes `pre_fly`; **leaving
-    carries the fly pose back into the orbit cam** (`Camera::from_fly`, the exact yaw/pitch
-    inverse) so the view stays put; **Home** restores `pre_fly`.
+    down/up (world Y), wheel dollies, cursor hidden, continuous repaint. Entering hands the orbit
+    pose over with `Orbit::to_fly` (roll dropped — the fly camera has a world up by construction,
+    and Blender levels on entry too) and stashes `pre_fly`; leaving rebuilds the orbit camera in
+    front of wherever you stopped (`Orbit::from_fly`). **Verified pixel-identical** across
+    orbit → FPS → orbit. **Home** returns to the stashed view, or frames the model when there
+    isn't one.
 - **Scene setup (`RenderOpts`, persisted `td_*`).** Top-bar controls: **`[x] Textured`** +
   **`[x] Wireframe`** (independent — bits 0/1 of `td_shade`; wireframe is an OVERLAY, composes
   with flat AND textured) + a **wireframe colour chip** (`td_wire_color`); a **`Scene…`** menu
@@ -1486,6 +1530,78 @@ surfaces now resolve the same fields. `Palette::resolve_with(ext, Option<&Theme>
 raced the GUI tests (which boot a real `Kaleidotron` and install their own) and failed about one run
 in four.
 
+## Rendered Markdown (`markdown.rs`)
+
+A `.md` has **three** readings and all are reachable: the syntax-highlighted raster tile (the grid),
+the text editor (`draw_text_ui`), and the **rendered page** — a GitHub / VS Code-preview-style view
+in native egui widgets. Right-click → **📖 Preview (rendered)** / Preview (image) / View (text) /
+Edit (text); the rendered one is the default (`md_preview`, persisted), and **`Ctrl+Shift+M`**
+(`Action::MarkdownPreview`, rebindable in Preferences → Hotkeys) flips page ⇄ source from either
+side. `is_markdown_ext` (md/markdown/mdown/mkd/mdx) is the gate; `ui_single` picks
+`draw_markdown_ui` vs `draw_text_ui`, so the text viewer is untouched.
+
+**Split like `icy_parser_core`: `pulldown-cmark` parses, we render.** The parser knows CommonMark +
+GFM and nothing about pixels; the document model, the styling and every glyph are ours — so the
+preview inherits the app's theme, its code font, its syntax highlighter and its **decoders** (an
+inline `.pcx`, `.ans` or `.svg` renders, which github.com cannot do). The parsing half is pure and
+unit-tested (25 tests); only the rendering half needs a `Ui`.
+
+- **"CSS" means the active theme** (`MdStyle::resolve`) — headings, links, code background, table
+  rules and blockquote bars resolve from the **same keys the code viewer reads**
+  (`editor.background`, `textLink.foreground`, `tokenColors`), so a preview and the source listing
+  beside it can never disagree, and importing a VS Code theme restyles the markdown too. No HTML/CSS
+  engine composes inside an egui panel (`blitz`/Stylo wants its own wgpu surface, `wry` is a
+  separate OS webview + webkit2gtk), and native widgets keep the text **selectable**.
+- **Covered:** headings (+ GitHub slugs, deduped `-1`/`-2`, a clickable **outline** sidebar),
+  emphasis/strike/inline code, links (external → OS, `#anchor` → scroll, **relative → opens
+  *inside* kaleidotron**: a sibling `.md` in the preview, an image in the viewer, a folder in the
+  browser), images (local via the `Registry`, remote via the HTTP cache, badges = a linked image),
+  nested + task lists, blockquotes, **GitHub alerts** (`> [!NOTE]`), fenced code (language label,
+  copy button, our highlighter), GFM tables with alignment, footnotes, front matter (collapsed),
+  `<details>/<summary>`, and `<p align="center">` logo/badge rows.
+- **Two inline paths, deliberately.** Text-only runs go through **one `LayoutJob`**, laid out once
+  and painted by a single `Label` — so the text is *selectable*, and link rectangles are recovered
+  from **that same galley** by char range (`rects_for_chars` → `layout_from_cursor` /
+  `pos_from_layout_cursor`), which is what makes hit-testing agree with what was drawn under any
+  wrap or font. A paragraph **containing an image** falls back to word-by-word widgets in a
+  `horizontal_wrapped` (the only way to flow an image between words); selection is lost for those
+  paragraphs alone. `inline_job` builds the job and is shared with measurement — see below.
+- **Faux bold.** epaint has no synthetic weight and no bold face is bundled, so a bold run is the
+  same galley redrawn ~0.6px to the side, clipped to that run's rect (the metadata OSD's trick).
+- **Images never block the UI.** `md_request_image` spawns a worker (local → `Registry::decode_path`;
+  remote → `cache::get_bytes`, already netpolicy-gated), and **only CPU pixels cross back** —
+  `poll_md_images` uploads the texture on the UI thread, exactly like the thumbnailer. `md_img_asked`
+  means a dead URL is tried once, not every frame. Uploaded **LINEAR**: a screenshot shrunk into the
+  reading column must area-average (these are documents, not pixel art).
+- **GFM autolink literals are ours** (`autolink`): `pulldown-cmark` does not implement them, so a
+  bare `https://…` typed into prose rendered as dead text while the same URL in `<angle brackets>`
+  was clickable. Trailing sentence punctuation is excluded; `code` runs and existing links are left
+  alone.
+- **A tight list emits no `Paragraph` events** — `- **a** then *b*` arrives as bare
+  `Strong`/`Text`/`Emphasis` straight inside the `Item`. With nowhere to put them each run was
+  flushed as its own block, so every README bullet broke into a stack of one-line fragments.
+  `ensure_inline`/`flush_inline` open an implicit paragraph on the first inline event and close it
+  at the next block boundary. Guarded by `a_tight_list_item_is_one_paragraph_not_one_per_run`.
+- **Table columns are measured with `inline_job`, not with the flattened string.** A cell is not
+  plain body text — a header is bold, a `` `.ans` `` span is the monospace font at another size — so
+  measuring `inline_text` in the body font under-measured both and the text spilled across the
+  column rule. And each cell **pins itself to the reserved width** (`set_min_width(w + pad*2)`):
+  `allocate_ui_with_layout` advances the parent cursor by the child's *min_rect*, so a narrow cell
+  packed the next one in early while the rules, drawn at the reserved pitch, walked right and sliced
+  through the text — the same trap as the pad grid's `scope_builder` cursor-advance. Alignment
+  (`:-:` / `--:`) is **measured leading space**, not a `Layout` alignment: the cell content is a
+  full-width child, so a layout has no slack to distribute.
+- **Centring is measured too** (`row_width`): a centred block's content is a `horizontal_wrapped`
+  row that claims the full width, so `vertical_centered` left it hard against the margin.
+- **`Ctrl+Shift+V` is impossible, not merely unused.** egui-winit turns *any* `command+V` into an
+  `Event::Paste` and `return`s **before** emitting a key event, so VS Code's binding could never
+  fire. Hence `Ctrl+Shift+M`. Check this before binding any other `Ctrl+<clipboard key>`.
+- **Settings** (`settings.json`, Preferences → Appearance): `md_preview`, `md_outline`,
+  `md_font_size`, `md_max_width` (0 = fill; otherwise a measured reading column).
+- **Not done:** Mermaid/math blocks (shown as code), arbitrary HTML layout (unknown tags are
+  dropped and their text kept), and interactive task-list checkboxes (rendered read-only — a viewer
+  should not silently rewrite the file).
+
 ## Font glyph gotcha (solved — two embedded fallbacks + an icon set)
 
 egui's *bundled* fonts (Ubuntu-Light + a small NotoEmoji subset) omit whole Unicode blocks,
@@ -1499,7 +1615,8 @@ unchanged. Between them, **nothing we draw tofus.**
 
 - **For a real icon, use `icons::*`** (the `mod icons` block near `install_fallback_font`) —
   `PLAY`/`PAUSE`/`STOP`/`VOLUME`/`MUTE`/`LOOP`/`SHUFFLE`/`REFRESH`/`DOWNLOAD`/`SEARCH`/`BOLT`/
-  `SORT_ASC`/`SORT_DESC`/`PIN`/`GLOBE`/`MUSIC`/`PIANO`. **Codepoint rule (critical):** use Nerd
+  `SORT_ASC`/`SORT_DESC`/`PIN`/`GLOBE`/`MUSIC`/`PIANO`/`COPY`/`PLUS`/`CART`/`CUBE`/`ROBOT`, and
+  the 3D nav set `ORBIT`/`MOVE`/`ZOOM`/`AXIS`/`FRAME_FIT`. **Codepoint rule (critical):** use Nerd
   Font's **Material-Design range (U+F0xxx, plane 15)**, *not* the low FontAwesome range (U+F0xx) —
   the text font stores the fi/fl ligatures at U+F001/F002 and egui's bundled emoji-icon-font is
   FontAwesome-based, so a low codepoint gets **shadowed** (music note → "fi"). Plane-15 is
@@ -1511,6 +1628,15 @@ unchanged. Between them, **nothing we draw tofus.**
   checked explicitly and none of Ubuntu-Light / NotoEmoji / emoji-icon-font / Hack / DejaVu Sans
   has a glyph at either codepoint. Check the same way (across every font in `apply_fonts`, not
   just Nerd Font) before reaching outside plane 15 again.
+- **Emoji are NOT automatically safe — audit, don't assume.** NotoEmoji is a *subset*. A sweep of
+  every non-ASCII character in every UI string literal against the real six-font stack
+  (Ubuntu-Light, Hack, NotoEmoji, emoji-icon-font, Symbols Nerd Font, DejaVu Sans — the first four
+  live in `epaint_default_fonts/fonts/`) found **23 sites rendering as a tofu diamond**: `📋`
+  (U+1F4CB, 13 sites — every Copy button in the app), `＋` (U+FF0B fullwidth plus, 10), `🧊`, `🤖`,
+  `⧉`, `🛒`, and fullwidth `＼`/`／`. All now use `icons::{COPY, PLUS, CUBE, ROBOT, CART}` or plain
+  ASCII. **Re-run that audit after adding UI strings** — load each font's `getBestCmap()`, union
+  them, and flag any char in a `"…"` literal that is in none of them. It takes a minute and is the
+  only way to catch this without eyeballing every screen.
 - **For a plain symbol**, a normal Unicode char (`·`/`…`/`×`/`★`) still just works via DejaVu.
 - Only ASCII (`*`) or a *painted* shape (see `drag_handle`'s dots) if something tofus even with
   both fallbacks (very new emoji / CJK / niche pictographs). When in doubt, test in the real app.
